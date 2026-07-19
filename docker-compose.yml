@@ -1,0 +1,12 @@
+services:
+  vod-manager:
+    image: vod-manager:dev
+    container_name: vod-manager
+    restart: unless-stopped
+    ports:
+      - "8282:8282"
+    volumes:
+      - vod_manager_data:/app/data
+
+volumes:
+  vod_manager_data:

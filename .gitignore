@@ -1,4 +1,44 @@
 
+# secrets — never commit
+.env
+*.env
+.env.*
+!.env.example
+_workshop/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# frontend
+node_modules/
+frontend/dist/
+
+# build artifacts
+backend/static/
+
+# runtime data (config.json, sessions.json, sqlite DBs — never commit real credentials/data)
+/data/
+backend/data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# ad-hoc verification screenshots / browser automation output
+.playwright-mcp/
+/*.png
+
+# os/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
