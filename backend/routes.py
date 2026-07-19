@@ -158,4 +158,4 @@ async def set_credentials_endpoint(
 
 @router.get("/version/")
 async def get_version():
-    return {"version": "0.1.0"}
+    return {"version": "0.1.00"}
