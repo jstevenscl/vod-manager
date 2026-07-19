@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "vod_manager",
+  "project_id": "d11b91ed-8529-4729-92dd-f527d3f1218d"
+}
