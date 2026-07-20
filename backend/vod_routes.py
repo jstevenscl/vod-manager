@@ -13,7 +13,7 @@ import tmdb_sync
 import vod_db
 import vod_importer
 import vod_sync
-from xc_server import get_active_sessions, get_expected_credentials
+from xc_server import get_active_sessions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/vod", tags=["vod-manager"])
@@ -31,6 +31,18 @@ class VodSettingsRequest(BaseModel):
 
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
+
+
+class XcClientRequest(BaseModel):
+    label: str
+    ip_allowlist: Optional[str] = None
+
+
+class XcClientUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    enabled: Optional[bool] = None
+    ip_allowlist: Optional[str] = None
+    clear_ip_allowlist: bool = False
 
 
 class MetadataRuleRequest(BaseModel):
@@ -128,14 +140,74 @@ async def save_vod_settings(body: VodSettingsRequest):
 
 @router.get("/xc-credentials/", dependencies=_GUARDS)
 async def get_xc_credentials():
-    """The username/password xc_server validates against — same ones used to
-    build a directly-playable stream URL (host comes from wherever the
-    caller is already reaching this app, e.g. window.location.origin)."""
-    creds = await get_expected_credentials()
-    if creds is None:
-        raise HTTPException(503, detail="VOD XC account not configured or unreachable")
-    username, password = creds
-    return {"username": username, "password": password}
+    """A representative valid XC credential pair, used to build in-app
+    preview/copy-URL links — any enabled client's credentials work
+    identically for that purpose since they all see the same pool. Not tied
+    to any particular downstream Dispatcharr instance; see /clients/ for
+    per-instance credential management."""
+    client = vod_db.get_default_xc_client()
+    if client is None:
+        raise HTTPException(503, detail="no XC clients configured yet — add one under Connected Instances")
+    return {"username": client["username"], "password": client["password"]}
+
+
+# ── XC clients (per-instance credentials) ───────────────────────────────────
+
+def _client_out(c: dict) -> dict:
+    return {
+        "id": c["id"],
+        "label": c["label"],
+        "username": c["username"],
+        "password": c["password"],
+        "enabled": bool(c["enabled"]),
+        "ip_allowlist": c["ip_allowlist"],
+        "created_at": c["created_at"],
+        "last_seen_at": c["last_seen_at"],
+        "last_seen_ip": c["last_seen_ip"],
+    }
+
+
+@router.get("/clients/", dependencies=_GUARDS)
+async def list_xc_clients():
+    return [_client_out(c) for c in vod_db.list_xc_clients()]
+
+
+@router.post("/clients/", dependencies=_GUARDS)
+async def create_xc_client(body: XcClientRequest):
+    label = body.label.strip()
+    if not label:
+        raise HTTPException(400, detail="label is required")
+    client = vod_db.create_xc_client(label, body.ip_allowlist)
+    return _client_out(client)
+
+
+@router.patch("/clients/{client_id}/", dependencies=_GUARDS)
+async def update_xc_client(client_id: int, body: XcClientUpdateRequest):
+    if not vod_db.get_xc_client(client_id):
+        raise HTTPException(404, detail="client not found")
+    vod_db.update_xc_client(
+        client_id,
+        label=body.label.strip() if body.label is not None else None,
+        enabled=body.enabled,
+        ip_allowlist=body.ip_allowlist,
+        clear_ip_allowlist=body.clear_ip_allowlist,
+    )
+    return _client_out(vod_db.get_xc_client(client_id))
+
+
+@router.post("/clients/{client_id}/regenerate/", dependencies=_GUARDS)
+async def regenerate_xc_client(client_id: int):
+    if not vod_db.get_xc_client(client_id):
+        raise HTTPException(404, detail="client not found")
+    return _client_out(vod_db.regenerate_xc_client_secret(client_id))
+
+
+@router.delete("/clients/{client_id}/", dependencies=_GUARDS)
+async def delete_xc_client(client_id: int):
+    if not vod_db.get_xc_client(client_id):
+        raise HTTPException(404, detail="client not found")
+    vod_db.delete_xc_client(client_id)
+    return {"ok": True}
 
 
 @router.get("/activity/", dependencies=_GUARDS)

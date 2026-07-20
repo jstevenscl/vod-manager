@@ -13,6 +13,7 @@ resolving back to the same real provider source.
 """
 
 import logging
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -182,6 +183,18 @@ def init_db() -> None:
             export_series_id INTEGER NOT NULL UNIQUE,
             name_suffix TEXT NOT NULL DEFAULT '',
             UNIQUE(series_id, category_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS xc_clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            username TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            ip_allowlist TEXT,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            last_seen_ip TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
@@ -377,6 +390,108 @@ def delete_provider(provider_id: int) -> None:
     even if this was their only source, same as any other source loss."""
     conn = _connect()
     conn.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+# ── XC clients ───────────────────────────────────────────────────────────────
+# One credential pair per downstream Dispatcharr instance (or any other XC
+# client) allowed to pull this pool. Auto-generated, high-entropy username/
+# password rather than anything user-chosen — this is the only thing standing
+# between the XC catalog and the open internet if this server is ever reached
+# from outside a trusted network, so it needs to be as strong as a real API
+# key, not a typed password. See xc_server.py's _authenticate.
+
+def _generate_xc_username() -> str:
+    return f"vm-{secrets.token_hex(4)}"
+
+
+def _generate_xc_password() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def create_xc_client(label: str, ip_allowlist: str | None = None) -> dict:
+    username = _generate_xc_username()
+    password = _generate_xc_password()
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO xc_clients (label, username, password, enabled, ip_allowlist, created_at) VALUES (?,?,?,1,?,?)",
+        (label, username, password, ip_allowlist, _now()),
+    )
+    client_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return get_xc_client(client_id)
+
+
+def list_xc_clients() -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM xc_clients ORDER BY created_at ASC").fetchall()]
+    conn.close()
+    return rows
+
+
+def list_enabled_xc_clients() -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM xc_clients WHERE enabled=1 ORDER BY created_at ASC").fetchall()]
+    conn.close()
+    return rows
+
+
+def get_xc_client(client_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM xc_clients WHERE id=?", (client_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_default_xc_client() -> dict | None:
+    """The oldest enabled client -- used only where a single representative
+    credential pair is needed (e.g. building a copy/preview URL in the UI),
+    not for real auth decisions. Any enabled client's credentials work
+    identically for that purpose since they all see the same pool."""
+    conn = _connect()
+    row = conn.execute("SELECT * FROM xc_clients WHERE enabled=1 ORDER BY created_at ASC LIMIT 1").fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_xc_client(
+    client_id: int, label: str | None = None, enabled: bool | None = None,
+    ip_allowlist: str | None = None, clear_ip_allowlist: bool = False,
+) -> None:
+    conn = _connect()
+    if label is not None:
+        conn.execute("UPDATE xc_clients SET label=? WHERE id=?", (label, client_id))
+    if enabled is not None:
+        conn.execute("UPDATE xc_clients SET enabled=? WHERE id=?", (int(enabled), client_id))
+    if clear_ip_allowlist:
+        conn.execute("UPDATE xc_clients SET ip_allowlist=NULL WHERE id=?", (client_id,))
+    elif ip_allowlist is not None:
+        conn.execute("UPDATE xc_clients SET ip_allowlist=? WHERE id=?", (ip_allowlist, client_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def regenerate_xc_client_secret(client_id: int) -> dict:
+    password = _generate_xc_password()
+    conn = _connect()
+    conn.execute("UPDATE xc_clients SET password=? WHERE id=?", (password, client_id))
+    _commit_with_retry(conn)
+    conn.close()
+    return get_xc_client(client_id)
+
+
+def delete_xc_client(client_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM xc_clients WHERE id=?", (client_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def record_xc_client_seen(client_id: int, ip: str) -> None:
+    conn = _connect()
+    conn.execute("UPDATE xc_clients SET last_seen_at=?, last_seen_ip=? WHERE id=?", (_now(), ip, client_id))
     _commit_with_retry(conn)
     conn.close()
 

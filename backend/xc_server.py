@@ -1,18 +1,22 @@
 """
 Minimal Xtream-Codes-compatible VOD server.
 
-Purpose: let Dispatcharr be configured with an "XC" M3U account pointing at
-VOD Manager, so its refresh-vod flow pulls VOD categories/movies from our
-own curated pool (vod_db) instead of a real external provider.
+Purpose: let one or more Dispatcharr instances each be configured with an
+"XC" M3U account pointing at VOD Manager, so their refresh-vod flow pulls VOD
+categories/movies from our own curated pool (vod_db) instead of a real
+external provider.
 
-Auth: requests are validated against the Dispatcharr-side M3U account
-identified by vod_xc_account_id (config.get_vod_xc_account_id()) — that
-account's own username/password ARE the credentials Dispatcharr will send us
-when it calls this server, so we fetch and compare against Dispatcharr's own
-copy rather than storing a duplicate. See get_expected_credentials().
+Auth: each downstream instance gets its own auto-generated, high-entropy
+username/password pair (a "client" -- see vod_db.create_xc_client and the
+xc_clients table), stored locally rather than fetched from any one
+Dispatcharr's own account. This supports multiple independent Dispatcharr
+instances pulling from the same pool, each individually identifiable and
+revocable, without assuming any of their source IPs are stable (VPN-fronted
+or CGNAT'd instances routinely aren't). See _authenticate.
 """
 
 import asyncio
+import ipaddress
 import logging
 import secrets
 import time
@@ -21,7 +25,6 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
-from config import get_vod_xc_account_id
 from dispatcharr_client import DispatcharrClient
 import emby_vod_client
 import plex_client
@@ -33,44 +36,17 @@ router = APIRouter(tags=["xc-vod"])
 
 vod_db.init_db()
 
-_CRED_CACHE_TTL = 300  # seconds — Dispatcharr's M3U account rarely changes; avoid hitting its API on every request
-_cred_cache: tuple[str, str] | None = None
-_cred_cache_at: float = 0.0
-
-
-async def get_expected_credentials() -> tuple[str, str] | None:
-    """The username/password Dispatcharr's vod_xc_account_id account is
-    configured with — i.e. exactly what Dispatcharr will send us. Falls back
-    to the last-known-good cached value on a transient fetch failure rather
-    than locking users out; returns None only if never configured or never
-    successfully fetched."""
-    global _cred_cache, _cred_cache_at
-    now = time.monotonic()
-    if _cred_cache is not None and (now - _cred_cache_at) < _CRED_CACHE_TTL:
-        return _cred_cache
-
-    account_id = get_vod_xc_account_id()
-    if not account_id:
-        return None
-
-    try:
-        account = await DispatcharrClient().get(f"/api/m3u/accounts/{account_id}/")
-    except Exception as exc:
-        logger.warning("[xc_server] failed to fetch XC account credentials from Dispatcharr: %s", exc)
-        return _cred_cache
-
-    _cred_cache = (account.get("username") or "", account.get("password") or "")
-    _cred_cache_at = now
-    return _cred_cache
-
 
 # Brute-force protection for the XC login. The XC protocol itself has no
 # concept of this (username/password in a URL, checked per-request, full
 # stop) -- if this server is ever reachable from outside a trusted LAN/VPN,
 # that's an open, unthrottled login form. Per-client-IP lockout after
 # repeated failures closes that gap without needing anything outside the
-# app itself. In-memory/best-effort like _active_sessions above -- a
-# restart clears it, which is an acceptable reset for this purpose.
+# app itself, and without assuming the caller's IP is stable or unique to
+# them (it isn't, for VPN-fronted or CGNAT'd instances) -- this is abuse
+# throttling, not identity. In-memory/best-effort like _active_sessions
+# below -- a restart clears it, which is an acceptable reset for this
+# purpose.
 _MAX_FAILED_ATTEMPTS    = 10
 _FAILURE_WINDOW_SECONDS = 300   # 5 min — failures older than this don't count toward the threshold
 _LOCKOUT_SECONDS        = 900   # 15 min
@@ -128,25 +104,65 @@ def _record_auth_success(client_ip: str) -> None:
     _failed_attempts.pop(client_ip, None)
 
 
-async def _authenticate(username: str, password: str, request: Request) -> bool:
+def _ip_allowed(client_ip: str, allowlist: str) -> bool:
+    """allowlist is a comma-separated list of IPs and/or CIDRs, e.g.
+    '203.0.113.4,198.51.100.0/24'. Invalid entries are skipped (logged), not
+    fatal -- a typo in one entry shouldn't lock out every entry."""
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for entry in allowlist.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if addr in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif addr == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            logger.warning("[xc_server] skipping invalid allowlist entry %r", entry)
+    return False
+
+
+async def _find_matching_client(username: str, password: str) -> dict | None:
+    """Checks the given credentials against every enabled client without
+    short-circuiting on the first match -- so response time doesn't leak
+    which position in the list (if any) matched."""
+    matched = None
+    for client in vod_db.list_enabled_xc_clients():
+        user_ok = secrets.compare_digest(username.encode(), client["username"].encode())
+        pass_ok = secrets.compare_digest(password.encode(), client["password"].encode())
+        if user_ok and pass_ok:
+            matched = client
+    return matched
+
+
+async def _authenticate(username: str, password: str, request: Request) -> dict | None:
+    """Returns the matched client dict on success, None otherwise -- truthy/
+    falsy either way, so existing `if not await _authenticate(...)` call
+    sites keep working unchanged."""
     _sweep_expired_auth_entries()
     client_ip = _client_ip(request)
     if _is_locked_out(client_ip):
-        return False
+        return None
 
-    expected = await get_expected_credentials()
-    if expected is None:
-        return False
-
-    ok = (
-        secrets.compare_digest(username.encode(), expected[0].encode()) and
-        secrets.compare_digest(password.encode(), expected[1].encode())
-    )
-    if ok:
-        _record_auth_success(client_ip)
-    else:
+    matched = await _find_matching_client(username, password)
+    if matched is None:
         _record_auth_failure(client_ip)
-    return ok
+        return None
+
+    if matched["ip_allowlist"] and not _ip_allowed(client_ip, matched["ip_allowlist"]):
+        logger.warning("[xc_server] client '%s' presented valid credentials from disallowed IP %s",
+                        matched["label"], client_ip)
+        _record_auth_failure(client_ip)
+        return None
+
+    _record_auth_success(client_ip)
+    vod_db.record_xc_client_seen(matched["id"], client_ip)
+    return matched
 
 
 def _log_hit(request: Request) -> None:
