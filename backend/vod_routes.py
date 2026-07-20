@@ -10,12 +10,10 @@ from config import (
     get_lockout_settings,
     get_refresh_settings,
     get_tmdb_api_key,
-    get_vod_xc_account_id,
     save_anthropic_api_key,
     save_lockout_settings,
     save_refresh_settings,
     save_tmdb_api_key,
-    save_vod_xc_account_id,
 )
 from routes import require_auth, require_configured
 import ai_assist
@@ -36,10 +34,6 @@ vod_db.init_db()
 
 
 # ── Request models ──────────────────────────────────────────────────────────
-
-class VodSettingsRequest(BaseModel):
-    xc_account_id: int
-
 
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
@@ -198,19 +192,6 @@ class EpisodeSourceRequest(BaseModel):
     provider_id: int
     provider_stream_id: str
     container_extension: str = "mp4"
-
-
-# ── Settings ─────────────────────────────────────────────────────────────────
-
-@router.get("/settings/", dependencies=_GUARDS)
-async def get_vod_settings():
-    return {"xc_account_id": get_vod_xc_account_id()}
-
-
-@router.post("/settings/", dependencies=_GUARDS)
-async def save_vod_settings(body: VodSettingsRequest):
-    save_vod_xc_account_id(body.xc_account_id)
-    return {"ok": True}
 
 
 @router.get("/xc-credentials/", dependencies=_GUARDS)

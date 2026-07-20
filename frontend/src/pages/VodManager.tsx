@@ -999,16 +999,6 @@ export default function VodManager() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-activity'] }),
   })
 
-  // ── Settings (XC account id) ──
-  const settingsQuery = useQuery({
-    queryKey: ['vod-settings'],
-    queryFn:  () => api.get('/vod/settings/').then((r) => r.data),
-  })
-  const [xcAccountId, setXcAccountId] = useState('')
-  const saveSettings = useMutation({
-    mutationFn: () => api.post('/vod/settings/', { xc_account_id: Number(xcAccountId) }),
-    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-settings'] }),
-  })
 
   // ── Connected Instances (per-instance XC credentials) ──
   const xcClientsQuery = useQuery<XcClient[]>({
@@ -1621,7 +1611,7 @@ export default function VodManager() {
   )
 
   return (
-    <div className="space-y-4 max-w-5xl">
+    <div className="space-y-4 max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto">
       <SectionCard title="Activity" icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
@@ -1665,26 +1655,8 @@ export default function VodManager() {
         )}
       </SectionCard>
 
-      <SectionCard title="VOD Settings" icon={<CheckCircle2 size={14} />}>
+      <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
         <p className="text-xs text-muted-foreground">
-          The Dispatcharr M3U account (type XC) pointing back at VOD Manager's own catalog server.
-          Create it once in Dispatcharr, then enter its account ID here.
-        </p>
-        <div className="flex items-center gap-1.5">
-          <input
-            className={inputCls()}
-            placeholder={settingsQuery.data?.xc_account_id != null ? String(settingsQuery.data.xc_account_id) : 'Account ID'}
-            value={xcAccountId}
-            onChange={(e) => setXcAccountId(e.target.value)}
-          />
-          <Button size="sm" disabled={!xcAccountId || saveSettings.isPending} onClick={() => saveSettings.mutate()}>
-            {saveSettings.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
-          </Button>
-          {settingsQuery.data?.xc_account_id != null && (
-            <span className="text-xs text-muted-foreground">currently: {settingsQuery.data.xc_account_id}</span>
-          )}
-        </div>
-        <p className="text-xs text-muted-foreground pt-2">
           TMDB API key — used to sync categories from public TMDB Lists (see Categories below).
         </p>
         <div className="flex items-center gap-1.5">
@@ -2249,7 +2221,8 @@ export default function VodManager() {
       </SectionCard>
 
       <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
-        <table className="w-full text-xs">
+        <div className="overflow-x-auto">
+        <table className="w-full text-xs min-w-[1100px]">
           <thead>
             <tr className="text-muted-foreground text-left">
               <th className="pb-1 font-normal">Name</th>
@@ -2416,6 +2389,7 @@ export default function VodManager() {
             ))}
           </tbody>
         </table>
+        </div>
         {importResult && <p className="text-xs text-muted-foreground">{importResult}</p>}
         <div className="flex flex-wrap items-center gap-1.5 pt-1">
           <select
