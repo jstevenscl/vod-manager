@@ -2058,16 +2058,26 @@ export default function VodManager() {
                   )}
                 </td>
                 <td className="py-1 pr-2">
-                  <input
-                    className={inputCls('w-20')} type="number" placeholder="acct id"
-                    defaultValue={c.vod_relay_account_id ?? ''} key={c.vod_relay_account_id}
-                    onBlur={(e) => {
-                      const v = e.target.value.trim()
-                      if (!v) { if (c.vod_relay_account_id != null) updateDispatcharrConnection.mutate({ id: c.id, clear_vod_relay_account_id: true }); return }
-                      const n = Number(v)
-                      if (n !== c.vod_relay_account_id) updateDispatcharrConnection.mutate({ id: c.id, vod_relay_account_id: n })
-                    }}
-                  />
+                  <div className="flex items-center gap-1">
+                    <input
+                      className={inputCls('w-20')} type="number" placeholder="acct id"
+                      defaultValue={c.vod_relay_account_id ?? ''} key={c.vod_relay_account_id}
+                      onBlur={(e) => {
+                        const v = e.target.value.trim()
+                        if (!v) { if (c.vod_relay_account_id != null) updateDispatcharrConnection.mutate({ id: c.id, clear_vod_relay_account_id: true }); return }
+                        const n = Number(v)
+                        if (n !== c.vod_relay_account_id) updateDispatcharrConnection.mutate({ id: c.id, vod_relay_account_id: n })
+                      }}
+                    />
+                    {c.vod_relay_account_id == null && (
+                      <span
+                        className="text-destructive flex items-center gap-1"
+                        title="No VOD-relay account set — this connection receives no provider syncs and no shared-connection-limit coordination. Enter the Dispatcharr-side M3U account ID above, or delete this and use 'Connect a new instance (automated)' instead."
+                      >
+                        <AlertCircle size={12} /> not syncing
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td className="py-1">
                   <button
