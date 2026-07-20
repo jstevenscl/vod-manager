@@ -66,6 +66,17 @@ interface NeedsReviewData {
   series: NeedsReviewItem[]
 }
 
+interface OrphanGroup {
+  count: number
+  sample: { id: number; name: string }[]
+}
+
+interface OrphanReport {
+  orphaned_series: OrphanGroup
+  sourceless_movies: OrphanGroup
+  sourceless_episodes: OrphanGroup
+}
+
 interface TmdbSuggestion {
   tmdb_id: string
   name: string
@@ -427,9 +438,21 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   // what fetches episode listings). Fetch on demand so there's something to
   // preview instead of just a name to guess from, and so the imported
   // season/episode counts below have something real to compare against.
+  const [fetchEpisodesMessage, setFetchEpisodesMessage] = useState<string | null>(null)
   const fetchEpisodes = useMutation({
     mutationFn: () => api.post(`/vod/series/${item.id}/enrich/`, null, { params: { force: true } }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-needs-review'] }),
+    onSuccess: (r) => {
+      if (r.data.fetched) {
+        setFetchEpisodesMessage(null)
+        qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      } else {
+        // e.g. "the provider this series was originally imported from no
+        // longer exists" — previously this looked identical to success
+        // (button just went back to normal, nothing shown).
+        setFetchEpisodesMessage(r.data.reason ?? 'Nothing fetched.')
+      }
+    },
+    onError: (e: any) => setFetchEpisodesMessage(e?.response?.data?.detail ?? e.message),
   })
 
   return (
@@ -447,11 +470,12 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
             <button
               className="text-muted-foreground hover:text-foreground underline decoration-dotted shrink-0"
               disabled={fetchEpisodes.isPending}
-              onClick={() => fetchEpisodes.mutate()}
+              onClick={() => { setFetchEpisodesMessage(null); fetchEpisodes.mutate() }}
             >
               {fetchEpisodes.isPending ? 'fetching…' : 'fetch episodes to preview'}
             </button>
           )}
+          {fetchEpisodesMessage && <span className="text-destructive">{fetchEpisodesMessage}</span>}
         </span>
         <button
           className="text-muted-foreground hover:text-foreground shrink-0"
@@ -1174,6 +1198,22 @@ export default function VodManager() {
   const needsReviewQuery = useQuery<NeedsReviewData>({
     queryKey: ['vod-needs-review'],
     queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
+  })
+
+  // ── Orphan checker (dead rows a provider deletion, or a bug, can leave behind) ──
+  const orphansQuery = useQuery<OrphanReport>({
+    queryKey: ['vod-orphans'],
+    queryFn:  () => api.get('/vod/orphans/').then((r) => r.data),
+    enabled:  false,  // scan on demand only -- this walks the whole pool, not something to run on every page load
+  })
+  const purgeOrphans = useMutation({
+    mutationFn: () => api.post('/vod/orphans/purge/'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-orphans'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
   })
 
   // ── Movies ──
@@ -1924,6 +1964,49 @@ export default function VodManager() {
                 <NeedsReviewRow key={s.id} contentType="series" item={s} qc={qc} xcCredentials={xcCredentialsQuery.data} />
               ))}
             </ul>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Finds dead rows a provider deletion (or a bug) can leave behind: series whose only source provider no
+          longer exists, and movies/episodes with zero sources at all. Doesn't flag series with no episodes yet —
+          that's normal for anything not yet lazily enriched, not broken.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" variant="outline" disabled={orphansQuery.isFetching} onClick={() => orphansQuery.refetch()}>
+            {orphansQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            Scan
+          </Button>
+          {!!orphansQuery.data && (
+            <>
+              {(() => {
+                const total = orphansQuery.data.orphaned_series.count + orphansQuery.data.sourceless_movies.count + orphansQuery.data.sourceless_episodes.count
+                return total === 0
+                  ? <span className="text-xs text-muted-foreground">Clean — nothing found.</span>
+                  : (
+                    <Button
+                      size="sm" variant="outline" className="text-destructive" disabled={purgeOrphans.isPending}
+                      onClick={() => { if (confirm(`Delete ${total} orphaned/sourceless row(s)? This can't be undone.`)) purgeOrphans.mutate() }}
+                    >
+                      {purgeOrphans.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Trash2 size={12} className="mr-1" />}
+                      Delete {total} orphan{total === 1 ? '' : 's'}
+                    </Button>
+                  )
+              })()}
+            </>
+          )}
+        </div>
+        {!!orphansQuery.data && (
+          <div className="text-xs text-muted-foreground space-y-1">
+            <p>Orphaned series (dead provider reference): {orphansQuery.data.orphaned_series.count}
+              {!!orphansQuery.data.orphaned_series.sample.length && ` — e.g. ${orphansQuery.data.orphaned_series.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+            </p>
+            <p>Sourceless movies: {orphansQuery.data.sourceless_movies.count}
+              {!!orphansQuery.data.sourceless_movies.sample.length && ` — e.g. ${orphansQuery.data.sourceless_movies.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+            </p>
+            <p>Sourceless episodes (in otherwise-healthy series): {orphansQuery.data.sourceless_episodes.count}</p>
           </div>
         )}
       </SectionCard>

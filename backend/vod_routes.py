@@ -465,6 +465,20 @@ async def list_needs_year_review(content_type: Optional[str] = None):
     return vod_db.list_needs_year_review(content_type)
 
 
+# ── Orphan checker ───────────────────────────────────────────────────────────
+# Self-service scan/purge for dead rows a provider deletion (or a bug
+# elsewhere) can leave behind -- see vod_db.find_orphans/purge_orphans.
+
+@router.get("/orphans/", dependencies=_GUARDS)
+async def scan_orphans():
+    return vod_db.find_orphans()
+
+
+@router.post("/orphans/purge/", dependencies=_GUARDS)
+async def purge_orphans_route():
+    return vod_db.purge_orphans()
+
+
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
 async def year_review_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
     if content_type not in ("movie", "series"):
@@ -711,13 +725,13 @@ async def delete_series(series_id: int):
 async def enrich_series(series_id: int, force: bool = False):
     if not vod_db.get_series(series_id):
         raise HTTPException(404, detail="series not found")
-    fetched = await vod_importer.enrich_series(series_id, force=force)
+    result = await vod_importer.enrich_series(series_id, force=force)
     series = vod_db.get_series(series_id)
     series["episodes"] = vod_db.list_episodes(series_id)
     episode_sources_by_id = vod_db.list_episode_sources_for_episode_ids([e["id"] for e in series["episodes"]])
     for e in series["episodes"]:
         e["sources"] = episode_sources_by_id.get(e["id"], [])
-    return {"fetched": fetched, "series": series}
+    return {"fetched": result["fetched"], "reason": result["reason"], "series": series}
 
 
 # ── Bulk enrichment ──────────────────────────────────────────────────────────

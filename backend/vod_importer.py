@@ -194,10 +194,18 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
     return True
 
 
-async def enrich_series(series_id: int, *, force: bool = False) -> bool:
+async def enrich_series(series_id: int, *, force: bool = False) -> dict:
     """Fetch get_series_info — this is also where episodes come from (the
     bulk get_series list is series-metadata-only, no episodes), so this call
     is load-bearing even just to populate episodes, not only for detail.
+
+    Returns {"fetched": bool, "reason": str | None} rather than a bare bool
+    -- every False outcome used to look identical (nothing happened, no
+    error), which meant a real problem (the provider this series was
+    imported from got deleted since) was indistinguishable from "already up
+    to date, nothing to do" from the caller's side. A caller like the
+    year-review panel's "fetch episodes to preview" button needs to tell
+    those apart to show something better than a spinner that just resets.
 
     Every vod_db call in here (and in enrich_movie above) is offloaded via
     asyncio.to_thread — these are plain synchronous sqlite3 calls, and
@@ -208,22 +216,24 @@ async def enrich_series(series_id: int, *, force: bool = False) -> bool:
     causing playback to stall mid-stream even though the network path to
     the source was fine."""
     if not force and not await asyncio.to_thread(vod_db.series_needs_enrichment, series_id):
-        return False
+        return {"fetched": False, "reason": "already up to date"}
 
     series = await asyncio.to_thread(vod_db.get_series, series_id)
-    if not series or not series.get("import_provider_id"):
-        return False
+    if not series:
+        return {"fetched": False, "reason": "series not found"}
+    if not series.get("import_provider_id"):
+        return {"fetched": False, "reason": "no source provider recorded for this series"}
 
     provider = await asyncio.to_thread(vod_db.get_provider, series["import_provider_id"])
     if not provider:
-        return False
+        return {"fetched": False, "reason": "the provider this series was originally imported from no longer exists"}
 
     if provider.get("provider_type") == "plex":
         # Same reasoning as enrich_movie: Plex already gave us full detail
         # and every episode at import time (plex_importer.py) — episodes
         # aren't lazily discovered here the way XC's are.
         await asyncio.to_thread(vod_db.set_series_enrichment, series_id)
-        return True
+        return {"fetched": True, "reason": None}
 
     client = XCProviderClient(provider)
     info = await client.get_series_info(str(series["import_provider_series_id"]))
@@ -274,7 +284,7 @@ async def enrich_series(series_id: int, *, force: bool = False) -> bool:
                 ep.get("container_extension") or "mp4",
             )
 
-    return True
+    return {"fetched": True, "reason": None}
 
 
 # ── Bulk enrichment ──────────────────────────────────────────────────────────

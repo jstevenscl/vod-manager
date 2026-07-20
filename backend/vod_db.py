@@ -402,14 +402,163 @@ def set_provider_active(provider_id: int, is_active: bool) -> None:
     conn.close()
 
 
+def _purge_if_sourceless_movie(conn: sqlite3.Connection, movie_id: int) -> None:
+    """A movie with zero sources from any provider can't actually be played,
+    but would still show up as if it were real, available content in
+    Dispatcharr's catalog and any downstream IPTV player -- worse than not
+    listing it at all. Called after removing what might have been a movie's
+    last source, whether that's one source, or a whole provider's worth."""
+    remaining = conn.execute("SELECT COUNT(*) c FROM movie_sources WHERE movie_id=?", (movie_id,)).fetchone()["c"]
+    if remaining == 0:
+        conn.execute("DELETE FROM movies WHERE id=?", (movie_id,))
+
+
+def _purge_if_sourceless_episode(conn: sqlite3.Connection, episode_id: int) -> None:
+    """A specific episode can go sourceless (its one source deleted, or
+    belonged to a now-deleted provider) while the series it belongs to
+    still has other episodes with real sources from other providers -- the
+    series survives, but this one episode is dead weight, same reasoning as
+    _purge_if_sourceless_movie."""
+    remaining = conn.execute("SELECT COUNT(*) c FROM episode_sources WHERE episode_id=?", (episode_id,)).fetchone()["c"]
+    if remaining == 0:
+        conn.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+
+
+def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphaned_provider_id: int | None = None) -> None:
+    """Series equivalent of _purge_if_sourceless_movie -- deletes the whole
+    series only once none of its episodes have any source left at all (see
+    _purge_if_sourceless_episode for the per-episode version). If the series
+    survives (still has sources from other providers) but its cached
+    import_provider_id -- the "ask this provider for episode details"
+    reference used by enrich_series, a plain column with no real FK, not a
+    real source record -- pointed at the provider that just lost its
+    sources, clear it too, so a later enrich attempt fails cleanly instead
+    of silently hitting a provider that's no longer there."""
+    remaining = conn.execute("""
+        SELECT COUNT(*) c FROM episode_sources es
+        JOIN episodes e ON e.id = es.episode_id
+        WHERE e.series_id=?
+    """, (series_id,)).fetchone()["c"]
+    if remaining == 0:
+        conn.execute("DELETE FROM series WHERE id=?", (series_id,))
+    elif orphaned_provider_id is not None:
+        conn.execute(
+            "UPDATE series SET import_provider_id=NULL, import_provider_series_id=NULL WHERE id=? AND import_provider_id=?",
+            (series_id, orphaned_provider_id),
+        )
+
+
 def delete_provider(provider_id: int) -> None:
     """Hard delete. movie_sources/episode_sources for this provider cascade
-    via FK (ON DELETE CASCADE) — the movies/series themselves are left intact
-    even if this was their only source, same as any other source loss."""
+    via FK (ON DELETE CASCADE). Anything left with zero sources from any
+    provider afterward is purged too -- see _purge_if_sourceless_movie/
+    episode/series."""
     conn = _connect()
+
+    # Capture affected movies/episodes/series before the cascade delete
+    # removes the only signal (their sources) that would tell us which ones
+    # to check.
+    affected_movie_ids = [r["movie_id"] for r in conn.execute(
+        "SELECT DISTINCT movie_id FROM movie_sources WHERE provider_id=?", (provider_id,)
+    ).fetchall()]
+    affected_episode_rows = conn.execute("""
+        SELECT DISTINCT e.id AS episode_id, e.series_id FROM episode_sources es
+        JOIN episodes e ON e.id = es.episode_id
+        WHERE es.provider_id=?
+    """, (provider_id,)).fetchall()
+
     conn.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+
+    for movie_id in affected_movie_ids:
+        _purge_if_sourceless_movie(conn, movie_id)
+    affected_series_ids = {r["series_id"] for r in affected_episode_rows}
+    for row in affected_episode_rows:
+        _purge_if_sourceless_episode(conn, row["episode_id"])
+    for series_id in affected_series_ids:
+        _purge_if_sourceless_series(conn, series_id, orphaned_provider_id=provider_id)
+
     _commit_with_retry(conn)
     conn.close()
+
+
+# ── Orphan checker ───────────────────────────────────────────────────────────
+# Self-service version of the manual investigation that found the original
+# bug this exists to prevent recurring: a provider getting deleted (or, more
+# subtly, a source silently losing its movie/episode association -- see the
+# ON CONFLICT fixes on the bulk_import_* functions above) can leave dead
+# rows behind that _purge_if_sourceless_* would have caught at the time, but
+# only if delete_provider/delete_movie_source/delete_episode_source was the
+# path taken. This re-derives the same two categories from scratch across
+# the whole pool, for whatever slips through (a bug elsewhere, a manual DB
+# edit, an upgrade from before these functions existed) rather than assuming
+# every future gap will go through the choke points already covered.
+#
+# Deliberately does NOT flag "series with zero episodes yet" as an orphan --
+# that's the overwhelming majority of any freshly bulk-imported pool (XC
+# episodes are fetched lazily per-series, on demand, by design) and is
+# completely normal, not broken. Only a series whose cached
+# import_provider_id points at a provider that no longer exists at all is
+# genuinely unfixable and worth flagging.
+
+def find_orphans() -> dict:
+    conn = _connect()
+    valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
+
+    orphaned_series = [dict(r) for r in conn.execute("SELECT id, name, import_provider_id FROM series").fetchall()
+                        if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+    sourceless_movies = [dict(r) for r in conn.execute("""
+        SELECT m.id, m.name FROM movies m
+        LEFT JOIN movie_sources ms ON ms.movie_id = m.id
+        WHERE ms.id IS NULL
+    """).fetchall()]
+    sourceless_episodes = [dict(r) for r in conn.execute("""
+        SELECT e.id, e.series_id, e.name FROM episodes e
+        LEFT JOIN episode_sources es ON es.episode_id = e.id
+        WHERE es.id IS NULL
+    """).fetchall()]
+    conn.close()
+
+    return {
+        "orphaned_series": {"count": len(orphaned_series), "sample": orphaned_series[:20]},
+        "sourceless_movies": {"count": len(sourceless_movies), "sample": sourceless_movies[:20]},
+        "sourceless_episodes": {"count": len(sourceless_episodes), "sample": sourceless_episodes[:20]},
+    }
+
+
+def purge_orphans() -> dict:
+    conn = _connect()
+    valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
+
+    orphaned_series_ids = [r["id"] for r in conn.execute("SELECT id, import_provider_id FROM series").fetchall()
+                            if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+    sourceless_movie_ids = [r["id"] for r in conn.execute("""
+        SELECT m.id FROM movies m LEFT JOIN movie_sources ms ON ms.movie_id = m.id WHERE ms.id IS NULL
+    """).fetchall()]
+    # Episodes belonging to a series about to be deleted anyway don't need a
+    # separate delete -- ON DELETE CASCADE handles them. Only ones inside an
+    # otherwise-healthy series need to be purged individually.
+    sourceless_episode_ids = [r["id"] for r in conn.execute("""
+        SELECT e.id FROM episodes e
+        LEFT JOIN episode_sources es ON es.episode_id = e.id
+        WHERE es.id IS NULL AND e.series_id NOT IN ({})
+    """.format(",".join("?" * len(orphaned_series_ids)) if orphaned_series_ids else "NULL"),
+        orphaned_series_ids,
+    ).fetchall()]
+
+    for sid in orphaned_series_ids:
+        conn.execute("DELETE FROM series WHERE id=?", (sid,))
+    for mid in sourceless_movie_ids:
+        conn.execute("DELETE FROM movies WHERE id=?", (mid,))
+    for eid in sourceless_episode_ids:
+        conn.execute("DELETE FROM episodes WHERE id=?", (eid,))
+
+    _commit_with_retry(conn)
+    conn.close()
+    return {
+        "series_deleted": len(orphaned_series_ids),
+        "movies_deleted": len(sourceless_movie_ids),
+        "episodes_deleted": len(sourceless_episode_ids),
+    }
 
 
 # ── XC clients ───────────────────────────────────────────────────────────────
@@ -817,7 +966,8 @@ def add_movie_source(
     conn.execute(
         """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
            VALUES (?,?,?,?,?,?,?)
-           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
+           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
         (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, _now(), _now()),
     )
     _commit_with_retry(conn)
@@ -847,6 +997,7 @@ def set_movie_adult(movie_id: int, is_adult: bool) -> None:
 def delete_movie_source(movie_id: int, source_id: int) -> None:
     conn = _connect()
     conn.execute("DELETE FROM movie_sources WHERE id=? AND movie_id=?", (source_id, movie_id))
+    _purge_if_sourceless_movie(conn, movie_id)
     _commit_with_retry(conn)
     conn.close()
 
@@ -1284,7 +1435,8 @@ def add_episode_source(episode_id: int, provider_id: int, provider_stream_id: st
     conn.execute(
         """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, added_at, last_seen_at)
            VALUES (?,?,?,?,?,?)
-           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET last_seen_at=excluded.last_seen_at""",
+           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+               episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at""",
         (episode_id, provider_id, provider_stream_id, container_extension, _now(), _now()),
     )
     _commit_with_retry(conn)
@@ -1315,6 +1467,10 @@ def set_series_adult(series_id: int, is_adult: bool) -> None:
 def delete_episode_source(episode_id: int, source_id: int) -> None:
     conn = _connect()
     conn.execute("DELETE FROM episode_sources WHERE id=? AND episode_id=?", (source_id, episode_id))
+    episode_row = conn.execute("SELECT series_id FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    _purge_if_sourceless_episode(conn, episode_id)
+    if episode_row:
+        _purge_if_sourceless_series(conn, episode_row["series_id"])
     _commit_with_retry(conn)
     conn.close()
 
@@ -1552,6 +1708,7 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
     now = _now()
     created = 0
     matched = 0
+    flagged = 0
     for item in items:
         name = item["name"]
         year = item.get("year")
@@ -1562,6 +1719,25 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
             matched += 1
             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                 conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+        elif year is None:
+            # No exact (name, NULL) row, and no year to key an exact match
+            # on -- same reasoning as upsert_movie: exactly one same-named
+            # candidate means this is almost certainly it, just missing year
+            # metadata from this provider; two or more is genuinely
+            # ambiguous, flag rather than silently duplicate.
+            candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
+            if len(candidates) == 1:
+                movie_id = candidates[0]["id"]
+                matched += 1
+            else:
+                cur = conn.execute(
+                    "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
+                    (name, year, int(category_looks_adult), 1 if candidates else 0, now),
+                )
+                movie_id = cur.lastrowid
+                created += 1
+                if candidates:
+                    flagged += 1
         else:
             cur = conn.execute(
                 "INSERT INTO movies (name, year, is_adult, created_at) VALUES (?,?,?,?)",
@@ -1573,13 +1749,13 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
             """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
                VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                   last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
+                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
             (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
              item.get("provider_category_name"), now, now),
         )
     _commit_with_retry(conn)
     conn.close()
-    return {"movies_created": created, "movies_matched": matched, "total": len(items)}
+    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged}
 
 
 def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
@@ -1594,15 +1770,43 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
     now = _now()
     created = 0
     matched = 0
+    flagged = 0
     for item in items:
         name = item["name"]
         year = item.get("year")
         category_looks_adult = _looks_adult(item.get("provider_category_name"))
-        row = conn.execute("SELECT id, is_adult, is_adult_manual FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+        row = conn.execute("SELECT id, is_adult, is_adult_manual, import_provider_id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
         if row:
             matched += 1
             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                 conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
+            if row["import_provider_id"] is None:
+                # This series previously had no working way to fetch episode
+                # detail (e.g. its only prior source's provider was later
+                # deleted) -- this provider can, so give it one rather than
+                # leaving it permanently stuck.
+                conn.execute(
+                    "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
+                    (provider_id, item.get("provider_series_id"), row["id"]),
+                )
+        elif year is None:
+            # Same reasoning as bulk_import_movies above.
+            candidates = conn.execute("SELECT id, import_provider_id FROM series WHERE name=?", (name,)).fetchall()
+            if len(candidates) == 1:
+                matched += 1
+                if candidates[0]["import_provider_id"] is None:
+                    conn.execute(
+                        "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
+                        (provider_id, item.get("provider_series_id"), candidates[0]["id"]),
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (name, year, int(category_looks_adult), 1 if candidates else 0, provider_id, item.get("provider_series_id"), now),
+                )
+                created += 1
+                if candidates:
+                    flagged += 1
         else:
             conn.execute(
                 "INSERT INTO series (name, year, is_adult, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?)",
@@ -1611,7 +1815,7 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
             created += 1
     _commit_with_retry(conn)
     conn.close()
-    return {"series_created": created, "series_matched": matched, "total": len(items)}
+    return {"series_created": created, "series_matched": matched, "total": len(items), "flagged_for_review": flagged}
 
 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at")
@@ -1629,6 +1833,7 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
     now = _now()
     created = 0
     matched = 0
+    flagged = 0
     batch_size = 200
     for i, item in enumerate(items):
         name = item["name"]
@@ -1640,6 +1845,24 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
             matched += 1
             sets = ", ".join(f"{k}=?" for k in detail)
             conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+        elif year is None:
+            # Same reasoning as bulk_import_movies. Still writes full detail
+            # even when flagged -- more info for whoever reviews it later.
+            candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
+            if len(candidates) == 1:
+                movie_id = candidates[0]["id"]
+                matched += 1
+                sets = ", ".join(f"{k}=?" for k in detail)
+                conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+            else:
+                cols = ["name", "year", "needs_year_review", *detail.keys()]
+                vals = [name, year, 1 if candidates else 0, *detail.values()]
+                placeholders = ", ".join("?" for _ in cols)
+                cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                movie_id = cur.lastrowid
+                created += 1
+                if candidates:
+                    flagged += 1
         else:
             cols = ["name", "year", *detail.keys()]
             vals = [name, year, *detail.values()]
@@ -1650,14 +1873,15 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
         conn.execute(
             """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
                VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
             (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
         )
         if (i + 1) % batch_size == 0:
             _commit_with_retry(conn)
     _commit_with_retry(conn)
     conn.close()
-    return {"movies_created": created, "movies_matched": matched, "total": len(items)}
+    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged}
 
 
 def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
@@ -1712,7 +1936,8 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
             conn.execute(
                 """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
                    VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                       episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
                 (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), now, now),
             )
             episodes_total += 1
