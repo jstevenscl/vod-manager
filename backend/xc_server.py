@@ -475,7 +475,7 @@ def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
     return f"{provider['base_url'].rstrip('/')}/{kind}/{provider['username']}/{provider['password']}/{source['provider_stream_id']}.{ext}"
 
 
-async def _transcode_vod_stream(kind: str, source: dict, request: Request) -> Response:
+async def _transcode_vod_stream(kind: str, source: dict, request: Request, start_secs: int = 0) -> Response:
     """Re-encodes a source to browser-compatible H.264/AAC on the fly and
     streams the result — for files a stock <video> element can't play
     natively (AVI containers, DTS/AC-3 audio, XviD/DivX video, etc.). Only
@@ -485,27 +485,37 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request) -> Re
     repackages the container, which doesn't help when the actual codec
     inside is what the browser can't decode.
 
-    No seek support: this is a single forward-only ffmpeg pipe, not HLS
-    segments, so scrubbing won't work mid-transcode. Acceptable for a test
-    player; a real fix would mean building an HLS segmenter, which is a
-    bigger feature than 'let it play at all'."""
+    No seek support once playing: this is a single forward-only ffmpeg pipe,
+    not HLS segments, so scrubbing mid-stream won't work (see
+    vod_manager-1qk for the real fix, a proper HLS segmenter -- a
+    meaningfully bigger feature than this). start_secs is a cheaper partial
+    fix for a real workflow need: jumping straight past an intro to verify
+    an ambiguous title without waiting through it every time. It's an
+    input-side ffmpeg -ss (seeks via the container's own index before
+    decoding starts, not a decode-then-discard seek), so a new stream has
+    to be requested for each jump rather than dragging a scrubber -- still
+    far cheaper than watching from zero every time."""
     provider = vod_db.get_provider(source["provider_id"])
     if not provider:
         return Response(status_code=404, content="not found")
     upstream_url = _build_upstream_url(kind, provider, source)
     conn_id = f"transcode-{time.time():.3f}"
-    logger.info("[xc_server] %s transcode OPEN id=%s upstream=%s", kind, conn_id, upstream_url)
+    logger.info("[xc_server] %s transcode OPEN id=%s start=%ds upstream=%s", kind, conn_id, start_secs, upstream_url)
 
     async def generate():
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-loglevel", "error",
+        args = ["ffmpeg", "-loglevel", "error"]
+        if start_secs > 0:
+            args += ["-ss", str(start_secs)]
+        args += [
             "-fflags", "+discardcorrupt+genpts",
             "-i", upstream_url,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -817,7 +827,7 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
 # preview above fails with a codec error.
 
 @router.get("/preview/movie-source-transcoded/{username}/{password}/{source_id_ext}")
-async def preview_movie_source_transcoded(username: str, password: str, source_id_ext: str, request: Request):
+async def preview_movie_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
     _log_hit(request)
     if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
@@ -825,11 +835,11 @@ async def preview_movie_source_transcoded(username: str, password: str, source_i
     source = vod_db.get_movie_source_for_streaming(source_id)
     if not source:
         return Response(status_code=404, content="not found")
-    return await _transcode_vod_stream("movie", source, request)
+    return await _transcode_vod_stream("movie", source, request, start_secs=max(0, start))
 
 
 @router.get("/preview/series-source-transcoded/{username}/{password}/{source_id_ext}")
-async def preview_episode_source_transcoded(username: str, password: str, source_id_ext: str, request: Request):
+async def preview_episode_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
     _log_hit(request)
     if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
@@ -837,4 +847,4 @@ async def preview_episode_source_transcoded(username: str, password: str, source
     source = vod_db.get_episode_source_for_streaming(source_id)
     if not source:
         return Response(status_code=404, content="not found")
-    return await _transcode_vod_stream("series", source, request)
+    return await _transcode_vod_stream("series", source, request, start_secs=max(0, start))

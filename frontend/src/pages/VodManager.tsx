@@ -119,11 +119,16 @@ function buildPreviewSourceUrl(kind: 'movie' | 'series', sourceId: number, ext: 
 }
 
 // Re-encodes to browser-compatible H.264/AAC on the fly — fallback for when
-// the direct preview above fails on a codec the browser can't decode.
-function buildTranscodedPreviewSourceUrl(kind: 'movie' | 'series', sourceId: number, creds?: XcCredentials) {
+// the direct preview above fails on a codec the browser can't decode. No
+// mid-stream seeking (single forward-only ffmpeg pipe, not HLS — see
+// _transcode_vod_stream) — startSecs instead starts a fresh stream partway
+// into the file (ffmpeg -ss before -i, a fast input-side seek), so jumping
+// past an intro to verify a title doesn't mean watching the whole thing.
+function buildTranscodedPreviewSourceUrl(kind: 'movie' | 'series', sourceId: number, creds?: XcCredentials, startSecs = 0) {
   if (!creds) return null
   const path = kind === 'movie' ? 'movie-source-transcoded' : 'series-source-transcoded'
-  return `${window.location.origin}/preview/${path}/${creds.username}/${creds.password}/${sourceId}.mp4`
+  const url = `${window.location.origin}/preview/${path}/${creds.username}/${creds.password}/${sourceId}.mp4`
+  return startSecs > 0 ? `${url}?start=${startSecs}` : url
 }
 
 function CopyUrlButton({ url }: { url: string | null }) {
@@ -153,12 +158,32 @@ function PlayButton({ url, transcodedUrl, title }: { url: string | null; transco
   )
 }
 
+// Merges/overwrites a ?start=<secs> query param — used to restart the
+// transcoded stream partway into the file (see buildTranscodedPreviewSourceUrl).
+function withStartParam(url: string, startSecs: number): string {
+  const u = new URL(url)
+  if (startSecs > 0) u.searchParams.set('start', String(startSecs))
+  else u.searchParams.delete('start')
+  return u.toString()
+}
+
+const JUMP_MARKS_SECS = [0, 120, 300, 600, 1200]
+
 function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transcodedUrl?: string | null; title: string; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [status, setStatus] = useState<'loading' | 'playing' | 'error'>('loading')
   const [error, setError] = useState<string | null>(null)
   const [usingTranscode, setUsingTranscode] = useState(false)
-  const activeUrl = usingTranscode && transcodedUrl ? transcodedUrl : url
+  const [jumpSecs, setJumpSecs] = useState(0)
+  const activeUrl = usingTranscode && transcodedUrl
+    ? (jumpSecs > 0 ? withStartParam(transcodedUrl, jumpSecs) : transcodedUrl)
+    : url
+
+  function jumpTo(secs: number) {
+    setJumpSecs(secs)
+    setStatus('loading')
+    setError(null)
+  }
 
   return createPortal(
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80" onClick={onClose}>
@@ -212,6 +237,22 @@ function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transc
         {status === 'loading' && (
           <div className="absolute inset-0 top-[41px] flex items-center justify-center gap-2 text-sm text-muted-foreground pointer-events-none">
             <Loader2 size={14} className="animate-spin" /> Loading…
+          </div>
+        )}
+
+        {usingTranscode && status !== 'error' && (
+          <div className="flex items-center gap-1.5 px-4 py-2 border-t border-border text-xs">
+            <span className="text-muted-foreground">Jump to (no mid-stream scrubbing — starts a fresh stream):</span>
+            {JUMP_MARKS_SECS.map((secs) => (
+              <Button
+                key={secs}
+                size="sm"
+                variant={jumpSecs === secs ? 'default' : 'outline'}
+                onClick={() => jumpTo(secs)}
+              >
+                {secs === 0 ? 'Start' : `${Math.floor(secs / 60)}m`}
+              </Button>
+            ))}
           </div>
         )}
       </div>
