@@ -971,6 +971,7 @@ export default function VodManager() {
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
     },
+    onError: (e: any) => setImportResult(`Import failed: ${e?.response?.data?.detail ?? e.message}`),
     onSettled: () => setImportingId(null),
   })
 

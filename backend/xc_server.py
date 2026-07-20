@@ -36,6 +36,13 @@ router = APIRouter(tags=["xc-vod"])
 
 vod_db.init_db()
 
+# Some real XC providers (e.g. ProviderD) silently drop the connection -- no
+# HTTP response at all -- for requests without a browser-like User-Agent,
+# httpx's default included. Same fix as vod_importer.py's XCProviderClient,
+# needed here too since this is a separate connection (the actual stream
+# relay, not the catalog import).
+_UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
 
 # Brute-force protection for the XC login. The XC protocol itself has no
 # concept of this (username/password in a URL, checked per-request, full
@@ -570,7 +577,7 @@ async def _proxy_vod_stream(
         # requests off to a CDN edge host rather than serving the file
         # directly — without this, we'd relay that dead-end redirect
         # straight to the client instead of the actual video.
-        client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_UPSTREAM_HEADERS)
         t_connect_start = time.monotonic()
         try:
             upstream_req = client.build_request("GET", upstream_url, headers=forward_headers)

@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 _YEAR_SUFFIX_RE = re.compile(r"^(.*?)\s*\((\d{4})\)\s*$")
 
+# Some real XC providers (e.g. ProviderD) silently drop the connection --
+# no HTTP response at all -- for requests without a browser-like User-Agent,
+# httpx's default ("python-httpx/x.y.z") included. A generic desktop-browser
+# UA is enough to get a normal response.
+_UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
 
 def parse_name_year(raw_name: str) -> tuple[str, int | None]:
     """Real XC providers commonly bake the year into the title string itself
@@ -52,7 +58,7 @@ class XCProviderClient:
         if action:
             query["action"] = action
         query.update(params)
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_UPSTREAM_HEADERS) as client:
             r = await client.get(f"{self.base_url}/player_api.php", params=query)
             r.raise_for_status()
             return r.json()
