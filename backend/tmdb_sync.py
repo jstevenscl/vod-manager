@@ -38,18 +38,26 @@ async def fetch_list_items(list_id: str) -> list[dict]:
     return data.get("items", [])
 
 
-async def search_title(name: str, content_type: str) -> list[dict]:
-    """Real TMDB search results for a name -- used by the year-review flow so
-    a user picks from actual candidates (title/year/poster/tmdb_id) instead
-    of researching the correct year themselves. content_type is 'movie' or
-    'series' (mapped to TMDB's own 'movie'/'tv' search endpoints).
+async def search_title(query: str, content_type: str) -> list[dict]:
+    """Real TMDB search results for a query -- used by the year-review flow so
+    a user picks from actual candidates (title/year/poster/tmdb_id/cast)
+    instead of researching each one themselves. content_type is 'movie' or
+    'series' (mapped to TMDB's own 'movie'/'tv' search endpoints). query is
+    caller-supplied rather than always the pool item's own stored name --
+    the same title is sometimes released under a different name in a
+    different region (e.g. a film's international title vs. its North
+    American one), and TMDB's search only finds what actually matches the
+    query string, so a fixed auto-derived query can't be fixed in code —
+    letting the reviewer type what they think it's actually called is the
+    real fix. See the /needs-review/.../suggestions/ route's q param.
 
-    Includes overview/rating (and, for series, season/episode counts) so a
-    reviewer has more than a bare name+year to go on -- the search endpoint
-    itself doesn't return season/episode counts, so that's one extra detail
-    call per candidate, fetched concurrently to keep this fast. Capped at 5
-    candidates (rather than 10) specifically to bound how many of those
-    extra calls a single suggestions lookup makes."""
+    Includes overview/rating/cast (and, for series, season/episode counts)
+    so a reviewer has more than a bare name+year to go on -- the search
+    endpoint alone doesn't return any of that, so it's one extra detail call
+    per candidate (cast comes along for free on the same call via
+    append_to_response=credits, no separate request needed), fetched
+    concurrently to keep this fast. Capped at 5 candidates (rather than 10)
+    specifically to bound how many of those extra calls one lookup makes."""
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
@@ -58,7 +66,7 @@ async def search_title(name: str, content_type: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         r = await client.get(
             f"{_API_BASE}/search/{endpoint}",
-            params={"api_key": api_key, "query": name},
+            params={"api_key": api_key, "query": query},
         )
         r.raise_for_status()
         data = r.json()
@@ -75,16 +83,21 @@ async def search_title(name: str, content_type: str) -> list[dict]:
                 "vote_average": item.get("vote_average"),
                 "season_count": None,
                 "episode_count": None,
+                "cast": [],
             }
-            if content_type == "series":
-                try:
-                    dr = await client.get(f"{_API_BASE}/tv/{item['id']}", params={"api_key": api_key})
-                    dr.raise_for_status()
-                    dd = dr.json()
+            try:
+                dr = await client.get(
+                    f"{_API_BASE}/{endpoint}/{item['id']}",
+                    params={"api_key": api_key, "append_to_response": "credits"},
+                )
+                dr.raise_for_status()
+                dd = dr.json()
+                if content_type == "series":
                     out["season_count"] = dd.get("number_of_seasons")
                     out["episode_count"] = dd.get("number_of_episodes")
-                except Exception as exc:
-                    logger.warning("[tmdb_sync] failed to fetch season/episode counts for tmdb_id=%s: %s", item["id"], exc)
+                out["cast"] = [c["name"] for c in dd.get("credits", {}).get("cast", [])[:4]]
+            except Exception as exc:
+                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], exc)
             return out
 
         candidates = data.get("results", [])[:5]

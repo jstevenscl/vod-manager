@@ -466,14 +466,19 @@ async def list_needs_year_review(content_type: Optional[str] = None):
 
 
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
-async def year_review_suggestions(content_type: str, item_id: int):
+async def year_review_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        return await tmdb_sync.search_title(item["name"], content_type)
+        # q lets a reviewer search a different title than what's stored --
+        # the same content is sometimes released under a different name in a
+        # different region (e.g. international vs. North American title),
+        # and the default search (item's own stored name) won't find a match
+        # TMDB's index doesn't already associate with that exact string.
+        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:

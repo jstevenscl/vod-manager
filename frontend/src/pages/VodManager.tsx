@@ -75,6 +75,7 @@ interface TmdbSuggestion {
   vote_average: number | null
   season_count: number | null
   episode_count: number | null
+  cast: string[]
 }
 
 interface XcClient {
@@ -397,9 +398,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     ? (item.sample_source_id ? buildTranscodedPreviewSourceUrl('movie', item.sample_source_id, xcCredentials) : null)
     : (item.sample_episode_source_id ? buildTranscodedPreviewSourceUrl('series', item.sample_episode_source_id, xcCredentials) : null)
 
+  // Same content is sometimes released under a different title in a
+  // different region -- the default search (this item's own stored name)
+  // won't find a match TMDB's index doesn't already associate with that
+  // exact string, so let the reviewer search a different title when they
+  // suspect/know one. Empty means "use the stored name" (the default).
+  const [searchOverride, setSearchOverride] = useState('')
   const suggestionsQuery = useQuery<TmdbSuggestion[]>({
-    queryKey: ['vod-needs-review-suggestions', contentType, item.id],
-    queryFn:  () => api.get(`/vod/needs-review/${contentType}/${item.id}/suggestions/`).then((r) => r.data),
+    queryKey: ['vod-needs-review-suggestions', contentType, item.id, searchOverride],
+    queryFn:  () => api.get(`/vod/needs-review/${contentType}/${item.id}/suggestions/`, {
+      params: searchOverride ? { q: searchOverride } : {},
+    }).then((r) => r.data),
     enabled:  expanded,
     retry:    false,
   })
@@ -454,6 +463,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
 
       {expanded && (
         <div className="mt-2 space-y-2">
+          <div className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">search TMDB as:</span>
+            <input
+              className={inputCls('w-40')}
+              placeholder={item.name}
+              defaultValue={searchOverride}
+              onKeyDown={(e) => { if (e.key === 'Enter') setSearchOverride((e.target as HTMLInputElement).value.trim()) }}
+              onBlur={(e) => setSearchOverride(e.target.value.trim())}
+              title="Same title is sometimes released under a different name in a different region — search a different one if you suspect that's the case here"
+            />
+          </div>
           {suggestionsQuery.isLoading && <p className="text-muted-foreground">Searching TMDB…</p>}
           {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
           {!!suggestionsQuery.data?.length && (
@@ -479,6 +499,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
                         <SeasonEpisodeMatch imported={item.imported_episode_count} candidate={s.episode_count} label="episodes" />
                       </div>
                     )}
+                    {!!s.cast.length && <p className="text-muted-foreground">Cast: {s.cast.join(', ')}</p>}
                     {s.overview && <p className="text-muted-foreground line-clamp-2">{s.overview}</p>}
                   </div>
                 </button>
