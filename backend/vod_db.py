@@ -18,7 +18,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from config import DATA_DIR, get_config, get_vod_xc_account_id
+from config import DATA_DIR, get_config, get_refresh_settings, get_vod_xc_account_id
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +292,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movies", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "custom_user_agent", "TEXT"),
+        ("providers", "last_catalog_refresh_at", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1104,13 +1105,47 @@ def get_movie_by_name_year(name: str, year: int | None) -> dict | None:
     return dict(row) if row else None
 
 
-ENRICHMENT_TTL_SECONDS = 24 * 3600
+_refresh_settings_cache: dict | None = None
+_refresh_settings_cache_at = 0.0
+_REFRESH_SETTINGS_CACHE_TTL = 30
+
+
+def _refresh_settings() -> dict:
+    """Cached read of config.get_refresh_settings() -- _is_stale() runs once
+    per item during a bulk_enrich_all pass over the whole pool (hundreds of
+    thousands of rows), so this can't be a raw config-file read per call."""
+    global _refresh_settings_cache, _refresh_settings_cache_at
+    now = time.time()
+    if _refresh_settings_cache is None or (now - _refresh_settings_cache_at) >= _REFRESH_SETTINGS_CACHE_TTL:
+        _refresh_settings_cache = get_refresh_settings()
+        _refresh_settings_cache_at = now
+    return _refresh_settings_cache
+
+
+def get_enrichment_ttl_seconds() -> int:
+    return _refresh_settings()["enrichment_ttl_seconds"]
+
+
+def get_catalog_refresh_interval_seconds(provider_type: str) -> int:
+    key = f"catalog_refresh_seconds_{provider_type}" if provider_type in ("xc", "plex", "emby", "jellyfin") else "catalog_refresh_seconds_xc"
+    return _refresh_settings()[key]
+
+
+def get_tmdb_sync_interval_seconds() -> int | None:
+    return _refresh_settings()["tmdb_sync_interval_seconds"]
+
+
+def mark_provider_catalog_refreshed(provider_id: int) -> None:
+    conn = _connect()
+    conn.execute("UPDATE providers SET last_catalog_refresh_at=? WHERE id=?", (_now(), provider_id))
+    _commit_with_retry(conn)
+    conn.close()
 
 
 def _is_stale(last_enriched_at) -> bool:
     if not last_enriched_at:
         return True
-    return (time.time() - float(last_enriched_at)) > ENRICHMENT_TTL_SECONDS
+    return (time.time() - float(last_enriched_at)) > get_enrichment_ttl_seconds()
 
 
 def movie_needs_enrichment(movie_id: int) -> bool:

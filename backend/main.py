@@ -15,6 +15,7 @@ from config import get_last_enrichment_run, save_last_enrichment_run
 import emby_vod_importer
 import plex_importer
 from routes import router
+import tmdb_sync
 import vod_db
 import vod_importer
 from vod_routes import router as vod_router
@@ -48,19 +49,33 @@ logging.getLogger("uvicorn.access").addFilter(_RedactPasswordFilter())
 logger     = logging.getLogger("vod_manager")
 STATIC_DIR = Path(__file__).parent / "static"
 
-_VOD_CATALOG_REFRESH_INTERVAL_SECONDS = 6 * 3600
+_CATALOG_REFRESH_POLL_SECONDS = 300
 
 
 async def _vod_catalog_refresher() -> None:
-    """Background task: periodically re-import every active VOD provider's
-    catalog so new titles show up without a manual 'Import catalog' click."""
+    """Background task: periodically re-imports each active VOD provider's
+    catalog so new titles show up without a manual 'Import catalog' click.
+    Each provider_type has its own configurable interval (Settings -> Refresh
+    Schedule) -- a Plex/Emby library scan can take 18+ minutes of real disk
+    I/O, so forcing it onto the same cadence as a cheap XC catalog pull
+    either starves XC providers waiting on Plex's schedule or rescans
+    Plex/Emby far more often than needed. This polls every
+    _CATALOG_REFRESH_POLL_SECONDS and refreshes whichever providers are
+    actually due (tracked per-provider via last_catalog_refresh_at), rather
+    than looping every active provider on one shared sleep."""
     await asyncio.sleep(15)
     while True:
         try:
             providers = [p for p in await asyncio.to_thread(vod_db.list_providers) if p["is_active"]]
-            if providers:
-                logger.info("[vod_catalog_refresher] refreshing %d provider(s)…", len(providers))
-                for p in providers:
+            now = time.time()
+            due = [
+                p for p in providers
+                if now - float(p.get("last_catalog_refresh_at") or 0)
+                   >= vod_db.get_catalog_refresh_interval_seconds(p.get("provider_type", "xc"))
+            ]
+            if due:
+                logger.info("[vod_catalog_refresher] refreshing %d of %d active provider(s)…", len(due), len(providers))
+                for p in due:
                     try:
                         if p.get("provider_type") == "plex":
                             result = await plex_importer.import_plex_library(p["id"])
@@ -68,14 +83,14 @@ async def _vod_catalog_refresher() -> None:
                             result = await emby_vod_importer.import_emby_library(p["id"])
                         else:
                             result = await vod_importer.import_provider_catalog(p["id"])
+                        await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                         logger.info("[vod_catalog_refresher] %s: %s", p["name"], result)
                     except Exception as exc:
                         logger.warning("[vod_catalog_refresher] provider=%s failed: %s", p["name"], exc)
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 
-        logger.info("[vod_catalog_refresher] next refresh in %.0f min", _VOD_CATALOG_REFRESH_INTERVAL_SECONDS / 60)
-        await asyncio.sleep(_VOD_CATALOG_REFRESH_INTERVAL_SECONDS)
+        await asyncio.sleep(_CATALOG_REFRESH_POLL_SECONDS)
 
 
 async def _vod_enrichment_scheduler() -> None:
@@ -92,7 +107,7 @@ async def _vod_enrichment_scheduler() -> None:
     load that competes with anything else the app is doing at that moment."""
     last_run = get_last_enrichment_run()
     if last_run is not None:
-        due_in = vod_db.ENRICHMENT_TTL_SECONDS - (time.time() - last_run)
+        due_in = vod_db.get_enrichment_ttl_seconds() - (time.time() - last_run)
         await asyncio.sleep(max(due_in, 45))
     else:
         await asyncio.sleep(45)
@@ -102,7 +117,31 @@ async def _vod_enrichment_scheduler() -> None:
             save_last_enrichment_run(time.time())
         except Exception as exc:
             logger.warning("[vod_enrichment_scheduler] run failed: %s", exc)
-        await asyncio.sleep(vod_db.ENRICHMENT_TTL_SECONDS)
+        await asyncio.sleep(vod_db.get_enrichment_ttl_seconds())
+
+
+_TMDB_SYNC_DISABLED_POLL_SECONDS = 300
+
+
+async def _tmdb_sync_scheduler() -> None:
+    """Background task: periodically re-syncs every category with a TMDB
+    Lists sync_source configured (see tmdb_sync.py). Disabled by default
+    (Settings -> Refresh Schedule) -- this is new background API traffic
+    that didn't run at all before this was exposed, so it's opt-in rather
+    than silently started for existing deployments. Re-checks whether it's
+    been turned on every _TMDB_SYNC_DISABLED_POLL_SECONDS while disabled."""
+    while True:
+        interval = vod_db.get_tmdb_sync_interval_seconds()
+        if not interval:
+            await asyncio.sleep(_TMDB_SYNC_DISABLED_POLL_SECONDS)
+            continue
+        try:
+            results = await tmdb_sync.sync_all()
+            if results:
+                logger.info("[tmdb_sync_scheduler] synced %d categor(y/ies): %s", len(results), results)
+        except Exception as exc:
+            logger.warning("[tmdb_sync_scheduler] run failed: %s", exc)
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
@@ -111,6 +150,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_vod_enrichment_scheduler()),
+        asyncio.create_task(_tmdb_sync_scheduler()),
     ]
     yield
     for task in tasks:

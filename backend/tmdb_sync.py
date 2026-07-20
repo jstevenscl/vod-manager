@@ -183,7 +183,9 @@ async def sync_category(category_id: int) -> dict:
 
 async def sync_all() -> dict:
     """Runs sync_category for every category with a sync_source configured —
-    called both from the manual 'Sync now' endpoint and the scheduled task."""
+    called both from the manual 'Sync now' endpoint and, if enabled in
+    Settings -> Refresh Schedule, the periodic background scheduler
+    (disabled by default; see main.py's _tmdb_sync_scheduler)."""
     results = {}
     for category in vod_db.list_sync_categories():
         try:

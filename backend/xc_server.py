@@ -25,6 +25,7 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
+import config
 from dispatcharr_client import DispatcharrClient
 import emby_vod_client
 import plex_client
@@ -53,15 +54,26 @@ _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Ap
 # them (it isn't, for VPN-fronted or CGNAT'd instances) -- this is abuse
 # throttling, not identity. In-memory/best-effort like _active_sessions
 # below -- a restart clears it, which is an acceptable reset for this
-# purpose.
-_MAX_FAILED_ATTEMPTS    = 10
-_FAILURE_WINDOW_SECONDS = 300   # 5 min — failures older than this don't count toward the threshold
-_LOCKOUT_SECONDS        = 900   # 15 min
+# purpose. Thresholds are configurable (Settings → Security) since the
+# right value depends on real-world exposure; _lockout_settings() caches
+# the config-file read briefly rather than hitting disk on every request.
 _SWEEP_INTERVAL_SECONDS = 600   # bound memory growth under sustained attack from many distinct IPs
+_LOCKOUT_SETTINGS_CACHE_TTL = 30
 
 _failed_attempts: dict[str, tuple[int, float]] = {}  # ip -> (count, window_started_at)
 _locked_until: dict[str, float] = {}                  # ip -> monotonic time lockout expires
 _last_sweep_at = 0.0
+_lockout_settings_cache: dict | None = None
+_lockout_settings_cache_at = 0.0
+
+
+def _lockout_settings() -> dict:
+    global _lockout_settings_cache, _lockout_settings_cache_at
+    now = time.monotonic()
+    if _lockout_settings_cache is None or (now - _lockout_settings_cache_at) >= _LOCKOUT_SETTINGS_CACHE_TTL:
+        _lockout_settings_cache = config.get_lockout_settings()
+        _lockout_settings_cache_at = now
+    return _lockout_settings_cache
 
 
 def _client_ip(request: Request) -> str:
@@ -74,8 +86,9 @@ def _sweep_expired_auth_entries() -> None:
     if now - _last_sweep_at < _SWEEP_INTERVAL_SECONDS:
         return
     _last_sweep_at = now
+    window_seconds = _lockout_settings()["lockout_window_seconds"]
     for ip, (_, window_started) in list(_failed_attempts.items()):
-        if now - window_started > _FAILURE_WINDOW_SECONDS:
+        if now - window_started > window_seconds:
             _failed_attempts.pop(ip, None)
     for ip, expires in list(_locked_until.items()):
         if now >= expires:
@@ -93,16 +106,21 @@ def _is_locked_out(client_ip: str) -> bool:
 
 
 def _record_auth_failure(client_ip: str) -> None:
+    settings = _lockout_settings()
+    max_attempts = settings["lockout_max_attempts"]
+    window_seconds = settings["lockout_window_seconds"]
+    lockout_seconds = settings["lockout_duration_seconds"]
+
     now = time.monotonic()
     count, window_started = _failed_attempts.get(client_ip, (0, now))
-    if now - window_started > _FAILURE_WINDOW_SECONDS:
+    if now - window_started > window_seconds:
         count, window_started = 0, now
     count += 1
-    if count >= _MAX_FAILED_ATTEMPTS:
-        _locked_until[client_ip] = now + _LOCKOUT_SECONDS
+    if count >= max_attempts:
+        _locked_until[client_ip] = now + lockout_seconds
         _failed_attempts.pop(client_ip, None)
         logger.warning("[xc_server] %s locked out for %ds after %d failed auth attempts in %ds",
-                        client_ip, _LOCKOUT_SECONDS, count, _FAILURE_WINDOW_SECONDS)
+                        client_ip, lockout_seconds, count, window_seconds)
     else:
         _failed_attempts[client_ip] = (count, window_started)
 

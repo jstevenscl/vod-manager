@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, Loader2, Play, Plus, RefreshCw, RotateCcw, Sparkles, Trash2, Tv, Upload, X, Zap } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, Loader2, Play, Plus, RefreshCw, RotateCcw, ShieldCheck, Sparkles, Trash2, Tv, Upload, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -43,6 +43,21 @@ interface ProviderLiveAccount {
 }
 
 interface XcCredentials { username: string; password: string }
+
+interface LockoutSettings {
+  lockout_max_attempts: number
+  lockout_window_seconds: number
+  lockout_duration_seconds: number
+}
+
+interface RefreshSettings {
+  catalog_refresh_seconds_xc: number
+  catalog_refresh_seconds_plex: number
+  catalog_refresh_seconds_emby: number
+  catalog_refresh_seconds_jellyfin: number
+  enrichment_ttl_seconds: number
+  tmdb_sync_interval_seconds: number | null
+}
 
 interface BackupComponent {
   id: string
@@ -997,6 +1012,57 @@ export default function VodManager() {
       setTmdbApiKeyInput('')
     },
   })
+  const lockoutSettingsQuery = useQuery<LockoutSettings>({
+    queryKey: ['vod-lockout-settings'],
+    queryFn:  () => api.get('/vod/lockout-settings/').then((r) => r.data),
+  })
+  const [lockoutForm, setLockoutForm] = useState<LockoutSettings | null>(null)
+  const lockoutValues = lockoutForm ?? lockoutSettingsQuery.data ?? null
+  const saveLockoutSettings = useMutation({
+    mutationFn: () => api.post('/vod/lockout-settings/', lockoutValues),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-lockout-settings'] })
+      setLockoutForm(null)
+    },
+  })
+  const refreshSettingsQuery = useQuery<RefreshSettings>({
+    queryKey: ['vod-refresh-settings'],
+    queryFn:  () => api.get('/vod/refresh-settings/').then((r) => r.data),
+  })
+  const [refreshForm, setRefreshForm] = useState<{
+    catalog_refresh_hours_xc: string
+    catalog_refresh_hours_plex: string
+    catalog_refresh_hours_emby: string
+    catalog_refresh_hours_jellyfin: string
+    enrichment_ttl_hours: string
+    tmdb_sync_hours: string
+  } | null>(null)
+  const secToHrStr = (s: number | null | undefined) => (s == null ? '' : String(s / 3600))
+  const refreshValues = refreshForm ?? (refreshSettingsQuery.data ? {
+    catalog_refresh_hours_xc:       secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_xc),
+    catalog_refresh_hours_plex:     secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_plex),
+    catalog_refresh_hours_emby:     secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_emby),
+    catalog_refresh_hours_jellyfin: secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_jellyfin),
+    enrichment_ttl_hours:           secToHrStr(refreshSettingsQuery.data.enrichment_ttl_seconds),
+    tmdb_sync_hours:                secToHrStr(refreshSettingsQuery.data.tmdb_sync_interval_seconds),
+  } : null)
+  const saveRefreshSettings = useMutation({
+    mutationFn: () => {
+      const hrToSec = (v: string) => Math.round(Number(v) * 3600)
+      return api.post('/vod/refresh-settings/', {
+        catalog_refresh_seconds_xc:       hrToSec(refreshValues!.catalog_refresh_hours_xc),
+        catalog_refresh_seconds_plex:     hrToSec(refreshValues!.catalog_refresh_hours_plex),
+        catalog_refresh_seconds_emby:     hrToSec(refreshValues!.catalog_refresh_hours_emby),
+        catalog_refresh_seconds_jellyfin: hrToSec(refreshValues!.catalog_refresh_hours_jellyfin),
+        enrichment_ttl_seconds:           hrToSec(refreshValues!.enrichment_ttl_hours),
+        tmdb_sync_interval_seconds:       refreshValues!.tmdb_sync_hours.trim() ? hrToSec(refreshValues!.tmdb_sync_hours) : null,
+      })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-refresh-settings'] })
+      setRefreshForm(null)
+    },
+  })
   // ── Backup & Restore ──
   const backupComponentsQuery = useQuery<BackupComponent[]>({
     queryKey: ['backup-components'],
@@ -1470,6 +1536,135 @@ export default function VodManager() {
           {tmdbSettingsQuery.data?.has_api_key && (
             <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
           )}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Security" icon={<ShieldCheck size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Per-IP lockout on the XC login (below Connected Instances) — repeated failed attempts from one
+          address get temporarily locked out. Changes apply within ~30s (cached, not re-read on every request).
+        </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <label className="flex items-center gap-1.5 text-xs">
+            Max failed attempts
+            <input
+              className={inputCls('w-16')}
+              type="number"
+              min={1}
+              value={lockoutValues?.lockout_max_attempts ?? ''}
+              onChange={(e) => setLockoutForm({ ...(lockoutValues as LockoutSettings), lockout_max_attempts: Number(e.target.value) })}
+            />
+          </label>
+          <label className="flex items-center gap-1.5 text-xs">
+            Window (seconds)
+            <input
+              className={inputCls('w-20')}
+              type="number"
+              min={1}
+              value={lockoutValues?.lockout_window_seconds ?? ''}
+              onChange={(e) => setLockoutForm({ ...(lockoutValues as LockoutSettings), lockout_window_seconds: Number(e.target.value) })}
+            />
+          </label>
+          <label className="flex items-center gap-1.5 text-xs">
+            Lockout duration (seconds)
+            <input
+              className={inputCls('w-20')}
+              type="number"
+              min={1}
+              value={lockoutValues?.lockout_duration_seconds ?? ''}
+              onChange={(e) => setLockoutForm({ ...(lockoutValues as LockoutSettings), lockout_duration_seconds: Number(e.target.value) })}
+            />
+          </label>
+          <Button
+            size="sm"
+            disabled={!lockoutForm || saveLockoutSettings.isPending}
+            onClick={() => saveLockoutSettings.mutate()}
+          >
+            {saveLockoutSettings.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          {lockoutForm && (
+            <Button size="sm" variant="outline" onClick={() => setLockoutForm(null)}>Cancel</Button>
+          )}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Refresh Schedule" icon={<RefreshCw size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          How often each provider type's catalog gets automatically re-imported, how long enrichment (posters,
+          cast, genre) is cached before refetching, and how often TMDB Lists auto-sync. Plex/Emby libraries can
+          take much longer to scan than a cheap XC catalog pull, so each provider type has its own interval.
+        </p>
+        {refreshValues && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-2">
+            <label className="flex items-center gap-1.5 text-xs">
+              XC refresh (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="0.5"
+                value={refreshValues.catalog_refresh_hours_xc}
+                onChange={(e) => setRefreshForm({ ...refreshValues, catalog_refresh_hours_xc: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              Plex refresh (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="0.5"
+                value={refreshValues.catalog_refresh_hours_plex}
+                onChange={(e) => setRefreshForm({ ...refreshValues, catalog_refresh_hours_plex: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              Emby refresh (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="0.5"
+                value={refreshValues.catalog_refresh_hours_emby}
+                onChange={(e) => setRefreshForm({ ...refreshValues, catalog_refresh_hours_emby: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              Jellyfin refresh (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="0.5"
+                value={refreshValues.catalog_refresh_hours_jellyfin}
+                onChange={(e) => setRefreshForm({ ...refreshValues, catalog_refresh_hours_jellyfin: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              Enrichment TTL (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="1"
+                value={refreshValues.enrichment_ttl_hours}
+                onChange={(e) => setRefreshForm({ ...refreshValues, enrichment_ttl_hours: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              TMDB Lists sync (hrs)
+              <input
+                className={inputCls('w-16')}
+                type="number" min={0.02} step="1"
+                placeholder="off"
+                value={refreshValues.tmdb_sync_hours}
+                onChange={(e) => setRefreshForm({ ...refreshValues, tmdb_sync_hours: e.target.value })}
+              />
+            </label>
+          </div>
+        )}
+        <div className="flex items-center gap-1.5">
+          <Button
+            size="sm"
+            disabled={!refreshForm || saveRefreshSettings.isPending}
+            onClick={() => saveRefreshSettings.mutate()}
+          >
+            {saveRefreshSettings.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          {refreshForm && (
+            <Button size="sm" variant="outline" onClick={() => setRefreshForm(null)}>Cancel</Button>
+          )}
+          <span className="text-xs text-muted-foreground">Leave TMDB Lists sync blank to keep it manual-only.</span>
         </div>
       </SectionCard>
 

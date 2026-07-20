@@ -92,6 +92,81 @@ def save_tmdb_api_key(api_key: str) -> None:
     _write_raw(data)
 
 
+# ── XC login lockout ─────────────────────────────────────────────────────────
+# Defaults match xc_server.py's original hardcoded constants. Configurable
+# since the right threshold depends on real-world exposure (a shared-NAT
+# household behind one connected instance's IP could plausibly hit the
+# default threshold with typo'd credentials; an internet-facing deployment
+# might want it tighter, not looser).
+
+_LOCKOUT_DEFAULTS = {
+    "lockout_max_attempts": 10,
+    "lockout_window_seconds": 300,
+    "lockout_duration_seconds": 900,
+}
+
+
+def get_lockout_settings() -> dict:
+    data = _read_raw()
+    return {k: data.get(k, v) for k, v in _LOCKOUT_DEFAULTS.items()}
+
+
+def save_lockout_settings(max_attempts: int, window_seconds: int, duration_seconds: int) -> None:
+    data = _read_raw()
+    data.update({
+        "lockout_max_attempts":     max(1, int(max_attempts)),
+        "lockout_window_seconds":   max(1, int(window_seconds)),
+        "lockout_duration_seconds": max(1, int(duration_seconds)),
+    })
+    _write_raw(data)
+
+
+# ── Background refresh scheduling ───────────────────────────────────────────
+# Catalog refresh interval is per provider_type, not a single global value --
+# a Plex/Emby library scan can take 18+ minutes and real disk I/O, while an
+# XC provider's catalog pull is cheap; forcing them onto the same interval
+# means either XC providers go stale waiting on Plex's cadence, or Plex/Emby
+# get rescanned far more often than needed. Enrichment TTL and the TMDB Lists
+# auto-sync interval are each a single global value -- lower-stakes, no
+# similar per-source cost asymmetry. TMDB auto-sync defaults to disabled
+# (None) since it's new background API traffic that didn't run before at all;
+# opt-in rather than silently started for existing deployments.
+
+_REFRESH_DEFAULTS = {
+    "catalog_refresh_seconds_xc":       6 * 3600,
+    "catalog_refresh_seconds_plex":     6 * 3600,
+    "catalog_refresh_seconds_emby":     6 * 3600,
+    "catalog_refresh_seconds_jellyfin": 6 * 3600,
+    "enrichment_ttl_seconds":           24 * 3600,
+    "tmdb_sync_interval_seconds":       None,
+}
+
+
+def get_refresh_settings() -> dict:
+    data = _read_raw()
+    return {k: data.get(k, v) for k, v in _REFRESH_DEFAULTS.items()}
+
+
+def save_refresh_settings(
+    catalog_refresh_seconds_xc: int,
+    catalog_refresh_seconds_plex: int,
+    catalog_refresh_seconds_emby: int,
+    catalog_refresh_seconds_jellyfin: int,
+    enrichment_ttl_seconds: int,
+    tmdb_sync_interval_seconds: int | None,
+) -> None:
+    data = _read_raw()
+    data.update({
+        "catalog_refresh_seconds_xc":       max(60, int(catalog_refresh_seconds_xc)),
+        "catalog_refresh_seconds_plex":     max(60, int(catalog_refresh_seconds_plex)),
+        "catalog_refresh_seconds_emby":     max(60, int(catalog_refresh_seconds_emby)),
+        "catalog_refresh_seconds_jellyfin": max(60, int(catalog_refresh_seconds_jellyfin)),
+        "enrichment_ttl_seconds":           max(60, int(enrichment_ttl_seconds)),
+        "tmdb_sync_interval_seconds":       max(60, int(tmdb_sync_interval_seconds)) if tmdb_sync_interval_seconds else None,
+    })
+    _write_raw(data)
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def has_credentials() -> bool:

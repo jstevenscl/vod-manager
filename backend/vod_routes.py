@@ -5,7 +5,16 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from config import get_tmdb_api_key, get_vod_xc_account_id, save_tmdb_api_key, save_vod_xc_account_id
+from config import (
+    get_lockout_settings,
+    get_refresh_settings,
+    get_tmdb_api_key,
+    get_vod_xc_account_id,
+    save_lockout_settings,
+    save_refresh_settings,
+    save_tmdb_api_key,
+    save_vod_xc_account_id,
+)
 from routes import require_auth, require_configured
 import emby_vod_importer
 import plex_importer
@@ -31,6 +40,21 @@ class VodSettingsRequest(BaseModel):
 
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
+
+
+class LockoutSettingsRequest(BaseModel):
+    lockout_max_attempts: int
+    lockout_window_seconds: int
+    lockout_duration_seconds: int
+
+
+class RefreshSettingsRequest(BaseModel):
+    catalog_refresh_seconds_xc: int
+    catalog_refresh_seconds_plex: int
+    catalog_refresh_seconds_emby: int
+    catalog_refresh_seconds_jellyfin: int
+    enrichment_ttl_seconds: int
+    tmdb_sync_interval_seconds: Optional[int] = None
 
 
 class XcClientRequest(BaseModel):
@@ -329,6 +353,39 @@ async def get_tmdb_settings():
 @router.post("/tmdb-settings/", dependencies=_GUARDS)
 async def save_tmdb_settings(body: TmdbApiKeyRequest):
     save_tmdb_api_key(body.api_key)
+    return {"ok": True}
+
+
+@router.get("/lockout-settings/", dependencies=_GUARDS)
+async def get_lockout_settings_route():
+    return get_lockout_settings()
+
+
+@router.post("/lockout-settings/", dependencies=_GUARDS)
+async def save_lockout_settings_route(body: LockoutSettingsRequest):
+    save_lockout_settings(
+        body.lockout_max_attempts,
+        body.lockout_window_seconds,
+        body.lockout_duration_seconds,
+    )
+    return {"ok": True}
+
+
+@router.get("/refresh-settings/", dependencies=_GUARDS)
+async def get_refresh_settings_route():
+    return get_refresh_settings()
+
+
+@router.post("/refresh-settings/", dependencies=_GUARDS)
+async def save_refresh_settings_route(body: RefreshSettingsRequest):
+    save_refresh_settings(
+        body.catalog_refresh_seconds_xc,
+        body.catalog_refresh_seconds_plex,
+        body.catalog_refresh_seconds_emby,
+        body.catalog_refresh_seconds_jellyfin,
+        body.enrichment_ttl_seconds,
+        body.tmdb_sync_interval_seconds,
+    )
     return {"ok": True}
 
 
