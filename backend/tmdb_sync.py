@@ -56,8 +56,19 @@ async def search_title(query: str, content_type: str) -> list[dict]:
     endpoint alone doesn't return any of that, so it's one extra detail call
     per candidate (cast comes along for free on the same call via
     append_to_response=credits, no separate request needed), fetched
-    concurrently to keep this fast. Capped at 5 candidates (rather than 10)
-    specifically to bound how many of those extra calls one lookup makes."""
+    concurrently to keep this fast. Capped at 5 candidates specifically to
+    bound how many of those extra calls one lookup makes.
+
+    TMDB's own search is fuzzy, not exact-title-only -- searching a short,
+    common word like "Action" returns 150+ results, and most aren't actually
+    titled "Action" (e.g. "Action Man", "Justice League Action", "World in
+    Action"). Left in TMDB's own popularity-ranked order, those often
+    outrank an exact-title match that's just less well-known, pushing it
+    past the cap entirely (a real case: an exact "Action" (2024) ranked 6th,
+    one past the cutoff). Re-sorted so exact (case-insensitive) title
+    matches come first, before applying the cap -- TMDB's relative ordering
+    is preserved within each group, only the exact/non-exact split is
+    forced to the front."""
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
@@ -100,7 +111,15 @@ async def search_title(query: str, content_type: str) -> list[dict]:
                 logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], exc)
             return out
 
-        candidates = data.get("results", [])[:5]
+        results = data.get("results", [])
+        query_lower = query.strip().lower()
+
+        def _not_exact(item: dict) -> bool:
+            title = item.get("title") if content_type == "movie" else item.get("name")
+            return (title or "").strip().lower() != query_lower
+
+        results.sort(key=_not_exact)  # stable sort: exact matches (False) float ahead of fuzzy ones (True)
+        candidates = results[:5]
         return list(await asyncio.gather(*[_build(item) for item in candidates]))
 
 
