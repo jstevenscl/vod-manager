@@ -63,6 +63,32 @@ class ProviderRequest(BaseModel):
     provider_type: str = "xc"
 
 
+class DispatcharrConnectionRequest(BaseModel):
+    label: str
+    url: str
+    token: str
+
+
+class ConnectDispatcharrInstanceRequest(BaseModel):
+    label: str
+    url: str
+    token: str
+    vod_manager_public_url: str
+
+
+class DispatcharrConnectionUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    url: Optional[str] = None
+    token: Optional[str] = None
+    vod_relay_account_id: Optional[int] = None
+    clear_vod_relay_account_id: bool = False
+
+
+class ProviderLiveAccountRequest(BaseModel):
+    dispatcharr_connection_id: int
+    dispatcharr_account_id: int
+
+
 class CategoryRequest(BaseModel):
     name: str
     content_type: str  # 'movie' or 'series'
@@ -215,6 +241,67 @@ async def delete_xc_client(client_id: int):
     return {"ok": True}
 
 
+# ── Dispatcharr connections ─────────────────────────────────────────────────
+# Who VOD Manager itself reaches out to -- the other side of xc_clients
+# above (who's allowed to pull from VOD Manager). See vod_db.py's comment
+# on the dispatcharr_connections table for what each is used for.
+
+@router.get("/dispatcharr-connections/", dependencies=_GUARDS)
+async def list_dispatcharr_connections():
+    return vod_db.list_dispatcharr_connections()
+
+
+@router.post("/dispatcharr-connections/", dependencies=_GUARDS)
+async def create_dispatcharr_connection(body: DispatcharrConnectionRequest):
+    label = body.label.strip()
+    url = body.url.strip()
+    token = body.token.strip()
+    if not label or not url or not token:
+        raise HTTPException(400, detail="label, url, and token are all required")
+    connection_id = vod_db.create_dispatcharr_connection(label, url, token)
+    return vod_db.get_dispatcharr_connection(connection_id)
+
+
+@router.post("/dispatcharr-connections/connect/", dependencies=_GUARDS)
+async def connect_dispatcharr_instance(body: ConnectDispatcharrInstanceRequest):
+    """Automated one-shot setup: creates the XC client + Dispatcharr-side
+    M3U account + saved connection in one step, instead of doing all three
+    by hand. See vod_sync.connect_dispatcharr_instance."""
+    label = body.label.strip()
+    url = body.url.strip()
+    token = body.token.strip()
+    public_url = body.vod_manager_public_url.strip()
+    if not label or not url or not token or not public_url:
+        raise HTTPException(400, detail="label, url, token, and vod_manager_public_url are all required")
+    try:
+        return await vod_sync.connect_dispatcharr_instance(label, url, token, public_url)
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Failed to connect: {exc}")
+
+
+@router.patch("/dispatcharr-connections/{connection_id}/", dependencies=_GUARDS)
+async def update_dispatcharr_connection(connection_id: int, body: DispatcharrConnectionUpdateRequest):
+    if not vod_db.get_dispatcharr_connection(connection_id):
+        raise HTTPException(404, detail="connection not found")
+    vod_db.update_dispatcharr_connection(
+        connection_id,
+        label=body.label.strip() if body.label is not None else None,
+        url=body.url.strip() if body.url is not None else None,
+        token=body.token.strip() if body.token is not None else None,
+        vod_relay_account_id=body.vod_relay_account_id,
+        clear_vod_relay_account_id=body.clear_vod_relay_account_id,
+    )
+    return vod_db.get_dispatcharr_connection(connection_id)
+
+
+@router.delete("/dispatcharr-connections/{connection_id}/", dependencies=_GUARDS)
+async def delete_dispatcharr_connection(connection_id: int):
+    if not vod_db.get_dispatcharr_connection(connection_id):
+        raise HTTPException(404, detail="connection not found")
+    vod_db.delete_dispatcharr_connection(connection_id)
+    return {"ok": True}
+
+
 @router.get("/activity/", dependencies=_GUARDS)
 async def list_activity():
     """Currently open VOD stream relays — in-memory only, cleared on
@@ -292,7 +379,7 @@ async def upsert_provider(body: ProviderRequest):
     try:
         await vod_sync.sync_provider(provider_id)
     except vod_sync.VodXcAccountNotConfigured:
-        sync_error = "vod_xc_account_id not configured — profile not synced to Dispatcharr"
+        sync_error = "no Dispatcharr connection has a VOD-relay account configured — profile not synced"
     except Exception as exc:
         logger.warning("[vod_routes] sync_provider(%s) failed: %s", provider_id, exc)
         sync_error = str(exc)
@@ -338,13 +425,34 @@ async def set_provider_max_streams(provider_id: int, max_streams: int):
     return {"ok": True}
 
 
-@router.post("/providers/{provider_id}/connection-sharing/", dependencies=_GUARDS)
-async def set_provider_connection_sharing(
-    provider_id: int, dispatcharr_live_account_id: Optional[int] = None, shared_connection_limit: Optional[int] = None,
-):
+@router.post("/providers/{provider_id}/shared-limit/", dependencies=_GUARDS)
+async def set_provider_shared_limit(provider_id: int, shared_connection_limit: Optional[int] = None):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
-    vod_db.set_provider_connection_sharing(provider_id, dispatcharr_live_account_id, shared_connection_limit)
+    vod_db.set_provider_shared_limit(provider_id, shared_connection_limit)
+    return {"ok": True}
+
+
+@router.get("/providers/{provider_id}/live-accounts/", dependencies=_GUARDS)
+async def list_provider_live_accounts(provider_id: int):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    return vod_db.list_provider_live_accounts(provider_id)
+
+
+@router.post("/providers/{provider_id}/live-accounts/", dependencies=_GUARDS)
+async def set_provider_live_account(provider_id: int, body: ProviderLiveAccountRequest):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    if not vod_db.get_dispatcharr_connection(body.dispatcharr_connection_id):
+        raise HTTPException(404, detail="dispatcharr connection not found")
+    link_id = vod_db.set_provider_live_account(provider_id, body.dispatcharr_connection_id, body.dispatcharr_account_id)
+    return {"id": link_id}
+
+
+@router.delete("/providers/live-accounts/{link_id}/", dependencies=_GUARDS)
+async def remove_provider_live_account(link_id: int):
+    vod_db.remove_provider_live_account(link_id)
     return {"ok": True}
 
 
@@ -385,10 +493,10 @@ async def sync_provider(provider_id: int):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
     try:
-        profile = await vod_sync.sync_provider(provider_id)
+        results = await vod_sync.sync_provider(provider_id)
     except vod_sync.VodXcAccountNotConfigured as exc:
         raise HTTPException(400, detail=str(exc))
-    return {"dispatcharr_profile": profile}
+    return {"results_by_connection": results}
 
 
 @router.post("/providers/{provider_id}/import/", dependencies=_GUARDS)

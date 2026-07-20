@@ -15,14 +15,31 @@ interface Provider {
   is_active: number
   priority: number
   provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin'
-  dispatcharr_profile_id: number | null
-  dispatcharr_live_account_id: number | null
   shared_connection_limit: number | null
   custom_user_agent: string | null
   has_password: boolean
   movie_count: number
   series_count: number
   episode_count: number
+  synced_connection_count: number
+  live_account_count: number
+}
+
+interface DispatcharrConnection {
+  id: number
+  label: string
+  url: string
+  token: string
+  vod_relay_account_id: number | null
+  created_at: string
+}
+
+interface ProviderLiveAccount {
+  id: number
+  provider_id: number
+  dispatcharr_connection_id: number
+  dispatcharr_account_id: number
+  connection_label: string
 }
 
 interface XcCredentials { username: string; password: string }
@@ -909,6 +926,54 @@ export default function VodManager() {
   })
   const [revealedClientId, setRevealedClientId] = useState<number | null>(null)
 
+  // ── Dispatcharr connections (who VOD Manager reaches out to -- the other
+  // side of xc_clients above, who's allowed to reach in) ──
+  const dispatcharrConnectionsQuery = useQuery<DispatcharrConnection[]>({
+    queryKey: ['vod-dispatcharr-connections'],
+    queryFn:  () => api.get('/vod/dispatcharr-connections/').then((r) => r.data),
+  })
+  const [newConnLabel, setNewConnLabel] = useState('')
+  const [newConnUrl, setNewConnUrl] = useState('')
+  const [newConnToken, setNewConnToken] = useState('')
+  const createDispatcharrConnection = useMutation({
+    mutationFn: () => api.post('/vod/dispatcharr-connections/', { label: newConnLabel, url: newConnUrl, token: newConnToken }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] })
+      setNewConnLabel(''); setNewConnUrl(''); setNewConnToken('')
+    },
+  })
+  const updateDispatcharrConnection = useMutation({
+    mutationFn: ({ id, ...body }: { id: number; label?: string; url?: string; token?: string; vod_relay_account_id?: number; clear_vod_relay_account_id?: boolean }) =>
+      api.patch(`/vod/dispatcharr-connections/${id}/`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] }),
+  })
+  const deleteDispatcharrConnection = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/dispatcharr-connections/${id}/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] }),
+  })
+  const [revealedConnId, setRevealedConnId] = useState<number | null>(null)
+
+  // Automated one-shot: creates the XC client + Dispatcharr-side M3U
+  // account + saved connection in one step instead of doing all three by
+  // hand (see vod_sync.connect_dispatcharr_instance).
+  const [connectLabel, setConnectLabel] = useState('')
+  const [connectUrl, setConnectUrl] = useState('')
+  const [connectToken, setConnectToken] = useState('')
+  const [connectPublicUrl, setConnectPublicUrl] = useState(window.location.origin)
+  const [connectResult, setConnectResult] = useState<string | null>(null)
+  const connectInstance = useMutation({
+    mutationFn: () => api.post('/vod/dispatcharr-connections/connect/', {
+      label: connectLabel, url: connectUrl, token: connectToken, vod_manager_public_url: connectPublicUrl,
+    }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] })
+      qc.invalidateQueries({ queryKey: ['vod-xc-clients'] })
+      setConnectResult(`Connected — Dispatcharr account #${r.data.dispatcharr_account.id} created, pointed at ${connectPublicUrl}. Go enable VOD and pick groups for it on that instance.`)
+      setConnectLabel(''); setConnectUrl(''); setConnectToken('')
+    },
+    onError: (e: any) => setConnectResult(`Connect failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+
   // ── Bulk enrichment ──
   const enrichProgressQuery = useQuery<EnrichProgress>({
     queryKey: ['vod-enrich-progress'],
@@ -1083,17 +1148,34 @@ export default function VodManager() {
       api.post(`/vod/providers/${id}/user-agent/`, null, { params: { custom_user_agent } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
   })
-  const setConnectionSharing = useMutation({
-    // 0 means "not set" on both sides (a real Dispatcharr account id or
-    // connection limit of 0 is never meaningful), so always send actual
-    // numbers rather than omitting params — avoids ambiguity around clearing
-    // a previously-set value.
-    mutationFn: ({ id, dispatcharr_live_account_id, shared_connection_limit }: {
-      id: number; dispatcharr_live_account_id: number; shared_connection_limit: number
-    }) => api.post(`/vod/providers/${id}/connection-sharing/`, null, {
-      params: { dispatcharr_live_account_id, shared_connection_limit },
-    }),
+  const setProviderSharedLimit = useMutation({
+    mutationFn: ({ id, shared_connection_limit }: { id: number; shared_connection_limit: number }) =>
+      api.post(`/vod/providers/${id}/shared-limit/`, null, { params: { shared_connection_limit } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
+  const [expandedLiveAccountsProviderId, setExpandedLiveAccountsProviderId] = useState<number | null>(null)
+  const providerLiveAccountsQuery = useQuery<ProviderLiveAccount[]>({
+    queryKey: ['vod-provider-live-accounts', expandedLiveAccountsProviderId],
+    queryFn:  () => api.get(`/vod/providers/${expandedLiveAccountsProviderId}/live-accounts/`).then((r) => r.data),
+    enabled:  expandedLiveAccountsProviderId != null,
+  })
+  const [newLiveAccountConnId, setNewLiveAccountConnId] = useState('')
+  const [newLiveAccountAcctId, setNewLiveAccountAcctId] = useState('')
+  const setProviderLiveAccount = useMutation({
+    mutationFn: ({ providerId, connectionId, accountId }: { providerId: number; connectionId: number; accountId: number }) =>
+      api.post(`/vod/providers/${providerId}/live-accounts/`, { dispatcharr_connection_id: connectionId, dispatcharr_account_id: accountId }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-provider-live-accounts'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setNewLiveAccountConnId(''); setNewLiveAccountAcctId('')
+    },
+  })
+  const removeProviderLiveAccount = useMutation({
+    mutationFn: (linkId: number) => api.delete(`/vod/providers/live-accounts/${linkId}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-provider-live-accounts'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
   })
   const toggleProviderActive = useMutation({
     mutationFn: ({ id, active }: { id: number; active: boolean }) =>
@@ -1476,6 +1558,114 @@ export default function VodManager() {
         </div>
       </SectionCard>
 
+      <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Who VOD Manager itself reaches out to — the other side of Connected Instances above (who's allowed to
+          reach in). Used to push each provider's stream limit into Dispatcharr's own connection accounting, and
+          to check real-time live-TV viewer counts for the shared-connection-limit coordination below.
+        </p>
+
+        <div className="border border-border rounded p-2 space-y-1.5">
+          <p className="text-xs font-medium">Connect a new instance (automated)</p>
+          <p className="text-xs text-muted-foreground">
+            Give it that instance's own admin API token — VOD Manager creates its client credentials and the
+            Dispatcharr-side M3U account for you. All that's left afterward is on Dispatcharr's own side: enable
+            VOD on the new account and pick which groups to turn on, same as any other source.
+          </p>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <input className={inputCls('w-24')} placeholder="Label" value={connectLabel} onChange={(e) => setConnectLabel(e.target.value)} />
+            <input className={inputCls('w-36')} placeholder="http://host:port" value={connectUrl} onChange={(e) => setConnectUrl(e.target.value)} />
+            <input className={inputCls('w-36')} placeholder="Admin API token" value={connectToken} onChange={(e) => setConnectToken(e.target.value)} />
+            <input
+              className={inputCls('w-44')} placeholder="VOD Manager's URL, as reachable from that instance"
+              value={connectPublicUrl} onChange={(e) => setConnectPublicUrl(e.target.value)}
+              title="e.g. host.docker.internal:8282 for a co-located instance, or the public tunnel URL for a remote one — not always the same as what you're viewing this page at"
+            />
+            <Button
+              size="sm"
+              disabled={!connectLabel || !connectUrl || !connectToken || !connectPublicUrl || connectInstance.isPending}
+              onClick={() => { setConnectResult(null); connectInstance.mutate() }}
+            >
+              {connectInstance.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Zap size={12} className="mr-1" />}
+              Connect
+            </Button>
+          </div>
+          {connectResult && <p className="text-xs text-muted-foreground">{connectResult}</p>}
+        </div>
+
+        <p className="text-xs font-medium pt-1">Manual / existing connections</p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-muted-foreground text-left">
+              <th className="pb-1 font-normal">Label</th>
+              <th className="pb-1 font-normal">URL</th>
+              <th className="pb-1 font-normal">Token</th>
+              <th className="pb-1 font-normal">VOD-relay account ID</th>
+              <th className="pb-1 font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {dispatcharrConnectionsQuery.data?.map((c) => (
+              <tr key={c.id} className="border-t border-border/50">
+                <td className="py-1 pr-2">
+                  <input
+                    className={inputCls('w-24')} defaultValue={c.label} key={c.label}
+                    onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== c.label) updateDispatcharrConnection.mutate({ id: c.id, label: v }) }}
+                  />
+                </td>
+                <td className="py-1 pr-2">
+                  <input
+                    className={inputCls('w-40')} defaultValue={c.url} key={c.url}
+                    onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== c.url) updateDispatcharrConnection.mutate({ id: c.id, url: v }) }}
+                  />
+                </td>
+                <td className="py-1 pr-2">
+                  {revealedConnId === c.id ? (
+                    <div className="flex items-center gap-1">
+                      {c.token}
+                      <CopyUrlButton url={c.token} />
+                    </div>
+                  ) : (
+                    <button className="text-muted-foreground hover:text-foreground flex items-center gap-1" onClick={() => setRevealedConnId(c.id)}>
+                      <Eye size={12} /> reveal
+                    </button>
+                  )}
+                </td>
+                <td className="py-1 pr-2">
+                  <input
+                    className={inputCls('w-20')} type="number" placeholder="acct id"
+                    defaultValue={c.vod_relay_account_id ?? ''} key={c.vod_relay_account_id}
+                    onBlur={(e) => {
+                      const v = e.target.value.trim()
+                      if (!v) { if (c.vod_relay_account_id != null) updateDispatcharrConnection.mutate({ id: c.id, clear_vod_relay_account_id: true }); return }
+                      const n = Number(v)
+                      if (n !== c.vod_relay_account_id) updateDispatcharrConnection.mutate({ id: c.id, vod_relay_account_id: n })
+                    }}
+                  />
+                </td>
+                <td className="py-1">
+                  <button
+                    title="Delete connection"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => { if (confirm(`Delete Dispatcharr connection "${c.label}"? Provider sync/coordination against it will stop.`)) deleteDispatcharrConnection.mutate(c.id) }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="flex items-center gap-1.5 pt-2">
+          <input className={inputCls('w-28')} placeholder="Label" value={newConnLabel} onChange={(e) => setNewConnLabel(e.target.value)} />
+          <input className={inputCls('w-40')} placeholder="http://host:port" value={newConnUrl} onChange={(e) => setNewConnUrl(e.target.value)} />
+          <input className={inputCls('w-40')} placeholder="API token" value={newConnToken} onChange={(e) => setNewConnToken(e.target.value)} />
+          <Button size="sm" disabled={!newConnLabel || !newConnUrl || !newConnToken || createDispatcharrConnection.isPending} onClick={() => createDispatcharrConnection.mutate()}>
+            {createDispatcharrConnection.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" />Add</>}
+          </Button>
+        </div>
+      </SectionCard>
+
       <SectionCard title="Backup & Restore" icon={<HardDriveDownload size={14} />}>
         <p className="text-xs text-muted-foreground">
           Each piece can be backed up, restored, or reset independently — e.g. wipe a corrupt
@@ -1615,8 +1805,8 @@ export default function VodManager() {
               <th className="pb-1 font-normal" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
               <th className="pb-1 font-normal" title="Higher number wins when multiple providers carry the same title">Priority</th>
               <th className="pb-1 font-normal">Max Streams</th>
-              <th className="pb-1 font-normal">Dispatcharr Profile</th>
-              <th className="pb-1 font-normal" title="If Dispatcharr also connects to this same real provider for live TV, set its account ID here plus the provider's true total connection limit — VOD will fail over to the next provider instead of exceeding it">Shares With (Live Acct / Limit)</th>
+              <th className="pb-1 font-normal" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
+              <th className="pb-1 font-normal" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it">Shared Limit / Live Accounts</th>
               <th className="pb-1 font-normal" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
               <th className="pb-1 font-normal"></th>
             </tr>
@@ -1680,37 +1870,58 @@ export default function VodManager() {
                     }}
                   />
                 </td>
-                <td className="py-1 pr-2 text-muted-foreground">{p.dispatcharr_profile_id ?? '—'}</td>
+                <td className="py-1 pr-2 text-muted-foreground">{p.synced_connection_count || '—'}</td>
                 <td className="py-1 pr-2">
-                  <span className="flex items-center gap-1">
-                    <input
-                      className={inputCls('w-14')}
-                      type="number"
-                      placeholder="acct id"
-                      defaultValue={p.dispatcharr_live_account_id ?? ''}
-                      key={`live-${p.dispatcharr_live_account_id}`}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value) || 0
-                        if (v !== (p.dispatcharr_live_account_id ?? 0)) {
-                          setConnectionSharing.mutate({ id: p.id, dispatcharr_live_account_id: v, shared_connection_limit: p.shared_connection_limit ?? 0 })
-                        }
-                      }}
-                    />
-                    <span className="text-muted-foreground">/</span>
+                  <span className="flex items-center gap-1.5">
                     <input
                       className={inputCls('w-14')}
                       type="number"
                       placeholder="limit"
+                      title="Real total connection cap for this provider, shared across every linked live-TV account plus our own VOD usage"
                       defaultValue={p.shared_connection_limit ?? ''}
                       key={`limit-${p.shared_connection_limit}`}
                       onBlur={(e) => {
                         const v = Number(e.target.value) || 0
-                        if (v !== (p.shared_connection_limit ?? 0)) {
-                          setConnectionSharing.mutate({ id: p.id, dispatcharr_live_account_id: p.dispatcharr_live_account_id ?? 0, shared_connection_limit: v })
-                        }
+                        if (v !== (p.shared_connection_limit ?? 0)) setProviderSharedLimit.mutate({ id: p.id, shared_connection_limit: v })
                       }}
                     />
+                    <button
+                      className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                      onClick={() => setExpandedLiveAccountsProviderId(expandedLiveAccountsProviderId === p.id ? null : p.id)}
+                    >
+                      {p.live_account_count} live acct{p.live_account_count === 1 ? '' : 's'}
+                    </button>
                   </span>
+                  {expandedLiveAccountsProviderId === p.id && (
+                    <div className="mt-1 p-1.5 border border-border rounded space-y-1">
+                      {providerLiveAccountsQuery.data?.map((la) => (
+                        <div key={la.id} className="flex items-center gap-1.5">
+                          <span>{la.connection_label}: acct #{la.dispatcharr_account_id}</span>
+                          <button className="text-muted-foreground hover:text-destructive" onClick={() => removeProviderLiveAccount.mutate(la.id)}>
+                            <X size={10} />
+                          </button>
+                        </div>
+                      ))}
+                      <div className="flex items-center gap-1">
+                        <select
+                          className={inputCls('w-24')}
+                          value={newLiveAccountConnId}
+                          onChange={(e) => setNewLiveAccountConnId(e.target.value)}
+                        >
+                          <option value="">connection…</option>
+                          {dispatcharrConnectionsQuery.data?.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+                        </select>
+                        <input className={inputCls('w-16')} type="number" placeholder="acct id" value={newLiveAccountAcctId} onChange={(e) => setNewLiveAccountAcctId(e.target.value)} />
+                        <Button
+                          size="sm"
+                          disabled={!newLiveAccountConnId || !newLiveAccountAcctId || setProviderLiveAccount.isPending}
+                          onClick={() => setProviderLiveAccount.mutate({ providerId: p.id, connectionId: Number(newLiveAccountConnId), accountId: Number(newLiveAccountAcctId) })}
+                        >
+                          Add
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                 </td>
                 <td className="py-1 pr-2">
                   <input

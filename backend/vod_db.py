@@ -18,7 +18,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from config import DATA_DIR
+from config import DATA_DIR, get_config, get_vod_xc_account_id
 
 logger = logging.getLogger(__name__)
 
@@ -197,13 +197,69 @@ def init_db() -> None:
             last_seen_ip TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS dispatcharr_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            url TEXT NOT NULL,
+            token TEXT NOT NULL,
+            vod_relay_account_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS provider_live_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_connection_id INTEGER NOT NULL REFERENCES dispatcharr_connections(id) ON DELETE CASCADE,
+            dispatcharr_account_id INTEGER NOT NULL,
+            UNIQUE(provider_id, dispatcharr_connection_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS provider_sync_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_connection_id INTEGER NOT NULL REFERENCES dispatcharr_connections(id) ON DELETE CASCADE,
+            dispatcharr_profile_id INTEGER NOT NULL,
+            UNIQUE(provider_id, dispatcharr_connection_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
+    _migrate_primary_dispatcharr_connection(conn)
     conn.close()
+
+
+def _migrate_primary_dispatcharr_connection(conn: sqlite3.Connection) -> None:
+    """One-time: dispatcharr_connections used to be a single implicit
+    connection (config.py's get_config() + get_vod_xc_account_id()) rather
+    than a real list. If nothing's been added to the new table yet but that
+    old single connection is configured, carry it over as the first row so
+    existing setups (already-connected Dispatcharr instances) keep working
+    exactly as before without the user needing to redo anything -- including
+    each provider's already-synced dispatcharr_profile_id (providers.
+    dispatcharr_profile_id was also a single implicit value; carried into
+    provider_sync_profiles for this same connection, or the next sync would
+    have re-POSTed a duplicate profile instead of PATCHing the existing one)."""
+    existing = conn.execute("SELECT COUNT(*) c FROM dispatcharr_connections").fetchone()["c"]
+    if existing > 0:
+        return
+    url, token = get_config()
+    if not url or not token:
+        return
+    cur = conn.execute(
+        "INSERT INTO dispatcharr_connections (label, url, token, vod_relay_account_id, created_at) VALUES (?,?,?,?,?)",
+        ("Primary", url, token, get_vod_xc_account_id(), _now()),
+    )
+    connection_id = cur.lastrowid
+    for row in conn.execute("SELECT id, dispatcharr_profile_id FROM providers WHERE dispatcharr_profile_id IS NOT NULL").fetchall():
+        conn.execute(
+            "INSERT INTO provider_sync_profiles (provider_id, dispatcharr_connection_id, dispatcharr_profile_id) VALUES (?,?,?)",
+            (row["id"], connection_id, row["dispatcharr_profile_id"]),
+        )
+    _commit_with_retry(conn)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -318,18 +374,16 @@ def set_provider_max_streams(provider_id: int, max_streams: int) -> None:
     conn.close()
 
 
-def set_provider_connection_sharing(
-    provider_id: int, dispatcharr_live_account_id: int | None, shared_connection_limit: int | None,
-) -> None:
-    """Configures cross-system connection coordination — see xc_server.py's
-    _has_capacity(). dispatcharr_live_account_id identifies the Dispatcharr
-    M3U account (if any) that ALSO connects to this same real provider for
-    live TV; shared_connection_limit is the real provider's true total
-    connection cap, shared across live TV + our own VOD streaming."""
+def set_provider_shared_limit(provider_id: int, shared_connection_limit: int | None) -> None:
+    """The real provider's true total connection cap, shared across every
+    live-TV account on any Dispatcharr instance plus our own VOD streaming
+    -- see xc_server.py's _has_capacity(). Which specific live-TV accounts
+    count toward it is managed separately (provider_live_accounts, since a
+    provider can have one on more than one Dispatcharr instance)."""
     conn = _connect()
     conn.execute(
-        "UPDATE providers SET dispatcharr_live_account_id=?, shared_connection_limit=?, updated_at=? WHERE id=?",
-        (dispatcharr_live_account_id, shared_connection_limit, _now(), provider_id),
+        "UPDATE providers SET shared_connection_limit=?, updated_at=? WHERE id=?",
+        (shared_connection_limit, _now(), provider_id),
     )
     _commit_with_retry(conn)
     conn.close()
@@ -387,11 +441,19 @@ def list_providers() -> list[dict]:
     episode_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM episode_sources GROUP BY provider_id"
     ).fetchall()}
+    synced_counts = {r["provider_id"]: r["c"] for r in conn.execute(
+        "SELECT provider_id, COUNT(*) c FROM provider_sync_profiles GROUP BY provider_id"
+    ).fetchall()}
+    live_account_counts = {r["provider_id"]: r["c"] for r in conn.execute(
+        "SELECT provider_id, COUNT(*) c FROM provider_live_accounts GROUP BY provider_id"
+    ).fetchall()}
     conn.close()
     for p in rows:
         p["movie_count"] = movie_counts.get(p["id"], 0)
         p["series_count"] = series_counts.get(p["id"], 0)
         p["episode_count"] = episode_counts.get(p["id"], 0)
+        p["synced_connection_count"] = synced_counts.get(p["id"], 0)
+        p["live_account_count"] = live_account_counts.get(p["id"], 0)
     return rows
 
 
@@ -659,6 +721,141 @@ def delete_xc_client(client_id: int) -> None:
 def record_xc_client_seen(client_id: int, ip: str) -> None:
     conn = _connect()
     conn.execute("UPDATE xc_clients SET last_seen_at=?, last_seen_ip=? WHERE id=?", (_now(), ip, client_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+# ── Dispatcharr connections ─────────────────────────────────────────────────
+# The other side of running against multiple Dispatcharr instances (see
+# xc_clients above, which is who's allowed to *pull from* VOD Manager): this
+# is who VOD Manager itself *reaches out to*, for two purposes that used to
+# assume there was only ever one such instance --
+#   1. vod_sync.py pushes each provider's max_streams into a Dispatcharr
+#      account's connection-limit profiles (vod_relay_account_id: which
+#      account on this connection is the one pointing back at VOD Manager).
+#   2. xc_server.py's shared-connection-limit coordination (_has_capacity)
+#      checks live-TV viewer counts against a real provider's total cap --
+#      see provider_live_accounts below, since a single real provider can
+#      have its own separate native live-TV account on more than one
+#      Dispatcharr instance, all drawing from the same real connection pool.
+
+def create_dispatcharr_connection(label: str, url: str, token: str) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO dispatcharr_connections (label, url, token, created_at) VALUES (?,?,?,?)",
+        (label, url.rstrip("/"), token, _now()),
+    )
+    connection_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return connection_id
+
+
+def list_dispatcharr_connections() -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM dispatcharr_connections ORDER BY created_at ASC").fetchall()]
+    conn.close()
+    return rows
+
+
+def get_dispatcharr_connection(connection_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM dispatcharr_connections WHERE id=?", (connection_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_dispatcharr_connection(
+    connection_id: int, label: str | None = None, url: str | None = None,
+    token: str | None = None, vod_relay_account_id: int | None = None,
+    clear_vod_relay_account_id: bool = False,
+) -> None:
+    conn = _connect()
+    if label is not None:
+        conn.execute("UPDATE dispatcharr_connections SET label=? WHERE id=?", (label, connection_id))
+    if url is not None:
+        conn.execute("UPDATE dispatcharr_connections SET url=? WHERE id=?", (url.rstrip("/"), connection_id))
+    if token is not None:
+        conn.execute("UPDATE dispatcharr_connections SET token=? WHERE id=?", (token, connection_id))
+    if clear_vod_relay_account_id:
+        conn.execute("UPDATE dispatcharr_connections SET vod_relay_account_id=NULL WHERE id=?", (connection_id,))
+    elif vod_relay_account_id is not None:
+        conn.execute("UPDATE dispatcharr_connections SET vod_relay_account_id=? WHERE id=?", (vod_relay_account_id, connection_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def delete_dispatcharr_connection(connection_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM dispatcharr_connections WHERE id=?", (connection_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+# ── Provider live-TV accounts (for shared connection-limit coordination) ────
+
+def list_provider_live_accounts(provider_id: int) -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("""
+        SELECT pla.*, dc.label AS connection_label FROM provider_live_accounts pla
+        JOIN dispatcharr_connections dc ON dc.id = pla.dispatcharr_connection_id
+        WHERE pla.provider_id=?
+        ORDER BY dc.label
+    """, (provider_id,)).fetchall()]
+    conn.close()
+    return rows
+
+
+def set_provider_live_account(provider_id: int, connection_id: int, account_id: int) -> int:
+    """Upsert -- one row per (provider, connection) pair; setting it again
+    for the same connection just updates the account id."""
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO provider_live_accounts (provider_id, dispatcharr_connection_id, dispatcharr_account_id)
+           VALUES (?,?,?)
+           ON CONFLICT(provider_id, dispatcharr_connection_id) DO UPDATE SET dispatcharr_account_id=excluded.dispatcharr_account_id""",
+        (provider_id, connection_id, account_id),
+    )
+    _commit_with_retry(conn)
+    row_id = conn.execute(
+        "SELECT id FROM provider_live_accounts WHERE provider_id=? AND dispatcharr_connection_id=?",
+        (provider_id, connection_id),
+    ).fetchone()["id"]
+    conn.close()
+    return row_id
+
+
+def remove_provider_live_account(link_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM provider_live_accounts WHERE id=?", (link_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+# ── Provider sync profiles (per-connection Dispatcharr profile id) ──────────
+# Which Dispatcharr profile object (on a given connection's VOD-relay
+# account) represents this provider's max_streams -- needed per-connection
+# since syncing to N Dispatcharr instances means N separate profile objects,
+# not one shared id.
+
+def get_provider_sync_profile(provider_id: int, connection_id: int) -> int | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT dispatcharr_profile_id FROM provider_sync_profiles WHERE provider_id=? AND dispatcharr_connection_id=?",
+        (provider_id, connection_id),
+    ).fetchone()
+    conn.close()
+    return row["dispatcharr_profile_id"] if row else None
+
+
+def set_provider_sync_profile(provider_id: int, connection_id: int, profile_id: int) -> None:
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO provider_sync_profiles (provider_id, dispatcharr_connection_id, dispatcharr_profile_id)
+           VALUES (?,?,?)
+           ON CONFLICT(provider_id, dispatcharr_connection_id) DO UPDATE SET dispatcharr_profile_id=excluded.dispatcharr_profile_id""",
+        (provider_id, connection_id, profile_id),
+    )
     _commit_with_retry(conn)
     conn.close()
 

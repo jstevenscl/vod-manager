@@ -6,8 +6,14 @@ logger = logging.getLogger(__name__)
 
 
 class DispatcharrClient:
-    def __init__(self):
-        url, token    = get_config()
+    def __init__(self, url: str | None = None, token: str | None = None):
+        """No-arg constructor keeps using VOD Manager's own single primary
+        connection (config.get_config()) -- unrelated to and unchanged by
+        the multi-connection support added for coordinating with several
+        Dispatcharr instances (see vod_db.dispatcharr_connections). Pass an
+        explicit url/token to talk to one of those instead."""
+        if url is None or token is None:
+            url, token = get_config()
         self._base    = url
         self._headers = {"X-API-Key": token}
 

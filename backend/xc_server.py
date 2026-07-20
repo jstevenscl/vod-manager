@@ -381,34 +381,48 @@ def kill_session(conn_id: str) -> bool:
     return True
 
 
-async def _live_viewer_count(dispatcharr_account_id: int) -> int:
+async def _live_viewer_count(connection: dict, dispatcharr_account_id: int) -> int:
+    cache_key = (connection["id"], dispatcharr_account_id)
     now = time.monotonic()
-    cached = _live_viewer_cache.get(dispatcharr_account_id)
+    cached = _live_viewer_cache.get(cache_key)
     if cached and (now - cached[1]) < _LIVE_VIEWER_CACHE_TTL:
         return cached[0]
     try:
-        account = await DispatcharrClient().get(f"/api/m3u/accounts/{dispatcharr_account_id}/")
+        account = await DispatcharrClient(connection["url"], connection["token"]).get(f"/api/m3u/accounts/{dispatcharr_account_id}/")
         count = sum(p.get("current_viewers", 0) for p in account.get("profiles", []))
     except Exception as exc:
-        logger.warning("[xc_server] failed to fetch live viewer count for dispatcharr account=%s: %s",
-                        dispatcharr_account_id, exc)
-        return _live_viewer_cache.get(dispatcharr_account_id, (0, 0))[0]
-    _live_viewer_cache[dispatcharr_account_id] = (count, now)
+        logger.warning("[xc_server] failed to fetch live viewer count from connection=%s account=%s: %s",
+                        connection["label"], dispatcharr_account_id, exc)
+        return _live_viewer_cache.get(cache_key, (0, 0))[0]
+    _live_viewer_cache[cache_key] = (count, now)
     return count
 
 
 async def _has_capacity(provider: dict) -> bool:
     """True if opening one more VOD stream against this provider wouldn't
-    exceed its real, total connection cap — which may be shared with
-    Dispatcharr's own live TV usage of the same real upstream account. Only
-    coordinates when the provider has both dispatcharr_live_account_id and
-    shared_connection_limit configured; otherwise always returns True (no
-    coordination attempted, matches prior behavior)."""
+    exceed its real, total connection cap — which is shared across every
+    live-TV account (on any Dispatcharr instance) plus VOD Manager's own
+    usage that draws from the same real upstream. A single real provider's
+    connection pool is one thing regardless of how many different
+    Dispatcharr instances happen to have their own native live-TV account
+    against it (see vod_db.provider_live_accounts) -- one real subscription
+    limit, summed across all of them. Only coordinates when the provider has
+    both shared_connection_limit and at least one linked live account;
+    otherwise always returns True (no coordination attempted)."""
     limit = provider.get("shared_connection_limit")
-    live_account_id = provider.get("dispatcharr_live_account_id")
-    if not limit or not live_account_id:
+    if not limit:
         return True
-    live_count = await _live_viewer_count(live_account_id)
+    live_accounts = await asyncio.to_thread(vod_db.list_provider_live_accounts, provider["id"])
+    if not live_accounts:
+        return True
+
+    live_count = 0
+    for link in live_accounts:
+        connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
+        if not connection:
+            continue
+        live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"])
+
     our_count = _active_vod_streams.get(provider["id"], 0)
     return (live_count + our_count) < limit
 
