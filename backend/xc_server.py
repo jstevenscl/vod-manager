@@ -18,12 +18,16 @@ or CGNAT'd instances routinely aren't). See _authenticate.
 import asyncio
 import ipaddress
 import logging
+import os
+import re
 import secrets
+import shutil
+import tempfile
 import time
 
 import httpx
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 import config
 from dispatcharr_client import DispatcharrClient
@@ -433,10 +437,18 @@ def kill_session(conn_id: str) -> bool:
     to kill) -- true even if it was already marked, so a caller can't
     accidentally kill a *different*, later session that happens to reuse
     the id (conn_ids are time-stamped, so that's only a theoretical risk,
-    but worth being precise about)."""
-    if conn_id not in _active_sessions:
+    but worth being precise about). HLS sessions (see below) have no single
+    long-lived request whose chunk loop can check _kill_requested -- ffmpeg
+    writes segments to disk independently of whether anyone's fetching them
+    -- so those are torn down directly instead of just flagged."""
+    session = _active_sessions.get(conn_id)
+    if session is None:
         return False
-    _kill_requested.add(conn_id)
+    hls_id = session.get("_hls_id")
+    if hls_id:
+        asyncio.ensure_future(_stop_hls_session(hls_id))
+    else:
+        _kill_requested.add(conn_id)
     return True
 
 
@@ -655,6 +667,207 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request, start
         generate(), media_type="video/mp4",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── HLS segmented transcoding (real seek support) ───────────────────────────
+# _transcode_vod_stream above pipes a single forward-only fMP4 stream to the
+# browser -- no seek support, since the player never gets a real duration or
+# segment index (see vod_manager-1qk). This gives the in-app test player a
+# real HLS source instead: ffmpeg writes a growing playlist + .ts segments to
+# a per-session temp directory, and the player (via hls.js) fetches them like
+# any other HLS stream, with genuine backward seek across everything encoded
+# so far (forward seek past the live edge is naturally blocked, same as any
+# in-progress live/event HLS playlist -- there's nothing to seek to yet).
+# Only worth this complexity for the in-app player -- external players (VLC
+# etc.) already seek fine against the direct Copy URL, and real end viewers
+# use external players via Dispatcharr, never this transcode path at all.
+
+_HLS_SEGMENT_SECONDS = 4
+_HLS_IDLE_TIMEOUT_SECONDS = 45  # no playlist/segment request in this long -> assume the player closed, tear down
+_HLS_SWEEP_INTERVAL_SECONDS = 15
+_HLS_PLAYLIST_READY_TIMEOUT_SECONDS = 20.0  # how long to wait for ffmpeg to produce a first segment before giving up
+
+_hls_sessions: dict[str, dict] = {}  # hls_id -> {tmpdir, proc, conn_id, last_request_at}
+_last_hls_sweep_at = 0.0
+
+
+def _read_text_file(path: str) -> str:
+    with open(path, "r") as f:
+        return f.read()
+
+
+async def _start_hls_session(kind: str, source: dict, request: Request, username: str, password: str,
+                              start_secs: int, title: str) -> str | None:
+    provider = vod_db.get_provider(source["provider_id"])
+    if not provider:
+        return None
+    upstream_url = _build_upstream_url(kind, provider, source)
+
+    hls_id = secrets.token_urlsafe(16)
+    tmpdir = tempfile.mkdtemp(prefix=f"vodhls-{hls_id[:8]}-")
+    conn_id = f"hls-{hls_id}"
+    base_url = f"{request.url.scheme}://{request.url.netloc}/hls-segment/{username}/{password}/{hls_id}/"
+
+    args = ["ffmpeg", "-loglevel", "error"]
+    if start_secs > 0:
+        args += ["-ss", str(start_secs)]
+    args += [
+        "-fflags", "+discardcorrupt+genpts",
+        "-i", upstream_url,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "hls",
+        "-hls_time", str(_HLS_SEGMENT_SECONDS),
+        "-hls_list_size", "0",
+        "-hls_playlist_type", "event",
+        "-hls_flags", "independent_segments+temp_file",
+        "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.ts"),
+        "-hls_base_url", base_url,
+        os.path.join(tmpdir, "index.m3u8"),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def log_stderr():
+        async for line in proc.stderr:
+            logger.warning("[ffmpeg-hls] id=%s: %s", hls_id, line.decode(errors="replace").rstrip())
+    asyncio.ensure_future(log_stderr())
+
+    _hls_sessions[hls_id] = {
+        "tmpdir": tmpdir, "proc": proc, "conn_id": conn_id, "last_request_at": time.monotonic(),
+    }
+    _active_sessions[conn_id] = {
+        "conn_id": conn_id, "kind": kind, "title": f"{title} (HLS)", "provider_name": provider["name"],
+        "provider_type": provider.get("provider_type", "xc"), "started_at": time.time(),
+        "bytes_sent": 0, "total_bytes": 0, "duration_secs": None,
+        "range_start_byte": 0, "plex_reported": False, "emby_reported": False,
+        "_hls_id": hls_id,
+    }
+    logger.info("[xc_server] %s HLS OPEN id=%s start=%ds upstream=%s", kind, hls_id, start_secs, upstream_url)
+    return hls_id
+
+
+async def _stop_hls_session(hls_id: str) -> None:
+    session = _hls_sessions.pop(hls_id, None)
+    if not session:
+        return
+    _active_sessions.pop(session["conn_id"], None)
+    proc = session["proc"]
+    if proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+    await asyncio.to_thread(shutil.rmtree, session["tmpdir"], True)
+    logger.info("[xc_server] HLS CLOSE id=%s", hls_id)
+
+
+async def _sweep_stale_hls_sessions() -> None:
+    global _last_hls_sweep_at
+    now = time.monotonic()
+    if now - _last_hls_sweep_at < _HLS_SWEEP_INTERVAL_SECONDS:
+        return
+    _last_hls_sweep_at = now
+    stale = [hid for hid, s in _hls_sessions.items() if now - s["last_request_at"] > _HLS_IDLE_TIMEOUT_SECONDS]
+    for hid in stale:
+        logger.info("[xc_server] HLS id=%s idle timeout (no request in %ds), tearing down", hid, _HLS_IDLE_TIMEOUT_SECONDS)
+        await _stop_hls_session(hid)
+
+
+async def hls_sweep_loop() -> None:
+    """Standalone background task (registered in main.py's lifespan) --
+    _sweep_stale_hls_sessions above only runs opportunistically from inside
+    the playlist/segment routes, which is fine while there's other HLS
+    traffic but does nothing at all for the common real case: someone
+    previews a movie, closes the tab, and never opens the HLS player again
+    all session. Without this, that leaks a running ffmpeg process and its
+    temp directory until the container restarts."""
+    while True:
+        await asyncio.sleep(_HLS_SWEEP_INTERVAL_SECONDS)
+        try:
+            global _last_hls_sweep_at
+            _last_hls_sweep_at = time.monotonic()
+            now = time.monotonic()
+            stale = [hid for hid, s in _hls_sessions.items() if now - s["last_request_at"] > _HLS_IDLE_TIMEOUT_SECONDS]
+            for hid in stale:
+                logger.info("[xc_server] HLS id=%s idle timeout (no request in %ds), tearing down", hid, _HLS_IDLE_TIMEOUT_SECONDS)
+                await _stop_hls_session(hid)
+        except Exception as exc:
+            logger.warning("[xc_server] hls_sweep_loop cycle failed: %s", exc)
+
+
+async def _serve_hls_playlist(kind: str, source: dict, request: Request, username: str, password: str,
+                               start_secs: int, title: str) -> Response:
+    await _sweep_stale_hls_sessions()
+    hls_id = await _start_hls_session(kind, source, request, username, password, start_secs, title)
+    if hls_id is None:
+        return Response(status_code=404, content="not found")
+    session = _hls_sessions[hls_id]
+    playlist_path = os.path.join(session["tmpdir"], "index.m3u8")
+
+    # HLS players expect the playlist to already list a fetchable segment on
+    # first load -- wait briefly for ffmpeg to actually produce one rather
+    # than handing back an empty/nonexistent playlist immediately.
+    deadline = time.monotonic() + _HLS_PLAYLIST_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if os.path.isfile(playlist_path):
+            content = await asyncio.to_thread(_read_text_file, playlist_path)
+            if "#EXTINF" in content:
+                return PlainTextResponse(content, media_type="application/vnd.apple.mpegurl")
+        if session["proc"].returncode is not None:
+            break  # ffmpeg exited before producing a usable segment
+        await asyncio.sleep(0.3)
+
+    logger.warning("[xc_server] HLS id=%s playlist not ready within %.0fs, aborting", hls_id, _HLS_PLAYLIST_READY_TIMEOUT_SECONDS)
+    await _stop_hls_session(hls_id)
+    return Response(status_code=504, content="transcode did not start in time")
+
+
+@router.get("/preview/movie-source-hls/{username}/{password}/{source_id_ext}/index.m3u8")
+async def preview_movie_source_hls_playlist(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
+    _log_hit(request)
+    client = await _authenticate(username, password, request)
+    if not client:
+        return Response(status_code=401, content="Unauthorized")
+    source_id = int(source_id_ext.split(".")[0])
+    source = vod_db.get_movie_source_for_streaming(source_id)
+    if not source or not _movie_allowed(client, source["movie_id"]):
+        return Response(status_code=404, content="not found")
+    title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
+    return await _serve_hls_playlist("movie", source, request, username, password, start_secs=max(0, start), title=title)
+
+
+@router.get("/preview/series-source-hls/{username}/{password}/{source_id_ext}/index.m3u8")
+async def preview_episode_source_hls_playlist(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
+    _log_hit(request)
+    client = await _authenticate(username, password, request)
+    if not client:
+        return Response(status_code=401, content="Unauthorized")
+    source_id = int(source_id_ext.split(".")[0])
+    source = vod_db.get_episode_source_for_streaming(source_id)
+    if not source or not _series_allowed(client, source["series_id"]):
+        return Response(status_code=404, content="not found")
+    title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
+    return await _serve_hls_playlist("series", source, request, username, password, start_secs=max(0, start), title=title)
+
+
+@router.get("/hls-segment/{username}/{password}/{hls_id}/{segment_name}")
+async def hls_segment(username: str, password: str, hls_id: str, segment_name: str, request: Request):
+    client = await _authenticate(username, password, request)
+    if not client:
+        return Response(status_code=401, content="Unauthorized")
+    await _sweep_stale_hls_sessions()
+    session = _hls_sessions.get(hls_id)
+    if not session:
+        return Response(status_code=404, content="not found")
+    if not re.fullmatch(r"seg\d+\.ts", segment_name):
+        return Response(status_code=400, content="bad segment name")
+    session["last_request_at"] = time.monotonic()
+    path = os.path.join(session["tmpdir"], segment_name)
+    if not os.path.isfile(path):
+        return Response(status_code=404, content="not found")
+    return FileResponse(path, media_type="video/mp2t")
 
 
 async def _proxy_vod_stream(

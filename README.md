@@ -88,6 +88,30 @@ lookups, and the actual stream — not just hidden from the browse UI, so a
 restricted client can't reach disallowed content even with a direct/copied
 stream URL.
 
+## In-app test player
+
+Movies, series episodes, and Needs Review items all have a Play button that
+opens a lightweight in-app player — meant for verifying imports (matched the
+right title, source actually plays, etc.), not real end-user viewing (real
+viewers watch through Dispatcharr with an external player, which never goes
+through this player at all). Direct playback works for anything a stock
+`<video>` element can decode natively; two fallbacks cover the rest, both
+re-encoding the source with ffmpeg on the fly rather than just relaying it:
+
+- **Transcoded** — fast to start, but forward-only (no mid-stream
+  scrubbing). "Jump to" buttons restart the stream partway in instead.
+- **HLS (seekable)** — real seek support via a proper HLS playlist +
+  segments, at the cost of a slower start (ffmpeg has to produce a first
+  segment before anything plays) and using somewhat more CPU/disk while
+  active. Backward seek works across everything encoded so far; seeking
+  past the live edge is naturally blocked until ffmpeg catches up, the same
+  limitation any in-progress live/event HLS stream has.
+
+Both fallbacks (and every other player-facing route) are torn down when a
+session ends — closing the player, an idle timeout with no further
+requests, or a Kill from Activity below all release the encoder process and
+any on-disk segments.
+
 ## Shared connection-limit coordination
 
 If a real provider also has its own native live-TV account somewhere in

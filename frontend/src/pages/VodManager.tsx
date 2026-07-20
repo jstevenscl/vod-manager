@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import Hls from 'hls.js'
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, Loader2, Play, Plus, RefreshCw, RotateCcw, ShieldCheck, Sparkles, Trash2, Tv, Upload, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -176,6 +177,19 @@ function buildTranscodedPreviewSourceUrl(kind: 'movie' | 'series', sourceId: num
   return startSecs > 0 ? `${url}?start=${startSecs}` : url
 }
 
+// Same re-encode as above, but as a real HLS playlist (see xc_server.py's
+// _serve_hls_playlist) instead of a single forward-only pipe -- gives the
+// in-app player genuine seek support (backward across everything encoded so
+// far; forward past the live edge is naturally blocked, same as any
+// in-progress live/event HLS playlist). Slower to start than the plain
+// transcode above (ffmpeg has to produce a first segment before anything
+// plays), so this is offered as a separate choice, not a replacement.
+function buildHlsPreviewSourceUrl(kind: 'movie' | 'series', sourceId: number, creds?: XcCredentials) {
+  if (!creds) return null
+  const path = kind === 'movie' ? 'movie-source-hls' : 'series-source-hls'
+  return `${window.location.origin}/preview/${path}/${creds.username}/${creds.password}/${sourceId}/index.m3u8`
+}
+
 function CopyUrlButton({ url }: { url: string | null }) {
   const [copied, setCopied] = useState(false)
   if (!url) return null
@@ -190,7 +204,7 @@ function CopyUrlButton({ url }: { url: string | null }) {
   )
 }
 
-function PlayButton({ url, transcodedUrl, title }: { url: string | null; transcodedUrl?: string | null; title: string }) {
+function PlayButton({ url, transcodedUrl, hlsUrl, title }: { url: string | null; transcodedUrl?: string | null; hlsUrl?: string | null; title: string }) {
   const [open, setOpen] = useState(false)
   if (!url) return null
   return (
@@ -198,7 +212,7 @@ function PlayButton({ url, transcodedUrl, title }: { url: string | null; transco
       <button title="Play" className="hover:text-foreground" onClick={() => setOpen(true)}>
         <Play size={12} />
       </button>
-      {open && <VodPlayer url={url} transcodedUrl={transcodedUrl} title={title} onClose={() => setOpen(false)} />}
+      {open && <VodPlayer url={url} transcodedUrl={transcodedUrl} hlsUrl={hlsUrl} title={title} onClose={() => setOpen(false)} />}
     </>
   )
 }
@@ -214,21 +228,52 @@ function withStartParam(url: string, startSecs: number): string {
 
 const JUMP_MARKS_SECS = [0, 120, 300, 600, 1200]
 
-function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transcodedUrl?: string | null; title: string; onClose: () => void }) {
+function VodPlayer({ url, transcodedUrl, hlsUrl, title, onClose }: {
+  url: string; transcodedUrl?: string | null; hlsUrl?: string | null; title: string; onClose: () => void
+}) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef = useRef<Hls | null>(null)
   const [status, setStatus] = useState<'loading' | 'playing' | 'error'>('loading')
   const [error, setError] = useState<string | null>(null)
-  const [usingTranscode, setUsingTranscode] = useState(false)
+  const [mode, setMode] = useState<'direct' | 'transcode' | 'hls'>('direct')
   const [jumpSecs, setJumpSecs] = useState(0)
-  const activeUrl = usingTranscode && transcodedUrl
+  const activeUrl = mode === 'transcode' && transcodedUrl
     ? (jumpSecs > 0 ? withStartParam(transcodedUrl, jumpSecs) : transcodedUrl)
-    : url
+    : mode === 'hls' && hlsUrl
+      ? hlsUrl
+      : url
 
   function jumpTo(secs: number) {
     setJumpSecs(secs)
     setStatus('loading')
     setError(null)
   }
+
+  // hls.js attaches to the <video> element itself rather than a plain `src`
+  // (only Safari plays .m3u8 natively) — wire/tear down manually instead of
+  // the plain src= attribute the direct/transcode modes use below.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || mode !== 'hls' || !hlsUrl) return
+    if (Hls.isSupported()) {
+      const hls = new Hls({ liveSyncDurationCount: 6 })
+      hlsRef.current = hls
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (data.fatal) {
+          setStatus('error')
+          setError('HLS playback failed — the transcode may have failed to start or the source is unreachable.')
+        }
+      })
+      hls.loadSource(hlsUrl)
+      hls.attachMedia(video)
+      return () => { hls.destroy(); hlsRef.current = null }
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl  // Safari: native HLS, no hls.js needed
+    } else {
+      setStatus('error')
+      setError('This browser has no HLS support.')
+    }
+  }, [mode, hlsUrl])
 
   return createPortal(
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80" onClick={onClose}>
@@ -239,7 +284,9 @@ function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transc
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
           <div className="flex items-center gap-2 min-w-0">
             <Play size={13} className="text-primary shrink-0" />
-            <span className="text-sm font-medium truncate">{title}{usingTranscode && ' (transcoded)'}</span>
+            <span className="text-sm font-medium truncate">
+              {title}{mode === 'transcode' && ' (transcoded)'}{mode === 'hls' && ' (HLS, seekable)'}
+            </span>
           </div>
           <button className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-accent shrink-0 ml-2" onClick={onClose}>
             <X size={16} />
@@ -252,15 +299,24 @@ function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transc
               <AlertCircle size={14} className="shrink-0" />
               <span>{error}</span>
             </div>
-            {!usingTranscode && transcodedUrl ? (
+            {mode === 'direct' && (transcodedUrl || hlsUrl) ? (
               <>
                 <p className="text-xs text-muted-foreground">
                   This is usually a codec this browser can't decode natively (e.g. AVI, DTS/AC-3 audio) — the file
                   itself relayed fine. Try a transcoded copy instead, or use Copy URL with an external player.
                 </p>
-                <Button size="sm" variant="outline" onClick={() => { setUsingTranscode(true); setStatus('loading'); setError(null) }}>
-                  Try transcoded playback
-                </Button>
+                <div className="flex items-center justify-center gap-2">
+                  {transcodedUrl && (
+                    <Button size="sm" variant="outline" onClick={() => { setMode('transcode'); setStatus('loading'); setError(null) }}>
+                      Try transcoded playback
+                    </Button>
+                  )}
+                  {hlsUrl && (
+                    <Button size="sm" variant="outline" onClick={() => { setMode('hls'); setStatus('loading'); setError(null) }}>
+                      Try HLS (seekable, slower start)
+                    </Button>
+                  )}
+                </div>
               </>
             ) : (
               <p className="text-xs text-muted-foreground">
@@ -270,22 +326,32 @@ function VodPlayer({ url, transcodedUrl, title, onClose }: { url: string; transc
           </div>
         )}
 
-        <video
-          ref={videoRef}
-          src={activeUrl}
-          controls
-          autoPlay
-          className={status === 'error' ? 'hidden' : 'w-full max-h-[70vh] bg-black'}
-          onCanPlay={() => setStatus('playing')}
-          onError={() => { setStatus('error'); setError('Playback failed — the file may be unreachable or use a codec this browser can\'t play.') }}
-        />
+        {mode === 'hls' ? (
+          <video
+            ref={videoRef}
+            controls
+            autoPlay
+            className={status === 'error' ? 'hidden' : 'w-full max-h-[70vh] bg-black'}
+            onCanPlay={() => setStatus('playing')}
+          />
+        ) : (
+          <video
+            ref={videoRef}
+            src={activeUrl}
+            controls
+            autoPlay
+            className={status === 'error' ? 'hidden' : 'w-full max-h-[70vh] bg-black'}
+            onCanPlay={() => setStatus('playing')}
+            onError={() => { setStatus('error'); setError('Playback failed — the file may be unreachable or use a codec this browser can\'t play.') }}
+          />
+        )}
         {status === 'loading' && (
           <div className="absolute inset-0 top-[41px] flex items-center justify-center gap-2 text-sm text-muted-foreground pointer-events-none">
-            <Loader2 size={14} className="animate-spin" /> Loading…
+            <Loader2 size={14} className="animate-spin" /> Loading{mode === 'hls' && ' (starting transcode, first segment takes a few seconds)'}…
           </div>
         )}
 
-        {usingTranscode && status !== 'error' && (
+        {mode === 'transcode' && status !== 'error' && (
           <div className="flex items-center gap-1.5 px-4 py-2 border-t border-border text-xs">
             <span className="text-muted-foreground">Jump to (no mid-stream scrubbing — starts a fresh stream):</span>
             {JUMP_MARKS_SECS.map((secs) => (
@@ -441,6 +507,9 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   const transcodedUrl = contentType === 'movie'
     ? (item.sample_source_id ? buildTranscodedPreviewSourceUrl('movie', item.sample_source_id, xcCredentials) : null)
     : (item.sample_episode_source_id ? buildTranscodedPreviewSourceUrl('series', item.sample_episode_source_id, xcCredentials) : null)
+  const hlsUrl = contentType === 'movie'
+    ? (item.sample_source_id ? buildHlsPreviewSourceUrl('movie', item.sample_source_id, xcCredentials) : null)
+    : (item.sample_episode_source_id ? buildHlsPreviewSourceUrl('series', item.sample_episode_source_id, xcCredentials) : null)
 
   // Same content is sometimes released under a different title in a
   // different region -- the default search (this item's own stored name)
@@ -492,7 +561,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     <li className="border-b border-border/50 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="min-w-0 truncate flex items-center gap-1.5">
-          <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} title={item.name} />
+          <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} hlsUrl={hlsUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
           {contentType === 'series' && !!item.imported_episode_count && (
             <span className="text-muted-foreground">
@@ -661,6 +730,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               <PlayButton
                 url={buildPreviewUrl('movie', movie.id, movie.sources[0]?.container_extension || 'mp4', xcCredentials)}
                 transcodedUrl={movie.sources[0] ? buildTranscodedPreviewSourceUrl('movie', movie.sources[0].id, xcCredentials) : null}
+                hlsUrl={movie.sources[0] ? buildHlsPreviewSourceUrl('movie', movie.sources[0].id, xcCredentials) : null}
                 title={`${movie.name}${movie.year ? ` (${movie.year})` : ''}`}
               />
               <CopyUrlButton url={buildPreviewUrl('movie', movie.id, movie.sources[0]?.container_extension || 'mp4', xcCredentials)} />
@@ -703,6 +773,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                   <PlayButton
                     url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
                     transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
+                    hlsUrl={buildHlsPreviewSourceUrl('movie', s.id, xcCredentials)}
                     title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
                   />
                   <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
@@ -848,6 +919,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   <PlayButton
                     url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
                     transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                    hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
                     title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
                   />
                   <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />

@@ -19,7 +19,7 @@ import tmdb_sync
 import vod_db
 import vod_importer
 from vod_routes import router as vod_router
-from xc_server import router as xc_router
+from xc_server import hls_sweep_loop, router as xc_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -151,6 +151,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
+        asyncio.create_task(hls_sweep_loop()),
     ]
     yield
     for task in tasks:
