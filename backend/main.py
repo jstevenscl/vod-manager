@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +24,26 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
+
+_PASSWORD_QS_RE = re.compile(r"(password=)[^&\s\"]*")
+
+
+class _RedactPasswordFilter(logging.Filter):
+    """xc_server's XC-protocol auth puts the password in the URL query string
+    (the client library's own convention, not ours) -- uvicorn's built-in
+    access log otherwise writes that raw URL, password included, straight to
+    stdout/container logs on every request."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            record.args = tuple(
+                _PASSWORD_QS_RE.sub(r"\1***", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactPasswordFilter())
 
 logger     = logging.getLogger("vod_manager")
 STATIC_DIR = Path(__file__).parent / "static"

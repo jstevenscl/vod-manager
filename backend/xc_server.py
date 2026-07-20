@@ -14,6 +14,7 @@ copy rather than storing a duplicate. See get_expected_credentials().
 
 import asyncio
 import logging
+import secrets
 import time
 
 import httpx
@@ -67,11 +68,17 @@ async def _authenticate(username: str, password: str) -> bool:
     expected = await get_expected_credentials()
     if expected is None:
         return False
-    return username == expected[0] and password == expected[1]
+    return (
+        secrets.compare_digest(username.encode(), expected[0].encode()) and
+        secrets.compare_digest(password.encode(), expected[1].encode())
+    )
 
 
 def _log_hit(request: Request) -> None:
-    logger.info("[xc_server] %s %s", request.url.path, dict(request.query_params))
+    params = dict(request.query_params)
+    if "password" in params:
+        params["password"] = "***"
+    logger.info("[xc_server] %s %s", request.url.path, params)
 
 
 @router.get("/player_api.php")
