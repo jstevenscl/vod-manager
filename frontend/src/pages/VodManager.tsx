@@ -48,6 +48,37 @@ interface ActivitySession {
   range_start_byte: number
 }
 
+interface NeedsReviewItem {
+  id: number
+  name: string
+  year: number | null
+  genre: string | null
+}
+
+interface NeedsReviewData {
+  movies: NeedsReviewItem[]
+  series: NeedsReviewItem[]
+}
+
+interface TmdbSuggestion {
+  tmdb_id: string
+  name: string
+  year: number | null
+  poster_url: string | null
+}
+
+interface XcClient {
+  id: number
+  label: string
+  username: string
+  password: string
+  enabled: boolean
+  ip_allowlist: string | null
+  created_at: string
+  last_seen_at: string | null
+  last_seen_ip: string | null
+}
+
 function formatElapsed(startedAt: number): string {
   const secs = Math.max(0, Math.floor(Date.now() / 1000 - startedAt))
   const m = Math.floor(secs / 60)
@@ -270,6 +301,95 @@ function Pager({ total, limit, offset, onOffset }: { total: number; limit: numbe
       <span>page {page} of {pages} · {total} total</span>
       <Button size="sm" variant="outline" disabled={offset + limit >= total} onClick={() => onOffset(offset + limit)}>Next</Button>
     </div>
+  )
+}
+
+// One flagged item: no year, ambiguous against 2+ existing pool entries with
+// the same name. TMDB suggestions are fetched on demand (only once expanded)
+// rather than eagerly for every flagged item on page load.
+function NeedsReviewRow({ contentType, item, qc }: {
+  contentType: 'movie' | 'series'
+  item: NeedsReviewItem
+  qc: ReturnType<typeof useQueryClient>
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [manualYear, setManualYear] = useState('')
+
+  const suggestionsQuery = useQuery<TmdbSuggestion[]>({
+    queryKey: ['vod-needs-review-suggestions', contentType, item.id],
+    queryFn:  () => api.get(`/vod/needs-review/${contentType}/${item.id}/suggestions/`).then((r) => r.data),
+    enabled:  expanded,
+    retry:    false,
+  })
+
+  const resolve = useMutation({
+    mutationFn: (body: { year: number; tmdb_id?: string }) =>
+      api.post(`/vod/needs-review/${contentType}/${item.id}/resolve/`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+
+  return (
+    <li className="border-b border-border/50 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate">
+          {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+        </span>
+        <button
+          className="text-muted-foreground hover:text-foreground shrink-0"
+          onClick={() => setExpanded((e) => !e)}
+        >
+          {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="mt-2 space-y-2">
+          {suggestionsQuery.isLoading && <p className="text-muted-foreground">Searching TMDB…</p>}
+          {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
+          {!!suggestionsQuery.data?.length && (
+            <div className="flex flex-wrap gap-2">
+              {suggestionsQuery.data.map((s) => (
+                <button
+                  key={s.tmdb_id}
+                  disabled={resolve.isPending}
+                  className="flex items-center gap-2 border border-border rounded px-2 py-1 hover:bg-accent text-left"
+                  onClick={() => resolve.mutate({ year: s.year ?? 0, tmdb_id: s.tmdb_id })}
+                >
+                  {s.poster_url
+                    ? <img src={s.poster_url} alt="" className="w-8 h-12 object-cover rounded" />
+                    : <div className="w-8 h-12 rounded bg-muted shrink-0" />}
+                  <span>{s.name} {s.year ? `(${s.year})` : ''}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {suggestionsQuery.data && suggestionsQuery.data.length === 0 && (
+            <p className="text-muted-foreground">No TMDB matches found for this name.</p>
+          )}
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">or set year manually:</span>
+            <input
+              className={inputCls('w-16')}
+              type="number"
+              placeholder="year"
+              value={manualYear}
+              onChange={(e) => setManualYear(e.target.value)}
+            />
+            <Button
+              size="sm"
+              disabled={!manualYear || resolve.isPending}
+              onClick={() => resolve.mutate({ year: Number(manualYear) })}
+            >
+              Resolve
+            </Button>
+          </div>
+        </div>
+      )}
+    </li>
   )
 }
 
@@ -592,6 +712,35 @@ export default function VodManager() {
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-settings'] }),
   })
 
+  // ── Connected Instances (per-instance XC credentials) ──
+  const xcClientsQuery = useQuery<XcClient[]>({
+    queryKey: ['vod-xc-clients'],
+    queryFn:  () => api.get('/vod/clients/').then((r) => r.data),
+  })
+  const [newClientLabel, setNewClientLabel] = useState('')
+  const [newClientIpAllowlist, setNewClientIpAllowlist] = useState('')
+  const createXcClient = useMutation({
+    mutationFn: () => api.post('/vod/clients/', { label: newClientLabel, ip_allowlist: newClientIpAllowlist || null }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-xc-clients'] })
+      setNewClientLabel('')
+      setNewClientIpAllowlist('')
+    },
+  })
+  const toggleXcClient = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => api.patch(`/vod/clients/${id}/`, { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-clients'] }),
+  })
+  const regenerateXcClient = useMutation({
+    mutationFn: (id: number) => api.post(`/vod/clients/${id}/regenerate/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-clients'] }),
+  })
+  const deleteXcClient = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/clients/${id}/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-clients'] }),
+  })
+  const [revealedClientId, setRevealedClientId] = useState<number | null>(null)
+
   // ── Bulk enrichment ──
   const enrichProgressQuery = useQuery<EnrichProgress>({
     queryKey: ['vod-enrich-progress'],
@@ -875,6 +1024,12 @@ export default function VodManager() {
     },
   })
 
+  // ── Year review (ambiguous no-year duplicates held out of categories) ──
+  const needsReviewQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-needs-review'],
+    queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
+  })
+
   // ── Movies ──
   const [movieSearch, setMovieSearch] = useState('')
   const [movieOffset, setMovieOffset] = useState(0)
@@ -1032,6 +1187,91 @@ export default function VodManager() {
           {tmdbSettingsQuery.data?.has_api_key && (
             <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
           )}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Connected Instances" icon={<Zap size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Each Dispatcharr instance (or other XC client) pulling from this pool gets its own credential pair —
+          use <code className="bg-muted px-1 rounded">{window.location.origin}</code> as the server URL in that
+          instance's XC-type M3U account, with the username/password below.
+        </p>
+
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-muted-foreground text-left">
+              <th className="pb-1 font-normal">Label</th>
+              <th className="pb-1 font-normal">Credentials</th>
+              <th className="pb-1 font-normal">IP allowlist</th>
+              <th className="pb-1 font-normal">Last seen</th>
+              <th className="pb-1 font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {xcClientsQuery.data?.map((c) => (
+              <tr key={c.id} className="border-t border-border/50 align-top">
+                <td className="py-1 pr-2">
+                  {c.label}
+                  {!c.enabled && <span className="text-muted-foreground"> (disabled)</span>}
+                </td>
+                <td className="py-1 pr-2">
+                  {revealedClientId === c.id ? (
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-1">
+                        {c.username}
+                        <CopyUrlButton url={c.username} />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {c.password}
+                        <CopyUrlButton url={c.password} />
+                      </div>
+                    </div>
+                  ) : (
+                    <button className="text-muted-foreground hover:text-foreground flex items-center gap-1" onClick={() => setRevealedClientId(c.id)}>
+                      <Eye size={12} /> reveal
+                    </button>
+                  )}
+                </td>
+                <td className="py-1 pr-2 text-muted-foreground">{c.ip_allowlist || '— any —'}</td>
+                <td className="py-1 pr-2 text-muted-foreground">
+                  {c.last_seen_at ? `${new Date(Number(c.last_seen_at) * 1000).toLocaleString()} (${c.last_seen_ip})` : 'never'}
+                </td>
+                <td className="py-1">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      title={c.enabled ? 'Disable' : 'Enable'}
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => toggleXcClient.mutate({ id: c.id, enabled: !c.enabled })}
+                    >
+                      {c.enabled ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />}
+                    </button>
+                    <button
+                      title="Regenerate secret (invalidates the old one immediately)"
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => { if (confirm(`Regenerate the credential for "${c.label}"? The old one stops working immediately.`)) regenerateXcClient.mutate(c.id) }}
+                    >
+                      <RotateCcw size={12} />
+                    </button>
+                    <button
+                      title="Delete"
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={() => { if (confirm(`Delete instance "${c.label}"? It will stop being able to authenticate immediately.`)) deleteXcClient.mutate(c.id) }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div className="flex items-center gap-1.5 pt-2">
+          <input className={inputCls('w-48')} placeholder="Label (e.g. Prod VPS 3)" value={newClientLabel} onChange={(e) => setNewClientLabel(e.target.value)} />
+          <input className={inputCls('w-40')} placeholder="IP allowlist (optional)" value={newClientIpAllowlist} onChange={(e) => setNewClientIpAllowlist(e.target.value)} />
+          <Button size="sm" disabled={!newClientLabel || createXcClient.isPending} onClick={() => createXcClient.mutate()}>
+            {createXcClient.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" />Add</>}
+          </Button>
         </div>
       </SectionCard>
 
@@ -1494,6 +1734,36 @@ export default function VodManager() {
             ) : (
               <input className={inputCls()} placeholder="value" value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })} />
             )}
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Needs Year Review" icon={<AlertCircle size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Imported with no year, and ambiguous against 2+ existing pool entries with the same name — held out of every category until resolved.
+        </p>
+        {needsReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+        {!!needsReviewQuery.data && !needsReviewQuery.data.movies.length && !needsReviewQuery.data.series.length && (
+          <p className="text-xs text-muted-foreground">Nothing needs review right now.</p>
+        )}
+        {!!needsReviewQuery.data?.movies.length && (
+          <div>
+            <p className="text-xs font-medium text-muted-foreground mb-1">Movies ({needsReviewQuery.data.movies.length})</p>
+            <ul className="text-xs">
+              {needsReviewQuery.data.movies.map((m) => (
+                <NeedsReviewRow key={m.id} contentType="movie" item={m} qc={qc} />
+              ))}
+            </ul>
+          </div>
+        )}
+        {!!needsReviewQuery.data?.series.length && (
+          <div>
+            <p className="text-xs font-medium text-muted-foreground mb-1">TV Shows ({needsReviewQuery.data.series.length})</p>
+            <ul className="text-xs">
+              {needsReviewQuery.data.series.map((s) => (
+                <NeedsReviewRow key={s.id} contentType="series" item={s} qc={qc} />
+              ))}
+            </ul>
           </div>
         )}
       </SectionCard>
