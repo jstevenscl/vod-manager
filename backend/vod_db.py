@@ -1392,7 +1392,8 @@ def get_movie_export_rows() -> list[dict]:
     rows = conn.execute(_BEST_SOURCE_CTE + """
         SELECT
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
-            m.description AS description, m.duration_secs AS duration_secs,
+            m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
+            m.cast_list AS cast_list, m.director AS director,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -1449,7 +1450,8 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
     row = conn.execute(_BEST_SOURCE_CTE + """
         SELECT
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
-            m.description AS description, m.duration_secs AS duration_secs,
+            m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
+            m.cast_list AS cast_list, m.director AS director,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -1842,7 +1844,8 @@ def get_series_export_rows() -> list[dict]:
     rows = conn.execute("""
         SELECT
             s.id AS series_id, s.name AS name, s.year AS year, s.genre AS genre,
-            s.description AS description,
+            s.description AS description, s.poster_url AS poster_url,
+            s.cast_list AS cast_list, s.director AS director,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -1859,7 +1862,8 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
     row = conn.execute("""
         SELECT
             s.id AS series_id, s.name AS name, s.year AS year, s.genre AS genre,
-            s.description AS description,
+            s.description AS description, s.poster_url AS poster_url,
+            s.cast_list AS cast_list, s.director AS director,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
