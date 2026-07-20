@@ -336,6 +336,14 @@ async def set_provider_connection_sharing(
     return {"ok": True}
 
 
+@router.post("/providers/{provider_id}/user-agent/", dependencies=_GUARDS)
+async def set_provider_custom_user_agent(provider_id: int, custom_user_agent: Optional[str] = None):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    vod_db.set_provider_custom_user_agent(provider_id, custom_user_agent.strip() if custom_user_agent else None)
+    return {"ok": True}
+
+
 @router.post("/providers/{provider_id}/deactivate/", dependencies=_GUARDS)
 async def deactivate_provider(provider_id: int):
     if not vod_db.get_provider(provider_id):

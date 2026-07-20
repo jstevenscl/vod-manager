@@ -18,6 +18,7 @@ interface Provider {
   dispatcharr_profile_id: number | null
   dispatcharr_live_account_id: number | null
   shared_connection_limit: number | null
+  custom_user_agent: string | null
   has_password: boolean
   movie_count: number
   series_count: number
@@ -54,6 +55,10 @@ interface NeedsReviewItem {
   year: number | null
   genre: string | null
   sample_episode_id?: number | null
+  sample_source_id?: number | null
+  sample_episode_source_id?: number | null
+  imported_season_count?: number
+  imported_episode_count?: number
 }
 
 interface NeedsReviewData {
@@ -66,6 +71,10 @@ interface TmdbSuggestion {
   name: string
   year: number | null
   poster_url: string | null
+  overview: string | null
+  vote_average: number | null
+  season_count: number | null
+  episode_count: number | null
 }
 
 interface XcClient {
@@ -308,6 +317,21 @@ function Pager({ total, limit, offset, onOffset }: { total: number; limit: numbe
 // One flagged item: no year, ambiguous against 2+ existing pool entries with
 // the same name. TMDB suggestions are fetched on demand (only once expanded)
 // rather than eagerly for every flagged item on page load.
+// Highlights whether our own imported season/episode counts line up with a
+// TMDB candidate's — a useful secondary signal when the name/year alone
+// don't settle it, though not proof either way: providers routinely have an
+// incomplete catalog (missing seasons, gaps), so a mismatch just means
+// "worth a second look," not "wrong."
+function SeasonEpisodeMatch({ imported, candidate, label }: { imported?: number; candidate: number | null; label: string }) {
+  if (imported == null || candidate == null) return null
+  const close = Math.abs(imported - candidate) <= 1
+  return (
+    <span className={close ? 'text-green-600 dark:text-green-500' : 'text-muted-foreground'}>
+      {label}: {imported} vs {candidate}{close ? ' ✓' : ''}
+    </span>
+  )
+}
+
 function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   contentType: 'movie' | 'series'
   item: NeedsReviewItem
@@ -320,11 +344,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   // Movies preview directly off their own id; series need a specific episode
   // (see xc_server.py's /preview/series/ route) — sample_episode_id is the
   // first episode we've actually imported for this flagged series, if any.
+  // Transcoded fallback needs the specific *source* row, not the movie/
+  // episode id — required for anything the browser can't decode natively
+  // (e.g. Plex-sourced .avi files, a real case hit in this exact panel).
   const previewUrl = contentType === 'movie'
     ? buildPreviewUrl('movie', item.id, 'mp4', xcCredentials)
     : item.sample_episode_id
       ? buildPreviewUrl('series', item.sample_episode_id, 'mp4', xcCredentials)
       : null
+  const transcodedUrl = contentType === 'movie'
+    ? (item.sample_source_id ? buildTranscodedPreviewSourceUrl('movie', item.sample_source_id, xcCredentials) : null)
+    : (item.sample_episode_source_id ? buildTranscodedPreviewSourceUrl('series', item.sample_episode_source_id, xcCredentials) : null)
 
   const suggestionsQuery = useQuery<TmdbSuggestion[]>({
     queryKey: ['vod-needs-review-suggestions', contentType, item.id],
@@ -345,7 +375,8 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   // Flagged series often have no episodes yet -- they were never placed in a
   // category, so they never went through normal enrichment (which is also
   // what fetches episode listings). Fetch on demand so there's something to
-  // preview instead of just a name to guess from.
+  // preview instead of just a name to guess from, and so the imported
+  // season/episode counts below have something real to compare against.
   const fetchEpisodes = useMutation({
     mutationFn: () => api.post(`/vod/series/${item.id}/enrich/`, null, { params: { force: true } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-needs-review'] }),
@@ -355,8 +386,13 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     <li className="border-b border-border/50 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="min-w-0 truncate flex items-center gap-1.5">
-          <PlayButton url={previewUrl} title={item.name} />
+          <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+          {contentType === 'series' && !!item.imported_episode_count && (
+            <span className="text-muted-foreground">
+              — imported: {item.imported_season_count} season{item.imported_season_count === 1 ? '' : 's'}, {item.imported_episode_count} episode{item.imported_episode_count === 1 ? '' : 's'}
+            </span>
+          )}
           {contentType === 'series' && !item.sample_episode_id && (
             <button
               className="text-muted-foreground hover:text-foreground underline decoration-dotted shrink-0"
@@ -380,18 +416,30 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
           {suggestionsQuery.isLoading && <p className="text-muted-foreground">Searching TMDB…</p>}
           {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
           {!!suggestionsQuery.data?.length && (
-            <div className="flex flex-wrap gap-2">
+            <div className="space-y-1.5">
               {suggestionsQuery.data.map((s) => (
                 <button
                   key={s.tmdb_id}
                   disabled={resolve.isPending}
-                  className="flex items-center gap-2 border border-border rounded px-2 py-1 hover:bg-accent text-left"
+                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left"
                   onClick={() => resolve.mutate({ year: s.year ?? 0, tmdb_id: s.tmdb_id })}
                 >
                   {s.poster_url
-                    ? <img src={s.poster_url} alt="" className="w-8 h-12 object-cover rounded" />
-                    : <div className="w-8 h-12 rounded bg-muted shrink-0" />}
-                  <span>{s.name} {s.year ? `(${s.year})` : ''}</span>
+                    ? <img src={s.poster_url} alt="" className="w-10 h-14 object-cover rounded shrink-0" />
+                    : <div className="w-10 h-14 rounded bg-muted shrink-0" />}
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{s.name} {s.year ? `(${s.year})` : ''}</span>
+                      {s.vote_average != null && <span className="text-muted-foreground">★ {s.vote_average.toFixed(1)}</span>}
+                    </div>
+                    {contentType === 'series' && (s.season_count != null || s.episode_count != null) && (
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <SeasonEpisodeMatch imported={item.imported_season_count} candidate={s.season_count} label="seasons" />
+                        <SeasonEpisodeMatch imported={item.imported_episode_count} candidate={s.episode_count} label="episodes" />
+                      </div>
+                    )}
+                    {s.overview && <p className="text-muted-foreground line-clamp-2">{s.overview}</p>}
+                  </div>
                 </button>
               ))}
             </div>
@@ -940,6 +988,11 @@ export default function VodManager() {
       api.post(`/vod/providers/${id}/max-streams/`, null, { params: { max_streams } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
   })
+  const setProviderUserAgent = useMutation({
+    mutationFn: ({ id, custom_user_agent }: { id: number; custom_user_agent: string }) =>
+      api.post(`/vod/providers/${id}/user-agent/`, null, { params: { custom_user_agent } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
   const setConnectionSharing = useMutation({
     // 0 means "not set" on both sides (a real Dispatcharr account id or
     // connection limit of 0 is never meaningful), so always send actual
@@ -1447,6 +1500,7 @@ export default function VodManager() {
               <th className="pb-1 font-normal">Max Streams</th>
               <th className="pb-1 font-normal">Dispatcharr Profile</th>
               <th className="pb-1 font-normal" title="If Dispatcharr also connects to this same real provider for live TV, set its account ID here plus the provider's true total connection limit — VOD will fail over to the next provider instead of exceeding it">Shares With (Live Acct / Limit)</th>
+              <th className="pb-1 font-normal" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
               <th className="pb-1 font-normal"></th>
             </tr>
           </thead>
@@ -1540,6 +1594,19 @@ export default function VodManager() {
                       }}
                     />
                   </span>
+                </td>
+                <td className="py-1 pr-2">
+                  <input
+                    className={inputCls('w-32')}
+                    placeholder="default"
+                    defaultValue={p.custom_user_agent ?? ''}
+                    key={p.custom_user_agent}
+                    title="Overrides the default browser User-Agent for this provider only"
+                    onBlur={(e) => {
+                      const v = e.target.value.trim()
+                      if (v !== (p.custom_user_agent ?? '')) setProviderUserAgent.mutate({ id: p.id, custom_user_agent: v })
+                    }}
+                  />
                 </td>
                 <td className="py-1 flex items-center gap-1.5">
                   <Button size="sm" variant="outline" disabled={syncProvider.isPending} onClick={() => syncProvider.mutate(p.id)}>

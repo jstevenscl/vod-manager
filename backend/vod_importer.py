@@ -52,13 +52,15 @@ class XCProviderClient:
         self.base_url = provider["base_url"].rstrip("/")
         self.username = provider["username"]
         self.password = provider["password"]
+        custom_ua = provider.get("custom_user_agent")
+        self.headers = {"User-Agent": custom_ua} if custom_ua else _UPSTREAM_HEADERS
 
     async def _call(self, action: str | None = None, **params) -> object:
         query = {"username": self.username, "password": self.password}
         if action:
             query["action"] = action
         query.update(params)
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_UPSTREAM_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
             r = await client.get(f"{self.base_url}/player_api.php", params=query)
             r.raise_for_status()
             return r.json()

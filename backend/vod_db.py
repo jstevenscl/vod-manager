@@ -235,6 +235,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("episode_sources", "plex_rating_key", "TEXT"),
         ("movies", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
+        ("providers", "custom_user_agent", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -329,6 +330,21 @@ def set_provider_connection_sharing(
     conn.execute(
         "UPDATE providers SET dispatcharr_live_account_id=?, shared_connection_limit=?, updated_at=? WHERE id=?",
         (dispatcharr_live_account_id, shared_connection_limit, _now(), provider_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_provider_custom_user_agent(provider_id: int, custom_user_agent: str | None) -> None:
+    """Overrides the default browser User-Agent (see vod_importer.py's
+    _UPSTREAM_HEADERS) for just this provider -- most providers work fine
+    with the shared default; this is only needed if one turns out to be
+    pickier (blocks even a normal browser UA, or wants something else
+    entirely). None/empty clears the override and falls back to the default."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE providers SET custom_user_agent=?, updated_at=? WHERE id=?",
+        (custom_user_agent or None, _now(), provider_id),
     )
     _commit_with_retry(conn)
     conn.close()
@@ -1905,9 +1921,19 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
     conn = _connect()
     out: dict = {}
     if content_type in (None, "movie"):
-        out["movies"] = [dict(r) for r in conn.execute(
+        rows = [dict(r) for r in conn.execute(
             "SELECT * FROM movies WHERE needs_year_review=1 ORDER BY name"
         ).fetchall()]
+        for row in rows:
+            # Transcoded fallback preview needs a specific movie_sources row
+            # (that route is keyed by source, not movie -- see xc_server.py's
+            # /preview/movie-source-transcoded/), for files whose codec the
+            # browser can't decode natively (common for Plex-sourced .avi).
+            src = conn.execute(
+                "SELECT id FROM movie_sources WHERE movie_id=? LIMIT 1", (row["id"],),
+            ).fetchone()
+            row["sample_source_id"] = src["id"] if src else None
+        out["movies"] = rows
     if content_type in (None, "series"):
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM series WHERE needs_year_review=1 ORDER BY name"
@@ -1921,6 +1947,25 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
                 (row["id"],),
             ).fetchone()
             row["sample_episode_id"] = ep["id"] if ep else None
+            if ep:
+                src = conn.execute(
+                    "SELECT id FROM episode_sources WHERE episode_id=? LIMIT 1", (ep["id"],),
+                ).fetchone()
+                row["sample_episode_source_id"] = src["id"] if src else None
+            else:
+                row["sample_episode_source_id"] = None
+            # Season/episode counts as a secondary signal alongside TMDB
+            # suggestions -- if we've pulled 5 seasons/62 episodes and a
+            # candidate's own TMDB counts are wildly different, that's a
+            # useful hint even when the name/year alone are ambiguous. Not
+            # every provider has a complete catalog, so this is corroborating
+            # evidence, not proof either way.
+            counts = conn.execute(
+                "SELECT COUNT(DISTINCT season_number) seasons, COUNT(*) episodes FROM episodes WHERE series_id=?",
+                (row["id"],),
+            ).fetchone()
+            row["imported_season_count"] = counts["seasons"]
+            row["imported_episode_count"] = counts["episodes"]
         out["series"] = rows
     conn.close()
     return out

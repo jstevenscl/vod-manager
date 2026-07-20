@@ -577,7 +577,11 @@ async def _proxy_vod_stream(
         # requests off to a CDN edge host rather than serving the file
         # directly — without this, we'd relay that dead-end redirect
         # straight to the client instead of the actual video.
-        client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_UPSTREAM_HEADERS)
+        custom_ua = provider.get("custom_user_agent")
+        client = httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True,
+            headers={"User-Agent": custom_ua} if custom_ua else _UPSTREAM_HEADERS,
+        )
         t_connect_start = time.monotonic()
         try:
             upstream_req = client.build_request("GET", upstream_url, headers=forward_headers)

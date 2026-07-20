@@ -12,6 +12,7 @@ provider) can ever get placed — this doesn't pull in new content, it just
 organizes what's already there according to an external list.
 """
 
+import asyncio
 import logging
 
 import httpx
@@ -41,7 +42,14 @@ async def search_title(name: str, content_type: str) -> list[dict]:
     """Real TMDB search results for a name -- used by the year-review flow so
     a user picks from actual candidates (title/year/poster/tmdb_id) instead
     of researching the correct year themselves. content_type is 'movie' or
-    'series' (mapped to TMDB's own 'movie'/'tv' search endpoints)."""
+    'series' (mapped to TMDB's own 'movie'/'tv' search endpoints).
+
+    Includes overview/rating (and, for series, season/episode counts) so a
+    reviewer has more than a bare name+year to go on -- the search endpoint
+    itself doesn't return season/episode counts, so that's one extra detail
+    call per candidate, fetched concurrently to keep this fast. Capped at 5
+    candidates (rather than 10) specifically to bound how many of those
+    extra calls a single suggestions lookup makes."""
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
@@ -55,17 +63,32 @@ async def search_title(name: str, content_type: str) -> list[dict]:
         r.raise_for_status()
         data = r.json()
 
-    results = []
-    for item in data.get("results", [])[:10]:
-        date = item.get("release_date") if content_type == "movie" else item.get("first_air_date")
-        year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
-        results.append({
-            "tmdb_id": str(item["id"]),
-            "name": item.get("title") if content_type == "movie" else item.get("name"),
-            "year": year,
-            "poster_url": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else None,
-        })
-    return results
+        async def _build(item: dict) -> dict:
+            date = item.get("release_date") if content_type == "movie" else item.get("first_air_date")
+            year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
+            out = {
+                "tmdb_id": str(item["id"]),
+                "name": item.get("title") if content_type == "movie" else item.get("name"),
+                "year": year,
+                "poster_url": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else None,
+                "overview": item.get("overview") or None,
+                "vote_average": item.get("vote_average"),
+                "season_count": None,
+                "episode_count": None,
+            }
+            if content_type == "series":
+                try:
+                    dr = await client.get(f"{_API_BASE}/tv/{item['id']}", params={"api_key": api_key})
+                    dr.raise_for_status()
+                    dd = dr.json()
+                    out["season_count"] = dd.get("number_of_seasons")
+                    out["episode_count"] = dd.get("number_of_episodes")
+                except Exception as exc:
+                    logger.warning("[tmdb_sync] failed to fetch season/episode counts for tmdb_id=%s: %s", item["id"], exc)
+            return out
+
+        candidates = data.get("results", [])[:5]
+        return list(await asyncio.gather(*[_build(item) for item in candidates]))
 
 
 def _parse_sync_source(sync_source: str) -> tuple[str, str] | None:
