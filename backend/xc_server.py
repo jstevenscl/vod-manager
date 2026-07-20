@@ -359,6 +359,28 @@ def get_active_sessions() -> list[dict]:
     return list(_active_sessions.values())
 
 
+# Sessions marked for forced termination -- checked by the relay loop itself
+# (see _proxy_vod_stream's relay()) on every chunk, same choke point as the
+# request.is_disconnected() check. Needed because disconnect detection isn't
+# fully reliable on its own (a client closing its tab doesn't always tear
+# down the TCP connection promptly, especially through a proxy/tunnel), so a
+# session can outlive the player that opened it -- confirmed live: a closed
+# preview kept relaying real bytes from the upstream provider afterward.
+_kill_requested: set[str] = set()
+
+
+def kill_session(conn_id: str) -> bool:
+    """Returns False if conn_id isn't currently an active session (nothing
+    to kill) -- true even if it was already marked, so a caller can't
+    accidentally kill a *different*, later session that happens to reuse
+    the id (conn_ids are time-stamped, so that's only a theoretical risk,
+    but worth being precise about)."""
+    if conn_id not in _active_sessions:
+        return False
+    _kill_requested.add(conn_id)
+    return True
+
+
 async def _live_viewer_count(dispatcharr_account_id: int) -> int:
     now = time.monotonic()
     cached = _live_viewer_cache.get(dispatcharr_account_id)
@@ -475,7 +497,7 @@ def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
     return f"{provider['base_url'].rstrip('/')}/{kind}/{provider['username']}/{provider['password']}/{source['provider_stream_id']}.{ext}"
 
 
-async def _transcode_vod_stream(kind: str, source: dict, request: Request, start_secs: int = 0) -> Response:
+async def _transcode_vod_stream(kind: str, source: dict, request: Request, start_secs: int = 0, title: str = "?") -> Response:
     """Re-encodes a source to browser-compatible H.264/AAC on the fly and
     streams the result — for files a stock <video> element can't play
     natively (AVI containers, DTS/AC-3 audio, XviD/DivX video, etc.). Only
@@ -501,6 +523,13 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request, start
     upstream_url = _build_upstream_url(kind, provider, source)
     conn_id = f"transcode-{time.time():.3f}"
     logger.info("[xc_server] %s transcode OPEN id=%s start=%ds upstream=%s", kind, conn_id, start_secs, upstream_url)
+
+    _active_sessions[conn_id] = {
+        "conn_id": conn_id, "kind": kind, "title": f"{title} (transcoded)", "provider_name": provider["name"],
+        "provider_type": provider.get("provider_type", "xc"), "started_at": time.time(),
+        "bytes_sent": 0, "total_bytes": 0, "duration_secs": None,
+        "range_start_byte": 0, "plex_reported": False, "emby_reported": False,
+    }
 
     async def generate():
         args = ["ffmpeg", "-loglevel", "error"]
@@ -532,11 +561,17 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request, start
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
-                bytes_sent += len(chunk)
+                if conn_id in _kill_requested:
+                    break
                 if await request.is_disconnected():
                     break
+                bytes_sent += len(chunk)
+                if conn_id in _active_sessions:
+                    _active_sessions[conn_id]["bytes_sent"] = bytes_sent
                 yield chunk
         finally:
+            _kill_requested.discard(conn_id)
+            _active_sessions.pop(conn_id, None)
             if proc.returncode is None:
                 proc.kill()
             await proc.wait()
@@ -661,6 +696,12 @@ async def _proxy_vod_stream(
             outcome = "ok"
             try:
                 async for chunk in upstream_resp.aiter_bytes():
+                    if conn_id in _kill_requested:
+                        outcome = "killed"
+                        break
+                    if await request.is_disconnected():
+                        outcome = "client disconnected"
+                        break
                     bytes_sent += len(chunk)
                     if conn_id in _active_sessions:
                         _active_sessions[conn_id]["bytes_sent"] = bytes_sent
@@ -669,6 +710,7 @@ async def _proxy_vod_stream(
                 outcome = f"{type(exc).__name__}: {exc}"
                 raise
             finally:
+                _kill_requested.discard(conn_id)
                 await upstream_resp.aclose()
                 await client.aclose()
                 _active_vod_streams[provider["id"]] = max(0, _active_vod_streams.get(provider["id"], 1) - 1)
@@ -835,7 +877,8 @@ async def preview_movie_source_transcoded(username: str, password: str, source_i
     source = vod_db.get_movie_source_for_streaming(source_id)
     if not source:
         return Response(status_code=404, content="not found")
-    return await _transcode_vod_stream("movie", source, request, start_secs=max(0, start))
+    title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
+    return await _transcode_vod_stream("movie", source, request, start_secs=max(0, start), title=title)
 
 
 @router.get("/preview/series-source-transcoded/{username}/{password}/{source_id_ext}")
@@ -847,4 +890,5 @@ async def preview_episode_source_transcoded(username: str, password: str, source
     source = vod_db.get_episode_source_for_streaming(source_id)
     if not source:
         return Response(status_code=404, content="not found")
-    return await _transcode_vod_stream("series", source, request, start_secs=max(0, start))
+    title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
+    return await _transcode_vod_stream("series", source, request, start_secs=max(0, start), title=title)

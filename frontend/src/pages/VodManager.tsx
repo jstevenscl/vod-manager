@@ -864,6 +864,10 @@ export default function VodManager() {
     queryFn:  () => api.get('/vod/activity/').then((r) => r.data),
     refetchInterval: 3000,
   })
+  const killSession = useMutation({
+    mutationFn: (connId: string) => api.post(`/vod/activity/${connId}/kill/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-activity'] }),
+  })
 
   // ── Settings (XC account id) ──
   const settingsQuery = useQuery({
@@ -1315,6 +1319,7 @@ export default function VodManager() {
                 <th className="pb-1 font-normal">Provider</th>
                 <th className="pb-1 font-normal">Elapsed</th>
                 <th className="pb-1 font-normal">Progress</th>
+                <th className="pb-1 font-normal"></th>
               </tr>
             </thead>
             <tbody>
@@ -1329,6 +1334,16 @@ export default function VodManager() {
                     </td>
                     <td className="py-1 pr-2 text-muted-foreground">{formatElapsed(s.started_at)}</td>
                     <td className="py-1 pr-2 text-muted-foreground">{pct != null ? `${pct}%` : '—'}</td>
+                    <td className="py-1">
+                      <button
+                        title="Force-close this stream"
+                        className="text-muted-foreground hover:text-destructive"
+                        disabled={killSession.isPending}
+                        onClick={() => killSession.mutate(s.conn_id)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </td>
                   </tr>
                 )
               })}

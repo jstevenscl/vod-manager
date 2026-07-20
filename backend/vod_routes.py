@@ -13,7 +13,7 @@ import tmdb_sync
 import vod_db
 import vod_importer
 import vod_sync
-from xc_server import get_active_sessions
+from xc_server import get_active_sessions, kill_session
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/vod", tags=["vod-manager"])
@@ -220,6 +220,18 @@ async def list_activity():
     """Currently open VOD stream relays — in-memory only, cleared on
     restart, same as the underlying session tracking in xc_server.py."""
     return get_active_sessions()
+
+
+@router.post("/activity/{conn_id}/kill/", dependencies=_GUARDS)
+async def kill_activity(conn_id: str):
+    """Force-closes a stuck/rogue relay -- a closed player doesn't always
+    tear down the underlying connection promptly (confirmed live: a closed
+    preview kept relaying real bytes from the upstream provider afterward),
+    and disconnect detection alone isn't a substitute for a manual escape
+    hatch."""
+    if not kill_session(conn_id):
+        raise HTTPException(404, detail="session not found (it may have already closed)")
+    return {"ok": True}
 
 
 @router.get("/tmdb-settings/", dependencies=_GUARDS)
