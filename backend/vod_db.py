@@ -1943,6 +1943,36 @@ def get_episode_export_row_by_export_id(export_episode_id: int) -> dict | None:
     return get_episode_export_row(export_episode_id - _EPISODE_EXPORT_BASE)
 
 
+def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
+    """Bulk equivalent of calling get_episode_export_row once per episode --
+    xc_server's get_series_info action used to do exactly that N+1 loop
+    (list_episodes, then a separate query per episode), which is fine for a
+    short series but opens one SQLite connection per episode synchronously
+    inside an async request handler -- for a long-running show (hundreds of
+    episodes) that's real blocking time on the single event-loop thread,
+    confirmed live: a real Dispatcharr full-catalog sync hitting
+    get_series_info for many series in a row froze the whole server for
+    every other request until it finished."""
+    conn = _connect()
+    rows = conn.execute(_EPISODE_BEST_SOURCE_CTE + """
+        SELECT
+            e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
+            e.episode_number AS episode_number, e.name AS name, e.description AS description,
+            e.duration_secs AS duration_secs,
+            es.provider_id AS provider_id, es.provider_stream_id AS provider_stream_id,
+            es.container_extension AS container_extension
+        FROM episodes e
+        LEFT JOIN best_source es ON es.episode_id = e.id AND es.rn = 1
+        WHERE e.series_id = ?
+        ORDER BY e.season_number, e.episode_number
+    """, (series_id,)).fetchall()
+    conn.close()
+    results = [dict(r) for r in rows]
+    for r in results:
+        r["export_episode_id"] = _EPISODE_EXPORT_BASE + r["episode_id"]
+    return results
+
+
 # ── Bulk import ──────────────────────────────────────────────────────────────
 # List-level import from a real provider (cheap — name/year/category/stream_id
 # only). Runs as a single transaction rather than the usual one-connection-per-

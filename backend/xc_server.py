@@ -185,10 +185,13 @@ def _series_allowed(client: dict, series_id: int) -> bool:
     return bool(allowed.intersection(vod_db.get_series_category_ids(series_id)))
 
 
-async def _find_matching_client(username: str, password: str) -> dict | None:
+def _find_matching_client_sync(username: str, password: str) -> dict | None:
     """Checks the given credentials against every enabled client without
     short-circuiting on the first match -- so response time doesn't leak
-    which position in the list (if any) matched."""
+    which position in the list (if any) matched. Plain sync function run via
+    asyncio.to_thread (see _authenticate) -- vod_db.list_enabled_xc_clients
+    opens its own SQLite connection, and this runs on every single request
+    across every route, so it shouldn't block the event loop either."""
     matched = None
     for client in vod_db.list_enabled_xc_clients():
         user_ok = secrets.compare_digest(username.encode(), client["username"].encode())
@@ -207,7 +210,7 @@ async def _authenticate(username: str, password: str, request: Request) -> dict 
     if _is_locked_out(client_ip):
         return None
 
-    matched = await _find_matching_client(username, password)
+    matched = await asyncio.to_thread(_find_matching_client_sync, username, password)
     if matched is None:
         _record_auth_failure(client_ip)
         return None
@@ -219,7 +222,7 @@ async def _authenticate(username: str, password: str, request: Request) -> dict 
         return None
 
     _record_auth_success(client_ip)
-    vod_db.record_xc_client_seen(matched["id"], client_ip)
+    await asyncio.to_thread(vod_db.record_xc_client_seen, matched["id"], client_ip)
     return matched
 
 
@@ -230,50 +233,16 @@ def _log_hit(request: Request) -> None:
     logger.info("[xc_server] %s %s", request.url.path, params)
 
 
-@router.get("/player_api.php")
-async def player_api(request: Request):
-    _log_hit(request)
-    action   = request.query_params.get("action")
-    username = request.query_params.get("username", "")
-    password = request.query_params.get("password", "")
-    authenticated = await _authenticate(username, password, request)
-    now = int(time.time())
-
-    if not action:
-        # XC protocol overloads this same no-action call as the login
-        # handshake — real XC servers respond 200 with auth:0 on bad
-        # credentials rather than an HTTP error, so clients can surface a
-        # clean "invalid login" instead of a connection failure.
-        return {
-            "user_info": {
-                "username": username,
-                "password": password,
-                "message": "" if authenticated else "Invalid credentials",
-                "auth": 1 if authenticated else 0,
-                "status": "Active" if authenticated else "Disabled",
-                "exp_date": str(now + 365 * 24 * 3600),
-                "is_trial": "0",
-                "active_cons": "0",
-                "created_at": str(now),
-                "max_connections": "1",
-                "allowed_output_formats": ["m3u8", "ts"],
-            },
-            "server_info": {
-                "url": request.url.hostname,
-                "port": str(request.url.port or 80),
-                "https_port": "443",
-                "server_protocol": request.url.scheme,
-                "rtmp_port": "25462",
-                "timezone": "UTC",
-                "timestamp_now": now,
-                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-
-    if not authenticated:
-        logger.warning("[xc_server] rejected action=%s for username=%s (bad credentials)", action, username)
-        return Response(status_code=401, content="Unauthorized")
-
+def _handle_player_api_action(action: str, params, authenticated: dict) -> dict | list:
+    """All the actual catalog work for player_api.php, as a plain synchronous
+    function run off the event loop via asyncio.to_thread (see the route
+    below) -- every vod_db.* call here opens its own SQLite connection and
+    some (get_series_info especially, before it was fixed to use a bulk
+    query) do many of them per request. Run inline inside the async route
+    handler, that's real synchronous blocking time on FastAPI's single
+    event-loop thread -- confirmed live: a real Dispatcharr full-catalog
+    sync froze the whole server, including totally unrelated requests like
+    a login, until the sync's burst of get_series_info calls finished."""
     allowed_category_ids = _allowed_category_ids(authenticated)
 
     if action == "get_vod_categories":
@@ -304,7 +273,7 @@ async def player_api(request: Request):
         } for i, row in enumerate(rows)]
 
     if action == "get_vod_info":
-        vod_id = request.query_params.get("vod_id")
+        vod_id = params.get("vod_id")
         row = vod_db.get_movie_export_row_by_stream_id(int(vod_id)) if vod_id else None
         if row and allowed_category_ids is not None and row["category_id"] not in allowed_category_ids:
             row = None
@@ -365,7 +334,7 @@ async def player_api(request: Request):
         } for i, row in enumerate(rows)]
 
     if action == "get_series_info":
-        series_id_param = request.query_params.get("series_id")
+        series_id_param = params.get("series_id")
         row = vod_db.get_series_export_row_by_export_id(int(series_id_param)) if series_id_param else None
         if row and allowed_category_ids is not None and row["category_id"] not in allowed_category_ids:
             row = None
@@ -373,14 +342,13 @@ async def player_api(request: Request):
             return {"seasons": [], "info": {}, "episodes": {}}
 
         episodes_by_season: dict[str, list] = {}
-        for ep in vod_db.list_episodes(row["series_id"]):
-            export_row = vod_db.get_episode_export_row(ep["id"])
+        for ep in vod_db.get_episode_export_rows_for_series(row["series_id"]):
             season_key = str(ep["season_number"])
             episodes_by_season.setdefault(season_key, []).append({
-                "id": str(export_row["export_episode_id"]),
+                "id": str(ep["export_episode_id"]),
                 "episode_num": ep["episode_number"],
                 "title": ep["name"],
-                "container_extension": (export_row["container_extension"] or "mp4"),
+                "container_extension": (ep["container_extension"] or "mp4"),
                 "info": {
                     "plot": ep["description"] or "",
                     "duration_secs": ep["duration_secs"] or 0,
@@ -403,8 +371,55 @@ async def player_api(request: Request):
             "episodes": episodes_by_season,
         }
 
-    logger.warning("[xc_server] unhandled action=%s params=%s", action, dict(request.query_params))
+    logger.warning("[xc_server] unhandled action=%s params=%s", action, dict(params))
     return []
+
+
+@router.get("/player_api.php")
+async def player_api(request: Request):
+    _log_hit(request)
+    action   = request.query_params.get("action")
+    username = request.query_params.get("username", "")
+    password = request.query_params.get("password", "")
+    authenticated = await _authenticate(username, password, request)
+    now = int(time.time())
+
+    if not action:
+        # XC protocol overloads this same no-action call as the login
+        # handshake — real XC servers respond 200 with auth:0 on bad
+        # credentials rather than an HTTP error, so clients can surface a
+        # clean "invalid login" instead of a connection failure.
+        return {
+            "user_info": {
+                "username": username,
+                "password": password,
+                "message": "" if authenticated else "Invalid credentials",
+                "auth": 1 if authenticated else 0,
+                "status": "Active" if authenticated else "Disabled",
+                "exp_date": str(now + 365 * 24 * 3600),
+                "is_trial": "0",
+                "active_cons": "0",
+                "created_at": str(now),
+                "max_connections": "1",
+                "allowed_output_formats": ["m3u8", "ts"],
+            },
+            "server_info": {
+                "url": request.url.hostname,
+                "port": str(request.url.port or 80),
+                "https_port": "443",
+                "server_protocol": request.url.scheme,
+                "rtmp_port": "25462",
+                "timezone": "UTC",
+                "timestamp_now": now,
+                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+
+    if not authenticated:
+        logger.warning("[xc_server] rejected action=%s for username=%s (bad credentials)", action, username)
+        return Response(status_code=401, content="Unauthorized")
+
+    return await asyncio.to_thread(_handle_player_api_action, action, request.query_params, authenticated)
 
 
 _active_vod_streams: dict[int, int] = {}  # provider_id -> count of VOD streams we're currently relaying
