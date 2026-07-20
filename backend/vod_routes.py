@@ -67,6 +67,8 @@ class XcClientUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     ip_allowlist: Optional[str] = None
     clear_ip_allowlist: bool = False
+    category_allowlist: Optional[str] = None
+    clear_category_allowlist: bool = False
 
 
 class MetadataRuleRequest(BaseModel):
@@ -216,6 +218,7 @@ def _client_out(c: dict) -> dict:
         "password": c["password"],
         "enabled": bool(c["enabled"]),
         "ip_allowlist": c["ip_allowlist"],
+        "category_allowlist": c.get("category_allowlist"),
         "created_at": c["created_at"],
         "last_seen_at": c["last_seen_at"],
         "last_seen_ip": c["last_seen_ip"],
@@ -246,6 +249,8 @@ async def update_xc_client(client_id: int, body: XcClientUpdateRequest):
         enabled=body.enabled,
         ip_allowlist=body.ip_allowlist,
         clear_ip_allowlist=body.clear_ip_allowlist,
+        category_allowlist=body.category_allowlist,
+        clear_category_allowlist=body.clear_category_allowlist,
     )
     return _client_out(vod_db.get_xc_client(client_id))
 

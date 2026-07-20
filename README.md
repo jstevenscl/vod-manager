@@ -72,6 +72,22 @@ Dispatcharr's own side: enable VOD on the new account and pick which
 groups/categories to turn on — normal setup for any source, regardless of
 how the account got created.
 
+## Per-instance category access control
+
+Dispatcharr has no per-user/per-profile VOD split of its own — once content
+is pulled in through a Connected Instance's M3U account, every Dispatcharr
+user on that instance sees the identical catalog. For real per-audience
+control (e.g. a kids-only client, or handing a limited catalog directly to
+an end-user IPTV app like TiviMate or IPTV Smarters instead of routing it
+through Dispatcharr at all), restrict a specific Connected Instance's
+credential to a set of categories under Settings → Connected Instances →
+*Category access*. Left as "— all —" (the default), a client sees the whole
+pool, matching every existing credential's behavior today. Restricting it
+is enforced everywhere that credential is used — catalog listing, info
+lookups, and the actual stream — not just hidden from the browse UI, so a
+restricted client can't reach disallowed content even with a direct/copied
+stream URL.
+
 ## Shared connection-limit coordination
 
 If a real provider also has its own native live-TV account somewhere in

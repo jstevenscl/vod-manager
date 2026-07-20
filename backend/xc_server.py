@@ -152,6 +152,35 @@ def _ip_allowed(client_ip: str, allowlist: str) -> bool:
     return False
 
 
+def _allowed_category_ids(client: dict) -> set[int] | None:
+    """None means unrestricted (every existing client, unless explicitly
+    given an allowlist) -- callers must treat None as 'skip the check', not
+    as an empty allowlist, or every client would suddenly see nothing."""
+    raw = client.get("category_allowlist")
+    if not raw:
+        return None
+    ids = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if entry.isdigit():
+            ids.add(int(entry))
+    return ids
+
+
+def _movie_allowed(client: dict, movie_id: int) -> bool:
+    allowed = _allowed_category_ids(client)
+    if allowed is None:
+        return True
+    return bool(allowed.intersection(vod_db.get_movie_category_ids(movie_id)))
+
+
+def _series_allowed(client: dict, series_id: int) -> bool:
+    allowed = _allowed_category_ids(client)
+    if allowed is None:
+        return True
+    return bool(allowed.intersection(vod_db.get_series_category_ids(series_id)))
+
+
 async def _find_matching_client(username: str, password: str) -> dict | None:
     """Checks the given credentials against every enabled client without
     short-circuiting on the first match -- so response time doesn't leak
@@ -241,14 +270,19 @@ async def player_api(request: Request):
         logger.warning("[xc_server] rejected action=%s for username=%s (bad credentials)", action, username)
         return Response(status_code=401, content="Unauthorized")
 
+    allowed_category_ids = _allowed_category_ids(authenticated)
+
     if action == "get_vod_categories":
         return [
             {"category_id": str(c["id"]), "category_name": c["name"], "parent_id": 0}
             for c in vod_db.list_categories(content_type="movie")
+            if allowed_category_ids is None or c["id"] in allowed_category_ids
         ]
 
     if action == "get_vod_streams":
         rows = vod_db.get_movie_export_rows()
+        if allowed_category_ids is not None:
+            rows = [r for r in rows if r["category_id"] in allowed_category_ids]
         return [{
             "num": i + 1,
             "name": row["name"] + row["name_suffix"],
@@ -268,6 +302,8 @@ async def player_api(request: Request):
     if action == "get_vod_info":
         vod_id = request.query_params.get("vod_id")
         row = vod_db.get_movie_export_row_by_stream_id(int(vod_id)) if vod_id else None
+        if row and allowed_category_ids is not None and row["category_id"] not in allowed_category_ids:
+            row = None
         if not row:
             return {"info": {}, "movie_data": {}}
         return {
@@ -297,10 +333,13 @@ async def player_api(request: Request):
         return [
             {"category_id": str(c["id"]), "category_name": c["name"], "parent_id": 0}
             for c in vod_db.list_categories(content_type="series")
+            if allowed_category_ids is None or c["id"] in allowed_category_ids
         ]
 
     if action == "get_series":
         rows = vod_db.get_series_export_rows()
+        if allowed_category_ids is not None:
+            rows = [r for r in rows if r["category_id"] in allowed_category_ids]
         return [{
             "num": i + 1,
             "name": row["name"] + row["name_suffix"],
@@ -324,6 +363,8 @@ async def player_api(request: Request):
     if action == "get_series_info":
         series_id_param = request.query_params.get("series_id")
         row = vod_db.get_series_export_row_by_export_id(int(series_id_param)) if series_id_param else None
+        if row and allowed_category_ids is not None and row["category_id"] not in allowed_category_ids:
+            row = None
         if not row:
             return {"seasons": [], "info": {}, "episodes": {}}
 
@@ -794,11 +835,15 @@ async def _proxy_vod_stream(
 @router.get("/movie/{username}/{password}/{stream_id_ext}")
 async def movie_stream(username: str, password: str, stream_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     export_stream_id = int(stream_id_ext.split(".")[0])
     row = vod_db.get_movie_export_row_by_stream_id(export_stream_id)
     if not row:
+        return Response(status_code=404, content="not found")
+    allowed = _allowed_category_ids(client)
+    if allowed is not None and row["category_id"] not in allowed:
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(row["movie_id"])
     title = f"{row['name']} ({row['year']})" if row.get("year") else row["name"]
@@ -808,11 +853,14 @@ async def movie_stream(username: str, password: str, stream_id_ext: str, request
 @router.get("/series/{username}/{password}/{episode_id_ext}")
 async def series_stream(username: str, password: str, episode_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     export_episode_id = int(episode_id_ext.split(".")[0])
     row = vod_db.get_episode_export_row_by_export_id(export_episode_id)
     if not row:
+        return Response(status_code=404, content="not found")
+    if not _series_allowed(client, row["series_id"]):
         return Response(status_code=404, content="not found")
     sources = vod_db.list_episode_sources_for_streaming(row["episode_id"])
     series = vod_db.get_series(row["series_id"])
@@ -835,11 +883,12 @@ async def series_stream(username: str, password: str, episode_id_ext: str, reque
 @router.get("/preview/movie/{username}/{password}/{movie_id_ext}")
 async def preview_movie_stream(username: str, password: str, movie_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     movie_id = int(movie_id_ext.split(".")[0])
     movie = vod_db.get_movie(movie_id)
-    if not movie:
+    if not movie or not _movie_allowed(client, movie_id):
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(movie_id)
     title = f"{movie['name']} ({movie['year']})" if movie.get("year") else movie["name"]
@@ -849,10 +898,13 @@ async def preview_movie_stream(username: str, password: str, movie_id_ext: str, 
 @router.get("/preview/series/{username}/{password}/{episode_id_ext}")
 async def preview_episode_stream(username: str, password: str, episode_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     episode_id = int(episode_id_ext.split(".")[0])
     episode = vod_db.get_episode(episode_id)
+    if episode and not _series_allowed(client, episode["series_id"]):
+        return Response(status_code=404, content="not found")
     sources = vod_db.list_episode_sources_for_streaming(episode_id)
     if episode:
         series = vod_db.get_series(episode["series_id"])
@@ -873,11 +925,12 @@ async def preview_episode_stream(username: str, password: str, episode_id_ext: s
 @router.get("/preview/movie-source/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_stream(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_movie_source_for_streaming(source_id)
-    if not source:
+    if not source or not _movie_allowed(client, source["movie_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
     return await _proxy_vod_stream("movie", username, [source], request, title=title, duration_secs=source.get("duration_secs"))
@@ -886,11 +939,12 @@ async def preview_movie_source_stream(username: str, password: str, source_id_ex
 @router.get("/preview/series-source/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_stream(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_episode_source_for_streaming(source_id)
-    if not source:
+    if not source or not _series_allowed(client, source["series_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
     return await _proxy_vod_stream("series", username, [source], request, title=title, duration_secs=source.get("duration_secs"))
@@ -903,11 +957,12 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
 @router.get("/preview/movie-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_movie_source_for_streaming(source_id)
-    if not source:
+    if not source or not _movie_allowed(client, source["movie_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
     return await _transcode_vod_stream("movie", source, request, start_secs=max(0, start), title=title)
@@ -916,11 +971,12 @@ async def preview_movie_source_transcoded(username: str, password: str, source_i
 @router.get("/preview/series-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
     _log_hit(request)
-    if not await _authenticate(username, password, request):
+    client = await _authenticate(username, password, request)
+    if not client:
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_episode_source_for_streaming(source_id)
-    if not source:
+    if not source or not _series_allowed(client, source["series_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
     return await _transcode_vod_stream("series", source, request, start_secs=max(0, start), title=title)

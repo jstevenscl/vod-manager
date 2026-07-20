@@ -128,6 +128,7 @@ interface XcClient {
   password: string
   enabled: boolean
   ip_allowlist: string | null
+  category_allowlist: string | null
   created_at: string
   last_seen_at: string | null
   last_seen_ip: string | null
@@ -940,6 +941,17 @@ export default function VodManager() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-clients'] }),
   })
   const [revealedClientId, setRevealedClientId] = useState<number | null>(null)
+  const [expandedCategoryAccessClientId, setExpandedCategoryAccessClientId] = useState<number | null>(null)
+  const [categoryAccessForm, setCategoryAccessForm] = useState<Set<number> | null>(null)
+  const setClientCategoryAllowlist = useMutation({
+    mutationFn: ({ id, ids }: { id: number; ids: number[] | null }) =>
+      api.patch(`/vod/clients/${id}/`, ids === null ? { clear_category_allowlist: true } : { category_allowlist: ids.join(',') }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-xc-clients'] })
+      setExpandedCategoryAccessClientId(null)
+      setCategoryAccessForm(null)
+    },
+  })
 
   // ── Dispatcharr connections (who VOD Manager reaches out to -- the other
   // side of xc_clients above, who's allowed to reach in) ──
@@ -1672,7 +1684,9 @@ export default function VodManager() {
         <p className="text-xs text-muted-foreground">
           Each Dispatcharr instance (or other XC client) pulling from this pool gets its own credential pair —
           use <code className="bg-muted px-1 rounded">{window.location.origin}</code> as the server URL in that
-          instance's XC-type M3U account, with the username/password below.
+          instance's XC-type M3U account, with the username/password below. Category access defaults to
+          everything — restrict it per-client to give an end-user IPTV app (TiviMate, IPTV Smarters, etc.) its
+          own limited catalog instead of the full pool, since Dispatcharr itself has no per-profile VOD split.
         </p>
 
         <table className="w-full text-xs">
@@ -1681,6 +1695,7 @@ export default function VodManager() {
               <th className="pb-1 font-normal">Label</th>
               <th className="pb-1 font-normal">Credentials</th>
               <th className="pb-1 font-normal">IP allowlist</th>
+              <th className="pb-1 font-normal">Category access</th>
               <th className="pb-1 font-normal">Last seen</th>
               <th className="pb-1 font-normal"></th>
             </tr>
@@ -1711,6 +1726,78 @@ export default function VodManager() {
                   )}
                 </td>
                 <td className="py-1 pr-2 text-muted-foreground">{c.ip_allowlist || '— any —'}</td>
+                <td className="py-1 pr-2 text-muted-foreground align-top">
+                  {expandedCategoryAccessClientId === c.id ? (
+                    <div className="p-1.5 border border-border rounded space-y-1.5 w-56">
+                      <div className="max-h-40 overflow-y-auto space-y-0.5">
+                        <p className="text-[10px] uppercase text-muted-foreground">Movies</p>
+                        {movieCategories.map((cat) => (
+                          <label key={cat.id} className="flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={categoryAccessForm?.has(cat.id) ?? false}
+                              onChange={(e) => {
+                                const next = new Set(categoryAccessForm ?? [])
+                                if (e.target.checked) next.add(cat.id); else next.delete(cat.id)
+                                setCategoryAccessForm(next)
+                              }}
+                            />
+                            <span className="truncate">{cat.name}</span>
+                          </label>
+                        ))}
+                        <p className="text-[10px] uppercase text-muted-foreground pt-1">TV Shows</p>
+                        {seriesCategories.map((cat) => (
+                          <label key={cat.id} className="flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={categoryAccessForm?.has(cat.id) ?? false}
+                              onChange={(e) => {
+                                const next = new Set(categoryAccessForm ?? [])
+                                if (e.target.checked) next.add(cat.id); else next.delete(cat.id)
+                                setCategoryAccessForm(next)
+                              }}
+                            />
+                            <span className="truncate">{cat.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <Button
+                          size="sm"
+                          disabled={setClientCategoryAllowlist.isPending || (categoryAccessForm?.size ?? 0) === 0}
+                          title={(categoryAccessForm?.size ?? 0) === 0 ? 'Select at least one category, or use Clear for full access' : undefined}
+                          onClick={() => setClientCategoryAllowlist.mutate({ id: c.id, ids: Array.from(categoryAccessForm ?? []) })}
+                        >
+                          Save
+                        </Button>
+                        <Button
+                          size="sm" variant="outline" disabled={setClientCategoryAllowlist.isPending}
+                          onClick={() => setClientCategoryAllowlist.mutate({ id: c.id, ids: null })}
+                        >
+                          Clear (allow all)
+                        </Button>
+                        <Button
+                          size="sm" variant="outline"
+                          onClick={() => { setExpandedCategoryAccessClientId(null); setCategoryAccessForm(null) }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      className="hover:text-foreground underline decoration-dotted"
+                      onClick={() => {
+                        setExpandedCategoryAccessClientId(c.id)
+                        setCategoryAccessForm(new Set((c.category_allowlist ?? '').split(',').map((s) => s.trim()).filter(Boolean).map(Number)))
+                      }}
+                    >
+                      {c.category_allowlist
+                        ? `${c.category_allowlist.split(',').filter(Boolean).length} categor${c.category_allowlist.split(',').filter(Boolean).length === 1 ? 'y' : 'ies'}`
+                        : '— all —'}
+                    </button>
+                  )}
+                </td>
                 <td className="py-1 pr-2 text-muted-foreground">
                   {c.last_seen_at ? `${new Date(Number(c.last_seen_at) * 1000).toLocaleString()} (${c.last_seen_ip})` : 'never'}
                 </td>

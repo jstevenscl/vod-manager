@@ -293,6 +293,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("series", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "custom_user_agent", "TEXT"),
         ("providers", "last_catalog_refresh_at", "TEXT"),
+        ("xc_clients", "category_allowlist", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -689,6 +690,7 @@ def get_default_xc_client() -> dict | None:
 def update_xc_client(
     client_id: int, label: str | None = None, enabled: bool | None = None,
     ip_allowlist: str | None = None, clear_ip_allowlist: bool = False,
+    category_allowlist: str | None = None, clear_category_allowlist: bool = False,
 ) -> None:
     conn = _connect()
     if label is not None:
@@ -699,6 +701,10 @@ def update_xc_client(
         conn.execute("UPDATE xc_clients SET ip_allowlist=NULL WHERE id=?", (client_id,))
     elif ip_allowlist is not None:
         conn.execute("UPDATE xc_clients SET ip_allowlist=? WHERE id=?", (ip_allowlist, client_id))
+    if clear_category_allowlist:
+        conn.execute("UPDATE xc_clients SET category_allowlist=NULL WHERE id=?", (client_id,))
+    elif category_allowlist is not None:
+        conn.execute("UPDATE xc_clients SET category_allowlist=? WHERE id=?", (category_allowlist, client_id))
     _commit_with_retry(conn)
     conn.close()
 
@@ -958,6 +964,25 @@ def list_categories(content_type: str | None = None) -> list[dict]:
         rows = conn.execute("SELECT * FROM categories ORDER BY sort_order, name").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_movie_category_ids(movie_id: int) -> list[int]:
+    """Which categories a movie is placed in -- used by xc_server's
+    per-client category allowlist to decide whether a restricted client may
+    reach a movie via a route (e.g. preview) that isn't already filtered by
+    a specific category placement's export id."""
+    conn = _connect()
+    rows = conn.execute("SELECT category_id FROM movie_category_placements WHERE movie_id=?", (movie_id,)).fetchall()
+    conn.close()
+    return [r["category_id"] for r in rows]
+
+
+def get_series_category_ids(series_id: int) -> list[int]:
+    """Series equivalent of get_movie_category_ids — see there."""
+    conn = _connect()
+    rows = conn.execute("SELECT category_id FROM series_category_placements WHERE series_id=?", (series_id,)).fetchall()
+    conn.close()
+    return [r["category_id"] for r in rows]
 
 
 # ── Movies ───────────────────────────────────────────────────────────────────
@@ -1380,7 +1405,7 @@ def get_movie_source_for_streaming(source_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("""
         SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key,
-               m.name AS movie_name, m.year AS movie_year, m.duration_secs AS duration_secs
+               m.id AS movie_id, m.name AS movie_name, m.year AS movie_year, m.duration_secs AS duration_secs
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
         JOIN movies m ON m.id = ms.movie_id
@@ -1854,7 +1879,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
     row = conn.execute("""
         SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key,
                e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
-               e.duration_secs AS duration_secs, s.name AS series_name
+               e.duration_secs AS duration_secs, s.id AS series_id, s.name AS series_name
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
         JOIN episodes e ON e.id = es.episode_id
