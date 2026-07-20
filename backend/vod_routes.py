@@ -72,6 +72,11 @@ class CategoryRequest(BaseModel):
     sync_source: Optional[str] = None
 
 
+class ResolveYearReviewRequest(BaseModel):
+    year: int
+    tmdb_id: Optional[str] = None
+
+
 class MovieRequest(BaseModel):
     name: str
     year: Optional[int] = None
@@ -439,6 +444,42 @@ async def evaluate_smart_category(category_id: int):
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     return result
+
+
+# ── Year review ──────────────────────────────────────────────────────────────
+# Items imported with no year, where more than one existing pool entry shares
+# the same name -- too ambiguous to auto-merge, so they're held out of every
+# category (see vod_db.place_*_in_category) until a human picks the right
+# year, usually from a real TMDB suggestion rather than having to research it.
+
+@router.get("/needs-review/", dependencies=_GUARDS)
+async def list_needs_year_review(content_type: Optional[str] = None):
+    return vod_db.list_needs_year_review(content_type)
+
+
+@router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
+async def year_review_suggestions(content_type: str, item_id: int):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        raise HTTPException(404, detail=f"{content_type} not found")
+    try:
+        return await tmdb_sync.search_title(item["name"], content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB search failed: {exc}")
+
+
+@router.post("/needs-review/{content_type}/{item_id}/resolve/", dependencies=_GUARDS)
+async def resolve_year_review(content_type: str, item_id: int, body: ResolveYearReviewRequest):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    try:
+        return vod_db.resolve_year_review(content_type, item_id, body.year, body.tmdb_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
 
 
 # ── Movies ───────────────────────────────────────────────────────────────────

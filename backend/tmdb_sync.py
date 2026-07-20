@@ -37,6 +37,37 @@ async def fetch_list_items(list_id: str) -> list[dict]:
     return data.get("items", [])
 
 
+async def search_title(name: str, content_type: str) -> list[dict]:
+    """Real TMDB search results for a name -- used by the year-review flow so
+    a user picks from actual candidates (title/year/poster/tmdb_id) instead
+    of researching the correct year themselves. content_type is 'movie' or
+    'series' (mapped to TMDB's own 'movie'/'tv' search endpoints)."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        raise ValueError("TMDB API key not configured")
+
+    endpoint = "movie" if content_type == "movie" else "tv"
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(
+            f"{_API_BASE}/search/{endpoint}",
+            params={"api_key": api_key, "query": name},
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    results = []
+    for item in data.get("results", [])[:10]:
+        date = item.get("release_date") if content_type == "movie" else item.get("first_air_date")
+        year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
+        results.append({
+            "tmdb_id": str(item["id"]),
+            "name": item.get("title") if content_type == "movie" else item.get("name"),
+            "year": year,
+            "poster_url": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else None,
+        })
+    return results
+
+
 def _parse_sync_source(sync_source: str) -> tuple[str, str] | None:
     if not sync_source or ":" not in sync_source:
         return None

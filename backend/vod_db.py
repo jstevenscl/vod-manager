@@ -233,6 +233,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "provider_type", "TEXT NOT NULL DEFAULT 'xc'"),
         ("movie_sources", "plex_rating_key", "TEXT"),
         ("episode_sources", "plex_rating_key", "TEXT"),
+        ("movies", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -599,21 +601,43 @@ def list_categories(content_type: str | None = None) -> list[dict]:
 
 def upsert_movie(name: str, year: int | None = None, **fields) -> int:
     conn = _connect()
-    row = conn.execute("SELECT id FROM movies WHERE name = ? AND year IS ?", (name, year)).fetchone()
-    if row:
-        movie_id = row["id"]
-        if fields:
-            sets = ", ".join(f"{k}=?" for k in fields)
-            conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), movie_id))
-    else:
-        cols = ["name", "year", *fields.keys()]
-        vals = [name, year, *fields.values()]
+
+    def _insert(needs_review: int = 0) -> int:
+        cols = ["name", "year", "needs_year_review", *fields.keys()]
+        vals = [name, year, needs_review, *fields.values()]
         placeholders = ", ".join("?" for _ in cols)
         cur = conn.execute(
             f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)",
             (*vals, _now()),
         )
-        movie_id = cur.lastrowid
+        return cur.lastrowid
+
+    def _update(movie_id: int) -> None:
+        if fields:
+            sets = ", ".join(f"{k}=?" for k in fields)
+            conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), movie_id))
+
+    row = conn.execute("SELECT id FROM movies WHERE name = ? AND year IS ?", (name, year)).fetchone()
+    if row:
+        movie_id = row["id"]
+        _update(movie_id)
+    elif year is None:
+        # No exact (name, NULL) row exists yet. Rather than blindly create a
+        # fresh row that might just be an unlabeled duplicate of something
+        # already in the pool, look for existing candidates by name alone.
+        # Exactly one -> merge into it (almost certainly the same title,
+        # just missing year metadata from this particular source). Two or
+        # more -> can't tell which one it is, so create a new row but flag
+        # it for a human to resolve rather than silently guessing wrong.
+        candidates = conn.execute("SELECT id FROM movies WHERE name = ?", (name,)).fetchall()
+        if len(candidates) == 1:
+            movie_id = candidates[0]["id"]
+            _update(movie_id)
+        else:
+            movie_id = _insert(needs_review=1 if candidates else 0)
+    else:
+        movie_id = _insert()
+
     _commit_with_retry(conn)
     conn.close()
     return movie_id
@@ -830,6 +854,10 @@ def place_movie_in_category(movie_id: int, category_id: int) -> int:
     (name, year) dedup treats each as a distinct catalog entry.
     """
     conn = _connect()
+    flagged = conn.execute("SELECT needs_year_review FROM movies WHERE id=?", (movie_id,)).fetchone()
+    if flagged and flagged["needs_year_review"]:
+        conn.close()
+        raise ValueError(f"movie {movie_id} needs year review before it can be placed in a category")
     existing = conn.execute(
         "SELECT export_stream_id FROM movie_category_placements WHERE movie_id=? AND category_id=?",
         (movie_id, category_id),
@@ -873,7 +901,12 @@ def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int
         f"SELECT movie_id FROM movie_category_placements WHERE category_id=? AND movie_id IN ({placeholders})",
         (category_id, *movie_ids),
     ).fetchall()}
-    to_place = [mid for mid in movie_ids if mid not in already]
+    flagged = {r["id"] for r in conn.execute(
+        f"SELECT id FROM movies WHERE needs_year_review=1 AND id IN ({placeholders})", movie_ids,
+    ).fetchall()}
+    if flagged:
+        logger.info("[vod_db] skipping %d movie(s) still needing year review for category=%s", len(flagged), category_id)
+    to_place = [mid for mid in movie_ids if mid not in already and mid not in flagged]
     if not to_place:
         conn.close()
         return 0
@@ -1001,21 +1034,37 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
 
 def upsert_series(name: str, year: int | None = None, **fields) -> int:
     conn = _connect()
-    row = conn.execute("SELECT id FROM series WHERE name = ? AND year IS ?", (name, year)).fetchone()
-    if row:
-        series_id = row["id"]
-        if fields:
-            sets = ", ".join(f"{k}=?" for k in fields)
-            conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), series_id))
-    else:
-        cols = ["name", "year", *fields.keys()]
-        vals = [name, year, *fields.values()]
+
+    def _insert(needs_review: int = 0) -> int:
+        cols = ["name", "year", "needs_year_review", *fields.keys()]
+        vals = [name, year, needs_review, *fields.values()]
         placeholders = ", ".join("?" for _ in cols)
         cur = conn.execute(
             f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)",
             (*vals, _now()),
         )
-        series_id = cur.lastrowid
+        return cur.lastrowid
+
+    def _update(series_id: int) -> None:
+        if fields:
+            sets = ", ".join(f"{k}=?" for k in fields)
+            conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), series_id))
+
+    row = conn.execute("SELECT id FROM series WHERE name = ? AND year IS ?", (name, year)).fetchone()
+    if row:
+        series_id = row["id"]
+        _update(series_id)
+    elif year is None:
+        # Same reasoning as upsert_movie above.
+        candidates = conn.execute("SELECT id FROM series WHERE name = ?", (name,)).fetchall()
+        if len(candidates) == 1:
+            series_id = candidates[0]["id"]
+            _update(series_id)
+        else:
+            series_id = _insert(needs_review=1 if candidates else 0)
+    else:
+        series_id = _insert()
+
     _commit_with_retry(conn)
     conn.close()
     return series_id
@@ -1267,6 +1316,10 @@ def remove_series_from_category(series_id: int, category_id: int) -> None:
 def place_series_in_category(series_id: int, category_id: int) -> int:
     """Same virtual-file mechanism as place_movie_in_category, scoped to series."""
     conn = _connect()
+    flagged = conn.execute("SELECT needs_year_review FROM series WHERE id=?", (series_id,)).fetchone()
+    if flagged and flagged["needs_year_review"]:
+        conn.close()
+        raise ValueError(f"series {series_id} needs year review before it can be placed in a category")
     existing = conn.execute(
         "SELECT export_series_id FROM series_category_placements WHERE series_id=? AND category_id=?",
         (series_id, category_id),
@@ -1305,7 +1358,12 @@ def bulk_place_series_in_category(series_ids: list[int], category_id: int) -> in
         f"SELECT series_id FROM series_category_placements WHERE category_id=? AND series_id IN ({placeholders})",
         (category_id, *series_ids),
     ).fetchall()}
-    to_place = [sid for sid in series_ids if sid not in already]
+    flagged = {r["id"] for r in conn.execute(
+        f"SELECT id FROM series WHERE needs_year_review=1 AND id IN ({placeholders})", series_ids,
+    ).fetchall()}
+    if flagged:
+        logger.info("[vod_db] skipping %d series still needing year review for category=%s", len(flagged), category_id)
+    to_place = [sid for sid in series_ids if sid not in already and sid not in flagged]
     if not to_place:
         conn.close()
         return 0
@@ -1752,6 +1810,144 @@ def apply_metadata_rules_to_pool(content_type: str) -> dict:
     _commit_with_retry(conn)
     conn.close()
     return {"checked": len(rows), "changed": changed}
+
+
+# ── Merging duplicate pool entries ──────────────────────────────────────────
+# Used both by the one-time null-year-duplicate cleanup and by the year-review
+# resolve flow (a flagged item's year turns out to match an existing entry).
+# `into_id`'s own row (name/year/genre/etc.) is left untouched -- it's treated
+# as authoritative; `from_id` only ever contributes its sources/episodes/
+# placements before being deleted, never overwrites into_id's metadata.
+
+def merge_movie(from_id: int, into_id: int) -> None:
+    if from_id == into_id:
+        return
+    conn = _connect()
+    # movie_sources has no per-movie uniqueness (UNIQUE is (provider_id,
+    # provider_stream_id) only) -- a plain reassignment can never collide.
+    conn.execute("UPDATE movie_sources SET movie_id=? WHERE movie_id=?", (into_id, from_id))
+
+    placements = conn.execute(
+        "SELECT category_id FROM movie_category_placements WHERE movie_id=?", (from_id,)
+    ).fetchall()
+    for p in placements:
+        target_has_it = conn.execute(
+            "SELECT 1 FROM movie_category_placements WHERE movie_id=? AND category_id=?",
+            (into_id, p["category_id"]),
+        ).fetchone()
+        if target_has_it:
+            conn.execute(
+                "DELETE FROM movie_category_placements WHERE movie_id=? AND category_id=?",
+                (from_id, p["category_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE movie_category_placements SET movie_id=? WHERE movie_id=? AND category_id=?",
+                (into_id, from_id, p["category_id"]),
+            )
+
+    conn.execute("DELETE FROM movies WHERE id=?", (from_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def merge_series(from_id: int, into_id: int) -> None:
+    if from_id == into_id:
+        return
+    conn = _connect()
+
+    from_episodes = conn.execute(
+        "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (from_id,)
+    ).fetchall()
+    for ep in from_episodes:
+        target_ep = conn.execute(
+            "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+            (into_id, ep["season_number"], ep["episode_number"]),
+        ).fetchone()
+        if target_ep:
+            # Both sides already have this episode -- move from's sources
+            # onto into's existing episode row, then drop from's now-empty
+            # episode (episode_sources cascades on the episodes delete).
+            conn.execute(
+                "UPDATE episode_sources SET episode_id=? WHERE episode_id=?",
+                (target_ep["id"], ep["id"]),
+            )
+            conn.execute("DELETE FROM episodes WHERE id=?", (ep["id"],))
+        else:
+            # into doesn't have this episode yet -- just move it over wholesale.
+            conn.execute("UPDATE episodes SET series_id=? WHERE id=?", (into_id, ep["id"]))
+
+    placements = conn.execute(
+        "SELECT category_id FROM series_category_placements WHERE series_id=?", (from_id,)
+    ).fetchall()
+    for p in placements:
+        target_has_it = conn.execute(
+            "SELECT 1 FROM series_category_placements WHERE series_id=? AND category_id=?",
+            (into_id, p["category_id"]),
+        ).fetchone()
+        if target_has_it:
+            conn.execute(
+                "DELETE FROM series_category_placements WHERE series_id=? AND category_id=?",
+                (from_id, p["category_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE series_category_placements SET series_id=? WHERE series_id=? AND category_id=?",
+                (into_id, from_id, p["category_id"]),
+            )
+
+    conn.execute("DELETE FROM series WHERE id=?", (from_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_needs_year_review(content_type: str | None = None) -> dict:
+    conn = _connect()
+    out: dict = {}
+    if content_type in (None, "movie"):
+        out["movies"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM movies WHERE needs_year_review=1 ORDER BY name"
+        ).fetchall()]
+    if content_type in (None, "series"):
+        out["series"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM series WHERE needs_year_review=1 ORDER BY name"
+        ).fetchall()]
+    conn.close()
+    return out
+
+
+def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
+    """Sets the correct year (and tmdb_id, if known) on a flagged item and
+    clears the flag. If that year now exactly matches an existing item of
+    the same name, merges into it instead of leaving two rows around."""
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+
+    existing = conn.execute(
+        f"SELECT id FROM {table} WHERE name=? AND year=? AND id != ?", (row["name"], year, item_id),
+    ).fetchone()
+    conn.close()
+
+    if existing:
+        if content_type == "movie":
+            merge_movie(item_id, existing["id"])
+        else:
+            merge_series(item_id, existing["id"])
+        return {"merged_into": existing["id"]}
+
+    conn = _connect()
+    fields = {"year": year, "needs_year_review": 0}
+    if tmdb_id:
+        fields["tmdb_id"] = tmdb_id
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
+    _commit_with_retry(conn)
+    conn.close()
+    return {"resolved_id": item_id}
 
 
 # ── Smart categories ─────────────────────────────────────────────────────────
