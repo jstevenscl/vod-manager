@@ -1909,9 +1909,19 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
             "SELECT * FROM movies WHERE needs_year_review=1 ORDER BY name"
         ).fetchall()]
     if content_type in (None, "series"):
-        out["series"] = [dict(r) for r in conn.execute(
+        rows = [dict(r) for r in conn.execute(
             "SELECT * FROM series WHERE needs_year_review=1 ORDER BY name"
         ).fetchall()]
+        for row in rows:
+            # A preview needs a specific episode (the XC preview route is keyed
+            # by episode, not series -- see xc_server.py) so a reviewer can
+            # actually watch a clip of the flagged item, not just read its name.
+            ep = conn.execute(
+                "SELECT id FROM episodes WHERE series_id=? ORDER BY season_number, episode_number LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            row["sample_episode_id"] = ep["id"] if ep else None
+        out["series"] = rows
     conn.close()
     return out
 

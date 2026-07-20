@@ -53,6 +53,7 @@ interface NeedsReviewItem {
   name: string
   year: number | null
   genre: string | null
+  sample_episode_id?: number | null
 }
 
 interface NeedsReviewData {
@@ -307,13 +308,23 @@ function Pager({ total, limit, offset, onOffset }: { total: number; limit: numbe
 // One flagged item: no year, ambiguous against 2+ existing pool entries with
 // the same name. TMDB suggestions are fetched on demand (only once expanded)
 // rather than eagerly for every flagged item on page load.
-function NeedsReviewRow({ contentType, item, qc }: {
+function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   contentType: 'movie' | 'series'
   item: NeedsReviewItem
   qc: ReturnType<typeof useQueryClient>
+  xcCredentials?: XcCredentials
 }) {
   const [expanded, setExpanded] = useState(false)
   const [manualYear, setManualYear] = useState('')
+
+  // Movies preview directly off their own id; series need a specific episode
+  // (see xc_server.py's /preview/series/ route) — sample_episode_id is the
+  // first episode we've actually imported for this flagged series, if any.
+  const previewUrl = contentType === 'movie'
+    ? buildPreviewUrl('movie', item.id, 'mp4', xcCredentials)
+    : item.sample_episode_id
+      ? buildPreviewUrl('series', item.sample_episode_id, 'mp4', xcCredentials)
+      : null
 
   const suggestionsQuery = useQuery<TmdbSuggestion[]>({
     queryKey: ['vod-needs-review-suggestions', contentType, item.id],
@@ -331,11 +342,30 @@ function NeedsReviewRow({ contentType, item, qc }: {
     },
   })
 
+  // Flagged series often have no episodes yet -- they were never placed in a
+  // category, so they never went through normal enrichment (which is also
+  // what fetches episode listings). Fetch on demand so there's something to
+  // preview instead of just a name to guess from.
+  const fetchEpisodes = useMutation({
+    mutationFn: () => api.post(`/vod/series/${item.id}/enrich/`, null, { params: { force: true } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-needs-review'] }),
+  })
+
   return (
     <li className="border-b border-border/50 py-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate">
+        <span className="min-w-0 truncate flex items-center gap-1.5">
+          <PlayButton url={previewUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+          {contentType === 'series' && !item.sample_episode_id && (
+            <button
+              className="text-muted-foreground hover:text-foreground underline decoration-dotted shrink-0"
+              disabled={fetchEpisodes.isPending}
+              onClick={() => fetchEpisodes.mutate()}
+            >
+              {fetchEpisodes.isPending ? 'fetching…' : 'fetch episodes to preview'}
+            </button>
+          )}
         </span>
         <button
           className="text-muted-foreground hover:text-foreground shrink-0"
@@ -1751,7 +1781,7 @@ export default function VodManager() {
             <p className="text-xs font-medium text-muted-foreground mb-1">Movies ({needsReviewQuery.data.movies.length})</p>
             <ul className="text-xs">
               {needsReviewQuery.data.movies.map((m) => (
-                <NeedsReviewRow key={m.id} contentType="movie" item={m} qc={qc} />
+                <NeedsReviewRow key={m.id} contentType="movie" item={m} qc={qc} xcCredentials={xcCredentialsQuery.data} />
               ))}
             </ul>
           </div>
@@ -1761,7 +1791,7 @@ export default function VodManager() {
             <p className="text-xs font-medium text-muted-foreground mb-1">TV Shows ({needsReviewQuery.data.series.length})</p>
             <ul className="text-xs">
               {needsReviewQuery.data.series.map((s) => (
-                <NeedsReviewRow key={s.id} contentType="series" item={s} qc={qc} />
+                <NeedsReviewRow key={s.id} contentType="series" item={s} qc={qc} xcCredentials={xcCredentialsQuery.data} />
               ))}
             </ul>
           </div>
