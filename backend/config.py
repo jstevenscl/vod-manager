@@ -92,6 +92,17 @@ def save_tmdb_api_key(api_key: str) -> None:
     _write_raw(data)
 
 
+def get_anthropic_api_key() -> str | None:
+    data = _read_raw()
+    return data.get("anthropic_api_key") or None
+
+
+def save_anthropic_api_key(api_key: str) -> None:
+    data = _read_raw()
+    data["anthropic_api_key"] = api_key
+    _write_raw(data)
+
+
 # ── XC login lockout ─────────────────────────────────────────────────────────
 # Defaults match xc_server.py's original hardcoded constants. Configurable
 # since the right threshold depends on real-world exposure (a shared-NAT

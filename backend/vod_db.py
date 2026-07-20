@@ -294,6 +294,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "custom_user_agent", "TEXT"),
         ("providers", "last_catalog_refresh_at", "TEXT"),
         ("xc_clients", "category_allowlist", "TEXT"),
+        ("categories", "ai_description", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -919,6 +920,16 @@ def set_category_sort_order(category_id: int, sort_order: int) -> None:
 def set_category_name(category_id: int, name: str) -> None:
     conn = _connect()
     conn.execute("UPDATE categories SET name=? WHERE id=?", (name, category_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_category_ai_description(category_id: int, ai_description: str | None) -> None:
+    """Persisted so a re-run of AI Evaluate (see ai_assist.py) doesn't require
+    re-typing the description each time -- same pattern as sync_source for
+    TMDB Lists categories."""
+    conn = _connect()
+    conn.execute("UPDATE categories SET ai_description=? WHERE id=?", (ai_description, category_id))
     _commit_with_retry(conn)
     conn.close()
 
@@ -2567,3 +2578,27 @@ def evaluate_smart_category(category_id: int) -> dict:
         newly_placed = bulk_place_series_in_category(matched_ids, category_id)
 
     return {"evaluated": len(rows), "matched": len(matched_ids), "newly_placed": newly_placed}
+
+
+def get_ai_candidate_rows(content_type: str, prefilter_rule_json: str | None, limit: int) -> tuple[list[dict], int]:
+    """Bounded candidate pool for AI Evaluate (see ai_assist.py's
+    evaluate_candidates_for_category) -- real per-item API cost means this
+    can never run over the raw pool. Reuses the exact same rule_json
+    pre-filter mechanism as rule-based smart categories (see
+    evaluate_smart_category above) to narrow the field before applying the
+    cap; without a pre-filter, it's just the first `limit` rows by id.
+    Returns (candidates, total_before_cap) so the caller can tell the user
+    how much was left out, rather than silently truncating."""
+    import json
+    conn = _connect()
+    if content_type == "movie":
+        rows = [dict(r) for r in conn.execute("SELECT * FROM movies").fetchall()]
+    else:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM series").fetchall()]
+    conn.close()
+
+    if prefilter_rule_json:
+        rule = json.loads(prefilter_rule_json)
+        rows = [r for r in rows if _rule_matches(r, rule)]
+
+    return rows[:limit], len(rows)

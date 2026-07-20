@@ -6,16 +6,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from config import (
+    get_anthropic_api_key,
     get_lockout_settings,
     get_refresh_settings,
     get_tmdb_api_key,
     get_vod_xc_account_id,
+    save_anthropic_api_key,
     save_lockout_settings,
     save_refresh_settings,
     save_tmdb_api_key,
     save_vod_xc_account_id,
 )
 from routes import require_auth, require_configured
+import ai_assist
 import emby_vod_importer
 import plex_importer
 import tmdb_sync
@@ -40,6 +43,21 @@ class VodSettingsRequest(BaseModel):
 
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
+
+
+class AnthropicApiKeyRequest(BaseModel):
+    api_key: str
+
+
+class SuggestCategoryRuleRequest(BaseModel):
+    description: str
+    content_type: str
+
+
+class AiEvaluateCategoryRequest(BaseModel):
+    description: str
+    prefilter_rule_json: Optional[str] = None
+    limit: int = 300
 
 
 class LockoutSettingsRequest(BaseModel):
@@ -361,6 +379,62 @@ async def save_tmdb_settings(body: TmdbApiKeyRequest):
     return {"ok": True}
 
 
+@router.get("/ai-settings/", dependencies=_GUARDS)
+async def get_ai_settings():
+    return {"has_api_key": bool(get_anthropic_api_key())}
+
+
+@router.post("/ai-settings/", dependencies=_GUARDS)
+async def save_ai_settings(body: AnthropicApiKeyRequest):
+    save_anthropic_api_key(body.api_key)
+    return {"ok": True}
+
+
+@router.post("/ai/suggest-category-rule/", dependencies=_GUARDS)
+async def suggest_category_rule(body: SuggestCategoryRuleRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    try:
+        return await ai_assist.suggest_category_rule(body.description, body.content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        logger.warning("[vod_routes] AI category rule suggestion failed: %s", exc)
+        raise HTTPException(502, detail=f"AI request failed: {exc}")
+
+
+@router.post("/categories/{category_id}/ai-evaluate/", dependencies=_GUARDS)
+async def ai_evaluate_category(category_id: int, body: AiEvaluateCategoryRequest):
+    category = vod_db.get_category(category_id)
+    if not category:
+        raise HTTPException(404, detail="category not found")
+
+    limit = max(1, min(body.limit, 2000))  # hard ceiling -- real per-item AI cost, never unbounded
+    candidates, total_before_cap = vod_db.get_ai_candidate_rows(category["content_type"], body.prefilter_rule_json, limit)
+
+    try:
+        matched_ids = await ai_assist.evaluate_candidates_for_category(body.description, category["content_type"], candidates)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        logger.warning("[vod_routes] AI category evaluation failed: %s", exc)
+        raise HTTPException(502, detail=f"AI request failed: {exc}")
+
+    if category["content_type"] == "movie":
+        newly_placed = vod_db.bulk_place_movies_in_category(matched_ids, category_id)
+    else:
+        newly_placed = vod_db.bulk_place_series_in_category(matched_ids, category_id)
+    vod_db.set_category_ai_description(category_id, body.description)
+
+    return {
+        "considered": len(candidates),
+        "total_before_cap": total_before_cap,
+        "capped": total_before_cap > len(candidates),
+        "matched": len(matched_ids),
+        "newly_placed": newly_placed,
+    }
+
+
 @router.get("/lockout-settings/", dependencies=_GUARDS)
 async def get_lockout_settings_route():
     return get_lockout_settings()
@@ -679,6 +753,34 @@ async def year_review_suggestions(content_type: str, item_id: int, q: Optional[s
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(502, detail=f"TMDB search failed: {exc}")
+
+
+@router.get("/needs-review/{content_type}/{item_id}/ai-suggest/", dependencies=_GUARDS)
+async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[str] = None):
+    """Asks Claude to pick the most likely correct match among the same TMDB
+    candidates the normal suggestions/ endpoint already surfaces -- purely a
+    recommendation for the reviewer to weigh, never applied automatically
+    (see resolve/ above, still a separate explicit action)."""
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        raise HTTPException(404, detail=f"{content_type} not found")
+    try:
+        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB search failed: {exc}")
+    if not candidates:
+        return {"best_match_index": None, "reasoning": "No TMDB candidates to choose from.", "confidence": "low"}
+    try:
+        return await ai_assist.suggest_year_review_match(item["name"], None, content_type, candidates)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        logger.warning("[vod_routes] AI year-review suggestion failed: %s", exc)
+        raise HTTPException(502, detail=f"AI request failed: {exc}")
 
 
 @router.post("/needs-review/{content_type}/{item_id}/resolve/", dependencies=_GUARDS)

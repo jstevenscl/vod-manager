@@ -112,6 +112,30 @@ session ends — closing the player, an idle timeout with no further
 requests, or a Kill from Activity below all release the encoder process and
 any on-disk segments.
 
+## AI-assisted categories and Needs Review
+
+An Anthropic API key (Settings → VOD Settings) unlocks three assists, none
+of which ever apply anything automatically — every one is a suggestion you
+still review and confirm:
+
+- **Suggest a category with AI** (Categories) — describe a category in
+  plain English and Claude proposes a structured filter rule using the
+  same fields/ops the manual rule builder uses (name, genre, year,
+  country/language, director, is_adult). Good for anything expressible as
+  field conditions; review the proposed rule before creating it.
+- **AI Evaluate** (✨ button on any category) — for criteria the rule
+  fields genuinely can't express (mood, plot, audience fit), Claude judges
+  actual titles against a plain-English description instead of matching
+  fields. Real per-request API cost, so this always runs over a *bounded*
+  candidate set (optionally narrowed first by a rule pre-filter) rather
+  than the whole pool — the result always reports how many candidates were
+  actually considered vs. left out by the cap, never a silent truncation.
+- **Ask AI** (Needs Year Review) — when an item has no year and multiple
+  TMDB candidates are ambiguous, Claude picks the most likely correct
+  match with its reasoning and a confidence level, as an extra hint
+  alongside the normal TMDB suggestion list. You still click a candidate
+  yourself to actually resolve it.
+
 ## Shared connection-limit coordination
 
 If a real provider also has its own native live-TV account somewhere in

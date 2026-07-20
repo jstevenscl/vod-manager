@@ -380,6 +380,7 @@ interface Category {
   rule_json: string | null
   sync_source: string | null
   sort_order: number
+  ai_description: string | null
 }
 
 const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin', string> = {
@@ -535,6 +536,16 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     },
   })
 
+  // Asks Claude to pick the most likely correct match among the same TMDB
+  // candidates already shown above -- purely a hint (name + reasoning +
+  // confidence) the reviewer weighs before still clicking Resolve
+  // themselves; never applies anything on its own.
+  const aiSuggest = useMutation({
+    mutationFn: () => api.get(`/vod/needs-review/${contentType}/${item.id}/ai-suggest/`, {
+      params: searchOverride ? { q: searchOverride } : {},
+    }),
+  })
+
   // Flagged series often have no episodes yet -- they were never placed in a
   // category, so they never went through normal enrichment (which is also
   // what fetches episode listings). Fetch on demand so there's something to
@@ -599,7 +610,21 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
               onBlur={(e) => setSearchOverride(e.target.value.trim())}
               title="Same title is sometimes released under a different name in a different region — search a different one if you suspect that's the case here"
             />
+            <Button size="sm" variant="outline" disabled={!suggestionsQuery.data?.length || aiSuggest.isPending} onClick={() => aiSuggest.mutate()}>
+              {aiSuggest.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} className="mr-1" />Ask AI</>}
+            </Button>
           </div>
+          {aiSuggest.isError && (
+            <p className="text-destructive">AI suggestion failed — check the Anthropic API key in VOD Settings.</p>
+          )}
+          {aiSuggest.data && (
+            <p className="text-muted-foreground border border-border rounded px-2 py-1">
+              <Sparkles size={11} className="inline mr-1" />
+              {aiSuggest.data.data.best_match_index != null && suggestionsQuery.data?.[aiSuggest.data.data.best_match_index]
+                ? <>AI suggests <strong className="text-foreground">{suggestionsQuery.data[aiSuggest.data.data.best_match_index].name}</strong> ({aiSuggest.data.data.confidence} confidence) — {aiSuggest.data.data.reasoning}</>
+                : <>AI found no confident match — {aiSuggest.data.data.reasoning}</>}
+            </p>
+          )}
           {suggestionsQuery.isLoading && <p className="text-muted-foreground">Searching TMDB…</p>}
           {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
           {!!suggestionsQuery.data?.length && (
@@ -1096,6 +1121,18 @@ export default function VodManager() {
       setTmdbApiKeyInput('')
     },
   })
+  const aiSettingsQuery = useQuery<{ has_api_key: boolean }>({
+    queryKey: ['vod-ai-settings'],
+    queryFn:  () => api.get('/vod/ai-settings/').then((r) => r.data),
+  })
+  const [aiApiKeyInput, setAiApiKeyInput] = useState('')
+  const saveAiApiKey = useMutation({
+    mutationFn: () => api.post('/vod/ai-settings/', { api_key: aiApiKeyInput }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-ai-settings'] })
+      setAiApiKeyInput('')
+    },
+  })
   const lockoutSettingsQuery = useQuery<LockoutSettings>({
     queryKey: ['vod-lockout-settings'],
     queryFn:  () => api.get('/vod/lockout-settings/').then((r) => r.data),
@@ -1430,6 +1467,50 @@ export default function VodManager() {
     },
   })
 
+  // ── AI-assisted categories (light mode: propose a rule from a plain-
+  // English description; heavy mode: judge actual titles against a
+  // description for anything the field-rule engine can't express) ──
+  const [aiRuleDescription, setAiRuleDescription] = useState('')
+  const [aiRuleContentType, setAiRuleContentType] = useState<'movie' | 'series'>('movie')
+  const [aiRuleSuggestion, setAiRuleSuggestion] = useState<{ name: string; match: string; conditions: { field: string; op: string; value: string }[] } | null>(null)
+  const suggestAiRule = useMutation({
+    mutationFn: () => api.post('/vod/ai/suggest-category-rule/', { description: aiRuleDescription, content_type: aiRuleContentType }),
+    onSuccess: (r) => setAiRuleSuggestion(r.data),
+  })
+  const createCategoryFromAiRule = useMutation({
+    mutationFn: () => api.post('/vod/categories/', {
+      name: aiRuleSuggestion!.name,
+      content_type: aiRuleContentType,
+      is_smart: true,
+      rule_json: JSON.stringify({ match: aiRuleSuggestion!.match, conditions: aiRuleSuggestion!.conditions }),
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      setAiRuleSuggestion(null)
+      setAiRuleDescription('')
+    },
+  })
+  const [aiEvaluateResult, setAiEvaluateResult] = useState<string | null>(null)
+  const aiEvaluateCategory = useMutation({
+    mutationFn: ({ id, description }: { id: number; description: string }) =>
+      api.post(`/vod/categories/${id}/ai-evaluate/`, { description }),
+    onSuccess: (r) => {
+      const capNote = r.data.capped ? ` (capped at ${r.data.considered} of ${r.data.total_before_cap} candidates — narrow it with a rule pre-filter or run again)` : ''
+      setAiEvaluateResult(`AI reviewed ${r.data.considered} candidate(s): ${r.data.matched} matched, ${r.data.newly_placed} newly placed.${capNote}`)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setAiEvaluateResult(`AI evaluation failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  function promptAiEvaluate(c: Category) {
+    const description = window.prompt(
+      `Describe what belongs in "${c.name}" in plain English (AI judges actual titles against this — good for criteria a field rule can't express, e.g. mood, plot, audience fit):`,
+      c.ai_description ?? '',
+    )
+    if (description && description.trim()) aiEvaluateCategory.mutate({ id: c.id, description: description.trim() })
+  }
+
   // ── Year review (ambiguous no-year duplicates held out of categories) ──
   const needsReviewQuery = useQuery<NeedsReviewData>({
     queryKey: ['vod-needs-review'],
@@ -1618,6 +1699,25 @@ export default function VodManager() {
             {saveTmdbApiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
           </Button>
           {tmdbSettingsQuery.data?.has_api_key && (
+            <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground pt-2">
+          Anthropic API key — powers AI-assisted smart category suggestions and Needs Review disambiguation
+          (see Categories and Needs Year Review below).
+        </p>
+        <div className="flex items-center gap-1.5">
+          <input
+            className={inputCls()}
+            type="password"
+            placeholder={aiSettingsQuery.data?.has_api_key ? '••••••••••••••••' : 'Anthropic API Key'}
+            value={aiApiKeyInput}
+            onChange={(e) => setAiApiKeyInput(e.target.value)}
+          />
+          <Button size="sm" disabled={!aiApiKeyInput || saveAiApiKey.isPending} onClick={() => saveAiApiKey.mutate()}>
+            {saveAiApiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          {aiSettingsQuery.data?.has_api_key && (
             <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
           )}
         </div>
@@ -2395,6 +2495,14 @@ export default function VodManager() {
                         <Zap size={12} />
                       </button>
                     )}
+                    <button
+                      title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
+                      className="text-muted-foreground hover:text-foreground"
+                      disabled={aiEvaluateCategory.isPending}
+                      onClick={() => promptAiEvaluate(c)}
+                    >
+                      <Sparkles size={12} />
+                    </button>
                     {!!c.sync_source && (
                       <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
                         <RefreshCw size={12} />
@@ -2451,6 +2559,14 @@ export default function VodManager() {
                         <Zap size={12} />
                       </button>
                     )}
+                    <button
+                      title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
+                      className="text-muted-foreground hover:text-foreground"
+                      disabled={aiEvaluateCategory.isPending}
+                      onClick={() => promptAiEvaluate(c)}
+                    >
+                      <Sparkles size={12} />
+                    </button>
                     {!!c.sync_source && (
                       <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
                         <RefreshCw size={12} />
@@ -2473,6 +2589,7 @@ export default function VodManager() {
           </div>
         </div>
         {evaluateResult && <p className="text-xs text-muted-foreground">{evaluateResult}</p>}
+        {aiEvaluateResult && <p className="text-xs text-muted-foreground">{aiEvaluateResult}</p>}
         <div className="flex flex-wrap items-center gap-1.5 pt-1">
           <input
             className={inputCls()}
@@ -2516,6 +2633,50 @@ export default function VodManager() {
             )}
           </div>
         )}
+
+        <div className="border border-border rounded p-2 space-y-1.5 mt-2">
+          <p className="text-xs font-medium flex items-center gap-1"><Sparkles size={12} /> Suggest a category with AI</p>
+          <p className="text-xs text-muted-foreground">
+            Describe a category in plain English — Claude proposes a rule using only the fields/ops above (name,
+            genre, year, country/language, director, is_adult). Review it before creating; nothing is saved until
+            you click Create.
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <select className={inputCls()} value={aiRuleContentType} onChange={(e) => setAiRuleContentType(e.target.value as 'movie' | 'series')}>
+              <option value="movie">Movie</option>
+              <option value="series">Series</option>
+            </select>
+            <input
+              className={inputCls('flex-1 min-w-[16rem]')}
+              placeholder='e.g. "90s action movies" or "kid-friendly animated films"'
+              value={aiRuleDescription}
+              onChange={(e) => setAiRuleDescription(e.target.value)}
+            />
+            <Button size="sm" variant="outline" disabled={!aiRuleDescription || suggestAiRule.isPending} onClick={() => suggestAiRule.mutate()}>
+              {suggestAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Suggest'}
+            </Button>
+          </div>
+          {suggestAiRule.isError && (
+            <p className="text-xs text-destructive">{(suggestAiRule.error as any)?.response?.data?.detail ?? (suggestAiRule.error as any)?.message}</p>
+          )}
+          {aiRuleSuggestion && (
+            <div className="text-xs space-y-1 border-t border-border/50 pt-1.5">
+              <p><span className="text-muted-foreground">Name:</span> {aiRuleSuggestion.name}</p>
+              <p className="text-muted-foreground">
+                Match {aiRuleSuggestion.match.toUpperCase()} of:{' '}
+                {aiRuleSuggestion.conditions.map((c, i) => (
+                  <span key={i}>{i > 0 ? ', ' : ''}<code className="bg-muted px-1 rounded">{c.field} {c.op} "{c.value}"</code></span>
+                ))}
+              </p>
+              <div className="flex items-center gap-1.5">
+                <Button size="sm" disabled={createCategoryFromAiRule.isPending} onClick={() => createCategoryFromAiRule.mutate()}>
+                  {createCategoryFromAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Create this category'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setAiRuleSuggestion(null)}>Discard</Button>
+              </div>
+            </div>
+          )}
+        </div>
       </SectionCard>
 
       <SectionCard title="Needs Year Review" icon={<AlertCircle size={14} />}>
