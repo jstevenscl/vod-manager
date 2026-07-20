@@ -64,14 +64,89 @@ async def get_expected_credentials() -> tuple[str, str] | None:
     return _cred_cache
 
 
-async def _authenticate(username: str, password: str) -> bool:
+# Brute-force protection for the XC login. The XC protocol itself has no
+# concept of this (username/password in a URL, checked per-request, full
+# stop) -- if this server is ever reachable from outside a trusted LAN/VPN,
+# that's an open, unthrottled login form. Per-client-IP lockout after
+# repeated failures closes that gap without needing anything outside the
+# app itself. In-memory/best-effort like _active_sessions above -- a
+# restart clears it, which is an acceptable reset for this purpose.
+_MAX_FAILED_ATTEMPTS    = 10
+_FAILURE_WINDOW_SECONDS = 300   # 5 min — failures older than this don't count toward the threshold
+_LOCKOUT_SECONDS        = 900   # 15 min
+_SWEEP_INTERVAL_SECONDS = 600   # bound memory growth under sustained attack from many distinct IPs
+
+_failed_attempts: dict[str, tuple[int, float]] = {}  # ip -> (count, window_started_at)
+_locked_until: dict[str, float] = {}                  # ip -> monotonic time lockout expires
+_last_sweep_at = 0.0
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _sweep_expired_auth_entries() -> None:
+    global _last_sweep_at
+    now = time.monotonic()
+    if now - _last_sweep_at < _SWEEP_INTERVAL_SECONDS:
+        return
+    _last_sweep_at = now
+    for ip, (_, window_started) in list(_failed_attempts.items()):
+        if now - window_started > _FAILURE_WINDOW_SECONDS:
+            _failed_attempts.pop(ip, None)
+    for ip, expires in list(_locked_until.items()):
+        if now >= expires:
+            _locked_until.pop(ip, None)
+
+
+def _is_locked_out(client_ip: str) -> bool:
+    expires = _locked_until.get(client_ip)
+    if expires is None:
+        return False
+    if time.monotonic() >= expires:
+        del _locked_until[client_ip]
+        return False
+    return True
+
+
+def _record_auth_failure(client_ip: str) -> None:
+    now = time.monotonic()
+    count, window_started = _failed_attempts.get(client_ip, (0, now))
+    if now - window_started > _FAILURE_WINDOW_SECONDS:
+        count, window_started = 0, now
+    count += 1
+    if count >= _MAX_FAILED_ATTEMPTS:
+        _locked_until[client_ip] = now + _LOCKOUT_SECONDS
+        _failed_attempts.pop(client_ip, None)
+        logger.warning("[xc_server] %s locked out for %ds after %d failed auth attempts in %ds",
+                        client_ip, _LOCKOUT_SECONDS, count, _FAILURE_WINDOW_SECONDS)
+    else:
+        _failed_attempts[client_ip] = (count, window_started)
+
+
+def _record_auth_success(client_ip: str) -> None:
+    _failed_attempts.pop(client_ip, None)
+
+
+async def _authenticate(username: str, password: str, request: Request) -> bool:
+    _sweep_expired_auth_entries()
+    client_ip = _client_ip(request)
+    if _is_locked_out(client_ip):
+        return False
+
     expected = await get_expected_credentials()
     if expected is None:
         return False
-    return (
+
+    ok = (
         secrets.compare_digest(username.encode(), expected[0].encode()) and
         secrets.compare_digest(password.encode(), expected[1].encode())
     )
+    if ok:
+        _record_auth_success(client_ip)
+    else:
+        _record_auth_failure(client_ip)
+    return ok
 
 
 def _log_hit(request: Request) -> None:
@@ -87,7 +162,7 @@ async def player_api(request: Request):
     action   = request.query_params.get("action")
     username = request.query_params.get("username", "")
     password = request.query_params.get("password", "")
-    authenticated = await _authenticate(username, password)
+    authenticated = await _authenticate(username, password, request)
     now = int(time.time())
 
     if not action:
@@ -608,7 +683,7 @@ async def _proxy_vod_stream(
 @router.get("/movie/{username}/{password}/{stream_id_ext}")
 async def movie_stream(username: str, password: str, stream_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     export_stream_id = int(stream_id_ext.split(".")[0])
     row = vod_db.get_movie_export_row_by_stream_id(export_stream_id)
@@ -622,7 +697,7 @@ async def movie_stream(username: str, password: str, stream_id_ext: str, request
 @router.get("/series/{username}/{password}/{episode_id_ext}")
 async def series_stream(username: str, password: str, episode_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     export_episode_id = int(episode_id_ext.split(".")[0])
     row = vod_db.get_episode_export_row_by_export_id(export_episode_id)
@@ -649,7 +724,7 @@ async def series_stream(username: str, password: str, episode_id_ext: str, reque
 @router.get("/preview/movie/{username}/{password}/{movie_id_ext}")
 async def preview_movie_stream(username: str, password: str, movie_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     movie_id = int(movie_id_ext.split(".")[0])
     movie = vod_db.get_movie(movie_id)
@@ -663,7 +738,7 @@ async def preview_movie_stream(username: str, password: str, movie_id_ext: str, 
 @router.get("/preview/series/{username}/{password}/{episode_id_ext}")
 async def preview_episode_stream(username: str, password: str, episode_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     episode_id = int(episode_id_ext.split(".")[0])
     episode = vod_db.get_episode(episode_id)
@@ -687,7 +762,7 @@ async def preview_episode_stream(username: str, password: str, episode_id_ext: s
 @router.get("/preview/movie-source/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_stream(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_movie_source_for_streaming(source_id)
@@ -700,7 +775,7 @@ async def preview_movie_source_stream(username: str, password: str, source_id_ex
 @router.get("/preview/series-source/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_stream(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_episode_source_for_streaming(source_id)
@@ -717,7 +792,7 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
 @router.get("/preview/movie-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_transcoded(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_movie_source_for_streaming(source_id)
@@ -729,7 +804,7 @@ async def preview_movie_source_transcoded(username: str, password: str, source_i
 @router.get("/preview/series-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_transcoded(username: str, password: str, source_id_ext: str, request: Request):
     _log_hit(request)
-    if not await _authenticate(username, password):
+    if not await _authenticate(username, password, request):
         return Response(status_code=401, content="Unauthorized")
     source_id = int(source_id_ext.split(".")[0])
     source = vod_db.get_episode_source_for_streaming(source_id)
