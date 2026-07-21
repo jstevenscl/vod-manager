@@ -237,7 +237,13 @@ def _log_hit(request: Request, password: str | None = None) -> None:
         params["password"] = "***"
     path = request.url.path
     if password:
-        path = path.replace(password, "***")
+        # Replace only a path segment that exactly equals the password, not
+        # any substring match -- this route is hit pre-authentication, so
+        # `password` is still attacker-controlled at this point; a global
+        # str.replace could let a short guessed value mangle unrelated
+        # parts of the logged path (e.g. password="movie" corrupting
+        # "/movie/..." elsewhere in the same URL).
+        path = "/".join("***" if segment == password else segment for segment in path.split("/"))
     logger.info("[xc_server] %s %s", path, params)
 
 

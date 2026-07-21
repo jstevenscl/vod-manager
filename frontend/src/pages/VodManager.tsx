@@ -2657,14 +2657,20 @@ export default function VodManager() {
     queryFn:  () => api.get('/vod/duplicates/', { params: { content_type: duplicatesContentType } }).then((r) => r.data),
     enabled:  false,  // scan on demand only -- this walks the whole pool, not something to run on every page load
   })
+  const [duplicatesMergeResult, setDuplicatesMergeResult] = useState<string | null>(null)
   const mergeDuplicateGroup = useMutation({
     mutationFn: (body: { keep_id: number; merge_ids: number[] }) =>
       api.post('/vod/duplicates/merge/', { content_type: duplicatesContentType, ...body }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-duplicates'] })
+      setDuplicatesMergeResult(null)
+      // duplicatesQuery is enabled:false (on-demand scan only) -- invalidateQueries
+      // alone won't refetch a disabled query, so the merged group would keep
+      // showing (now stale/wrong) until the next manual Scan without this.
+      duplicatesQuery.refetch()
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
+    onError: (e: any) => setDuplicatesMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
   // ── Movies ──
@@ -3746,6 +3752,7 @@ export default function VodManager() {
               <Pager total={duplicatesQuery.data.length} limit={DUPLICATES_PAGE_SIZE} offset={duplicatesOffset} onOffset={setDuplicatesOffset} />
             </>
           )}
+          {duplicatesMergeResult && <span className="text-xs text-destructive">{duplicatesMergeResult}</span>}
         </div>
         {!!duplicatesQuery.data?.length && (
           // Client-side slice, not a second network round-trip -- the scan

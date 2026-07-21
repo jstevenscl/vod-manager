@@ -2295,6 +2295,40 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
         name = item["name"]
         year = item.get("year")
         detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
+        if not name.strip():
+            # Same guard as bulk_import_movies -- a blank name has no real
+            # identity to match on, so never match it against anything,
+            # including another blank one. Reuse this exact stream's own
+            # existing row across re-syncs so a refresh doesn't mint a
+            # fresh orphaned row every pass.
+            existing_source = conn.execute(
+                "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+                (provider_id, item["provider_stream_id"]),
+            ).fetchone()
+            if existing_source:
+                movie_id = existing_source["movie_id"]
+                matched += 1
+                sets = ", ".join(f"{k}=?" for k in detail)
+                conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+            else:
+                placeholder = f"[Untitled] Plex · stream {item['provider_stream_id']}"
+                cur = conn.execute(
+                    "INSERT INTO movies (name, year, needs_year_review, created_at) VALUES (?,?,?,?)",
+                    (placeholder, year, 1, now),
+                )
+                movie_id = cur.lastrowid
+                created += 1
+                flagged += 1
+            conn.execute(
+                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                       movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+                (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
+            )
+            if (i + 1) % batch_size == 0:
+                _commit_with_retry(conn)
+            continue
         row = conn.execute("SELECT id FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
         if row:
             movie_id = row["id"]
@@ -2358,19 +2392,42 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
         name = item["name"]
         year = item.get("year")
         detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
-        row = conn.execute("SELECT id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
-        if row:
-            series_id = row["id"]
-            series_matched += 1
-            sets = ", ".join(f"{k}=?" for k in detail)
-            conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
+        if not name.strip():
+            # Same guard as bulk_import_series -- a blank name has no real
+            # identity to match on, so never match it against anything,
+            # including another blank one. Reuse this exact series' own
+            # existing row across re-syncs (looked up by provider+series_id).
+            existing = conn.execute(
+                "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                (provider_id, item.get("provider_series_id")),
+            ).fetchone()
+            if existing:
+                series_id = existing["id"]
+                series_matched += 1
+                sets = ", ".join(f"{k}=?" for k in detail)
+                conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
+            else:
+                placeholder = f"[Untitled] Plex · series {item.get('provider_series_id')}"
+                cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                vals = [placeholder, year, 1, provider_id, item.get("provider_series_id"), *detail.values()]
+                placeholders_sql = ", ".join("?" for _ in cols)
+                cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders_sql}, ?)", (*vals, now))
+                series_id = cur.lastrowid
+                series_created += 1
         else:
-            cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
-            vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
-            placeholders = ", ".join("?" for _ in cols)
-            cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
-            series_id = cur.lastrowid
-            series_created += 1
+            row = conn.execute("SELECT id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+            if row:
+                series_id = row["id"]
+                series_matched += 1
+                sets = ", ".join(f"{k}=?" for k in detail)
+                conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
+            else:
+                cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
+                placeholders = ", ".join("?" for _ in cols)
+                cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                series_id = cur.lastrowid
+                series_created += 1
 
         for ep in item.get("episodes", []):
             erow = conn.execute(
@@ -2806,6 +2863,20 @@ def count_missing_artwork(
     return n
 
 
+def list_missing_artwork_page(
+    content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
+    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None,
+) -> dict:
+    """Combined items+total in one pass -- calling list_missing_artwork and
+    count_missing_artwork separately each re-runs the same full-table Python
+    scan+filter whenever script/prefixes is set (once per call, so twice per
+    page load, on top of the separate /prefixes/ scan), which is pure waste
+    since it's the exact same row set both times."""
+    table = "movies" if content_type == "movie" else "series"
+    rows = _missing_artwork_rows(table, search, excluded, script, prefixes)
+    return {"items": [dict(r) for r in rows[offset:offset + limit]], "total": len(rows)}
+
+
 def list_missing_artwork_ids(
     content_type: str, search: str | None = None, excluded: bool = False,
     script: str | None = None, prefixes: list[str] | None = None,
@@ -2953,6 +3024,12 @@ def list_library_filtered(
     excluded: bool | None = None, script: str | None = None, prefixes: list[str] | None = None,
 ) -> list[dict]:
     table = "movies" if content_type == "movie" else "series"
+    if not script and not prefixes:
+        clause, params = _library_clause(search, excluded)
+        conn = _connect()
+        rows = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY name LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
     rows = _library_rows(table, search, excluded, script, prefixes)
     return [dict(r) for r in rows[offset:offset + limit]]
 
@@ -2962,7 +3039,32 @@ def count_library_filtered(
     script: str | None = None, prefixes: list[str] | None = None,
 ) -> int:
     table = "movies" if content_type == "movie" else "series"
+    if not script and not prefixes:
+        clause, params = _library_clause(search, excluded)
+        conn = _connect()
+        n = conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
+        conn.close()
+        return n
     return len(_library_rows(table, search, excluded, script, prefixes))
+
+
+def list_library_page(
+    content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
+    excluded: bool | None = None, script: str | None = None, prefixes: list[str] | None = None,
+) -> dict:
+    """Combined items+total in one pass when script/prefixes forces the
+    Python-side scan (same reasoning as list_missing_artwork_page) -- the
+    plain search/excluded-only case still uses cheap SQL-native
+    LIMIT/OFFSET + COUNT(*), not a full-table fetch, since that's the
+    common case (no language filter engaged at all)."""
+    table = "movies" if content_type == "movie" else "series"
+    if not script and not prefixes:
+        return {
+            "items": list_library_filtered(content_type, limit, offset, search, excluded, script, prefixes),
+            "total": count_library_filtered(content_type, search, excluded, script, prefixes),
+        }
+    rows = _library_rows(table, search, excluded, script, prefixes)
+    return {"items": [dict(r) for r in rows[offset:offset + limit]], "total": len(rows)}
 
 
 def list_library_ids(
@@ -2970,6 +3072,12 @@ def list_library_ids(
     script: str | None = None, prefixes: list[str] | None = None,
 ) -> list[int]:
     table = "movies" if content_type == "movie" else "series"
+    if not script and not prefixes:
+        clause, params = _library_clause(search, excluded)
+        conn = _connect()
+        rows = conn.execute(f"SELECT id FROM {table} {clause}", params).fetchall()
+        conn.close()
+        return [r["id"] for r in rows]
     return [r["id"] for r in _library_rows(table, search, excluded, script, prefixes)]
 
 

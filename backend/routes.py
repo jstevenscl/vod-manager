@@ -37,16 +37,37 @@ async def require_auth(x_session_token: Optional[str] = Header(None, alias="X-Se
 _LOGIN_MAX_ATTEMPTS = 8
 _LOGIN_WINDOW_SECONDS = 300
 _LOGIN_LOCKOUT_SECONDS = 900
+_LOGIN_SWEEP_INTERVAL_SECONDS = 600  # bound memory growth under sustained attack from many distinct IPs
 
 _login_failed_attempts: dict[str, tuple[int, float]] = {}
 _login_locked_until: dict[str, float] = {}
+_login_last_sweep_at = 0.0
 
 
 def _login_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _sweep_expired_login_entries() -> None:
+    # Entries for an IP that never reaches the lockout threshold otherwise
+    # sit in _login_failed_attempts forever -- every distinct IP that ever
+    # fails a login once (internet scanners/bots included) leaks memory
+    # indefinitely without this, same fix xc_server.py's lockout already has.
+    global _login_last_sweep_at
+    now = time.monotonic()
+    if now - _login_last_sweep_at < _LOGIN_SWEEP_INTERVAL_SECONDS:
+        return
+    _login_last_sweep_at = now
+    for ip, (_, window_started) in list(_login_failed_attempts.items()):
+        if now - window_started > _LOGIN_WINDOW_SECONDS:
+            _login_failed_attempts.pop(ip, None)
+    for ip, expires in list(_login_locked_until.items()):
+        if now >= expires:
+            _login_locked_until.pop(ip, None)
+
+
 def _login_locked_out(ip: str) -> bool:
+    _sweep_expired_login_entries()
     expires = _login_locked_until.get(ip)
     if expires is None:
         return False

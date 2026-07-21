@@ -894,10 +894,7 @@ async def list_missing_artwork(
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(prefixes)
-    return {
-        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list),
-        "total": vod_db.count_missing_artwork(content_type, search=search, excluded=excluded, script=script, prefixes=prefix_list),
-    }
+    return vod_db.list_missing_artwork_page(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list)
 
 
 @router.get("/missing-artwork/prefixes/", dependencies=_GUARDS)
@@ -925,18 +922,16 @@ async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(body.prefixes)
     ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
-    # Archiving driven by a language/script filter goes through the sibling
-    # check -- never archive the only copy of something just because it's
-    # not in a language you picked (see smart_bulk_exclude). A plain manual
-    # selection (no filter engaged) or an un-archive always applies directly.
-    # dry_run mirrors this exact same condition so the preview never shows
-    # skips that the real (non-preview) click wouldn't actually apply.
+    # Always run the sibling check on archive, regardless of which filter
+    # (prefix chip, script checkbox, or plain search text) produced the
+    # candidate set -- a plain-search-only path used to skip this check
+    # entirely, which reopened the exact "archived N titles with zero
+    # sibling protection" bug already fixed for /library-language/. Only an
+    # un-archive (never destructive) applies directly.
     if body.dry_run:
-        if body.script or prefix_list:
-            result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes), dry_run=True)
-            return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
-        return {"changed": len(ids), "skipped": 0, "skipped_examples": []}
-    if body.set_excluded and (body.script or prefix_list):
+        result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes), dry_run=True)
+        return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
+    if body.set_excluded:
         result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes))
         return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
     changed = vod_db.bulk_set_review_excluded(body.content_type, ids, body.set_excluded)
@@ -956,10 +951,7 @@ async def list_library_language(
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(prefixes)
-    return {
-        "items": vod_db.list_library_filtered(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list),
-        "total": vod_db.count_library_filtered(content_type, search=search, excluded=excluded, script=script, prefixes=prefix_list),
-    }
+    return vod_db.list_library_page(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list)
 
 
 @router.get("/library-language/prefixes/", dependencies=_GUARDS)
