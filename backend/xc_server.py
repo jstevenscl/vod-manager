@@ -226,11 +226,19 @@ async def _authenticate(username: str, password: str, request: Request) -> dict 
     return matched
 
 
-def _log_hit(request: Request) -> None:
+def _log_hit(request: Request, password: str | None = None) -> None:
+    """password: pass the caller's own path-parameter value (most of these
+    routes are /{username}/{password}/... -- the XC protocol's own
+    convention, not ours) so it gets masked out of the logged path too, not
+    just the query-string case below. Without this, every stream request
+    wrote the real client password straight to stdout/container logs."""
     params = dict(request.query_params)
     if "password" in params:
         params["password"] = "***"
-    logger.info("[xc_server] %s %s", request.url.path, params)
+    path = request.url.path
+    if password:
+        path = path.replace(password, "***")
+    logger.info("[xc_server] %s %s", path, params)
 
 
 def _handle_player_api_action(action: str, params, authenticated: dict) -> dict | list:
@@ -841,7 +849,7 @@ async def _serve_hls_playlist(kind: str, source: dict, request: Request, usernam
 
 @router.get("/preview/movie-source-hls/{username}/{password}/{source_id_ext}/index.m3u8")
 async def preview_movie_source_hls_playlist(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -855,7 +863,7 @@ async def preview_movie_source_hls_playlist(username: str, password: str, source
 
 @router.get("/preview/series-source-hls/{username}/{password}/{source_id_ext}/index.m3u8")
 async def preview_episode_source_hls_playlist(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1062,7 +1070,7 @@ async def _proxy_vod_stream(
 
 @router.get("/movie/{username}/{password}/{stream_id_ext}")
 async def movie_stream(username: str, password: str, stream_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1080,7 +1088,7 @@ async def movie_stream(username: str, password: str, stream_id_ext: str, request
 
 @router.get("/series/{username}/{password}/{episode_id_ext}")
 async def series_stream(username: str, password: str, episode_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1110,7 +1118,7 @@ async def series_stream(username: str, password: str, episode_id_ext: str, reque
 
 @router.get("/preview/movie/{username}/{password}/{movie_id_ext}")
 async def preview_movie_stream(username: str, password: str, movie_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1125,7 +1133,7 @@ async def preview_movie_stream(username: str, password: str, movie_id_ext: str, 
 
 @router.get("/preview/series/{username}/{password}/{episode_id_ext}")
 async def preview_episode_stream(username: str, password: str, episode_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1152,7 +1160,7 @@ async def preview_episode_stream(username: str, password: str, episode_id_ext: s
 
 @router.get("/preview/movie-source/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_stream(username: str, password: str, source_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1166,7 +1174,7 @@ async def preview_movie_source_stream(username: str, password: str, source_id_ex
 
 @router.get("/preview/series-source/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_stream(username: str, password: str, source_id_ext: str, request: Request):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1184,7 +1192,7 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
 
 @router.get("/preview/movie-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_movie_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")
@@ -1198,7 +1206,7 @@ async def preview_movie_source_transcoded(username: str, password: str, source_i
 
 @router.get("/preview/series-source-transcoded/{username}/{password}/{source_id_ext}")
 async def preview_episode_source_transcoded(username: str, password: str, source_id_ext: str, request: Request, start: int = 0):
-    _log_hit(request)
+    _log_hit(request, password)
     client = await _authenticate(username, password, request)
     if not client:
         return Response(status_code=401, content="Unauthorized")

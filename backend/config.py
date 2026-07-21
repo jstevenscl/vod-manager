@@ -235,6 +235,20 @@ def save_refresh_settings(
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+# PBKDF2-HMAC-SHA256 with a real iteration count -- a plain single-round
+# SHA-256 (this file's original scheme) is fast enough that a leaked
+# salt+hash pair is crackable offline at billions of guesses/sec on a GPU;
+# PBKDF2's iteration count is specifically what makes that expensive.
+# 260k iterations matches OWASP's 2023 minimum recommendation for this
+# algorithm. auth_scheme distinguishes old accounts from new ones so
+# existing logins keep working -- see verify_credentials's legacy branch.
+
+_PBKDF2_ITERATIONS = 260_000
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITERATIONS).hex()
+
 
 def has_credentials() -> bool:
     if os.environ.get("VODMANAGER_ADMIN_USER") and os.environ.get("VODMANAGER_ADMIN_PASSWORD"):
@@ -257,16 +271,27 @@ def verify_credentials(username: str, password: str) -> bool:
     stored_hash = data.get("auth_hash", "")
     if not (stored_user and stored_salt and stored_hash):
         return False
-    candidate = hashlib.sha256((stored_salt + password).encode()).hexdigest()
-    return (
-        secrets.compare_digest(username.encode(), stored_user.encode()) and
-        secrets.compare_digest(candidate.encode(), stored_hash.encode())
-    )
+    if not secrets.compare_digest(username.encode(), stored_user.encode()):
+        return False
+
+    if data.get("auth_scheme") == "pbkdf2":
+        candidate = _hash_password(password, stored_salt)
+        return secrets.compare_digest(candidate.encode(), stored_hash.encode())
+
+    # Legacy single-round-SHA-256 account (predates auth_scheme). Verify
+    # against the old scheme, then transparently upgrade to PBKDF2 on this
+    # successful login -- migrates existing accounts off the weaker hash
+    # without forcing a password reset.
+    legacy_candidate = hashlib.sha256((stored_salt + password).encode()).hexdigest()
+    ok = secrets.compare_digest(legacy_candidate.encode(), stored_hash.encode())
+    if ok:
+        set_credentials(stored_user, password)
+    return ok
 
 
 def set_credentials(username: str, password: str) -> None:
     salt   = secrets.token_hex(16)
-    hashed = hashlib.sha256((salt + password).encode()).hexdigest()
+    hashed = _hash_password(password, salt)
     data   = _read_raw()
-    data.update({"auth_username": username, "auth_salt": salt, "auth_hash": hashed})
+    data.update({"auth_username": username, "auth_salt": salt, "auth_hash": hashed, "auth_scheme": "pbkdf2"})
     _write_raw(data)
