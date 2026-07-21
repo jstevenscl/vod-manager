@@ -174,6 +174,7 @@ class BulkMissingArtworkPosterRequest(BaseModel):
     search: Optional[str] = None
     excluded: bool = False
     script: Optional[str] = None
+    prefixes: Optional[str] = None
 
 
 class BulkMissingArtworkExcludeRequest(BaseModel):
@@ -183,6 +184,7 @@ class BulkMissingArtworkExcludeRequest(BaseModel):
     search: Optional[str] = None
     excluded: bool = False
     script: Optional[str] = None
+    prefixes: Optional[str] = None
 
 
 class MovieRequest(BaseModel):
@@ -861,17 +863,29 @@ async def resolve_year_review(content_type: str, item_id: int, body: ResolveYear
 # vod_db.list_missing_artwork's docstring for why this can't just be an
 # automatic pass.
 
+def _split_prefixes(prefixes: Optional[str]) -> Optional[list[str]]:
+    return [p for p in prefixes.split(",") if p] if prefixes else None
+
+
 @router.get("/missing-artwork/", dependencies=_GUARDS)
 async def list_missing_artwork(
     content_type: str, limit: int = 30, offset: int = 0, search: Optional[str] = None,
-    excluded: bool = False, script: Optional[str] = None,
+    excluded: bool = False, script: Optional[str] = None, prefixes: Optional[str] = None,
 ):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    prefix_list = _split_prefixes(prefixes)
     return {
-        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script),
-        "total": vod_db.count_missing_artwork(content_type, search=search, excluded=excluded, script=script),
+        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list),
+        "total": vod_db.count_missing_artwork(content_type, search=search, excluded=excluded, script=script, prefixes=prefix_list),
     }
+
+
+@router.get("/missing-artwork/prefixes/", dependencies=_GUARDS)
+async def missing_artwork_prefixes(content_type: str, search: Optional[str] = None, excluded: bool = False, script: Optional[str] = None):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.list_missing_artwork_prefixes(content_type, search=search, excluded=excluded, script=script)
 
 
 @router.post("/missing-artwork/bulk-poster/", dependencies=_GUARDS)
@@ -880,7 +894,8 @@ async def bulk_apply_missing_artwork_poster(body: BulkMissingArtworkPosterReques
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     if not body.poster_url.strip():
         raise HTTPException(400, detail="poster_url is required")
-    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script)
+    prefix_list = _split_prefixes(body.prefixes)
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
     applied = vod_db.bulk_set_poster_url(body.content_type, ids, body.poster_url.strip())
     return {"applied": applied}
 
@@ -889,7 +904,8 @@ async def bulk_apply_missing_artwork_poster(body: BulkMissingArtworkPosterReques
 async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
     if body.content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script)
+    prefix_list = _split_prefixes(body.prefixes)
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
     changed = vod_db.bulk_set_review_excluded(body.content_type, ids, body.set_excluded)
     return {"changed": changed}
 

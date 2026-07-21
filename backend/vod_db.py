@@ -2658,6 +2658,20 @@ def _is_non_latin_name(name: str) -> bool:
     return bool(_NON_LATIN_RE.search(name))
 
 
+# Some real XC providers tag language/dub/sub variants with a leading
+# "XX|" code (e.g. "AR| Apex", "ALB| Apex", "IN| TELUGU| Apex") -- a much
+# broader and more precise signal than script detection alone, since it
+# also flags Latin-script variants (French, German, Spanish...) and, unlike
+# a fixed language list, works for whatever codes a given deployment's
+# providers actually use rather than ones picked in advance.
+_LANG_PREFIX_RE = re.compile(r"^([A-Z]{2,6})\|")
+
+
+def _name_prefix_code(name: str) -> str | None:
+    m = _LANG_PREFIX_RE.match(name)
+    return m.group(1) if m else None
+
+
 def _missing_artwork_clause(search: str | None, excluded: bool) -> tuple[str, list]:
     where = ["(poster_url IS NULL OR poster_url = '')", "review_excluded = ?"]
     params: list = [1 if excluded else 0]
@@ -2667,9 +2681,10 @@ def _missing_artwork_clause(search: str | None, excluded: bool) -> tuple[str, li
     return f"WHERE {' AND '.join(where)}", params
 
 
-def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script: str | None) -> list:
-    """script filtering can't be expressed in SQL (SQLite has no Unicode
-    script/category matching), so when it's requested this fetches every
+def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script: str | None, prefixes: list[str] | None = None) -> list:
+    """script/prefix filtering can't be expressed in SQL (SQLite has no
+    Unicode script/category matching, and a leading-substring group-by is
+    awkward in plain SQL), so when either is requested this fetches every
     matching row (already bounded by the poster/search/excluded filters,
     same as any other admin scan in this file) and filters in Python."""
     clause, params = _missing_artwork_clause(search, excluded)
@@ -2678,22 +2693,42 @@ def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script
     conn.close()
     if script == "non_latin":
         rows = [r for r in rows if _is_non_latin_name(r["name"])]
+    if prefixes:
+        wanted = set(prefixes)
+        rows = [r for r in rows if _name_prefix_code(r["name"]) in wanted]
     return rows
+
+
+def list_missing_artwork_prefixes(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> list[dict]:
+    """Distinct "XX|"-style language-prefix codes actually present in the
+    current filter scope, with counts -- powers a picker showing real
+    options instead of a fixed guessed-in-advance language list."""
+    table = "movies" if content_type == "movie" else "series"
+    rows = _missing_artwork_rows(table, search, excluded, script)
+    counts: dict[str, int] = {}
+    for r in rows:
+        code = _name_prefix_code(r["name"])
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])
 
 
 def list_missing_artwork(
     content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
-    excluded: bool = False, script: str | None = None,
+    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None,
 ) -> list[dict]:
     table = "movies" if content_type == "movie" else "series"
-    rows = _missing_artwork_rows(table, search, excluded, script)
+    rows = _missing_artwork_rows(table, search, excluded, script, prefixes)
     return [dict(r) for r in rows[offset:offset + limit]]
 
 
-def count_missing_artwork(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> int:
+def count_missing_artwork(
+    content_type: str, search: str | None = None, excluded: bool = False,
+    script: str | None = None, prefixes: list[str] | None = None,
+) -> int:
     table = "movies" if content_type == "movie" else "series"
-    if script:
-        return len(_missing_artwork_rows(table, search, excluded, script))
+    if script or prefixes:
+        return len(_missing_artwork_rows(table, search, excluded, script, prefixes))
     clause, params = _missing_artwork_clause(search, excluded)
     conn = _connect()
     n = conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
@@ -2701,13 +2736,16 @@ def count_missing_artwork(content_type: str, search: str | None = None, excluded
     return n
 
 
-def list_missing_artwork_ids(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> list[int]:
+def list_missing_artwork_ids(
+    content_type: str, search: str | None = None, excluded: bool = False,
+    script: str | None = None, prefixes: list[str] | None = None,
+) -> list[int]:
     """Every matching id, not just one page -- backs the "select all
     matching this search" bulk actions (apply-poster/exclude), same pattern
     as list_all_movie_ids for category bulk-place."""
     table = "movies" if content_type == "movie" else "series"
-    if script:
-        return [r["id"] for r in _missing_artwork_rows(table, search, excluded, script)]
+    if script or prefixes:
+        return [r["id"] for r in _missing_artwork_rows(table, search, excluded, script, prefixes)]
     clause, params = _missing_artwork_clause(search, excluded)
     conn = _connect()
     rows = conn.execute(f"SELECT id FROM {table} {clause}", params).fetchall()

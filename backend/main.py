@@ -176,6 +176,11 @@ if os.environ.get("VODMANAGER_TEST_UPSTREAM"):
 
 if STATIC_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
+    # Bundled placeholder art (e.g. a properly poster-shaped logo for
+    # bulk-applying to content that will never have a real per-title
+    # poster) -- see frontend/public/placeholders/.
+    if (STATIC_DIR / "placeholders").exists():
+        app.mount("/placeholders", StaticFiles(directory=str(STATIC_DIR / "placeholders")), name="placeholders")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):

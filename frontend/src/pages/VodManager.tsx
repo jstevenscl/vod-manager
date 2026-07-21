@@ -1609,13 +1609,34 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
   // worth of titles can be archived in one "all filtered" action instead of
   // checking them off one at a time.
   const [nonLatinOnly, setNonLatinOnly] = useState(false)
+  // Some providers tag language/dub variants with a leading "XX|" code
+  // (e.g. "AR| Apex", "ALB| Apex") -- a more precise signal than script
+  // detection alone since it also catches Latin-script variants (French,
+  // German...), and works for whatever codes THIS deployment's providers
+  // actually use rather than a fixed guessed-in-advance language list.
+  const [selectedPrefixes, setSelectedPrefixes] = useState<Set<string>>(new Set())
+  const prefixesParam = selectedPrefixes.size ? Array.from(selectedPrefixes).join(',') : undefined
   const LIMIT = 25
   const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
-    queryKey: ['vod-missing-artwork', contentType, search, offset, showExcluded, nonLatinOnly],
+    queryKey: ['vod-missing-artwork', contentType, search, offset, showExcluded, nonLatinOnly, prefixesParam],
     queryFn:  () => api.get('/vod/missing-artwork/', {
-      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined },
+      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam },
     }).then((r) => r.data),
   })
+  const prefixesQuery = useQuery<{ code: string; count: number }[]>({
+    queryKey: ['vod-missing-artwork-prefixes', contentType, search, showExcluded, nonLatinOnly],
+    queryFn:  () => api.get('/vod/missing-artwork/prefixes/', {
+      params: { content_type: contentType, search: search || undefined, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined },
+    }).then((r) => r.data),
+  })
+  function togglePrefix(code: string) {
+    setSelectedPrefixes((prev) => {
+      const next = new Set(prev)
+      next.has(code) ? next.delete(code) : next.add(code)
+      return next
+    })
+    setOffset(0)
+  }
 
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   function toggleSelected(id: number) {
@@ -1637,7 +1658,7 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     mutationFn: (body: { ids?: number[]; search?: string }) =>
       api.post('/vod/missing-artwork/bulk-poster/', {
         content_type: contentType, poster_url: bulkPosterUrl.trim(), excluded: showExcluded,
-        script: nonLatinOnly ? 'non_latin' : undefined, ...body,
+        script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam, ...body,
       }),
     onSuccess: (r) => { setBulkResult(`Applied to ${r.data.applied}.`); setBulkPosterUrl(''); invalidateAfterBulk() },
     onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
@@ -1646,7 +1667,7 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     mutationFn: (body: { set_excluded: boolean; ids?: number[]; search?: string }) =>
       api.post('/vod/missing-artwork/bulk-exclude/', {
         content_type: contentType, excluded: showExcluded,
-        script: nonLatinOnly ? 'non_latin' : undefined, ...body,
+        script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam, ...body,
       }),
     onSuccess: (r) => { setBulkResult(`${r.data.changed} updated.`); invalidateAfterBulk() },
     onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
@@ -1680,6 +1701,25 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
             ? 'Archived items are hidden from Missing Artwork, Needs Review, and Duplicate Finder — still fully browsable/playable, just not flagged as needing attention.'
             : 'Blanket-apply one image to many items at once (e.g. a generic logo for content that will never have a real per-title poster), or archive content you don\'t want flagged here.'}
         </p>
+        {!!prefixesQuery.data?.length && (
+          <div className="flex items-center gap-1 flex-wrap">
+            <span className="text-muted-foreground shrink-0">Language prefix:</span>
+            {prefixesQuery.data.map(({ code, count }) => (
+              <button
+                key={code}
+                className={`px-1.5 py-0.5 rounded border text-xs ${selectedPrefixes.has(code) ? 'bg-primary text-primary-foreground border-primary' : 'border-border text-muted-foreground hover:text-foreground'}`}
+                onClick={() => togglePrefix(code)}
+              >
+                {code} ({count})
+              </button>
+            ))}
+            {!!selectedPrefixes.size && (
+              <button className="text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={() => { setSelectedPrefixes(new Set()); setOffset(0) }}>
+                clear
+              </button>
+            )}
+          </div>
+        )}
         <div className="flex items-center gap-1.5 flex-wrap">
           <input
             className={inputCls('flex-1 min-w-40')}
