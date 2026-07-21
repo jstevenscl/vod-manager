@@ -2111,6 +2111,42 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
         name = item["name"]
         year = item.get("year")
         category_looks_adult = _looks_adult(item.get("provider_category_name"))
+        if not name.strip():
+            # A blank provider-supplied name has no real identity to match
+            # on -- treating "" like any other string let unrelated titles
+            # silently collapse into one shared row (a real corruption found
+            # in production: 3 completely unrelated ProviderC movies, different
+            # genres, merged into a single blank-named entry because they
+            # all matched (name='', year=NULL) exactly). Never match a blank
+            # name against anything, including another blank one -- but do
+            # reuse this exact stream's own existing row across re-syncs
+            # (looked up by provider+stream_id, not by name), or a periodic
+            # catalog refresh would mint a fresh orphaned row every pass.
+            existing_source = conn.execute(
+                "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+                (provider_id, item["provider_stream_id"]),
+            ).fetchone()
+            if existing_source:
+                movie_id = existing_source["movie_id"]
+                matched += 1
+            else:
+                placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
+                cur = conn.execute(
+                    "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
+                    (placeholder, year, int(category_looks_adult), 1, now),
+                )
+                movie_id = cur.lastrowid
+                created += 1
+                flagged += 1
+            conn.execute(
+                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                       movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
+                (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
+                 item.get("provider_category_name"), now, now),
+            )
+            continue
         row = conn.execute("SELECT id, is_adult, is_adult_manual FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
         if row:
             movie_id = row["id"]
@@ -2173,6 +2209,28 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
         name = item["name"]
         year = item.get("year")
         category_looks_adult = _looks_adult(item.get("provider_category_name"))
+        if not name.strip():
+            # Same reasoning as bulk_import_movies's identical guard -- a
+            # blank name has no real identity to match on, so never match it
+            # against anything, including another blank one. Reuse this
+            # exact series' own existing row across re-syncs (looked up by
+            # provider+series_id, not by name) to avoid minting a fresh
+            # orphaned row every periodic catalog refresh.
+            existing = conn.execute(
+                "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                (provider_id, item.get("provider_series_id")),
+            ).fetchone()
+            if existing:
+                matched += 1
+            else:
+                placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
+                conn.execute(
+                    "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (placeholder, year, int(category_looks_adult), 1, provider_id, item.get("provider_series_id"), now),
+                )
+                created += 1
+                flagged += 1
+            continue
         row = conn.execute("SELECT id, is_adult, is_adult_manual, import_provider_id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
         if row:
             matched += 1
@@ -2804,7 +2862,7 @@ def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) 
     return len(ids)
 
 
-def smart_bulk_exclude(content_type: str, ids: list[int], keep_codes: list[str] | None) -> dict:
+def smart_bulk_exclude(content_type: str, ids: list[int], keep_codes: list[str] | None, dry_run: bool = False) -> dict:
     """Archives each id UNLESS it's the only copy of that content in the
     pool -- e.g. don't archive "AR| Apex" if there's no "EN| Apex" (or
     unprefixed "Apex") to fall back on, since that would remove the only
@@ -2815,7 +2873,10 @@ def smart_bulk_exclude(content_type: str, ids: list[int], keep_codes: list[str] 
     `ids` (e.g. it already has a poster, so it's not in a Missing Artwork
     scan). keep_codes: prefix codes that count as an acceptable sibling,
     in addition to no-prefix-at-all (always treated as the base/native
-    listing)."""
+    listing). dry_run: compute the same archived/skipped counts without
+    writing anything -- backs a live "this is what would happen" preview,
+    since changing keep_codes has no visible effect otherwise until after
+    you've already committed the archive."""
     if not ids:
         return {"archived": 0, "skipped": 0, "skipped_examples": []}
     table = "movies" if content_type == "movie" else "series"
@@ -2848,6 +2909,8 @@ def smart_bulk_exclude(content_type: str, ids: list[int], keep_codes: list[str] 
         else:
             skipped_names.append(entry["name"])
 
+    if dry_run:
+        return {"archived": len(to_archive), "skipped": len(skipped_names), "skipped_examples": skipped_names[:10]}
     archived = bulk_set_review_excluded(content_type, to_archive, True)
     return {"archived": archived, "skipped": len(skipped_names), "skipped_examples": skipped_names[:10]}
 
@@ -2972,6 +3035,48 @@ def resolve_missing_artwork(
     _commit_with_retry(conn)
     conn.close()
     return {"resolved_id": item_id}
+
+
+def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
+    """Manually corrects a movie/series' own name/year -- the general
+    escape hatch for whatever a provider's own catalog data got wrong (most
+    commonly a blank/garbled title with no other tooling to fix it). Same
+    merge-on-collision safety as resolve_missing_artwork/resolve_year_review:
+    if the corrected name+year now matches an existing pool entry exactly,
+    merge into it rather than leaving two rows with the same identity."""
+    table = "movies" if content_type == "movie" else "series"
+    name = name.strip()
+    if not name:
+        raise ValueError("name is required")
+
+    conn = _connect()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+
+    existing = None
+    if (name, year) != (row["name"], row["year"]):
+        existing = conn.execute(
+            f"SELECT id FROM {table} WHERE name=? AND year IS ? AND id != ?", (name, year, item_id),
+        ).fetchone()
+    conn.close()
+
+    if existing:
+        if content_type == "movie":
+            merge_movie(item_id, existing["id"])
+        else:
+            merge_series(item_id, existing["id"])
+        return {"merged_into": existing["id"]}
+
+    conn = _connect()
+    conn.execute(
+        f"UPDATE {table} SET name=?, year=?, needs_year_review=0, updated_at=? WHERE id=?",
+        (name, year, _now(), item_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+    return {"renamed_id": item_id}
 
 
 # ── Smart categories ─────────────────────────────────────────────────────────

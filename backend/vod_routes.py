@@ -167,6 +167,11 @@ class MergeDuplicateGroupRequest(BaseModel):
     merge_ids: list[int]
 
 
+class RenameRequest(BaseModel):
+    name: str
+    year: Optional[int] = None
+
+
 class BulkMissingArtworkPosterRequest(BaseModel):
     content_type: str
     poster_url: str
@@ -186,6 +191,7 @@ class BulkMissingArtworkExcludeRequest(BaseModel):
     script: Optional[str] = None
     prefixes: Optional[str] = None
     keep_codes: Optional[str] = None
+    dry_run: bool = False
 
 
 class BulkLibraryExcludeRequest(BaseModel):
@@ -197,6 +203,7 @@ class BulkLibraryExcludeRequest(BaseModel):
     script: Optional[str] = None
     prefixes: Optional[str] = None
     keep_codes: Optional[str] = None
+    dry_run: bool = False
 
 
 class MovieRequest(BaseModel):
@@ -922,6 +929,13 @@ async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
     # check -- never archive the only copy of something just because it's
     # not in a language you picked (see smart_bulk_exclude). A plain manual
     # selection (no filter engaged) or an un-archive always applies directly.
+    # dry_run mirrors this exact same condition so the preview never shows
+    # skips that the real (non-preview) click wouldn't actually apply.
+    if body.dry_run:
+        if body.script or prefix_list:
+            result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes), dry_run=True)
+            return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
+        return {"changed": len(ids), "skipped": 0, "skipped_examples": []}
     if body.set_excluded and (body.script or prefix_list):
         result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes))
         return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
@@ -961,6 +975,11 @@ async def bulk_exclude_library(body: BulkLibraryExcludeRequest):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(body.prefixes)
     ids = body.ids if body.ids is not None else vod_db.list_library_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
+    # dry_run always goes through the (read-only) smart-exclude path -- see
+    # the missing-artwork route's identical comment.
+    if body.dry_run:
+        result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes), dry_run=True)
+        return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
     # This modal exists specifically for language-based archiving -- always
     # run the sibling check on archive, regardless of which filter (prefix
     # chip, script checkbox, or plain search text) produced the candidate
@@ -1117,6 +1136,14 @@ async def set_movie_adult(movie_id: int, is_adult: bool):
     return {"ok": True}
 
 
+@router.post("/movies/{movie_id}/rename/", dependencies=_GUARDS)
+async def rename_movie(movie_id: int, body: RenameRequest):
+    try:
+        return vod_db.rename_item("movie", movie_id, body.name, body.year)
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+
+
 @router.delete("/movies/{movie_id}/", dependencies=_GUARDS)
 async def delete_movie(movie_id: int):
     if not vod_db.get_movie(movie_id):
@@ -1231,6 +1258,14 @@ async def set_series_adult(series_id: int, is_adult: bool):
         raise HTTPException(404, detail="series not found")
     vod_db.set_series_adult(series_id, is_adult)
     return {"ok": True}
+
+
+@router.post("/series/{series_id}/rename/", dependencies=_GUARDS)
+async def rename_series(series_id: int, body: RenameRequest):
+    try:
+        return vod_db.rename_item("series", series_id, body.name, body.year)
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
 
 
 @router.delete("/series/{series_id}/", dependencies=_GUARDS)

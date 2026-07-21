@@ -920,6 +920,17 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   const [open, setOpen] = useState(false)
   const [sourceForm, setSourceForm] = useState({ provider_id: '', provider_stream_id: '', container_extension: 'mp4' })
   const [categoryPick, setCategoryPick] = useState('')
+  const [renameForm, setRenameForm] = useState<{ name: string; year: string } | null>(null)
+
+  const rename = useMutation({
+    mutationFn: () => api.post(`/vod/movies/${movie.id}/rename/`, {
+      name: renameForm!.name, year: renameForm!.year ? Number(renameForm!.year) : undefined,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      setRenameForm(null)
+    },
+  })
 
   const addSource = useMutation({
     mutationFn: () => api.post(`/vod/movies/${movie.id}/sources/`, {
@@ -964,6 +975,37 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       {movie.poster_url && mode === 'list' && (
         <img src={movie.poster_url} alt="" className="w-24 rounded" loading="lazy" />
       )}
+      <div>
+        {renameForm ? (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <input
+              className={inputCls('flex-1 min-w-32')}
+              placeholder="Name"
+              value={renameForm.name}
+              onChange={(e) => setRenameForm({ ...renameForm, name: e.target.value })}
+            />
+            <input
+              className={inputCls('w-20')}
+              type="number"
+              placeholder="Year"
+              value={renameForm.year}
+              onChange={(e) => setRenameForm({ ...renameForm, year: e.target.value })}
+            />
+            <Button size="sm" disabled={!renameForm.name.trim() || rename.isPending} onClick={() => rename.mutate()}>
+              {rename.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setRenameForm(null)}>Cancel</Button>
+          </div>
+        ) : (
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setRenameForm({ name: movie.name, year: movie.year ? String(movie.year) : '' })}
+          >
+            Rename / fix year
+          </button>
+        )}
+        {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
+      </div>
       {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
 
       <div>
@@ -1140,6 +1182,17 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 }) {
   const [open, setOpen] = useState(false)
   const [categoryPick, setCategoryPick] = useState('')
+  const [renameForm, setRenameForm] = useState<{ name: string; year: string } | null>(null)
+
+  const rename = useMutation({
+    mutationFn: () => api.post(`/vod/series/${series.id}/rename/`, {
+      name: renameForm!.name, year: renameForm!.year ? Number(renameForm!.year) : undefined,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      setRenameForm(null)
+    },
+  })
 
   const addPlacement = useMutation({
     mutationFn: () => api.post(`/vod/series/${series.id}/categories/`, { category_id: Number(categoryPick) }),
@@ -1170,6 +1223,37 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
       {series.poster_url && mode === 'list' && (
         <img src={series.poster_url} alt="" className="w-24 rounded" loading="lazy" />
       )}
+      <div>
+        {renameForm ? (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <input
+              className={inputCls('flex-1 min-w-32')}
+              placeholder="Name"
+              value={renameForm.name}
+              onChange={(e) => setRenameForm({ ...renameForm, name: e.target.value })}
+            />
+            <input
+              className={inputCls('w-20')}
+              type="number"
+              placeholder="Year"
+              value={renameForm.year}
+              onChange={(e) => setRenameForm({ ...renameForm, year: e.target.value })}
+            />
+            <Button size="sm" disabled={!renameForm.name.trim() || rename.isPending} onClick={() => rename.mutate()}>
+              {rename.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setRenameForm(null)}>Cancel</Button>
+          </div>
+        ) : (
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setRenameForm({ name: series.name, year: series.year ? String(series.year) : '' })}
+          >
+            Rename / fix year
+          </button>
+        )}
+        {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
+      </div>
       {series.description && <p className="text-muted-foreground">{series.description}</p>}
 
       <div>
@@ -1685,6 +1769,33 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
+  // Read-only preview of what archiving would actually do -- otherwise
+  // changing "keep a title if also available as" has no visible effect
+  // until after you've already committed, which looks like the field
+  // isn't doing anything (only matters once a language/script filter is
+  // active -- see the route's identical condition for when this applies).
+  type ExcludePreview = { changed: number; skipped: number; skipped_examples: string[] }
+  const previewAllFiltered = useQuery<ExcludePreview>({
+    queryKey: ['vod-missing-artwork-preview-all', contentType, search, showExcluded, nonLatinOnly, prefixesParam, keepCodes],
+    queryFn:  () => api.post('/vod/missing-artwork/bulk-exclude/', {
+      content_type: contentType, excluded: showExcluded,
+      script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam,
+      keep_codes: keepCodes.trim() || undefined,
+      set_excluded: !showExcluded, search: search || undefined, dry_run: true,
+    }).then((r) => r.data),
+    enabled: !showExcluded && !!query.data?.total,
+  })
+  const previewSelected = useQuery<ExcludePreview>({
+    queryKey: ['vod-missing-artwork-preview-selected', contentType, showExcluded, nonLatinOnly, prefixesParam, keepCodes, Array.from(selectedIds).join(',')],
+    queryFn:  () => api.post('/vod/missing-artwork/bulk-exclude/', {
+      content_type: contentType, excluded: showExcluded,
+      script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam,
+      keep_codes: keepCodes.trim() || undefined,
+      set_excluded: !showExcluded, ids: Array.from(selectedIds), dry_run: true,
+    }).then((r) => r.data),
+    enabled: !showExcluded && selectedIds.size > 0,
+  })
+
   return (
     <Modal onClose={onClose} maxWidth="max-w-2xl">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
@@ -1735,7 +1846,14 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
         {!showExcluded && (
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-muted-foreground shrink-0">Archiving by language keeps a title if also available as:</span>
-            <input className={inputCls('w-28')} placeholder="e.g. EN (optional)" value={keepCodes} onChange={(e) => setKeepCodes(e.target.value)} />
+            <input
+              className={inputCls('w-28')}
+              placeholder="e.g. EN (optional)"
+              defaultValue={keepCodes}
+              onKeyDown={(e) => { if (e.key === 'Enter') setKeepCodes((e.target as HTMLInputElement).value.trim()) }}
+              onBlur={(e) => setKeepCodes(e.target.value.trim())}
+            />
+            {previewAllFiltered.isFetching && <Loader2 size={12} className="animate-spin text-muted-foreground" />}
           </div>
         )}
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -1767,7 +1885,11 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
             disabled={selectedIds.size === 0 || bulkExclude.isPending}
             onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, ids: Array.from(selectedIds) })}
           >
-            {showExcluded ? 'Un-archive selected' : 'Archive selected'} ({selectedIds.size})
+            {showExcluded
+              ? `Un-archive selected (${selectedIds.size})`
+              : previewSelected.data
+                ? `Archive selected (${previewSelected.data.changed} of ${selectedIds.size}${previewSelected.data.skipped ? ` — ${previewSelected.data.skipped} would be skipped` : ''})`
+                : `Archive selected (${selectedIds.size})`}
           </Button>
           <Button
             size="sm" variant="outline"
@@ -1775,7 +1897,11 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
             onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, search: search || undefined })}
             title="Applies to every item matching the current search, not just this page"
           >
-            {showExcluded ? 'Un-archive all filtered' : 'Archive all filtered'} ({query.data?.total ?? 0})
+            {showExcluded
+              ? `Un-archive all filtered (${query.data?.total ?? 0})`
+              : previewAllFiltered.data
+                ? `Archive all filtered (${previewAllFiltered.data.changed} of ${query.data?.total ?? 0}${previewAllFiltered.data.skipped ? ` — ${previewAllFiltered.data.skipped} would be skipped` : ''})`
+                : `Archive all filtered (${query.data?.total ?? 0})`}
           </Button>
           {bulkResult && <span className="text-muted-foreground">{bulkResult}</span>}
         </div>
@@ -1870,6 +1996,31 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
     onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
+  // Read-only preview of what "Archive all/selected filtered" would
+  // actually do -- without this, changing "keep a title if also available
+  // as" has no visible effect until after you've already committed the
+  // archive, which looks like the field isn't doing anything.
+  type ExcludePreview = { changed: number; skipped: number; skipped_examples: string[] }
+  const previewAllFiltered = useQuery<ExcludePreview>({
+    queryKey: ['vod-library-language-preview-all', contentType, search, showExcluded, nonLatinOnly, prefixesParam, keepCodes],
+    queryFn:  () => api.post('/vod/library-language/bulk-exclude/', {
+      content_type: contentType, excluded: showExcluded,
+      script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam,
+      keep_codes: keepCodes.trim() || undefined,
+      set_excluded: !showExcluded, search: search || undefined, dry_run: true,
+    }).then((r) => r.data),
+    enabled: !showExcluded && !!query.data?.total,
+  })
+  const previewSelected = useQuery<ExcludePreview>({
+    queryKey: ['vod-library-language-preview-selected', contentType, showExcluded, keepCodes, Array.from(selectedIds).join(',')],
+    queryFn:  () => api.post('/vod/library-language/bulk-exclude/', {
+      content_type: contentType, excluded: showExcluded,
+      keep_codes: keepCodes.trim() || undefined,
+      set_excluded: !showExcluded, ids: Array.from(selectedIds), dry_run: true,
+    }).then((r) => r.data),
+    enabled: !showExcluded && selectedIds.size > 0,
+  })
+
   return (
     <Modal onClose={onClose} maxWidth="max-w-2xl">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
@@ -1920,7 +2071,14 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
         {!showExcluded && (
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-muted-foreground shrink-0">Keep a title if also available as:</span>
-            <input className={inputCls('w-28')} placeholder="e.g. EN (optional)" value={keepCodes} onChange={(e) => setKeepCodes(e.target.value)} />
+            <input
+              className={inputCls('w-28')}
+              placeholder="e.g. EN (optional)"
+              defaultValue={keepCodes}
+              onKeyDown={(e) => { if (e.key === 'Enter') setKeepCodes((e.target as HTMLInputElement).value.trim()) }}
+              onBlur={(e) => setKeepCodes(e.target.value.trim())}
+            />
+            {previewAllFiltered.isFetching && <Loader2 size={12} className="animate-spin text-muted-foreground" />}
           </div>
         )}
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -1929,7 +2087,11 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
             disabled={selectedIds.size === 0 || bulkExclude.isPending}
             onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, ids: Array.from(selectedIds) })}
           >
-            {showExcluded ? 'Un-archive selected' : 'Archive selected'} ({selectedIds.size})
+            {showExcluded
+              ? `Un-archive selected (${selectedIds.size})`
+              : previewSelected.data
+                ? `Archive selected (${previewSelected.data.changed} of ${selectedIds.size}${previewSelected.data.skipped ? ` — ${previewSelected.data.skipped} would be skipped` : ''})`
+                : `Archive selected (${selectedIds.size})`}
           </Button>
           <Button
             size="sm" variant="outline"
@@ -1937,7 +2099,11 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
             onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, search: search || undefined })}
             title="Applies to every item matching the current search/language filter, not just this page"
           >
-            {showExcluded ? 'Un-archive all filtered' : 'Archive all filtered'} ({query.data?.total ?? 0})
+            {showExcluded
+              ? `Un-archive all filtered (${query.data?.total ?? 0})`
+              : previewAllFiltered.data
+                ? `Archive all filtered (${previewAllFiltered.data.changed} of ${query.data?.total ?? 0}${previewAllFiltered.data.skipped ? ` — ${previewAllFiltered.data.skipped} would be skipped` : ''})`
+                : `Archive all filtered (${query.data?.total ?? 0})`}
           </Button>
           {bulkResult && <span className="text-muted-foreground">{bulkResult}</span>}
         </div>
