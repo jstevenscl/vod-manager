@@ -3837,7 +3837,7 @@ export default function VodManager() {
           <input className={inputCls('w-28')} placeholder="TMDB List ID" value={tmdbListForm.list_id} onChange={(e) => setTmdbListForm({ ...tmdbListForm, list_id: e.target.value })} />
           <input
             className={inputCls()}
-            placeholder={`Name template, e.g. "Steven's ${TMDB_TOKEN} Picks"`}
+            placeholder={`Name template, e.g. "My ${TMDB_TOKEN} Picks"`}
             title={`Use ${TMDB_TOKEN} where the type name should be inserted. No ${TMDB_TOKEN}? We'll append " — <type>" to the end instead.`}
             value={tmdbListForm.name_template}
             onChange={(e) => setTmdbListForm({ ...tmdbListForm, name_template: e.target.value })}
