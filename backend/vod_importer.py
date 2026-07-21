@@ -29,8 +29,8 @@ _YEAR_SUFFIX_RE = re.compile(
     r"^(.*?)\s*(?<!\d)[-(]\s*(19\d{2}|20\d{2})\)?\s*(?:\[[^\]]*\]|[A-Z][A-Z\- ]{2,})?\s*$"
 )
 
-# Some real XC providers (e.g. ProviderD) silently drop the connection --
-# no HTTP response at all -- for requests without a browser-like User-Agent,
+# Some real XC providers silently drop the connection -- no HTTP response
+# at all -- for requests without a browser-like User-Agent,
 # httpx's default ("python-httpx/x.y.z") included. A generic desktop-browser
 # UA is enough to get a normal response.
 _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
@@ -268,8 +268,8 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
     )
 
     # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
-    # (standard XC shape), but at least one real provider (example-provider.tv)
-    # returns a plain list of per-season lists instead — [[ep,...], [ep,...]].
+    # (standard XC shape), but at least one real provider returns a plain
+    # list of per-season lists instead — [[ep,...], [ep,...]].
     # Each episode also carries its own "season" field regardless of shape, so
     # trust that over the dict key / list index, falling back to the latter
     # only if a provider omits it.

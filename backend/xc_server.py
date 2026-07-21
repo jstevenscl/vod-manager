@@ -41,11 +41,11 @@ router = APIRouter(tags=["xc-vod"])
 
 vod_db.init_db()
 
-# Some real XC providers (e.g. ProviderD) silently drop the connection -- no
-# HTTP response at all -- for requests without a browser-like User-Agent,
-# httpx's default included. Same fix as vod_importer.py's XCProviderClient,
-# needed here too since this is a separate connection (the actual stream
-# relay, not the catalog import).
+# Some real XC providers silently drop the connection -- no HTTP response at
+# all -- for requests without a browser-like User-Agent, httpx's default
+# included. Same fix as vod_importer.py's XCProviderClient, needed here too
+# since this is a separate connection (the actual stream relay, not the
+# catalog import).
 _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 

@@ -2115,10 +2115,11 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
             # A blank provider-supplied name has no real identity to match
             # on -- treating "" like any other string let unrelated titles
             # silently collapse into one shared row (a real corruption found
-            # in production: 3 completely unrelated ProviderC movies, different
-            # genres, merged into a single blank-named entry because they
-            # all matched (name='', year=NULL) exactly). Never match a blank
-            # name against anything, including another blank one -- but do
+            # in production: 3 completely unrelated movies from the same
+            # provider, different genres, merged into a single blank-named
+            # entry because they all matched (name='', year=NULL) exactly).
+            # Never match a blank name against anything, including another
+            # blank one -- but do
             # reuse this exact stream's own existing row across re-syncs
             # (looked up by provider+stream_id, not by name), or a periodic
             # catalog refresh would mint a fresh orphaned row every pass.
