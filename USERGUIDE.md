@@ -209,6 +209,32 @@ Manager only reaches out to for coordination.
 
 ![Connected Instances and Dispatcharr Connections](docs/screenshots/configuration-dispatcharr.png)
 
+### Before you start: remove existing provider VOD from Dispatcharr
+
+If any of your providers are already connected directly in Dispatcharr with
+VOD enabled, turn that off first. Otherwise you end up with the same movies
+and series pulled in twice — once straight from the provider, once again
+through VOD Manager's own pool — competing for the same groups.
+
+Do this **one provider at a time**, not all at once — running it across
+every provider simultaneously can cause database issues.
+
+For each provider:
+
+1. Open that provider's settings in Dispatcharr and go to **Groups → VOD -
+   Movies**, click **Deselect Visible**, then switch to the **VOD - Series**
+   tab and click **Deselect Visible** there too. Click **Save**, then
+   refresh the provider and wait for it to finish refreshing its VOD before
+   continuing.
+2. Go back into that provider's settings and turn off **Enable VOD
+   Scanning**.
+3. Move on to the next provider and repeat steps 1–2. Don't start the next
+   one until the current provider's refresh has fully finished.
+
+Once every provider is done, open the **VODs** modal in Dispatcharr and
+confirm both Movies and Series are empty. Only then are you ready to attach
+VOD Manager as the new source.
+
 ### Connecting a single instance (the easy way)
 
 Under *Dispatcharr Connections → Connect a new instance*, give it:
