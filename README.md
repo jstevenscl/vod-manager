@@ -11,6 +11,11 @@ different resellers). VOD Manager treats those as multiple *sources* for one
 pool entry rather than duplicate entries, and automatically fails over
 between them if one goes down or hits its connection limit.
 
+**New here?** See [USERGUIDE.md](USERGUIDE.md) for a full walkthrough with
+screenshots — installation, connecting Dispatcharr (single or multiple
+instances), security hardening, and every curation tool. This README is a
+concise technical reference for people already up and running.
+
 ## Requirements
 
 - Docker + Docker Compose
@@ -20,27 +25,27 @@ between them if one goes down or hits its connection limit.
   an Emby/Jellyfin server
 - One or more Dispatcharr instances to pull the resulting catalog into
 - A free [TMDB](https://www.themoviedb.org/settings/api) API key (v3 auth)
-  — used for enrichment and the year-review disambiguation flow, not
-  required for basic operation
+  — used for enrichment, the year-review/missing-artwork disambiguation
+  flows, and TMDB List sync; not required for basic operation
+- Optional: an API key from Anthropic, OpenAI, and/or Google (Gemini) for
+  the AI-assisted features (any one is enough; more than one lets you
+  switch providers without re-entering a key)
 
 ## Quick start
 
 ```bash
+docker build -t vod-manager:dev .
 docker compose up -d
 ```
 
-The app listens on port `8282`. First run walks you through:
+The app listens on port `8282`. First run asks you to set an admin
+username/password (VOD Manager's own login, separate from Dispatcharr's) —
+see [USERGUIDE.md](USERGUIDE.md#4-first-run-setup) for why you should set
+one rather than skip it.
 
-1. **Connect Dispatcharr** — VOD Manager needs its own Dispatcharr
-   connection (URL + API token) to push provider connection limits and
-   check live-TV viewer counts. This can be a different instance from the
-   ones actually pulling VOD content from it (see *Connecting multiple
-   Dispatcharr instances* below).
-2. **Set an admin username/password** — this is VOD Manager's own login,
-   separate from Dispatcharr's.
-
-From there, add your real providers (Providers section) and import their
-catalogs.
+From there: add your real providers (Curation & Maintenance → Providers)
+and import their catalogs, then connect Dispatcharr (below). Full
+walkthrough with screenshots in [USERGUIDE.md](USERGUIDE.md).
 
 ## Connecting Dispatcharr instances
 
@@ -61,8 +66,8 @@ Manager *and* VOD Manager pushes profile data back to it), but they don't
 have to match — you can have Dispatcharr instances that only pull, and
 connections VOD Manager only reaches out to for coordination.
 
-**Adding a new instance** (Settings → Dispatcharr Connections → "Connect a
-new instance"): give it that instance's own admin API token and VOD
+**Adding a new instance** (Configuration → Dispatcharr Connections →
+"Connect a new instance"): give it that instance's own admin API token and VOD
 Manager's own URL as reachable *from that instance* — this isn't always the
 same URL you're viewing VOD Manager at yourself (a co-located instance
 might use a Docker-internal hostname; a remote one needs your real public
@@ -82,8 +87,8 @@ user on that instance sees the identical catalog. For real per-audience
 control (e.g. a kids-only client, or handing a limited catalog directly to
 an end-user IPTV app like TiviMate or IPTV Smarters instead of routing it
 through Dispatcharr at all), restrict a specific Connected Instance's
-credential to a set of categories under Settings → Connected Instances →
-*Category access*. Left as "— all —" (the default), a client sees the whole
+credential to a set of categories under Configuration → Connected Instances
+→ *Category access*. Left as "— all —" (the default), a client sees the whole
 pool, matching every existing credential's behavior today. Restricting it
 is enforced everywhere that credential is used — catalog listing, info
 lookups, and the actual stream — not just hidden from the browse UI, so a
@@ -114,29 +119,34 @@ session ends — closing the player, an idle timeout with no further
 requests, or a Kill from Activity below all release the encoder process and
 any on-disk segments.
 
-## AI-assisted categories and Needs Review
+## AI-assisted categories, Needs Review, and Missing Artwork
 
-An Anthropic API key (Settings → VOD Settings) unlocks three assists, none
-of which ever apply anything automatically — every one is a suggestion you
-still review and confirm:
+An API key from **any** of Anthropic, OpenAI, or Google Gemini (Configuration
+→ API Keys — configure as many as you have access to, then pick which one
+is active) unlocks three assists, none of which ever apply anything
+automatically — every one is a suggestion you still review and confirm:
 
 - **Suggest a category with AI** (Categories) — describe a category in
-  plain English and Claude proposes a structured filter rule using the
+  plain English and the AI proposes a structured filter rule using the
   same fields/ops the manual rule builder uses (name, genre, year,
   country/language, director, is_adult). Good for anything expressible as
   field conditions; review the proposed rule before creating it.
 - **AI Evaluate** (✨ button on any category) — for criteria the rule
-  fields genuinely can't express (mood, plot, audience fit), Claude judges
+  fields genuinely can't express (mood, plot, audience fit), the AI judges
   actual titles against a plain-English description instead of matching
   fields. Real per-request API cost, so this always runs over a *bounded*
   candidate set (optionally narrowed first by a rule pre-filter) rather
   than the whole pool — the result always reports how many candidates were
   actually considered vs. left out by the cap, never a silent truncation.
-- **Ask AI** (Needs Year Review) — when an item has no year and multiple
-  TMDB candidates are ambiguous, Claude picks the most likely correct
-  match with its reasoning and a confidence level, as an extra hint
-  alongside the normal TMDB suggestion list. You still click a candidate
-  yourself to actually resolve it.
+- **Ask AI** (Needs Review, Missing Artwork) — when an item has no year, or
+  no confident poster match, and multiple TMDB candidates are ambiguous,
+  the AI picks the most likely correct match with its reasoning and a
+  confidence level, as an extra hint alongside the normal TMDB suggestion
+  list. You still click a candidate yourself to actually resolve it.
+
+See [USERGUIDE.md](USERGUIDE.md#10-curation-tools) for the full set of
+curation tools (Missing Artwork, Language Filter, Duplicate Finder, Needs
+Review, Orphan Checker) with screenshots.
 
 ## Shared connection-limit coordination
 
@@ -160,6 +170,9 @@ of exceeding the real limit.
 
 ## Security and deployment
 
+- **Set an admin login and don't skip it.** Until a login is configured,
+  every API route is unauthenticated — a startup log warning and an in-UI
+  confirmation are both there specifically to make this hard to overlook.
 - **Don't expose this to the public internet without TLS in front of it.**
   The app itself doesn't terminate TLS — put a reverse proxy or VPN/tunnel
   (Cloudflare Tunnel, WireGuard, etc.) in front if it needs to be reachable
@@ -167,29 +180,35 @@ of exceeding the real limit.
   protocol itself has no concept of session auth beyond a username/password
   in the URL, checked on every request — that's a real, if unavoidable,
   weak point once anything is internet-facing.
-- **Every connected instance gets its own credential**, not a shared one —
-  Settings → Connected Instances. Revoke or regenerate one without
-  affecting the others if a specific instance's credential is ever
-  compromised.
-- **Per-IP lockout** on the XC login: repeated failed attempts from one
-  address lock it out temporarily (configurable in Settings → Security;
+- **Login passwords are hashed with PBKDF2-HMAC-SHA256** (260,000
+  iterations), not a fast general-purpose hash — resistant to offline
+  brute-forcing if the config file ever leaked.
+- **Both the admin login and the XC (streaming) login have brute-force
+  lockout** — repeated failed attempts from one address get temporarily
+  locked out (XC lockout is configurable under Configuration → Security;
   changes apply within ~30s). This slows down automated brute-forcing but
   doesn't replace putting this behind a VPN/tunnel if it's ever going to be
-  reachable beyond a trusted network.
+  reachable beyond a trusted network. Lockout state is in-memory and resets
+  on every container restart — a restart-and-retry attacker is a much
+  smaller threat than an internet-facing app with no lockout at all.
+- **Streaming credentials are never written to logs.** The XC protocol
+  embeds them in the URL itself (its own convention, not ours) — both the
+  app's own logging and the container's access log redact them before
+  anything is written to stdout.
+- **Every connected instance gets its own credential**, not a shared one —
+  Configuration → Connected Instances. Revoke or regenerate one without
+  affecting the others if a specific instance's credential is ever
+  compromised.
 - **Optional per-instance IP allowlist** — if a specific connected
   instance's source IP is known and stable, you can lock its credential to
   that IP as an extra layer. Leave it blank for instances behind
   CGNAT/rotating IPs (locking those would just break them, not add real
   security, since the address isn't a reliable identity signal for them
   anyway).
-- Lockout state is in-memory and resets on every container restart — this
-  slows down a sustained automated attacker, but a restart-and-retry
-  attacker is a much smaller threat than an internet-facing app with no
-  lockout at all.
 
 ## Refresh schedule
 
-Settings → Refresh Schedule controls how often background work runs:
+Configuration → Refresh Schedule controls how often background work runs:
 
 - **Catalog refresh** — how often each provider *type* (XC, Plex, Emby,
   Jellyfin) gets automatically re-imported, each on its own interval.
@@ -205,18 +224,25 @@ Settings → Refresh Schedule controls how often background work runs:
 
 ## Backup and restore
 
-Settings → Backup & Restore lets you download, restore, or reset each piece
-of VOD Manager's state independently (config, sessions, the catalog
+Configuration → Backup & Restore lets you download, restore, or reset each
+piece of VOD Manager's state independently (config, sessions, the catalog
 database) — e.g. reset a corrupted database without touching saved
 credentials, or roll back just the config. Database downloads use SQLite's
 `VACUUM INTO` for a consistent snapshot even while the app is actively
 writing to it.
 
-## Orphan Checker
+## Curation tools
 
-Settings → Orphan Checker finds dead rows a provider deletion (or a bug)
-can leave behind — a series whose only source provider no longer exists,
-or movies/episodes with zero sources at all. Run a scan periodically,
-especially after removing a provider, and purge what it finds. It won't
-flag series with no episodes yet — that's normal for anything not yet
-lazily enriched, not broken.
+Curation & Maintenance and the Movies/TV Shows toolbars host a set of
+catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
+language-aware filter and sibling-safe bulk archiving), **Language Filter**
+(the same language filtering over your whole library, not just
+poster-missing items), **Duplicate Finder** (merges same-year entries that
+only differ by punctuation), **Needs Review** (resolves year-ambiguous
+imports), and **Orphan Checker** (finds dead rows a provider deletion can
+leave behind — a series whose only source provider no longer exists, or
+movies/episodes with zero sources at all). Every movie/series can also be
+manually renamed or have its year corrected from its own detail view, for
+whatever a provider's own catalog data got wrong with no other way to fix
+it. Full details and screenshots for each in
+[USERGUIDE.md](USERGUIDE.md#10-curation-tools).
