@@ -37,15 +37,32 @@ Jellyfin server — and merges them into a single deduplicated catalog (the
 Dispatcharr (or any other XC client) can pull it in exactly like it would
 pull in a real provider.
 
-```
- Your real sources                VOD Manager                Consumers
-┌──────────────────┐          ┌──────────────────┐        ┌──────────────┐
-│ XC provider #1    │───┐     │                   │        │              │
-│ XC provider #2    │───┼────▶│  Import → Pool    │───────▶│ Dispatcharr  │
-│ Plex server        │───┤     │  (dedupe, curate) │        │ (instance 1) │
-│ Emby/Jellyfin      │───┘     │  Own XC server    │───────▶│ Dispatcharr  │
-└──────────────────┘          └──────────────────┘        │ (instance 2) │
-                                                             └──────────────┘
+```mermaid
+flowchart LR
+    subgraph Sources["Your real sources"]
+        XC1["XC provider #1"]
+        XC2["XC provider #2"]
+        PLEX["Plex server"]
+        EMBY["Emby / Jellyfin"]
+    end
+
+    subgraph VM["VOD Manager"]
+        POOL["Import → Pool<br/>(dedupe, curate)"]
+        XCS["Own XC server"]
+    end
+
+    subgraph Consumers["Consumers"]
+        D1["Dispatcharr<br/>(instance 1)"]
+        D2["Dispatcharr<br/>(instance 2)"]
+    end
+
+    XC1 --> POOL
+    XC2 --> POOL
+    PLEX --> POOL
+    EMBY --> POOL
+    POOL --> XCS
+    XCS --> D1
+    XCS --> D2
 ```
 
 Why this matters in practice:
