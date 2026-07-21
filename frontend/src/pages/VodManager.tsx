@@ -128,6 +128,17 @@ interface MissingArtworkItem {
   year: number | null
 }
 
+interface DuplicateGroupItem {
+  id: number
+  name: string
+  source_count: number
+  category_count: number
+}
+
+interface DuplicateGroup {
+  items: DuplicateGroupItem[]
+}
+
 interface XcClient {
   id: number
   label: string
@@ -498,6 +509,16 @@ function Pager({ total, limit, offset, onOffset }: { total: number; limit: numbe
   )
 }
 
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200]
+
+function PageSizeSelect({ value, onChange }: { value: number; onChange: (n: number) => void }) {
+  return (
+    <select className={inputCls()} value={value} onChange={(e) => onChange(Number(e.target.value))} title="Items per page">
+      {PAGE_SIZE_OPTIONS.map((n) => <option key={n} value={n}>{n} / page</option>)}
+    </select>
+  )
+}
+
 // One flagged item: no year, ambiguous against 2+ existing pool entries with
 // the same name. TMDB suggestions are fetched on demand (only once expanded)
 // rather than eagerly for every flagged item on page load.
@@ -849,6 +870,37 @@ function MissingArtworkRow({ contentType, item, qc }: {
         </div>
       )}
     </li>
+  )
+}
+
+function DuplicateGroupRow({ group, onMerge, isPending }: {
+  group: DuplicateGroup
+  onMerge: (keepId: number, mergeIds: number[]) => void
+  isPending: boolean
+}) {
+  // Backend already sorts most-sourced/most-placed first -- the obvious
+  // default "keep" pick, but still a human decision the reviewer can override.
+  const [keepId, setKeepId] = useState(group.items[0].id)
+  return (
+    <div className="border border-border rounded px-2 py-1.5 space-y-1">
+      {group.items.map((item) => (
+        <label key={item.id} className="flex items-center gap-2 cursor-pointer">
+          <input type="radio" checked={keepId === item.id} onChange={() => setKeepId(item.id)} />
+          <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}</span>
+          <span className="text-muted-foreground">
+            {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
+          </span>
+        </label>
+      ))}
+      <Button
+        size="sm"
+        disabled={isPending}
+        onClick={() => onMerge(keepId, group.items.filter((i) => i.id !== keepId).map((i) => i.id))}
+      >
+        {isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+        Merge into selected
+      </Button>
+    </div>
   )
 }
 
@@ -2103,14 +2155,40 @@ export default function VodManager() {
     },
   })
 
+  // ── Duplicate finder (same-year entries differing only by punctuation) ──
+  const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
+  const [duplicatesOffset, setDuplicatesOffset] = useState(0)
+  const DUPLICATES_PAGE_SIZE = 20
+  const duplicatesQuery = useQuery<DuplicateGroup[]>({
+    queryKey: ['vod-duplicates', duplicatesContentType],
+    queryFn:  () => api.get('/vod/duplicates/', { params: { content_type: duplicatesContentType } }).then((r) => r.data),
+    enabled:  false,  // scan on demand only -- this walks the whole pool, not something to run on every page load
+  })
+  const mergeDuplicateGroup = useMutation({
+    mutationFn: (body: { keep_id: number; merge_ids: number[] }) =>
+      api.post('/vod/duplicates/merge/', { content_type: duplicatesContentType, ...body }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-duplicates'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+
   // ── Movies ──
   const [movieSearch, setMovieSearch] = useState('')
   const [movieOffset, setMovieOffset] = useState(0)
   const [movieCategoryFilter, setMovieCategoryFilter] = useState<number | null>(null)
   const [movieProviderFilter, setMovieProviderFilter] = useState<number | null>(null)
-  const MOVIE_LIMIT = 25
+  const [MOVIE_LIMIT, setMovieLimitState] = useState(
+    () => Number(localStorage.getItem('vodmanager-movies-limit')) || 25
+  )
+  function setMovieLimit(n: number) {
+    localStorage.setItem('vodmanager-movies-limit', String(n))
+    setMovieLimitState(n)
+    setMovieOffset(0)
+  }
   const moviesQuery = useQuery<Page<Movie>>({
-    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter],
+    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, MOVIE_LIMIT],
     queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined } }).then((r) => r.data),
   })
   const [movieForm, setMovieForm] = useState({ name: '', year: '' })
@@ -2145,9 +2223,16 @@ export default function VodManager() {
   const [seriesOffset, setSeriesOffset] = useState(0)
   const [seriesCategoryFilter, setSeriesCategoryFilter] = useState<number | null>(null)
   const [seriesProviderFilter, setSeriesProviderFilter] = useState<number | null>(null)
-  const SERIES_LIMIT = 25
+  const [SERIES_LIMIT, setSeriesLimitState] = useState(
+    () => Number(localStorage.getItem('vodmanager-series-limit')) || 25
+  )
+  function setSeriesLimit(n: number) {
+    localStorage.setItem('vodmanager-series-limit', String(n))
+    setSeriesLimitState(n)
+    setSeriesOffset(0)
+  }
   const seriesQuery = useQuery<Page<Series>>({
-    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter],
+    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, SERIES_LIMIT],
     queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined } }).then((r) => r.data),
   })
   const [seriesForm, setSeriesForm] = useState({ name: '', year: '' })
@@ -3133,6 +3218,60 @@ export default function VodManager() {
         )}
       </SectionCard>
 
+      <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Finds same-year pool entries whose names only differ by cosmetic punctuation (a colon, a dash, quote
+          style) — real providers sometimes format the same title slightly differently, splitting what should be
+          one pool entry with multiple sources into two "duplicates". Pick which spelling to keep for each group;
+          the rest merge into it (sources, categories, and episodes move over, nothing is lost).
+        </p>
+        <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+            <button
+              className={`px-2 py-0.5 rounded text-xs ${duplicatesContentType === 'movie' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => { setDuplicatesContentType('movie'); setDuplicatesOffset(0) }}
+            >
+              Movies
+            </button>
+            <button
+              className={`px-2 py-0.5 rounded text-xs ${duplicatesContentType === 'series' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => { setDuplicatesContentType('series'); setDuplicatesOffset(0) }}
+            >
+              TV Shows
+            </button>
+          </div>
+          <Button size="sm" variant="outline" disabled={duplicatesQuery.isFetching} onClick={() => { setDuplicatesOffset(0); duplicatesQuery.refetch() }}>
+            {duplicatesQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            Scan
+          </Button>
+          {duplicatesQuery.data && duplicatesQuery.data.length === 0 && (
+            <span className="text-xs text-muted-foreground">Clean — nothing found.</span>
+          )}
+          {!!duplicatesQuery.data?.length && (
+            <>
+              <span className="text-xs text-muted-foreground">{duplicatesQuery.data.length} group{duplicatesQuery.data.length === 1 ? '' : 's'} found</span>
+              <Pager total={duplicatesQuery.data.length} limit={DUPLICATES_PAGE_SIZE} offset={duplicatesOffset} onOffset={setDuplicatesOffset} />
+            </>
+          )}
+        </div>
+        {!!duplicatesQuery.data?.length && (
+          // Client-side slice, not a second network round-trip -- the scan
+          // already walked the whole pool in one query; thousands of groups
+          // in the DOM at once (not just in memory) is what actually made
+          // the page unusably slow, so only render one page's worth.
+          <div className="text-xs space-y-1.5">
+            {duplicatesQuery.data.slice(duplicatesOffset, duplicatesOffset + DUPLICATES_PAGE_SIZE).map((group) => (
+              <DuplicateGroupRow
+                key={group.items.map((i) => i.id).join('-')}
+                group={group}
+                isPending={mergeDuplicateGroup.isPending}
+                onMerge={(keepId, mergeIds) => mergeDuplicateGroup.mutate({ keep_id: keepId, merge_ids: mergeIds })}
+              />
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
       <SectionCard title="TMDB Lists" icon={<RefreshCw size={14} />}>
         <p className="text-xs text-muted-foreground">
           Auto-populate categories from a public TMDB List (movie + TV watchlists). A list can hold both movies and
@@ -3245,6 +3384,7 @@ export default function VodManager() {
             </span>
           )}
           {moviesQuery.data && <Pager total={moviesQuery.data.total} limit={MOVIE_LIMIT} offset={movieOffset} onOffset={setMovieOffset} />}
+          <PageSizeSelect value={MOVIE_LIMIT} onChange={setMovieLimit} />
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('movie')}>Manage Categories</Button>
@@ -3317,6 +3457,12 @@ export default function VodManager() {
             />
           ))}
         </div>
+        {moviesQuery.data && (
+          <div className="flex items-center gap-1.5">
+            <Pager total={moviesQuery.data.total} limit={MOVIE_LIMIT} offset={movieOffset} onOffset={setMovieOffset} />
+            <PageSizeSelect value={MOVIE_LIMIT} onChange={setMovieLimit} />
+          </div>
+        )}
         <div className="flex items-center gap-1.5 pt-1">
           <input className={inputCls()} placeholder="Movie name" value={movieForm.name} onChange={(e) => setMovieForm({ ...movieForm, name: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Year" value={movieForm.year} onChange={(e) => setMovieForm({ ...movieForm, year: e.target.value })} />
@@ -3355,6 +3501,7 @@ export default function VodManager() {
             </span>
           )}
           {seriesQuery.data && <Pager total={seriesQuery.data.total} limit={SERIES_LIMIT} offset={seriesOffset} onOffset={setSeriesOffset} />}
+          <PageSizeSelect value={SERIES_LIMIT} onChange={setSeriesLimit} />
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('series')}>Manage Categories</Button>
@@ -3426,6 +3573,12 @@ export default function VodManager() {
             />
           ))}
         </div>
+        {seriesQuery.data && (
+          <div className="flex items-center gap-1.5">
+            <Pager total={seriesQuery.data.total} limit={SERIES_LIMIT} offset={seriesOffset} onOffset={setSeriesOffset} />
+            <PageSizeSelect value={SERIES_LIMIT} onChange={setSeriesLimit} />
+          </div>
+        )}
         <div className="flex items-center gap-1.5 pt-1">
           <input className={inputCls()} placeholder="Series name" value={seriesForm.name} onChange={(e) => setSeriesForm({ ...seriesForm, name: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Year" value={seriesForm.year} onChange={(e) => setSeriesForm({ ...seriesForm, year: e.target.value })} />

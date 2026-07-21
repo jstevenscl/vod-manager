@@ -13,6 +13,7 @@ resolving back to the same real provider source.
 """
 
 import logging
+import re
 import secrets
 import sqlite3
 import time
@@ -624,6 +625,99 @@ def purge_orphans() -> dict:
         "movies_deleted": len(sourceless_movie_ids),
         "episodes_deleted": len(sourceless_episode_ids),
     }
+
+
+# ── Duplicate finder (punctuation/whitespace-only name variants) ───────────
+# Import matching (bulk_import_movies/bulk_import_series, upsert_movie) keys
+# on exact name+year -- a provider that formats the same title slightly
+# differently ("Title" vs "Title:") creates a second real pool entry instead
+# of matching the existing one (a real case: "#AMFAD All My Friends Are
+# Dead" vs "#AMFAD: All My Friends Are Dead", both 2024, split into two
+# rows). Same review-before-merge trust pattern as Orphan Checker/Needs
+# Review, not an automatic pass -- punctuation normalization is
+# high-confidence but not risk-free, and a bad auto-merge is much harder to
+# notice/undo than a bad auto-delete.
+
+_DUPLICATE_STRIP_RE = re.compile(r"[:;,.'\"’‘“”\-–—]")
+_DUPLICATE_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_title_for_dedup(name: str) -> str:
+    stripped = _DUPLICATE_STRIP_RE.sub("", name)
+    return _DUPLICATE_WS_RE.sub(" ", stripped).strip().lower()
+
+
+def find_duplicate_groups(content_type: str) -> list[dict]:
+    """Groups same-year pool entries whose names are identical once cosmetic
+    punctuation/whitespace is stripped. Only years we're confident about
+    (year IS NOT NULL) -- pairing on name alone would be a much weaker
+    signal and belongs to needs_year_review instead, not this scan."""
+    table = "movies" if content_type == "movie" else "series"
+    id_col = "movie_id" if content_type == "movie" else "series_id"
+    placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
+
+    conn = _connect()
+    rows = conn.execute(f"SELECT id, name, year FROM {table} WHERE year IS NOT NULL").fetchall()
+
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for r in rows:
+        key = (_normalize_title_for_dedup(r["name"]), r["year"])
+        groups.setdefault(key, []).append({"id": r["id"], "name": r["name"]})
+
+    # Only real punctuation-variant duplicates -- a group of 2+ rows that
+    # already share the exact same name shouldn't exist (import matching
+    # would have collapsed them), so require at least 2 *distinct* spellings.
+    candidate_groups = [items for items in groups.values() if len(items) >= 2 and len({i["name"] for i in items}) >= 2]
+    if not candidate_groups:
+        conn.close()
+        return []
+
+    all_ids = [i["id"] for items in candidate_groups for i in items]
+    placeholders = ",".join("?" for _ in all_ids)
+
+    if content_type == "movie":
+        src_counts = conn.execute(
+            f"SELECT movie_id AS id, COUNT(*) c FROM movie_sources WHERE movie_id IN ({placeholders}) GROUP BY movie_id",
+            all_ids,
+        ).fetchall()
+    else:
+        src_counts = conn.execute(f"""
+            SELECT e.series_id AS id, COUNT(*) c FROM episode_sources es
+            JOIN episodes e ON e.id = es.episode_id
+            WHERE e.series_id IN ({placeholders}) GROUP BY e.series_id
+        """, all_ids).fetchall()
+    src_count_by_id = {r["id"]: r["c"] for r in src_counts}
+
+    cat_counts = conn.execute(
+        f"SELECT {id_col} AS id, COUNT(*) c FROM {placements_table} WHERE {id_col} IN ({placeholders}) GROUP BY {id_col}",
+        all_ids,
+    ).fetchall()
+    cat_count_by_id = {r["id"]: r["c"] for r in cat_counts}
+    conn.close()
+
+    result = []
+    for items in candidate_groups:
+        for i in items:
+            i["source_count"] = src_count_by_id.get(i["id"], 0)
+            i["category_count"] = cat_count_by_id.get(i["id"], 0)
+        # Most-sourced/most-placed first -- the obvious default "keep" pick.
+        items.sort(key=lambda i: (-i["source_count"], -i["category_count"]))
+        result.append({"items": items})
+    result.sort(key=lambda g: -sum(i["source_count"] for i in g["items"]))
+    return result
+
+
+def merge_duplicate_group(content_type: str, keep_id: int, merge_ids: list[int]) -> dict:
+    merged = 0
+    for mid in merge_ids:
+        if mid == keep_id:
+            continue
+        if content_type == "movie":
+            merge_movie(mid, keep_id)
+        else:
+            merge_series(mid, keep_id)
+        merged += 1
+    return {"kept_id": keep_id, "merged_count": merged}
 
 
 # ── XC clients ───────────────────────────────────────────────────────────────

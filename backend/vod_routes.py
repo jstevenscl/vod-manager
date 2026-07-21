@@ -161,6 +161,12 @@ class ResolveMissingArtworkRequest(BaseModel):
     year: Optional[int] = None
 
 
+class MergeDuplicateGroupRequest(BaseModel):
+    content_type: str
+    keep_id: int
+    merge_ids: list[int]
+
+
 class MovieRequest(BaseModel):
     name: str
     year: Optional[int] = None
@@ -753,6 +759,25 @@ async def scan_orphans():
 @router.post("/orphans/purge/", dependencies=_GUARDS)
 async def purge_orphans_route():
     return vod_db.purge_orphans()
+
+
+# ── Duplicate finder ─────────────────────────────────────────────────────────
+# Self-service scan/merge for same-year pool entries that only differ by
+# cosmetic punctuation (a colon, a dash, quote style) -- see
+# vod_db.find_duplicate_groups/merge_duplicate_group.
+
+@router.get("/duplicates/", dependencies=_GUARDS)
+async def scan_duplicates(content_type: str):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.find_duplicate_groups(content_type)
+
+
+@router.post("/duplicates/merge/", dependencies=_GUARDS)
+async def merge_duplicates(body: MergeDuplicateGroupRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.merge_duplicate_group(body.content_type, body.keep_id, body.merge_ids)
 
 
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
