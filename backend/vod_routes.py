@@ -167,6 +167,24 @@ class MergeDuplicateGroupRequest(BaseModel):
     merge_ids: list[int]
 
 
+class BulkMissingArtworkPosterRequest(BaseModel):
+    content_type: str
+    poster_url: str
+    ids: Optional[list[int]] = None
+    search: Optional[str] = None
+    excluded: bool = False
+    script: Optional[str] = None
+
+
+class BulkMissingArtworkExcludeRequest(BaseModel):
+    content_type: str
+    set_excluded: bool
+    ids: Optional[list[int]] = None
+    search: Optional[str] = None
+    excluded: bool = False
+    script: Optional[str] = None
+
+
 class MovieRequest(BaseModel):
     name: str
     year: Optional[int] = None
@@ -846,13 +864,34 @@ async def resolve_year_review(content_type: str, item_id: int, body: ResolveYear
 @router.get("/missing-artwork/", dependencies=_GUARDS)
 async def list_missing_artwork(
     content_type: str, limit: int = 30, offset: int = 0, search: Optional[str] = None,
+    excluded: bool = False, script: Optional[str] = None,
 ):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     return {
-        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search),
-        "total": vod_db.count_missing_artwork(content_type, search=search),
+        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script),
+        "total": vod_db.count_missing_artwork(content_type, search=search, excluded=excluded, script=script),
     }
+
+
+@router.post("/missing-artwork/bulk-poster/", dependencies=_GUARDS)
+async def bulk_apply_missing_artwork_poster(body: BulkMissingArtworkPosterRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if not body.poster_url.strip():
+        raise HTTPException(400, detail="poster_url is required")
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script)
+    applied = vod_db.bulk_set_poster_url(body.content_type, ids, body.poster_url.strip())
+    return {"applied": applied}
+
+
+@router.post("/missing-artwork/bulk-exclude/", dependencies=_GUARDS)
+async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script)
+    changed = vod_db.bulk_set_review_excluded(body.content_type, ids, body.set_excluded)
+    return {"changed": changed}
 
 
 @router.get("/missing-artwork/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)

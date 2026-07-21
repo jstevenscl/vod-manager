@@ -296,6 +296,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "last_catalog_refresh_at", "TEXT"),
         ("xc_clients", "category_allowlist", "TEXT"),
         ("categories", "ai_description", "TEXT"),
+        ("movies", "review_excluded", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "review_excluded", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -657,7 +659,7 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
 
     conn = _connect()
-    rows = conn.execute(f"SELECT id, name, year FROM {table} WHERE year IS NOT NULL").fetchall()
+    rows = conn.execute(f"SELECT id, name, year FROM {table} WHERE year IS NOT NULL AND review_excluded=0").fetchall()
 
     groups: dict[tuple[str, int], list[dict]] = {}
     for r in rows:
@@ -2543,7 +2545,7 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
     out: dict = {}
     if content_type in (None, "movie"):
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM movies WHERE needs_year_review=1 ORDER BY name"
+            "SELECT * FROM movies WHERE needs_year_review=1 AND review_excluded=0 ORDER BY name"
         ).fetchall()]
         for row in rows:
             # Transcoded fallback preview needs a specific movie_sources row
@@ -2557,7 +2559,7 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
         out["movies"] = rows
     if content_type in (None, "series"):
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM series WHERE needs_year_review=1 ORDER BY name"
+            "SELECT * FROM series WHERE needs_year_review=1 AND review_excluded=0 ORDER BY name"
         ).fetchall()]
         for row in rows:
             # A preview needs a specific episode (the XC preview route is keyed
@@ -2634,35 +2636,122 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
 # real TMDB search (tmdb_sync.search_title) a human or the AI picks from,
 # same review-before-apply shape as needs_year_review above.
 
-def list_missing_artwork(content_type: str, limit: int = 50, offset: int = 0, search: str | None = None) -> list[dict]:
-    table = "movies" if content_type == "movie" else "series"
-    conn = _connect()
-    where = ["(poster_url IS NULL OR poster_url = '')"]
-    params: list = []
+# Broad non-Latin-script detector -- not tied to any one language (Arabic,
+# Thai, Chinese/Japanese/Korean, Cyrillic, Greek, Hebrew, Devanagari all
+# match) so "filter out foreign-script titles" works the same way for any
+# deployment's actual catalog mix, not just the language a given provider
+# happens to include a lot of.
+_NON_LATIN_RE = re.compile(
+    "[؀-ۿݐ-ݿ"   # Arabic
+    "֐-׿"                 # Hebrew
+    "฀-๿"                 # Thai
+    "一-鿿㐀-䶿"    # CJK
+    "぀-ヿ"                 # Hiragana/Katakana
+    "가-힯"                 # Hangul
+    "Ѐ-ӿ"                 # Cyrillic
+    "Ͱ-Ͽ"                 # Greek
+    "ऀ-ॿ]"                # Devanagari
+)
+
+
+def _is_non_latin_name(name: str) -> bool:
+    return bool(_NON_LATIN_RE.search(name))
+
+
+def _missing_artwork_clause(search: str | None, excluded: bool) -> tuple[str, list]:
+    where = ["(poster_url IS NULL OR poster_url = '')", "review_excluded = ?"]
+    params: list = [1 if excluded else 0]
     if search:
         where.append("name LIKE ?")
         params.append(f"%{search}%")
-    clause = f"WHERE {' AND '.join(where)}"
-    rows = conn.execute(
-        f"SELECT * FROM {table} {clause} ORDER BY name LIMIT ? OFFSET ?",
-        (*params, limit, offset),
-    ).fetchall()
+    return f"WHERE {' AND '.join(where)}", params
+
+
+def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script: str | None) -> list:
+    """script filtering can't be expressed in SQL (SQLite has no Unicode
+    script/category matching), so when it's requested this fetches every
+    matching row (already bounded by the poster/search/excluded filters,
+    same as any other admin scan in this file) and filters in Python."""
+    clause, params = _missing_artwork_clause(search, excluded)
+    conn = _connect()
+    rows = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY name", params).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    if script == "non_latin":
+        rows = [r for r in rows if _is_non_latin_name(r["name"])]
+    return rows
 
 
-def count_missing_artwork(content_type: str, search: str | None = None) -> int:
+def list_missing_artwork(
+    content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
+    excluded: bool = False, script: str | None = None,
+) -> list[dict]:
     table = "movies" if content_type == "movie" else "series"
+    rows = _missing_artwork_rows(table, search, excluded, script)
+    return [dict(r) for r in rows[offset:offset + limit]]
+
+
+def count_missing_artwork(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> int:
+    table = "movies" if content_type == "movie" else "series"
+    if script:
+        return len(_missing_artwork_rows(table, search, excluded, script))
+    clause, params = _missing_artwork_clause(search, excluded)
     conn = _connect()
-    where = ["(poster_url IS NULL OR poster_url = '')"]
-    params: list = []
-    if search:
-        where.append("name LIKE ?")
-        params.append(f"%{search}%")
-    clause = f"WHERE {' AND '.join(where)}"
     n = conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
     conn.close()
     return n
+
+
+def list_missing_artwork_ids(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> list[int]:
+    """Every matching id, not just one page -- backs the "select all
+    matching this search" bulk actions (apply-poster/exclude), same pattern
+    as list_all_movie_ids for category bulk-place."""
+    table = "movies" if content_type == "movie" else "series"
+    if script:
+        return [r["id"] for r in _missing_artwork_rows(table, search, excluded, script)]
+    clause, params = _missing_artwork_clause(search, excluded)
+    conn = _connect()
+    rows = conn.execute(f"SELECT id FROM {table} {clause}", params).fetchall()
+    conn.close()
+    return [r["id"] for r in rows]
+
+
+def bulk_set_poster_url(content_type: str, ids: list[int], poster_url: str) -> int:
+    """Blanket-apply one poster/placeholder image to many items at once --
+    e.g. a generic logo for a whole batch of items a real per-title poster
+    will never exist for (stock/creator content, local recordings)."""
+    if not ids:
+        return 0
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"UPDATE {table} SET poster_url=?, updated_at=? WHERE id IN ({placeholders})",
+        (poster_url, _now(), *ids),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+    return len(ids)
+
+
+def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) -> int:
+    """Archives/unarchives items out of (or back into) every review queue --
+    Missing Artwork, Needs Review, Duplicate Finder -- without touching the
+    content itself: still fully browsable/playable/categorizable, just no
+    longer flagged as something that needs attention. For content a given
+    deployment doesn't care to curate (e.g. a foreign-language catalog a
+    user has no interest in enriching) rather than something to delete."""
+    if not ids:
+        return 0
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"UPDATE {table} SET review_excluded=?, updated_at=? WHERE id IN ({placeholders})",
+        (1 if excluded else 0, _now(), *ids),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+    return len(ids)
 
 
 def resolve_missing_artwork(

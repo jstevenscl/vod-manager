@@ -736,10 +736,12 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   )
 }
 
-function MissingArtworkRow({ contentType, item, qc }: {
+function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: {
   contentType: 'movie' | 'series'
   item: MissingArtworkItem
   qc: ReturnType<typeof useQueryClient>
+  selected: boolean
+  onToggleSelect: () => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const [searchOverride, setSearchOverride] = useState('')
@@ -780,6 +782,7 @@ function MissingArtworkRow({ contentType, item, qc }: {
     <li className="border-b border-border/50 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="min-w-0 truncate flex items-center gap-1.5">
+          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk action" />
           <ImageOff size={12} className="text-muted-foreground shrink-0" />
           {item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}
         </span>
@@ -1599,12 +1602,54 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
 }) {
   const [search, setSearch] = useState('')
   const [offset, setOffset] = useState(0)
+  const [showExcluded, setShowExcluded] = useState(false)
+  // Free-text search can't isolate "everything in a foreign script" -- this
+  // flags any title containing non-Latin-script characters (Arabic, Thai,
+  // CJK, Cyrillic, Greek, Hebrew, Devanagari), so a whole language/region's
+  // worth of titles can be archived in one "all filtered" action instead of
+  // checking them off one at a time.
+  const [nonLatinOnly, setNonLatinOnly] = useState(false)
   const LIMIT = 25
   const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
-    queryKey: ['vod-missing-artwork', contentType, search, offset],
+    queryKey: ['vod-missing-artwork', contentType, search, offset, showExcluded, nonLatinOnly],
     queryFn:  () => api.get('/vod/missing-artwork/', {
-      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset },
+      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined },
     }).then((r) => r.data),
+  })
+
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  function toggleSelected(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const [bulkPosterUrl, setBulkPosterUrl] = useState('')
+  const [bulkResult, setBulkResult] = useState<string | null>(null)
+  const invalidateAfterBulk = () => {
+    qc.invalidateQueries({ queryKey: ['vod-missing-artwork'] })
+    qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    setSelectedIds(new Set())
+  }
+  const bulkApplyPoster = useMutation({
+    mutationFn: (body: { ids?: number[]; search?: string }) =>
+      api.post('/vod/missing-artwork/bulk-poster/', {
+        content_type: contentType, poster_url: bulkPosterUrl.trim(), excluded: showExcluded,
+        script: nonLatinOnly ? 'non_latin' : undefined, ...body,
+      }),
+    onSuccess: (r) => { setBulkResult(`Applied to ${r.data.applied}.`); setBulkPosterUrl(''); invalidateAfterBulk() },
+    onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const bulkExclude = useMutation({
+    mutationFn: (body: { set_excluded: boolean; ids?: number[]; search?: string }) =>
+      api.post('/vod/missing-artwork/bulk-exclude/', {
+        content_type: contentType, excluded: showExcluded,
+        script: nonLatinOnly ? 'non_latin' : undefined, ...body,
+      }),
+    onSuccess: (r) => { setBulkResult(`${r.data.changed} updated.`); invalidateAfterBulk() },
+    onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
   return (
@@ -1613,19 +1658,81 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
         <span className="text-sm font-medium shrink-0">
           Missing Artwork — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({query.data?.total ?? '…'})
         </span>
+        <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer">
+          <input type="checkbox" checked={showExcluded} onChange={(e) => { setShowExcluded(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
+          Show archived
+        </label>
+        <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer" title="Titles containing Arabic, Thai, CJK, Cyrillic, Greek, Hebrew, or Devanagari characters">
+          <input type="checkbox" checked={nonLatinOnly} onChange={(e) => { setNonLatinOnly(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
+          Non-Latin script only
+        </label>
         <input
-          className={inputCls('w-40')}
+          className={inputCls('w-36')}
           placeholder="Search…"
           defaultValue={search}
           onKeyDown={(e) => { if (e.key === 'Enter') { setSearch((e.target as HTMLInputElement).value.trim()); setOffset(0) } }}
           onBlur={(e) => { setSearch(e.target.value.trim()); setOffset(0) }}
         />
       </div>
+      <div className="px-4 pt-3 text-xs space-y-1.5 border-b border-border pb-3">
+        <p className="text-muted-foreground">
+          {showExcluded
+            ? 'Archived items are hidden from Missing Artwork, Needs Review, and Duplicate Finder — still fully browsable/playable, just not flagged as needing attention.'
+            : 'Blanket-apply one image to many items at once (e.g. a generic logo for content that will never have a real per-title poster), or archive content you don\'t want flagged here.'}
+        </p>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <input
+            className={inputCls('flex-1 min-w-40')}
+            placeholder="Poster URL to apply…"
+            value={bulkPosterUrl}
+            onChange={(e) => setBulkPosterUrl(e.target.value)}
+          />
+          <Button
+            size="sm" variant="outline"
+            disabled={!bulkPosterUrl.trim() || selectedIds.size === 0 || bulkApplyPoster.isPending}
+            onClick={() => bulkApplyPoster.mutate({ ids: Array.from(selectedIds) })}
+          >
+            Apply to selected ({selectedIds.size})
+          </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!bulkPosterUrl.trim() || !query.data?.total || bulkApplyPoster.isPending}
+            onClick={() => bulkApplyPoster.mutate({ search: search || undefined })}
+            title="Applies to every item matching the current search, not just this page"
+          >
+            Apply to all filtered ({query.data?.total ?? 0})
+          </Button>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <Button
+            size="sm" variant="outline"
+            disabled={selectedIds.size === 0 || bulkExclude.isPending}
+            onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, ids: Array.from(selectedIds) })}
+          >
+            {showExcluded ? 'Un-archive selected' : 'Archive selected'} ({selectedIds.size})
+          </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!query.data?.total || bulkExclude.isPending}
+            onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, search: search || undefined })}
+            title="Applies to every item matching the current search, not just this page"
+          >
+            {showExcluded ? 'Un-archive all filtered' : 'Archive all filtered'} ({query.data?.total ?? 0})
+          </Button>
+          {bulkResult && <span className="text-muted-foreground">{bulkResult}</span>}
+        </div>
+      </div>
       <div className="p-4 text-xs overflow-y-auto">
-        {query.data?.items.length === 0 && <p className="text-muted-foreground">Nothing missing artwork right now.</p>}
+        {query.data?.items.length === 0 && (
+          <p className="text-muted-foreground">{showExcluded ? 'Nothing archived.' : 'Nothing missing artwork right now.'}</p>
+        )}
         <ul>
           {query.data?.items.map((item) => (
-            <MissingArtworkRow key={item.id} contentType={contentType} item={item} qc={qc} />
+            <MissingArtworkRow
+              key={item.id} contentType={contentType} item={item} qc={qc}
+              selected={selectedIds.has(item.id)}
+              onToggleSelect={() => toggleSelected(item.id)}
+            />
           ))}
         </ul>
         {query.data && <div className="pt-2"><Pager total={query.data.total} limit={LIMIT} offset={offset} onOffset={setOffset} /></div>}
