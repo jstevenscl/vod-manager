@@ -1648,6 +1648,10 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
   }
 
   const [bulkPosterUrl, setBulkPosterUrl] = useState('')
+  // Only used for archiving driven by the language/script filters above --
+  // "archive all filtered" then only archives a title if a copy also
+  // exists in one of these (or unprefixed), never your only copy of it.
+  const [keepCodes, setKeepCodes] = useState('')
   const [bulkResult, setBulkResult] = useState<string | null>(null)
   const invalidateAfterBulk = () => {
     qc.invalidateQueries({ queryKey: ['vod-missing-artwork'] })
@@ -1667,9 +1671,17 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     mutationFn: (body: { set_excluded: boolean; ids?: number[]; search?: string }) =>
       api.post('/vod/missing-artwork/bulk-exclude/', {
         content_type: contentType, excluded: showExcluded,
-        script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam, ...body,
+        script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam,
+        keep_codes: keepCodes.trim() || undefined, ...body,
       }),
-    onSuccess: (r) => { setBulkResult(`${r.data.changed} updated.`); invalidateAfterBulk() },
+    onSuccess: (r) => {
+      const skipped = r.data.skipped as number | undefined
+      setBulkResult(
+        `${r.data.changed} updated.` +
+        (skipped ? ` ${skipped} skipped (no copy in a kept language) — e.g. ${r.data.skipped_examples.slice(0, 3).join(', ')}` : '')
+      )
+      invalidateAfterBulk()
+    },
     onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
@@ -1718,6 +1730,12 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
                 clear
               </button>
             )}
+          </div>
+        )}
+        {!showExcluded && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-muted-foreground shrink-0">Archiving by language keeps a title if also available as:</span>
+            <input className={inputCls('w-28')} placeholder="e.g. EN (optional)" value={keepCodes} onChange={(e) => setKeepCodes(e.target.value)} />
           </div>
         )}
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -1781,6 +1799,167 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
   )
 }
 
+// Same script/prefix filtering as Missing Artwork, but over the WHOLE pool
+// (a title with a real poster is just as much "not in my language" as one
+// without) -- see vod_db.list_library_filtered's docstring. Archiving here
+// always goes through the sibling check (vod_db.smart_bulk_exclude): a
+// title only gets archived if a copy also exists in a kept language,
+// never removing the only way to watch something.
+function LibraryLanguageModal({ contentType, qc, onClose }: {
+  contentType: 'movie' | 'series'
+  qc: ReturnType<typeof useQueryClient>
+  onClose: () => void
+}) {
+  const [search, setSearch] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [showExcluded, setShowExcluded] = useState(false)
+  const [nonLatinOnly, setNonLatinOnly] = useState(false)
+  const [selectedPrefixes, setSelectedPrefixes] = useState<Set<string>>(new Set())
+  const [keepCodes, setKeepCodes] = useState('')
+  const prefixesParam = selectedPrefixes.size ? Array.from(selectedPrefixes).join(',') : undefined
+  const LIMIT = 25
+
+  const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
+    queryKey: ['vod-library-language', contentType, search, offset, showExcluded, nonLatinOnly, prefixesParam],
+    queryFn:  () => api.get('/vod/library-language/', {
+      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam },
+    }).then((r) => r.data),
+  })
+  const prefixesQuery = useQuery<{ code: string; count: number }[]>({
+    queryKey: ['vod-library-language-prefixes', contentType, search, showExcluded, nonLatinOnly],
+    queryFn:  () => api.get('/vod/library-language/prefixes/', {
+      params: { content_type: contentType, search: search || undefined, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined },
+    }).then((r) => r.data),
+  })
+  function togglePrefix(code: string) {
+    setSelectedPrefixes((prev) => {
+      const next = new Set(prev)
+      next.has(code) ? next.delete(code) : next.add(code)
+      return next
+    })
+    setOffset(0)
+  }
+
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  function toggleSelected(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const [bulkResult, setBulkResult] = useState<string | null>(null)
+  const bulkExclude = useMutation({
+    mutationFn: (body: { set_excluded: boolean; ids?: number[]; search?: string }) =>
+      api.post('/vod/library-language/bulk-exclude/', {
+        content_type: contentType, excluded: showExcluded,
+        script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam,
+        keep_codes: keepCodes.trim() || undefined, ...body,
+      }),
+    onSuccess: (r) => {
+      const skipped = r.data.skipped as number | undefined
+      setBulkResult(
+        `${r.data.changed} updated.` +
+        (skipped ? ` ${skipped} skipped (no copy in a kept language) — e.g. ${r.data.skipped_examples.slice(0, 3).join(', ')}` : '')
+      )
+      qc.invalidateQueries({ queryKey: ['vod-library-language'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+      setSelectedIds(new Set())
+    },
+    onError: (e: any) => setBulkResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+
+  return (
+    <Modal onClose={onClose} maxWidth="max-w-2xl">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
+        <span className="text-sm font-medium shrink-0">
+          Language Filter — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({query.data?.total ?? '…'})
+        </span>
+        <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer">
+          <input type="checkbox" checked={showExcluded} onChange={(e) => { setShowExcluded(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
+          Show archived
+        </label>
+        <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer" title="Titles containing Arabic, Thai, CJK, Cyrillic, Greek, Hebrew, or Devanagari characters">
+          <input type="checkbox" checked={nonLatinOnly} onChange={(e) => { setNonLatinOnly(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
+          Non-Latin script only
+        </label>
+        <input
+          className={inputCls('w-36')}
+          placeholder="Search…"
+          defaultValue={search}
+          onKeyDown={(e) => { if (e.key === 'Enter') { setSearch((e.target as HTMLInputElement).value.trim()); setOffset(0) } }}
+          onBlur={(e) => { setSearch(e.target.value.trim()); setOffset(0) }}
+        />
+      </div>
+      <div className="px-4 pt-3 text-xs space-y-1.5 border-b border-border pb-3">
+        <p className="text-muted-foreground">
+          {showExcluded
+            ? 'Archived items are hidden from Missing Artwork, Needs Review, and Duplicate Finder — still fully browsable/playable, just not flagged as needing attention.'
+            : 'Filters the whole library by language, not just items missing a poster. Archiving only removes a title from these queues if a copy also exists in a kept language -- your only copy of something is never archived this way.'}
+        </p>
+        {!!prefixesQuery.data?.length && (
+          <div className="flex items-center gap-1 flex-wrap">
+            <span className="text-muted-foreground shrink-0">Language prefix:</span>
+            {prefixesQuery.data.map(({ code, count }) => (
+              <button
+                key={code}
+                className={`px-1.5 py-0.5 rounded border text-xs ${selectedPrefixes.has(code) ? 'bg-primary text-primary-foreground border-primary' : 'border-border text-muted-foreground hover:text-foreground'}`}
+                onClick={() => togglePrefix(code)}
+              >
+                {code} ({count})
+              </button>
+            ))}
+            {!!selectedPrefixes.size && (
+              <button className="text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={() => { setSelectedPrefixes(new Set()); setOffset(0) }}>
+                clear
+              </button>
+            )}
+          </div>
+        )}
+        {!showExcluded && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-muted-foreground shrink-0">Keep a title if also available as:</span>
+            <input className={inputCls('w-28')} placeholder="e.g. EN (optional)" value={keepCodes} onChange={(e) => setKeepCodes(e.target.value)} />
+          </div>
+        )}
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <Button
+            size="sm" variant="outline"
+            disabled={selectedIds.size === 0 || bulkExclude.isPending}
+            onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, ids: Array.from(selectedIds) })}
+          >
+            {showExcluded ? 'Un-archive selected' : 'Archive selected'} ({selectedIds.size})
+          </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!query.data?.total || bulkExclude.isPending}
+            onClick={() => bulkExclude.mutate({ set_excluded: !showExcluded, search: search || undefined })}
+            title="Applies to every item matching the current search/language filter, not just this page"
+          >
+            {showExcluded ? 'Un-archive all filtered' : 'Archive all filtered'} ({query.data?.total ?? 0})
+          </Button>
+          {bulkResult && <span className="text-muted-foreground">{bulkResult}</span>}
+        </div>
+      </div>
+      <div className="p-4 text-xs overflow-y-auto">
+        {query.data?.items.length === 0 && (
+          <p className="text-muted-foreground">{showExcluded ? 'Nothing archived.' : 'No matches.'}</p>
+        )}
+        <ul>
+          {query.data?.items.map((item) => (
+            <li key={item.id} className="border-b border-border/50 py-1.5 flex items-center gap-1.5">
+              <input type="checkbox" checked={selectedIds.has(item.id)} onChange={() => toggleSelected(item.id)} />
+              <span className="min-w-0 truncate">{item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}</span>
+            </li>
+          ))}
+        </ul>
+        {query.data && <div className="pt-2"><Pager total={query.data.total} limit={LIMIT} offset={offset} onOffset={setOffset} /></div>}
+      </div>
+    </Modal>
+  )
+}
+
 export default function VodManager() {
   const qc = useQueryClient()
 
@@ -1810,6 +1989,7 @@ export default function VodManager() {
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
   // ── Activity (currently open stream relays) ──
   const activityQuery = useQuery<ActivitySession[]>({
@@ -3541,6 +3721,9 @@ export default function VodManager() {
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('movie')}>
             Missing Artwork{missingArtworkCountsQuery.data?.movies ? ` (${missingArtworkCountsQuery.data.movies})` : ''}
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('movie')}>
+            Language Filter
+          </Button>
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -3658,6 +3841,9 @@ export default function VodManager() {
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('series')}>
             Missing Artwork{missingArtworkCountsQuery.data?.series ? ` (${missingArtworkCountsQuery.data.series})` : ''}
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('series')}>
+            Language Filter
+          </Button>
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -3765,6 +3951,13 @@ export default function VodManager() {
           contentType={missingArtworkModalOpen}
           qc={qc}
           onClose={() => setMissingArtworkModalOpen(null)}
+        />
+      )}
+      {libraryLanguageModalOpen && (
+        <LibraryLanguageModal
+          contentType={libraryLanguageModalOpen}
+          qc={qc}
+          onClose={() => setLibraryLanguageModalOpen(null)}
         />
       )}
     </div>

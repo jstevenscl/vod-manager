@@ -2672,6 +2672,18 @@ def _name_prefix_code(name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _strip_lang_prefixes(name: str) -> str:
+    """Repeated -- some providers double-tag (e.g. "IN| TELUGU| Apex") --
+    strip every leading "XX|" layer to get the bare title, used to match a
+    language-tagged row against its same-content sibling in another
+    language (see smart_bulk_exclude)."""
+    while True:
+        new_name = _LANG_PREFIX_RE.sub("", name, count=1).strip()
+        if new_name == name:
+            return name
+        name = new_name
+
+
 def _missing_artwork_clause(search: str | None, excluded: bool) -> tuple[str, list]:
     where = ["(poster_url IS NULL OR poster_url = '')", "review_excluded = ?"]
     params: list = [1 if excluded else 0]
@@ -2790,6 +2802,123 @@ def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) 
     _commit_with_retry(conn)
     conn.close()
     return len(ids)
+
+
+def smart_bulk_exclude(content_type: str, ids: list[int], keep_codes: list[str] | None) -> dict:
+    """Archives each id UNLESS it's the only copy of that content in the
+    pool -- e.g. don't archive "AR| Apex" if there's no "EN| Apex" (or
+    unprefixed "Apex") to fall back on, since that would remove the only
+    way to watch it at all, not just the non-preferred-language copy.
+    Matches siblings by bare title (language prefix stripped) across the
+    WHOLE table, not just the filtered candidate set -- the keeper sibling
+    might already be fully enriched and outside whatever scope produced
+    `ids` (e.g. it already has a poster, so it's not in a Missing Artwork
+    scan). keep_codes: prefix codes that count as an acceptable sibling,
+    in addition to no-prefix-at-all (always treated as the base/native
+    listing)."""
+    if not ids:
+        return {"archived": 0, "skipped": 0, "skipped_examples": []}
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    all_rows = conn.execute(f"SELECT id, name FROM {table}").fetchall()
+    conn.close()
+
+    by_id: dict[int, dict] = {}
+    by_bare: dict[str, list[dict]] = {}
+    for r in all_rows:
+        code = _name_prefix_code(r["name"])
+        entry = {"id": r["id"], "name": r["name"], "code": code}
+        by_id[r["id"]] = entry
+        by_bare.setdefault(_strip_lang_prefixes(r["name"]), []).append(entry)
+
+    keep_set = set(keep_codes or [])
+    to_archive = []
+    skipped_names = []
+    for item_id in ids:
+        entry = by_id.get(item_id)
+        if not entry:
+            continue
+        bare = _strip_lang_prefixes(entry["name"])
+        has_keeper = any(
+            sib["id"] != item_id and (sib["code"] is None or sib["code"] in keep_set)
+            for sib in by_bare.get(bare, [])
+        )
+        if has_keeper:
+            to_archive.append(item_id)
+        else:
+            skipped_names.append(entry["name"])
+
+    archived = bulk_set_review_excluded(content_type, to_archive, True)
+    return {"archived": archived, "skipped": len(skipped_names), "skipped_examples": skipped_names[:10]}
+
+
+# ── Whole-library language filter ───────────────────────────────────────────
+# Same script/prefix filtering as Missing Artwork, but over the entire pool
+# rather than just the poster-missing subset -- lets a deployment curate its
+# catalog by language broadly, not only where a poster happens to be
+# missing (a title with a real poster is just as much "not in my language"
+# as one without).
+
+def _library_clause(search: str | None, excluded: bool | None) -> tuple[str, list]:
+    where = []
+    params: list = []
+    if excluded is not None:
+        where.append("review_excluded = ?")
+        params.append(1 if excluded else 0)
+    if search:
+        where.append("name LIKE ?")
+        params.append(f"%{search}%")
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    return clause, params
+
+
+def _library_rows(table: str, search: str | None, excluded: bool | None, script: str | None, prefixes: list[str] | None) -> list:
+    clause, params = _library_clause(search, excluded)
+    conn = _connect()
+    rows = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY name", params).fetchall()
+    conn.close()
+    if script == "non_latin":
+        rows = [r for r in rows if _is_non_latin_name(r["name"])]
+    if prefixes:
+        wanted = set(prefixes)
+        rows = [r for r in rows if _name_prefix_code(r["name"]) in wanted]
+    return rows
+
+
+def list_library_filtered(
+    content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
+    excluded: bool | None = None, script: str | None = None, prefixes: list[str] | None = None,
+) -> list[dict]:
+    table = "movies" if content_type == "movie" else "series"
+    rows = _library_rows(table, search, excluded, script, prefixes)
+    return [dict(r) for r in rows[offset:offset + limit]]
+
+
+def count_library_filtered(
+    content_type: str, search: str | None = None, excluded: bool | None = None,
+    script: str | None = None, prefixes: list[str] | None = None,
+) -> int:
+    table = "movies" if content_type == "movie" else "series"
+    return len(_library_rows(table, search, excluded, script, prefixes))
+
+
+def list_library_ids(
+    content_type: str, search: str | None = None, excluded: bool | None = None,
+    script: str | None = None, prefixes: list[str] | None = None,
+) -> list[int]:
+    table = "movies" if content_type == "movie" else "series"
+    return [r["id"] for r in _library_rows(table, search, excluded, script, prefixes)]
+
+
+def list_library_prefixes(content_type: str, search: str | None = None, excluded: bool | None = None, script: str | None = None) -> list[dict]:
+    table = "movies" if content_type == "movie" else "series"
+    rows = _library_rows(table, search, excluded, script, None)
+    counts: dict[str, int] = {}
+    for r in rows:
+        code = _name_prefix_code(r["name"])
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])
 
 
 def resolve_missing_artwork(

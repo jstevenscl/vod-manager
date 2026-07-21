@@ -185,6 +185,18 @@ class BulkMissingArtworkExcludeRequest(BaseModel):
     excluded: bool = False
     script: Optional[str] = None
     prefixes: Optional[str] = None
+    keep_codes: Optional[str] = None
+
+
+class BulkLibraryExcludeRequest(BaseModel):
+    content_type: str
+    set_excluded: bool
+    ids: Optional[list[int]] = None
+    search: Optional[str] = None
+    excluded: Optional[bool] = None
+    script: Optional[str] = None
+    prefixes: Optional[str] = None
+    keep_codes: Optional[str] = None
 
 
 class MovieRequest(BaseModel):
@@ -906,6 +918,56 @@ async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(body.prefixes)
     ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
+    # Archiving driven by a language/script filter goes through the sibling
+    # check -- never archive the only copy of something just because it's
+    # not in a language you picked (see smart_bulk_exclude). A plain manual
+    # selection (no filter engaged) or an un-archive always applies directly.
+    if body.set_excluded and (body.script or prefix_list):
+        result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes))
+        return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
+    changed = vod_db.bulk_set_review_excluded(body.content_type, ids, body.set_excluded)
+    return {"changed": changed}
+
+
+# ── Whole-library language filter ───────────────────────────────────────────
+# Same script/prefix filtering as Missing Artwork, but over the entire pool
+# (a title with a real poster is just as much "not in my language" as one
+# without) -- see vod_db.list_library_filtered's docstring.
+
+@router.get("/library-language/", dependencies=_GUARDS)
+async def list_library_language(
+    content_type: str, limit: int = 30, offset: int = 0, search: Optional[str] = None,
+    excluded: Optional[bool] = None, script: Optional[str] = None, prefixes: Optional[str] = None,
+):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    prefix_list = _split_prefixes(prefixes)
+    return {
+        "items": vod_db.list_library_filtered(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list),
+        "total": vod_db.count_library_filtered(content_type, search=search, excluded=excluded, script=script, prefixes=prefix_list),
+    }
+
+
+@router.get("/library-language/prefixes/", dependencies=_GUARDS)
+async def library_language_prefixes(content_type: str, search: Optional[str] = None, excluded: Optional[bool] = None, script: Optional[str] = None):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.list_library_prefixes(content_type, search=search, excluded=excluded, script=script)
+
+
+@router.post("/library-language/bulk-exclude/", dependencies=_GUARDS)
+async def bulk_exclude_library(body: BulkLibraryExcludeRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    prefix_list = _split_prefixes(body.prefixes)
+    ids = body.ids if body.ids is not None else vod_db.list_library_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
+    # This modal exists specifically for language-based archiving -- always
+    # run the sibling check on archive, regardless of which filter (prefix
+    # chip, script checkbox, or plain search text) produced the candidate
+    # set. Un-archiving is never destructive, so it always applies directly.
+    if body.set_excluded:
+        result = vod_db.smart_bulk_exclude(body.content_type, ids, _split_prefixes(body.keep_codes))
+        return {"changed": result["archived"], "skipped": result["skipped"], "skipped_examples": result["skipped_examples"]}
     changed = vod_db.bulk_set_review_excluded(body.content_type, ids, body.set_excluded)
     return {"changed": changed}
 
