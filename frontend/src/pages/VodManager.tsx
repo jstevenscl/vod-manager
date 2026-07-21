@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, Loader2, Play, Plus, RefreshCw, RotateCcw, ShieldCheck, Sparkles, Trash2, Tv, Upload, X, Zap } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -372,6 +372,31 @@ function VodPlayer({ url, transcodedUrl, hlsUrl, title, onClose }: {
   )
 }
 
+// Small reusable overlay wrapper -- createPortal + backdrop + centered card +
+// corner close button, extracted from VodPlayer's inline pattern above so the
+// per-content-type Categories/Needs Review modals (and grid-mode item detail)
+// don't each duplicate that boilerplate. Purely a shell -- callers supply
+// their own header/body content as children, including any title bar.
+function Modal({ onClose, children, maxWidth = 'max-w-lg' }: { onClose: () => void; children: React.ReactNode; maxWidth?: string }) {
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 p-4" onClick={onClose}>
+      <div
+        className={`relative bg-card border border-border rounded-xl overflow-hidden w-full ${maxWidth} shadow-2xl max-h-[85vh] flex flex-col`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          className="absolute top-2 right-2 text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-accent z-10"
+          onClick={onClose}
+        >
+          <X size={16} />
+        </button>
+        {children}
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
 interface Category {
   id: number
   name: string
@@ -684,7 +709,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   )
 }
 
-function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect }: {
+function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list' }: {
   movie: Movie
   movieCategories: Category[]
   providers: Provider[]
@@ -692,6 +717,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   xcCredentials?: XcCredentials
   selected: boolean
   onToggleSelect: () => void
+  mode?: 'list' | 'grid'
 }) {
   const [open, setOpen] = useState(false)
   const [sourceForm, setSourceForm] = useState({ provider_id: '', provider_stream_id: '', container_extension: 'mp4' })
@@ -734,6 +760,119 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
     mutationFn: (categoryId: number) => api.delete(`/vod/movies/${movie.id}/categories/${categoryId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
+
+  const detailContent = (
+    <>
+      {movie.poster_url && mode === 'list' && (
+        <img src={movie.poster_url} alt="" className="w-24 rounded" loading="lazy" />
+      )}
+      {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
+
+      <div>
+        <p className="font-medium mb-1">Sources</p>
+        {movie.sources.map((s) => (
+          <div key={s.id} className="flex items-center justify-between text-muted-foreground">
+            <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
+            <span className="flex items-center gap-1.5">
+              <PlayButton
+                url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
+                transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
+                hlsUrl={buildHlsPreviewSourceUrl('movie', s.id, xcCredentials)}
+                title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
+              />
+              <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
+              <button title="Remove source" className="hover:text-destructive" onClick={() => deleteSource.mutate(s.id)}>
+                <X size={12} />
+              </button>
+            </span>
+          </div>
+        ))}
+        <div className="flex items-center gap-1.5 pt-1">
+          <select className={inputCls()} value={sourceForm.provider_id} onChange={(e) => setSourceForm({ ...sourceForm, provider_id: e.target.value })}>
+            <option value="">Provider…</option>
+            {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <input className={inputCls()} placeholder="Provider stream ID" value={sourceForm.provider_stream_id} onChange={(e) => setSourceForm({ ...sourceForm, provider_stream_id: e.target.value })} />
+          <input className={inputCls('w-16')} placeholder="ext" value={sourceForm.container_extension} onChange={(e) => setSourceForm({ ...sourceForm, container_extension: e.target.value })} />
+          <Button size="sm" disabled={!sourceForm.provider_id || !sourceForm.provider_stream_id || addSource.isPending} onClick={() => addSource.mutate()}>
+            <Plus size={12} className="mr-1" /> Add source
+          </Button>
+        </div>
+      </div>
+
+      <div>
+        <p className="font-medium mb-1">Categories</p>
+        {movie.placements.map((p) => (
+          <div key={p.id} className="flex items-center justify-between text-muted-foreground">
+            <span>{p.category_name}</span>
+            <button title="Remove from category" className="hover:text-destructive" onClick={() => removePlacement.mutate(p.category_id)}>
+              <X size={12} />
+            </button>
+          </div>
+        ))}
+        <div className="flex items-center gap-1.5 pt-1">
+          <select className={inputCls()} value={categoryPick} onChange={(e) => setCategoryPick(e.target.value)}>
+            <option value="">Category…</option>
+            {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <Button size="sm" disabled={!categoryPick || addPlacement.isPending} onClick={() => addPlacement.mutate()}>
+            <Plus size={12} className="mr-1" /> Place in category
+          </Button>
+        </div>
+      </div>
+
+      <Button size="sm" variant="outline" disabled={enrich.isPending} onClick={() => enrich.mutate()}>
+        {enrich.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
+        Fetch full detail
+      </Button>
+    </>
+  )
+
+  if (mode === 'grid') {
+    return (
+      <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
+        <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
+          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" className="w-3.5 h-3.5" />
+        </div>
+        {!!movie.is_adult && (
+          <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
+        )}
+        <button className="block w-full text-left" onClick={() => setOpen(true)}>
+          {movie.poster_url ? (
+            <img src={movie.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
+          ) : (
+            <div className="w-full aspect-[2/3] bg-muted flex items-center justify-center">
+              <Film size={24} className="text-muted-foreground" />
+            </div>
+          )}
+          <div className="p-1.5 text-xs">
+            <p className="font-medium truncate">{movie.name}</p>
+            <p className="text-muted-foreground">{movie.year ?? ''}</p>
+          </div>
+        </button>
+        {movie.sources.length > 0 && (
+          <div className="absolute bottom-8 right-1 z-10 bg-background/80 rounded" onClick={(e) => e.stopPropagation()}>
+            <PlayButton
+              url={buildPreviewUrl('movie', movie.id, movie.sources[0]?.container_extension || 'mp4', xcCredentials)}
+              transcodedUrl={movie.sources[0] ? buildTranscodedPreviewSourceUrl('movie', movie.sources[0].id, xcCredentials) : null}
+              hlsUrl={movie.sources[0] ? buildHlsPreviewSourceUrl('movie', movie.sources[0].id, xcCredentials) : null}
+              title={`${movie.name}${movie.year ? ` (${movie.year})` : ''}`}
+            />
+          </div>
+        )}
+        {open && (
+          <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
+            <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+              <span className="text-sm font-medium truncate pr-6">{movie.name}{movie.year ? ` (${movie.year})` : ''}</span>
+            </div>
+            <div className="p-4 text-xs space-y-2 overflow-y-auto">
+              {detailContent}
+            </div>
+          </Modal>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
@@ -784,68 +923,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
-          {movie.poster_url && (
-            <img src={movie.poster_url} alt="" className="w-24 rounded" loading="lazy" />
-          )}
-          {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
-
-          <div>
-            <p className="font-medium mb-1">Sources</p>
-            {movie.sources.map((s) => (
-              <div key={s.id} className="flex items-center justify-between text-muted-foreground">
-                <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
-                <span className="flex items-center gap-1.5">
-                  <PlayButton
-                    url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
-                    transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
-                    hlsUrl={buildHlsPreviewSourceUrl('movie', s.id, xcCredentials)}
-                    title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
-                  />
-                  <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
-                  <button title="Remove source" className="hover:text-destructive" onClick={() => deleteSource.mutate(s.id)}>
-                    <X size={12} />
-                  </button>
-                </span>
-              </div>
-            ))}
-            <div className="flex items-center gap-1.5 pt-1">
-              <select className={inputCls()} value={sourceForm.provider_id} onChange={(e) => setSourceForm({ ...sourceForm, provider_id: e.target.value })}>
-                <option value="">Provider…</option>
-                {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-              <input className={inputCls()} placeholder="Provider stream ID" value={sourceForm.provider_stream_id} onChange={(e) => setSourceForm({ ...sourceForm, provider_stream_id: e.target.value })} />
-              <input className={inputCls('w-16')} placeholder="ext" value={sourceForm.container_extension} onChange={(e) => setSourceForm({ ...sourceForm, container_extension: e.target.value })} />
-              <Button size="sm" disabled={!sourceForm.provider_id || !sourceForm.provider_stream_id || addSource.isPending} onClick={() => addSource.mutate()}>
-                <Plus size={12} className="mr-1" /> Add source
-              </Button>
-            </div>
-          </div>
-
-          <div>
-            <p className="font-medium mb-1">Categories</p>
-            {movie.placements.map((p) => (
-              <div key={p.id} className="flex items-center justify-between text-muted-foreground">
-                <span>{p.category_name}</span>
-                <button title="Remove from category" className="hover:text-destructive" onClick={() => removePlacement.mutate(p.category_id)}>
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
-            <div className="flex items-center gap-1.5 pt-1">
-              <select className={inputCls()} value={categoryPick} onChange={(e) => setCategoryPick(e.target.value)}>
-                <option value="">Category…</option>
-                {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <Button size="sm" disabled={!categoryPick || addPlacement.isPending} onClick={() => addPlacement.mutate()}>
-                <Plus size={12} className="mr-1" /> Place in category
-              </Button>
-            </div>
-          </div>
-
-          <Button size="sm" variant="outline" disabled={enrich.isPending} onClick={() => enrich.mutate()}>
-            {enrich.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
-            Fetch full detail
-          </Button>
+          {detailContent}
         </div>
       )}
       </div>
@@ -853,13 +931,14 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   )
 }
 
-function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect }: {
+function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect, mode = 'list' }: {
   series: Series
   seriesCategories: Category[]
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
   selected: boolean
   onToggleSelect: () => void
+  mode?: 'list' | 'grid'
 }) {
   const [open, setOpen] = useState(false)
   const [categoryPick, setCategoryPick] = useState('')
@@ -887,6 +966,101 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     mutationFn: (categoryId: number) => api.delete(`/vod/series/${series.id}/categories/${categoryId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
+
+  const detailContent = (
+    <>
+      {series.poster_url && mode === 'list' && (
+        <img src={series.poster_url} alt="" className="w-24 rounded" loading="lazy" />
+      )}
+      {series.description && <p className="text-muted-foreground">{series.description}</p>}
+
+      <div>
+        <p className="font-medium mb-1">Episodes</p>
+        {series.episodes.length === 0 && (
+          <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
+        )}
+        {series.episodes.map((e) => (
+          <div key={e.id} className="flex items-center justify-between text-muted-foreground">
+            <span>
+              S{e.season_number}E{e.episode_number} — {e.name}
+              {e.sources.length > 0 && <span className="text-[10px]"> ({e.sources.map((s) => s.provider_name).join(', ')})</span>}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <PlayButton
+                url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
+                transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
+              />
+              <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div>
+        <p className="font-medium mb-1">Categories</p>
+        {series.placements.map((p) => (
+          <div key={p.id} className="flex items-center justify-between text-muted-foreground">
+            <span>{p.category_name}</span>
+            <button title="Remove from category" className="hover:text-destructive" onClick={() => removePlacement.mutate(p.category_id)}>
+              <X size={12} />
+            </button>
+          </div>
+        ))}
+        <div className="flex items-center gap-1.5">
+          <select className={inputCls()} value={categoryPick} onChange={(e) => setCategoryPick(e.target.value)}>
+            <option value="">Category…</option>
+            {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <Button size="sm" disabled={!categoryPick || addPlacement.isPending} onClick={() => addPlacement.mutate()}>
+            <Plus size={12} className="mr-1" /> Place in category
+          </Button>
+        </div>
+      </div>
+
+      <Button size="sm" variant="outline" disabled={enrich.isPending} onClick={() => enrich.mutate()}>
+        {enrich.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
+        Fetch episodes &amp; detail
+      </Button>
+    </>
+  )
+
+  if (mode === 'grid') {
+    return (
+      <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
+        <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
+          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" className="w-3.5 h-3.5" />
+        </div>
+        {!!series.is_adult && (
+          <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
+        )}
+        <button className="block w-full text-left" onClick={() => setOpen(true)}>
+          {series.poster_url ? (
+            <img src={series.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
+          ) : (
+            <div className="w-full aspect-[2/3] bg-muted flex items-center justify-center">
+              <Tv size={24} className="text-muted-foreground" />
+            </div>
+          )}
+          <div className="p-1.5 text-xs">
+            <p className="font-medium truncate">{series.name}</p>
+            <p className="text-muted-foreground">{series.year ?? ''}</p>
+          </div>
+        </button>
+        {open && (
+          <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
+            <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+              <span className="text-sm font-medium truncate pr-6">{series.name}{series.year ? ` (${series.year})` : ''}</span>
+            </div>
+            <div className="p-4 text-xs space-y-2 overflow-y-auto">
+              {detailContent}
+            </div>
+          </Modal>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
@@ -924,60 +1098,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
-          {series.poster_url && (
-            <img src={series.poster_url} alt="" className="w-24 rounded" loading="lazy" />
-          )}
-          {series.description && <p className="text-muted-foreground">{series.description}</p>}
-
-          <div>
-            <p className="font-medium mb-1">Episodes</p>
-            {series.episodes.length === 0 && (
-              <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
-            )}
-            {series.episodes.map((e) => (
-              <div key={e.id} className="flex items-center justify-between text-muted-foreground">
-                <span>
-                  S{e.season_number}E{e.episode_number} — {e.name}
-                  {e.sources.length > 0 && <span className="text-[10px]"> ({e.sources.map((s) => s.provider_name).join(', ')})</span>}
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <PlayButton
-                    url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
-                    transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                    hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                    title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
-                  />
-                  <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
-                </span>
-              </div>
-            ))}
-          </div>
-
-          <div>
-            <p className="font-medium mb-1">Categories</p>
-            {series.placements.map((p) => (
-              <div key={p.id} className="flex items-center justify-between text-muted-foreground">
-                <span>{p.category_name}</span>
-                <button title="Remove from category" className="hover:text-destructive" onClick={() => removePlacement.mutate(p.category_id)}>
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
-            <div className="flex items-center gap-1.5">
-              <select className={inputCls()} value={categoryPick} onChange={(e) => setCategoryPick(e.target.value)}>
-                <option value="">Category…</option>
-                {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <Button size="sm" disabled={!categoryPick || addPlacement.isPending} onClick={() => addPlacement.mutate()}>
-                <Plus size={12} className="mr-1" /> Place in category
-              </Button>
-            </div>
-          </div>
-
-          <Button size="sm" variant="outline" disabled={enrich.isPending} onClick={() => enrich.mutate()}>
-            {enrich.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
-            Fetch episodes &amp; detail
-          </Button>
+          {detailContent}
         </div>
       )}
       </div>
@@ -985,8 +1106,322 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   )
 }
 
+// Category management scoped to one content type at a time -- opened from
+// the Movies or TV Shows tab's own toolbar, so it always shows just the
+// categories relevant to whatever you're already browsing (manual, smart,
+// and TMDB-synced alike -- unlike the old unified card, TMDB-synced
+// categories are included here too, so "View" works for them without a tab
+// switch). Fully self-contained: declares its own copies of the category
+// mutations (same endpoints as the ones vod_manager's "TMDB Lists" section
+// still uses directly) rather than threading ~10 mutation objects down as
+// props -- consistent with how every other row/item component in this file
+// (MovieRow, SeriesRow, NeedsReviewRow) already owns its own mutations.
+function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
+  contentType: 'movie' | 'series'
+  categories: Category[]
+  qc: ReturnType<typeof useQueryClient>
+  onView: (categoryId: number) => void
+  onClose: () => void
+}) {
+  const [categoryForm, setCategoryForm] = useState({
+    name: '', is_smart: false,
+    rule_field: 'genre' as typeof RULE_FIELDS[number], rule_op: 'contains' as typeof RULE_OPS[number], rule_value: '',
+  })
+  const addCategory = useMutation({
+    mutationFn: () => api.post('/vod/categories/', {
+      name: categoryForm.name,
+      content_type: contentType,
+      is_smart: categoryForm.is_smart,
+      rule_json: categoryForm.is_smart
+        ? JSON.stringify({ match: 'all', conditions: [{ field: categoryForm.rule_field, op: categoryForm.rule_op, value: categoryForm.rule_value }] })
+        : null,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      setCategoryForm({ name: '', is_smart: false, rule_field: 'genre', rule_op: 'contains', rule_value: '' })
+    },
+  })
+  const deleteCategory = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/categories/${id}/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  const setCategorySortOrder = useMutation({
+    mutationFn: ({ id, sort_order }: { id: number; sort_order: number }) =>
+      api.post(`/vod/categories/${id}/sort-order/`, null, { params: { sort_order } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  const renameCategory = useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) =>
+      api.post(`/vod/categories/${id}/name/`, null, { params: { name } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  const [tmdbSyncResult, setTmdbSyncResult] = useState<string | null>(null)
+  const syncCategoryNow = useMutation({
+    mutationFn: (id: number) => api.post(`/vod/categories/${id}/sync-now/`),
+    onSuccess: (r) => {
+      setTmdbSyncResult(`List had ${r.data.list_total}: ${r.data.found_in_pool} in pool (${r.data.newly_placed} newly placed), ${r.data.not_in_pool} not in pool.`)
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setTmdbSyncResult(`Sync failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const [evaluateResult, setEvaluateResult] = useState<string | null>(null)
+  const evaluateCategory = useMutation({
+    mutationFn: (id: number) => api.post(`/vod/categories/${id}/evaluate/`),
+    onSuccess: (r) => {
+      setEvaluateResult(`Evaluated ${r.data.evaluated}: ${r.data.matched} matched, ${r.data.newly_placed} newly placed.`)
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+  const [aiRuleDescription, setAiRuleDescription] = useState('')
+  const [aiRuleSuggestion, setAiRuleSuggestion] = useState<{ name: string; match: string; conditions: { field: string; op: string; value: string }[] } | null>(null)
+  const suggestAiRule = useMutation({
+    mutationFn: () => api.post('/vod/ai/suggest-category-rule/', { description: aiRuleDescription, content_type: contentType }),
+    onSuccess: (r) => setAiRuleSuggestion(r.data),
+  })
+  const createCategoryFromAiRule = useMutation({
+    mutationFn: () => api.post('/vod/categories/', {
+      name: aiRuleSuggestion!.name,
+      content_type: contentType,
+      is_smart: true,
+      rule_json: JSON.stringify({ match: aiRuleSuggestion!.match, conditions: aiRuleSuggestion!.conditions }),
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      setAiRuleSuggestion(null)
+      setAiRuleDescription('')
+    },
+  })
+  const [aiEvaluateResult, setAiEvaluateResult] = useState<string | null>(null)
+  const aiEvaluateCategory = useMutation({
+    mutationFn: ({ id, description }: { id: number; description: string }) =>
+      api.post(`/vod/categories/${id}/ai-evaluate/`, { description }),
+    onSuccess: (r) => {
+      const capNote = r.data.capped ? ` (capped at ${r.data.considered} of ${r.data.total_before_cap} candidates — narrow it with a rule pre-filter or run again)` : ''
+      setAiEvaluateResult(`AI reviewed ${r.data.considered} candidate(s): ${r.data.matched} matched, ${r.data.newly_placed} newly placed.${capNote}`)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setAiEvaluateResult(`AI evaluation failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  function promptAiEvaluate(c: Category) {
+    const description = window.prompt(
+      `Describe what belongs in "${c.name}" in plain English (AI judges actual titles against this — good for criteria a field rule can't express, e.g. mood, plot, audience fit):`,
+      c.ai_description ?? '',
+    )
+    if (description && description.trim()) aiEvaluateCategory.mutate({ id: c.id, description: description.trim() })
+  }
+
+  return (
+    <Modal onClose={onClose} maxWidth="max-w-xl">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+        <span className="text-sm font-medium">{contentType === 'movie' ? 'Movie Categories' : 'TV Show Categories'}</span>
+      </div>
+      <div className="p-4 text-xs space-y-3 overflow-y-auto">
+        <ul className="space-y-0.5">
+          {categories.map((c) => (
+            <li key={c.id} className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1 min-w-0">
+                <input
+                  className={inputCls('w-32')}
+                  defaultValue={c.name}
+                  key={c.name}
+                  title="Rename category"
+                  onBlur={(e) => {
+                    const v = e.target.value.trim()
+                    if (v && v !== c.name) renameCategory.mutate({ id: c.id, name: v })
+                  }}
+                />
+                {!!c.is_smart && <span className="text-muted-foreground"> (smart)</span>}
+                {!!c.sync_source && <span className="text-muted-foreground"> (TMDB: {c.sync_source.replace('tmdb_list:', '')})</span>}
+              </span>
+              <span className="flex items-center gap-1.5">
+                <input
+                  className={inputCls('w-12')}
+                  type="number"
+                  title="Sort order (lower shows first in Dispatcharr)"
+                  defaultValue={c.sort_order}
+                  key={c.sort_order}
+                  onBlur={(e) => {
+                    const v = Number(e.target.value) || 0
+                    if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
+                  }}
+                />
+                {!!c.is_smart && (
+                  <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
+                    <Zap size={12} />
+                  </button>
+                )}
+                <button
+                  title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
+                  className="text-muted-foreground hover:text-foreground"
+                  disabled={aiEvaluateCategory.isPending}
+                  onClick={() => promptAiEvaluate(c)}
+                >
+                  <Sparkles size={12} />
+                </button>
+                {!!c.sync_source && (
+                  <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
+                    <RefreshCw size={12} />
+                  </button>
+                )}
+                <button
+                  title={contentType === 'movie' ? 'View movies in this category' : 'View series in this category'}
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => onView(c.id)}
+                >
+                  <Eye size={12} />
+                </button>
+                <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
+                  <Trash2 size={12} />
+                </button>
+              </span>
+            </li>
+          ))}
+          {categories.length === 0 && <p className="text-muted-foreground">No categories yet.</p>}
+        </ul>
+        {evaluateResult && <p className="text-muted-foreground">{evaluateResult}</p>}
+        {aiEvaluateResult && <p className="text-muted-foreground">{aiEvaluateResult}</p>}
+        {tmdbSyncResult && <p className="text-muted-foreground">{tmdbSyncResult}</p>}
+
+        <div className="border-t border-border/50 pt-2 flex flex-wrap items-center gap-1.5">
+          <input
+            className={inputCls()}
+            placeholder="Category name"
+            value={categoryForm.name}
+            onChange={(e) => setCategoryForm({ ...categoryForm, name: e.target.value })}
+          />
+          <label className="flex items-center gap-1 text-muted-foreground">
+            <input type="checkbox" checked={categoryForm.is_smart} onChange={(e) => setCategoryForm({ ...categoryForm, is_smart: e.target.checked })} />
+            Smart (rule-based)
+          </label>
+          <Button size="sm" disabled={!categoryForm.name || (categoryForm.is_smart && !categoryForm.rule_value) || addCategory.isPending} onClick={() => addCategory.mutate()}>
+            <Plus size={12} className="mr-1" /> Add
+          </Button>
+        </div>
+        {categoryForm.is_smart && (
+          <div className="flex items-center gap-1.5 text-muted-foreground flex-wrap">
+            <span>Rule: field</span>
+            <select className={inputCls()} value={categoryForm.rule_field} onChange={(e) => setCategoryForm({ ...categoryForm, rule_field: e.target.value as typeof RULE_FIELDS[number] })}>
+              {RULE_FIELDS.map((f) => <option key={f} value={f}>{f}</option>)}
+            </select>
+            <select className={inputCls()} value={categoryForm.rule_op} onChange={(e) => setCategoryForm({ ...categoryForm, rule_op: e.target.value as typeof RULE_OPS[number] })}>
+              {RULE_OPS.map((op) => <option key={op} value={op}>{op}</option>)}
+            </select>
+            {categoryForm.rule_field === 'is_adult' ? (
+              <select className={inputCls()} value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })}>
+                <option value="">value…</option>
+                <option value="1">Yes (adult)</option>
+                <option value="0">No</option>
+              </select>
+            ) : (
+              <input className={inputCls()} placeholder="value" value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })} />
+            )}
+          </div>
+        )}
+
+        <div className="border border-border rounded p-2 space-y-1.5">
+          <p className="font-medium flex items-center gap-1"><Sparkles size={12} /> Suggest a category with AI</p>
+          <p className="text-muted-foreground">
+            Describe a category in plain English — Claude proposes a rule using only the fields/ops above (name,
+            genre, year, country/language, director, is_adult). Review it before creating; nothing is saved until
+            you click Create.
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <input
+              className={inputCls('flex-1 min-w-[14rem]')}
+              placeholder='e.g. "90s action movies" or "kid-friendly animated films"'
+              value={aiRuleDescription}
+              onChange={(e) => setAiRuleDescription(e.target.value)}
+            />
+            <Button size="sm" variant="outline" disabled={!aiRuleDescription || suggestAiRule.isPending} onClick={() => suggestAiRule.mutate()}>
+              {suggestAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Suggest'}
+            </Button>
+          </div>
+          {suggestAiRule.isError && (
+            <p className="text-destructive">{(suggestAiRule.error as any)?.response?.data?.detail ?? (suggestAiRule.error as any)?.message}</p>
+          )}
+          {aiRuleSuggestion && (
+            <div className="space-y-1 border-t border-border/50 pt-1.5">
+              <p><span className="text-muted-foreground">Name:</span> {aiRuleSuggestion.name}</p>
+              <p className="text-muted-foreground">
+                Match {aiRuleSuggestion.match.toUpperCase()} of:{' '}
+                {aiRuleSuggestion.conditions.map((c, i) => (
+                  <span key={i}>{i > 0 ? ', ' : ''}<code className="bg-muted px-1 rounded">{c.field} {c.op} "{c.value}"</code></span>
+                ))}
+              </p>
+              <div className="flex items-center gap-1.5">
+                <Button size="sm" disabled={createCategoryFromAiRule.isPending} onClick={() => createCategoryFromAiRule.mutate()}>
+                  {createCategoryFromAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Create this category'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setAiRuleSuggestion(null)}>Discard</Button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
+// Same per-content-type scoping as CategoriesModal above, reusing
+// NeedsReviewRow unchanged.
+function NeedsReviewModal({ contentType, items, qc, xcCredentials, onClose }: {
+  contentType: 'movie' | 'series'
+  items: NeedsReviewItem[]
+  qc: ReturnType<typeof useQueryClient>
+  xcCredentials?: XcCredentials
+  onClose: () => void
+}) {
+  return (
+    <Modal onClose={onClose} maxWidth="max-w-2xl">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+        <span className="text-sm font-medium">
+          Needs Review — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({items.length})
+        </span>
+      </div>
+      <div className="p-4 text-xs overflow-y-auto">
+        {items.length === 0 && <p className="text-muted-foreground">Nothing needs review right now.</p>}
+        <ul>
+          {items.map((item) => (
+            <NeedsReviewRow key={item.id} contentType={contentType} item={item} qc={qc} xcCredentials={xcCredentials} />
+          ))}
+        </ul>
+      </div>
+    </Modal>
+  )
+}
+
 export default function VodManager() {
   const qc = useQueryClient()
+
+  // ── Page tabs + view modes, persisted across reloads ──
+  const [activeTab, setActiveTabState] = useState<'movies' | 'series' | 'curation' | 'config'>(() => {
+    const saved = localStorage.getItem('vodmanager-tab')
+    return saved === 'movies' || saved === 'series' || saved === 'curation' || saved === 'config' ? saved : 'movies'
+  })
+  function setActiveTab(t: typeof activeTab) {
+    localStorage.setItem('vodmanager-tab', t)
+    setActiveTabState(t)
+  }
+  const [movieViewMode, setMovieViewModeState] = useState<'list' | 'grid'>(
+    () => (localStorage.getItem('vodmanager-movies-view') === 'grid' ? 'grid' : 'list')
+  )
+  function setMovieViewMode(m: 'list' | 'grid') {
+    localStorage.setItem('vodmanager-movies-view', m)
+    setMovieViewModeState(m)
+  }
+  const [seriesViewMode, setSeriesViewModeState] = useState<'list' | 'grid'>(
+    () => (localStorage.getItem('vodmanager-series-view') === 'grid' ? 'grid' : 'list')
+  )
+  function setSeriesViewMode(m: 'list' | 'grid') {
+    localStorage.setItem('vodmanager-series-view', m)
+    setSeriesViewModeState(m)
+  }
+  const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
 
   // ── Activity (currently open stream relays) ──
   const activityQuery = useQuery<ActivitySession[]>({
@@ -1382,25 +1817,6 @@ export default function VodManager() {
     queryKey: ['vod-categories'],
     queryFn:  () => api.get('/vod/categories/').then((r) => r.data),
   })
-  const [categoryForm, setCategoryForm] = useState({
-    name: '', content_type: 'movie' as 'movie' | 'series', is_smart: false,
-    rule_field: 'genre' as typeof RULE_FIELDS[number], rule_op: 'contains' as typeof RULE_OPS[number], rule_value: '',
-  })
-  const addCategory = useMutation({
-    mutationFn: () => api.post('/vod/categories/', {
-      name: categoryForm.name,
-      content_type: categoryForm.content_type,
-      is_smart: categoryForm.is_smart,
-      rule_json: categoryForm.is_smart
-        ? JSON.stringify({ match: 'all', conditions: [{ field: categoryForm.rule_field, op: categoryForm.rule_op, value: categoryForm.rule_value }] })
-        : null,
-    }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-categories'] })
-      setCategoryForm({ name: '', content_type: 'movie', is_smart: false, rule_field: 'genre', rule_op: 'contains', rule_value: '' })
-    },
-  })
-
   // ── TMDB Lists (a list can hold both movies and shows; Dispatcharr keeps those
   // catalogs separate, so each list gets a paired movie + series category) ──
   const TMDB_TOKEN = '%'
@@ -1447,60 +1863,6 @@ export default function VodManager() {
     },
     onError: (e: any) => setTmdbSyncResult(`Sync failed: ${e?.response?.data?.detail ?? e.message}`),
   })
-  const [evaluateResult, setEvaluateResult] = useState<string | null>(null)
-  const evaluateCategory = useMutation({
-    mutationFn: (id: number) => api.post(`/vod/categories/${id}/evaluate/`),
-    onSuccess: (r) => {
-      setEvaluateResult(`Evaluated ${r.data.evaluated}: ${r.data.matched} matched, ${r.data.newly_placed} newly placed.`)
-      qc.invalidateQueries({ queryKey: ['vod-movies'] })
-      qc.invalidateQueries({ queryKey: ['vod-series'] })
-    },
-  })
-
-  // ── AI-assisted categories (light mode: propose a rule from a plain-
-  // English description; heavy mode: judge actual titles against a
-  // description for anything the field-rule engine can't express) ──
-  const [aiRuleDescription, setAiRuleDescription] = useState('')
-  const [aiRuleContentType, setAiRuleContentType] = useState<'movie' | 'series'>('movie')
-  const [aiRuleSuggestion, setAiRuleSuggestion] = useState<{ name: string; match: string; conditions: { field: string; op: string; value: string }[] } | null>(null)
-  const suggestAiRule = useMutation({
-    mutationFn: () => api.post('/vod/ai/suggest-category-rule/', { description: aiRuleDescription, content_type: aiRuleContentType }),
-    onSuccess: (r) => setAiRuleSuggestion(r.data),
-  })
-  const createCategoryFromAiRule = useMutation({
-    mutationFn: () => api.post('/vod/categories/', {
-      name: aiRuleSuggestion!.name,
-      content_type: aiRuleContentType,
-      is_smart: true,
-      rule_json: JSON.stringify({ match: aiRuleSuggestion!.match, conditions: aiRuleSuggestion!.conditions }),
-    }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-categories'] })
-      setAiRuleSuggestion(null)
-      setAiRuleDescription('')
-    },
-  })
-  const [aiEvaluateResult, setAiEvaluateResult] = useState<string | null>(null)
-  const aiEvaluateCategory = useMutation({
-    mutationFn: ({ id, description }: { id: number; description: string }) =>
-      api.post(`/vod/categories/${id}/ai-evaluate/`, { description }),
-    onSuccess: (r) => {
-      const capNote = r.data.capped ? ` (capped at ${r.data.considered} of ${r.data.total_before_cap} candidates — narrow it with a rule pre-filter or run again)` : ''
-      setAiEvaluateResult(`AI reviewed ${r.data.considered} candidate(s): ${r.data.matched} matched, ${r.data.newly_placed} newly placed.${capNote}`)
-      qc.invalidateQueries({ queryKey: ['vod-categories'] })
-      qc.invalidateQueries({ queryKey: ['vod-movies'] })
-      qc.invalidateQueries({ queryKey: ['vod-series'] })
-    },
-    onError: (e: any) => setAiEvaluateResult(`AI evaluation failed: ${e?.response?.data?.detail ?? e.message}`),
-  })
-  function promptAiEvaluate(c: Category) {
-    const description = window.prompt(
-      `Describe what belongs in "${c.name}" in plain English (AI judges actual titles against this — good for criteria a field rule can't express, e.g. mood, plot, audience fit):`,
-      c.ai_description ?? '',
-    )
-    if (description && description.trim()) aiEvaluateCategory.mutate({ id: c.id, description: description.trim() })
-  }
-
   // ── Year review (ambiguous no-year duplicates held out of categories) ──
   const needsReviewQuery = useQuery<NeedsReviewData>({
     queryKey: ['vod-needs-review'],
@@ -1599,8 +1961,6 @@ export default function VodManager() {
 
   const movieCategories  = categoriesQuery.data?.filter((c) => c.content_type === 'movie')  ?? []
   const seriesCategories = categoriesQuery.data?.filter((c) => c.content_type === 'series') ?? []
-  const plainMovieCategories  = movieCategories.filter((c) => !c.sync_source)
-  const plainSeriesCategories = seriesCategories.filter((c) => !c.sync_source)
   const tmdbGroups = Object.values(
     (categoriesQuery.data ?? []).filter((c) => !!c.sync_source).reduce((acc, c) => {
       const key = c.sync_source as string
@@ -1655,6 +2015,29 @@ export default function VodManager() {
         )}
       </SectionCard>
 
+      <div className="flex items-center gap-0.5 rounded border border-border p-0.5 w-fit">
+        {([
+          { key: 'movies' as const, label: 'Movies', icon: <Film size={12} /> },
+          { key: 'series' as const, label: 'TV Shows', icon: <Tv size={12} /> },
+          { key: 'curation' as const, label: 'Curation & Maintenance', icon: <Wrench size={12} /> },
+          { key: 'config' as const, label: 'Configuration', icon: <Settings size={12} /> },
+        ]).map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setActiveTab(t.key)}
+            className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs transition-colors ${
+              activeTab === t.key
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+            }`}
+          >
+            {t.icon}{t.label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === 'config' && (
+      <>
       <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           TMDB API key — used to sync categories from public TMDB Lists (see Categories below).
@@ -2155,7 +2538,11 @@ export default function VodManager() {
           </tbody>
         </table>
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'curation' && (
+      <>
       <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
         <p className="text-xs text-muted-foreground">
           Fetches detail (genre, poster, description, cast) from each item's source provider for every movie
@@ -2180,7 +2567,11 @@ export default function VodManager() {
           )}
         </div>
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'config' && (
+      <>
       <SectionCard title="Title & Metadata Rules" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Regex find/replace applied to imported text, e.g. stripping a provider's own quality-tier
@@ -2229,7 +2620,11 @@ export default function VodManager() {
           {applyRulesResult && <span className="text-xs text-muted-foreground">{applyRulesResult}</span>}
         </div>
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'curation' && (
+      <>
       <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
         <div className="overflow-x-auto">
         <table className="w-full text-xs min-w-[1100px]">
@@ -2441,258 +2836,6 @@ export default function VodManager() {
         </div>
       </SectionCard>
 
-      <SectionCard title="Categories" icon={<CheckCircle2 size={14} />}>
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <p className="text-xs font-medium text-muted-foreground mb-1">Movie categories</p>
-            <ul className="text-xs space-y-0.5">
-              {plainMovieCategories.map((c) => (
-                <li key={c.id} className="flex items-center justify-between gap-2">
-                  <span className="flex items-center gap-1 min-w-0">
-                    <input
-                      className={inputCls('w-32')}
-                      defaultValue={c.name}
-                      key={c.name}
-                      title="Rename category"
-                      onBlur={(e) => {
-                        const v = e.target.value.trim()
-                        if (v && v !== c.name) renameCategory.mutate({ id: c.id, name: v })
-                      }}
-                    />
-                    {!!c.is_smart && <span className="text-muted-foreground"> (smart)</span>}
-                    {!!c.sync_source && <span className="text-muted-foreground"> (TMDB: {c.sync_source.replace('tmdb_list:', '')})</span>}
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <input
-                      className={inputCls('w-12')}
-                      type="number"
-                      title="Sort order (lower shows first in Dispatcharr)"
-                      defaultValue={c.sort_order}
-                      key={c.sort_order}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value) || 0
-                        if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
-                      }}
-                    />
-                    {!!c.is_smart && (
-                      <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
-                        <Zap size={12} />
-                      </button>
-                    )}
-                    <button
-                      title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
-                      className="text-muted-foreground hover:text-foreground"
-                      disabled={aiEvaluateCategory.isPending}
-                      onClick={() => promptAiEvaluate(c)}
-                    >
-                      <Sparkles size={12} />
-                    </button>
-                    {!!c.sync_source && (
-                      <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
-                        <RefreshCw size={12} />
-                      </button>
-                    )}
-                    <button
-                      title="View movies in this category"
-                      className={movieCategoryFilter === c.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}
-                      onClick={() => { setMovieCategoryFilter(c.id); setMovieSearch(''); setMovieOffset(0) }}
-                    >
-                      <Eye size={12} />
-                    </button>
-                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Movies stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
-                      <Trash2 size={12} />
-                    </button>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div>
-            <p className="text-xs font-medium text-muted-foreground mb-1">Series categories</p>
-            <ul className="text-xs space-y-0.5">
-              {plainSeriesCategories.map((c) => (
-                <li key={c.id} className="flex items-center justify-between gap-2">
-                  <span className="flex items-center gap-1 min-w-0">
-                    <input
-                      className={inputCls('w-32')}
-                      defaultValue={c.name}
-                      key={c.name}
-                      title="Rename category"
-                      onBlur={(e) => {
-                        const v = e.target.value.trim()
-                        if (v && v !== c.name) renameCategory.mutate({ id: c.id, name: v })
-                      }}
-                    />
-                    {!!c.is_smart && <span className="text-muted-foreground"> (smart)</span>}
-                    {!!c.sync_source && <span className="text-muted-foreground"> (TMDB: {c.sync_source.replace('tmdb_list:', '')})</span>}
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <input
-                      className={inputCls('w-12')}
-                      type="number"
-                      title="Sort order (lower shows first in Dispatcharr)"
-                      defaultValue={c.sort_order}
-                      key={c.sort_order}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value) || 0
-                        if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
-                      }}
-                    />
-                    {!!c.is_smart && (
-                      <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
-                        <Zap size={12} />
-                      </button>
-                    )}
-                    <button
-                      title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
-                      className="text-muted-foreground hover:text-foreground"
-                      disabled={aiEvaluateCategory.isPending}
-                      onClick={() => promptAiEvaluate(c)}
-                    >
-                      <Sparkles size={12} />
-                    </button>
-                    {!!c.sync_source && (
-                      <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
-                        <RefreshCw size={12} />
-                      </button>
-                    )}
-                    <button
-                      title="View series in this category"
-                      className={seriesCategoryFilter === c.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}
-                      onClick={() => { setSeriesCategoryFilter(c.id); setSeriesSearch(''); setSeriesOffset(0) }}
-                    >
-                      <Eye size={12} />
-                    </button>
-                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Series stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
-                      <Trash2 size={12} />
-                    </button>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-        {evaluateResult && <p className="text-xs text-muted-foreground">{evaluateResult}</p>}
-        {aiEvaluateResult && <p className="text-xs text-muted-foreground">{aiEvaluateResult}</p>}
-        <div className="flex flex-wrap items-center gap-1.5 pt-1">
-          <input
-            className={inputCls()}
-            placeholder="Category name"
-            value={categoryForm.name}
-            onChange={(e) => setCategoryForm({ ...categoryForm, name: e.target.value })}
-          />
-          <select
-            className={inputCls()}
-            value={categoryForm.content_type}
-            onChange={(e) => setCategoryForm({ ...categoryForm, content_type: e.target.value as 'movie' | 'series' })}
-          >
-            <option value="movie">Movie</option>
-            <option value="series">Series</option>
-          </select>
-          <label className="flex items-center gap-1 text-xs text-muted-foreground">
-            <input type="checkbox" checked={categoryForm.is_smart} onChange={(e) => setCategoryForm({ ...categoryForm, is_smart: e.target.checked })} />
-            Smart (rule-based)
-          </label>
-          <Button size="sm" disabled={!categoryForm.name || (categoryForm.is_smart && !categoryForm.rule_value) || addCategory.isPending} onClick={() => addCategory.mutate()}>
-            <Plus size={12} className="mr-1" /> Add
-          </Button>
-        </div>
-        {categoryForm.is_smart && (
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span>Rule: field</span>
-            <select className={inputCls()} value={categoryForm.rule_field} onChange={(e) => setCategoryForm({ ...categoryForm, rule_field: e.target.value as typeof RULE_FIELDS[number] })}>
-              {RULE_FIELDS.map((f) => <option key={f} value={f}>{f}</option>)}
-            </select>
-            <select className={inputCls()} value={categoryForm.rule_op} onChange={(e) => setCategoryForm({ ...categoryForm, rule_op: e.target.value as typeof RULE_OPS[number] })}>
-              {RULE_OPS.map((op) => <option key={op} value={op}>{op}</option>)}
-            </select>
-            {categoryForm.rule_field === 'is_adult' ? (
-              <select className={inputCls()} value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })}>
-                <option value="">value…</option>
-                <option value="1">Yes (adult)</option>
-                <option value="0">No</option>
-              </select>
-            ) : (
-              <input className={inputCls()} placeholder="value" value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })} />
-            )}
-          </div>
-        )}
-
-        <div className="border border-border rounded p-2 space-y-1.5 mt-2">
-          <p className="text-xs font-medium flex items-center gap-1"><Sparkles size={12} /> Suggest a category with AI</p>
-          <p className="text-xs text-muted-foreground">
-            Describe a category in plain English — Claude proposes a rule using only the fields/ops above (name,
-            genre, year, country/language, director, is_adult). Review it before creating; nothing is saved until
-            you click Create.
-          </p>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <select className={inputCls()} value={aiRuleContentType} onChange={(e) => setAiRuleContentType(e.target.value as 'movie' | 'series')}>
-              <option value="movie">Movie</option>
-              <option value="series">Series</option>
-            </select>
-            <input
-              className={inputCls('flex-1 min-w-[16rem]')}
-              placeholder='e.g. "90s action movies" or "kid-friendly animated films"'
-              value={aiRuleDescription}
-              onChange={(e) => setAiRuleDescription(e.target.value)}
-            />
-            <Button size="sm" variant="outline" disabled={!aiRuleDescription || suggestAiRule.isPending} onClick={() => suggestAiRule.mutate()}>
-              {suggestAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Suggest'}
-            </Button>
-          </div>
-          {suggestAiRule.isError && (
-            <p className="text-xs text-destructive">{(suggestAiRule.error as any)?.response?.data?.detail ?? (suggestAiRule.error as any)?.message}</p>
-          )}
-          {aiRuleSuggestion && (
-            <div className="text-xs space-y-1 border-t border-border/50 pt-1.5">
-              <p><span className="text-muted-foreground">Name:</span> {aiRuleSuggestion.name}</p>
-              <p className="text-muted-foreground">
-                Match {aiRuleSuggestion.match.toUpperCase()} of:{' '}
-                {aiRuleSuggestion.conditions.map((c, i) => (
-                  <span key={i}>{i > 0 ? ', ' : ''}<code className="bg-muted px-1 rounded">{c.field} {c.op} "{c.value}"</code></span>
-                ))}
-              </p>
-              <div className="flex items-center gap-1.5">
-                <Button size="sm" disabled={createCategoryFromAiRule.isPending} onClick={() => createCategoryFromAiRule.mutate()}>
-                  {createCategoryFromAiRule.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Create this category'}
-                </Button>
-                <Button size="sm" variant="outline" onClick={() => setAiRuleSuggestion(null)}>Discard</Button>
-              </div>
-            </div>
-          )}
-        </div>
-      </SectionCard>
-
-      <SectionCard title="Needs Year Review" icon={<AlertCircle size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Imported with no year, and ambiguous against 2+ existing pool entries with the same name — held out of every category until resolved.
-        </p>
-        {needsReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
-        {!!needsReviewQuery.data && !needsReviewQuery.data.movies.length && !needsReviewQuery.data.series.length && (
-          <p className="text-xs text-muted-foreground">Nothing needs review right now.</p>
-        )}
-        {!!needsReviewQuery.data?.movies.length && (
-          <div>
-            <p className="text-xs font-medium text-muted-foreground mb-1">Movies ({needsReviewQuery.data.movies.length})</p>
-            <ul className="text-xs">
-              {needsReviewQuery.data.movies.map((m) => (
-                <NeedsReviewRow key={m.id} contentType="movie" item={m} qc={qc} xcCredentials={xcCredentialsQuery.data} />
-              ))}
-            </ul>
-          </div>
-        )}
-        {!!needsReviewQuery.data?.series.length && (
-          <div>
-            <p className="text-xs font-medium text-muted-foreground mb-1">TV Shows ({needsReviewQuery.data.series.length})</p>
-            <ul className="text-xs">
-              {needsReviewQuery.data.series.map((s) => (
-                <NeedsReviewRow key={s.id} contentType="series" item={s} qc={qc} xcCredentials={xcCredentialsQuery.data} />
-              ))}
-            </ul>
-          </div>
-        )}
-      </SectionCard>
-
       <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds dead rows a provider deletion (or a bug) can leave behind: series whose only source provider no
@@ -2818,9 +2961,13 @@ export default function VodManager() {
           </p>
         )}
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'movies' && (
+      <>
       <SectionCard title="Movies" icon={<Film size={14} />}>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <input
             className={inputCls('w-64')}
             placeholder="Search movies…"
@@ -2844,6 +2991,28 @@ export default function VodManager() {
             </span>
           )}
           {moviesQuery.data && <Pager total={moviesQuery.data.total} limit={MOVIE_LIMIT} offset={movieOffset} onOffset={setMovieOffset} />}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('movie')}>Manage Categories</Button>
+          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('movie')}>
+            Needs Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
+          </Button>
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
+            <button
+              title="List view"
+              className={`flex items-center p-1 rounded ${movieViewMode === 'list' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent'}`}
+              onClick={() => setMovieViewMode('list')}
+            >
+              <List size={12} />
+            </button>
+            <button
+              title="Grid view"
+              className={`flex items-center p-1 rounded ${movieViewMode === 'grid' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent'}`}
+              onClick={() => setMovieViewMode('grid')}
+            >
+              <LayoutGrid size={12} />
+            </button>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
           <span className="text-xs text-muted-foreground">{selectedMovieIds.size} selected</span>
@@ -2875,7 +3044,7 @@ export default function VodManager() {
           </Button>
           {bulkMovieResult && <span className="text-xs text-muted-foreground">{bulkMovieResult}</span>}
         </div>
-        <div className="space-y-2">
+        <div className={movieViewMode === 'grid' ? 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2' : 'space-y-2'}>
           {moviesQuery.isFetching && <p className="text-xs text-muted-foreground">Loading…</p>}
           {moviesQuery.data?.items.map((m) => (
             <MovieRow
@@ -2887,6 +3056,7 @@ export default function VodManager() {
               xcCredentials={xcCredentialsQuery.data}
               selected={selectedMovieIds.has(m.id)}
               onToggleSelect={() => toggleMovieSelected(m.id)}
+              mode={movieViewMode}
             />
           ))}
         </div>
@@ -2898,9 +3068,13 @@ export default function VodManager() {
           </Button>
         </div>
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'series' && (
+      <>
       <SectionCard title="TV Shows" icon={<Tv size={14} />}>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <input
             className={inputCls('w-64')}
             placeholder="Search series…"
@@ -2924,6 +3098,28 @@ export default function VodManager() {
             </span>
           )}
           {seriesQuery.data && <Pager total={seriesQuery.data.total} limit={SERIES_LIMIT} offset={seriesOffset} onOffset={setSeriesOffset} />}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('series')}>Manage Categories</Button>
+          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('series')}>
+            Needs Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
+          </Button>
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
+            <button
+              title="List view"
+              className={`flex items-center p-1 rounded ${seriesViewMode === 'list' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent'}`}
+              onClick={() => setSeriesViewMode('list')}
+            >
+              <List size={12} />
+            </button>
+            <button
+              title="Grid view"
+              className={`flex items-center p-1 rounded ${seriesViewMode === 'grid' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent'}`}
+              onClick={() => setSeriesViewMode('grid')}
+            >
+              <LayoutGrid size={12} />
+            </button>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
           <span className="text-xs text-muted-foreground">{selectedSeriesIds.size} selected</span>
@@ -2955,7 +3151,7 @@ export default function VodManager() {
           </Button>
           {bulkSeriesResult && <span className="text-xs text-muted-foreground">{bulkSeriesResult}</span>}
         </div>
-        <div className="space-y-2">
+        <div className={seriesViewMode === 'grid' ? 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2' : 'space-y-2'}>
           {seriesQuery.isFetching && <p className="text-xs text-muted-foreground">Loading…</p>}
           {seriesQuery.data?.items.map((s) => (
             <SeriesRow
@@ -2966,6 +3162,7 @@ export default function VodManager() {
               xcCredentials={xcCredentialsQuery.data}
               selected={selectedSeriesIds.has(s.id)}
               onToggleSelect={() => toggleSeriesSelected(s.id)}
+              mode={seriesViewMode}
             />
           ))}
         </div>
@@ -2977,6 +3174,32 @@ export default function VodManager() {
           </Button>
         </div>
       </SectionCard>
+      </>
+      )}
+
+      {categoriesModalOpen && (
+        <CategoriesModal
+          contentType={categoriesModalOpen}
+          categories={categoriesModalOpen === 'movie' ? movieCategories : seriesCategories}
+          qc={qc}
+          onView={(categoryId) => {
+            if (categoriesModalOpen === 'movie') { setMovieCategoryFilter(categoryId); setMovieSearch(''); setMovieOffset(0) }
+            else { setSeriesCategoryFilter(categoryId); setSeriesSearch(''); setSeriesOffset(0) }
+            setCategoriesModalOpen(null)
+          }}
+          onClose={() => setCategoriesModalOpen(null)}
+        />
+      )}
+
+      {needsReviewModalOpen && (
+        <NeedsReviewModal
+          contentType={needsReviewModalOpen}
+          items={(needsReviewModalOpen === 'movie' ? needsReviewQuery.data?.movies : needsReviewQuery.data?.series) ?? []}
+          qc={qc}
+          xcCredentials={xcCredentialsQuery.data}
+          onClose={() => setNeedsReviewModalOpen(null)}
+        />
+      )}
     </div>
   )
 }
