@@ -67,10 +67,12 @@ Manager's own URL as reachable *from that instance* — this isn't always the
 same URL you're viewing VOD Manager at yourself (a co-located instance
 might use a Docker-internal hostname; a remote one needs your real public
 URL). VOD Manager then automatically creates the client credentials and the
-Dispatcharr-side M3U account for you. The only thing left is on
-Dispatcharr's own side: enable VOD on the new account and pick which
-groups/categories to turn on — normal setup for any source, regardless of
-how the account got created.
+Dispatcharr-side M3U account for you (with a 50-concurrent-stream account-
+level cap — generous on purpose, since the real per-provider limits are
+enforced separately; see below). The only thing left is on Dispatcharr's
+own side: enable VOD on the new account and pick which groups/categories to
+turn on — normal setup for any source, regardless of how the account got
+created.
 
 ## Per-instance category access control
 

@@ -16,6 +16,8 @@ import vod_db
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_ACCOUNT_MAX_STREAMS = 50
+
 
 class VodXcAccountNotConfigured(Exception):
     pass
@@ -45,7 +47,17 @@ async def connect_dispatcharr_instance(label: str, url: str, token: str, vod_man
             "username": client_record["username"],
             "password": client_record["password"],
             "is_active": True,
-            "max_streams": 1,
+            # Account-level cap on how many concurrent streams Dispatcharr
+            # will pull from VOD Manager through this account as a whole --
+            # NOT the real per-provider limit (that's enforced separately,
+            # per-provider, via the "profiles" _sync_provider_to_connection
+            # below creates/updates). This just needs to be generous enough
+            # to never be the practical bottleneck itself. Confirmed live
+            # 2026-07-20: leaving this at 1 (the old value) meant a single
+            # player's ordinary probe-then-play double-connect, or two
+            # concurrent viewers, got hard-rejected with zero indication why
+            # -- looked identical to a codec/client problem from the outside.
+            "max_streams": _DEFAULT_ACCOUNT_MAX_STREAMS,
         })
     except Exception:
         vod_db.delete_xc_client(client_record["id"])
