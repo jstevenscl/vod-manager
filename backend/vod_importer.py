@@ -21,7 +21,13 @@ import vod_db
 
 logger = logging.getLogger(__name__)
 
-_YEAR_SUFFIX_RE = re.compile(r"^(.*?)\s*\((\d{4})\)\s*$")
+_YEAR_SUFFIX_RE = re.compile(
+    # (?<!\d) keeps this from firing inside a genuine in-title year range like
+    # "... (1987-1997)" or "Wartorn: 1861-2010" -- without it, the dash/paren
+    # right before the second year in the range looks identical to a real
+    # trailing year suffix and the title gets mangled.
+    r"^(.*?)\s*(?<!\d)[-(]\s*(19\d{2}|20\d{2})\)?\s*(?:\[[^\]]*\]|[A-Z][A-Z\- ]{2,})?\s*$"
+)
 
 # Some real XC providers (e.g. ProviderD) silently drop the connection --
 # no HTTP response at all -- for requests without a browser-like User-Agent,
@@ -31,18 +37,22 @@ _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Ap
 
 
 def parse_name_year(raw_name: str) -> tuple[str, int | None]:
-    """Real XC providers commonly bake the year into the title string itself
-    (e.g. "The Angel (2018)") rather than populating a separate year field.
-    Some catalogs duplicate it (e.g. "1 1 (2018) (2018)") — strip every
-    trailing "(YYYY)" layer, not just one, or the leftover copy in the name
-    doubles up with the year we display alongside it."""
+    """Real XC providers commonly bake the year into the title string itself,
+    not always as a clean trailing "(YYYY)" -- also seen: "Title - YYYY",
+    "Title (YYYY) [MULTI-SUB]", "Title (YYYY) HINDI", and even an unclosed
+    "Title (YYYY". Some catalogs duplicate it (e.g. "1 1 (2018) (2018)") --
+    strip every trailing year layer, not just one, or the leftover copy in
+    the name doubles up with the year we display alongside it."""
     name = raw_name.strip()
     year = None
     while True:
         m = _YEAR_SUFFIX_RE.match(name)
         if not m:
             break
-        name, year = m.group(1).strip(), int(m.group(2))
+        new_name = m.group(1).strip()
+        if new_name == name:
+            break
+        name, year = new_name, int(m.group(2))
     return name, year
 
 

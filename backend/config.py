@@ -103,6 +103,62 @@ def save_anthropic_api_key(api_key: str) -> None:
     _write_raw(data)
 
 
+# ── AI provider selection ────────────────────────────────────────────────────
+# ai_assist.py can talk to any of these three -- a user might already have a
+# key for one and not another, or want to compare quality/cost, so the key
+# for each is stored independently of which one is actually "active".
+
+AI_PROVIDERS = ("anthropic", "openai", "gemini")
+
+_AI_DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-5",
+    "openai": "gpt-5",
+    "gemini": "gemini-2.5-pro",
+}
+
+
+def get_ai_provider() -> str:
+    data = _read_raw()
+    provider = data.get("ai_provider")
+    return provider if provider in AI_PROVIDERS else "anthropic"
+
+
+def get_ai_model() -> str:
+    data = _read_raw()
+    return data.get("ai_model") or _AI_DEFAULT_MODELS[get_ai_provider()]
+
+
+def save_ai_provider(provider: str, model: str | None = None) -> None:
+    if provider not in AI_PROVIDERS:
+        raise ValueError(f"unknown AI provider '{provider}'")
+    data = _read_raw()
+    data["ai_provider"] = provider
+    data["ai_model"] = model.strip() if model and model.strip() else _AI_DEFAULT_MODELS[provider]
+    _write_raw(data)
+
+
+def get_openai_api_key() -> str | None:
+    data = _read_raw()
+    return data.get("openai_api_key") or None
+
+
+def save_openai_api_key(api_key: str) -> None:
+    data = _read_raw()
+    data["openai_api_key"] = api_key
+    _write_raw(data)
+
+
+def get_gemini_api_key() -> str | None:
+    data = _read_raw()
+    return data.get("gemini_api_key") or None
+
+
+def save_gemini_api_key(api_key: str) -> None:
+    data = _read_raw()
+    data["gemini_api_key"] = api_key
+    _write_raw(data)
+
+
 # ── XC login lockout ─────────────────────────────────────────────────────────
 # Defaults match xc_server.py's original hardcoded constants. Configurable
 # since the right threshold depends on real-world exposure (a shared-NAT

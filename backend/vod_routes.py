@@ -6,12 +6,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from config import (
+    get_ai_model,
+    get_ai_provider,
     get_anthropic_api_key,
+    get_gemini_api_key,
     get_lockout_settings,
+    get_openai_api_key,
     get_refresh_settings,
     get_tmdb_api_key,
+    save_ai_provider,
     save_anthropic_api_key,
+    save_gemini_api_key,
     save_lockout_settings,
+    save_openai_api_key,
     save_refresh_settings,
     save_tmdb_api_key,
 )
@@ -39,7 +46,13 @@ class TmdbApiKeyRequest(BaseModel):
     api_key: str
 
 
-class AnthropicApiKeyRequest(BaseModel):
+class AiProviderRequest(BaseModel):
+    provider: str
+    model: Optional[str] = None
+
+
+class AiApiKeyRequest(BaseModel):
+    provider: str
     api_key: str
 
 
@@ -139,6 +152,13 @@ class CategoryRequest(BaseModel):
 class ResolveYearReviewRequest(BaseModel):
     year: int
     tmdb_id: Optional[str] = None
+
+
+class ResolveMissingArtworkRequest(BaseModel):
+    poster_url: str
+    tmdb_id: Optional[str] = None
+    name: Optional[str] = None
+    year: Optional[int] = None
 
 
 class MovieRequest(BaseModel):
@@ -362,12 +382,31 @@ async def save_tmdb_settings(body: TmdbApiKeyRequest):
 
 @router.get("/ai-settings/", dependencies=_GUARDS)
 async def get_ai_settings():
-    return {"has_api_key": bool(get_anthropic_api_key())}
+    return {
+        "provider": get_ai_provider(),
+        "model": get_ai_model(),
+        "has_anthropic_key": bool(get_anthropic_api_key()),
+        "has_openai_key": bool(get_openai_api_key()),
+        "has_gemini_key": bool(get_gemini_api_key()),
+    }
 
 
 @router.post("/ai-settings/", dependencies=_GUARDS)
-async def save_ai_settings(body: AnthropicApiKeyRequest):
-    save_anthropic_api_key(body.api_key)
+async def save_ai_settings(body: AiProviderRequest):
+    save_ai_provider(body.provider, body.model)
+    return {"ok": True}
+
+
+@router.post("/ai-settings/key/", dependencies=_GUARDS)
+async def save_ai_key(body: AiApiKeyRequest):
+    if body.provider == "anthropic":
+        save_anthropic_api_key(body.api_key)
+    elif body.provider == "openai":
+        save_openai_api_key(body.api_key)
+    elif body.provider == "gemini":
+        save_gemini_api_key(body.api_key)
+    else:
+        raise HTTPException(400, detail=f"unknown AI provider '{body.provider}'")
     return {"ok": True}
 
 
@@ -770,6 +809,80 @@ async def resolve_year_review(content_type: str, item_id: int, body: ResolveYear
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     try:
         return vod_db.resolve_year_review(content_type, item_id, body.year, body.tmdb_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+# ── Missing artwork ──────────────────────────────────────────────────────────
+# Browse-and-fix queue for movies/series with no poster — see
+# vod_db.list_missing_artwork's docstring for why this can't just be an
+# automatic pass.
+
+@router.get("/missing-artwork/", dependencies=_GUARDS)
+async def list_missing_artwork(
+    content_type: str, limit: int = 30, offset: int = 0, search: Optional[str] = None,
+):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return {
+        "items": vod_db.list_missing_artwork(content_type, limit=limit, offset=offset, search=search),
+        "total": vod_db.count_missing_artwork(content_type, search=search),
+    }
+
+
+@router.get("/missing-artwork/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
+async def missing_artwork_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        raise HTTPException(404, detail=f"{content_type} not found")
+    try:
+        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB search failed: {exc}")
+
+
+@router.get("/missing-artwork/{content_type}/{item_id}/ai-suggest/", dependencies=_GUARDS)
+async def missing_artwork_ai_suggest(content_type: str, item_id: int, q: Optional[str] = None):
+    """Same pattern as the Needs Review AI-suggest route: asks the configured
+    AI provider to pick the most likely correct match among real TMDB search
+    results, purely a recommendation the reviewer still has to click to
+    apply (see resolve/ below)."""
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        raise HTTPException(404, detail=f"{content_type} not found")
+    try:
+        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB search failed: {exc}")
+    if not candidates:
+        return {"best_match_index": None, "reasoning": "No TMDB candidates to choose from.", "confidence": "low"}
+    try:
+        return await ai_assist.suggest_year_review_match(item["name"], None, content_type, candidates)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except Exception as exc:
+        logger.warning("[vod_routes] AI missing-artwork suggestion failed: %s", exc)
+        raise HTTPException(502, detail=f"AI request failed: {exc}")
+
+
+@router.post("/missing-artwork/{content_type}/{item_id}/resolve/", dependencies=_GUARDS)
+async def resolve_missing_artwork(content_type: str, item_id: int, body: ResolveMissingArtworkRequest):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if not body.poster_url.strip():
+        raise HTTPException(400, detail="poster_url is required")
+    try:
+        return vod_db.resolve_missing_artwork(
+            content_type, item_id, body.poster_url.strip(), body.tmdb_id, body.name, body.year,
+        )
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
 

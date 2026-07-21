@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -120,6 +120,12 @@ interface TmdbSuggestion {
   season_count: number | null
   episode_count: number | null
   cast: string[]
+}
+
+interface MissingArtworkItem {
+  id: number
+  name: string
+  year: number | null
 }
 
 interface XcClient {
@@ -640,7 +646,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
             </Button>
           </div>
           {aiSuggest.isError && (
-            <p className="text-destructive">AI suggestion failed — check the Anthropic API key in VOD Settings.</p>
+            <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
           )}
           {aiSuggest.data && (
             <p className="text-muted-foreground border border-border rounded px-2 py-1">
@@ -701,6 +707,143 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
               onClick={() => resolve.mutate({ year: Number(manualYear) })}
             >
               Resolve
+            </Button>
+          </div>
+        </div>
+      )}
+    </li>
+  )
+}
+
+function MissingArtworkRow({ contentType, item, qc }: {
+  contentType: 'movie' | 'series'
+  item: MissingArtworkItem
+  qc: ReturnType<typeof useQueryClient>
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [searchOverride, setSearchOverride] = useState('')
+  const [manualPosterUrl, setManualPosterUrl] = useState('')
+
+  // Same reasoning as NeedsReviewRow's search override -- a mangled/
+  // punctuation-stripped stored title (the actual cause of most missing
+  // artwork) often just doesn't find its real TMDB entry, so let the
+  // reviewer try a cleaned-up query instead of the stored name verbatim.
+  const suggestionsQuery = useQuery<TmdbSuggestion[]>({
+    queryKey: ['vod-missing-artwork-suggestions', contentType, item.id, searchOverride],
+    queryFn:  () => api.get(`/vod/missing-artwork/${contentType}/${item.id}/suggestions/`, {
+      params: searchOverride ? { q: searchOverride } : {},
+    }).then((r) => r.data),
+    enabled:  expanded,
+    retry:    false,
+  })
+
+  const resolve = useMutation({
+    mutationFn: (body: { poster_url: string; tmdb_id?: string; name?: string; year?: number }) =>
+      api.post(`/vod/missing-artwork/${contentType}/${item.id}/resolve/`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-missing-artwork'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+
+  // Same "purely a recommendation" contract as Needs Review's Ask AI --
+  // whichever provider is configured in Settings picks among the same TMDB
+  // candidates shown above; nothing is ever applied without an explicit click.
+  const aiSuggest = useMutation({
+    mutationFn: () => api.get(`/vod/missing-artwork/${contentType}/${item.id}/ai-suggest/`, {
+      params: searchOverride ? { q: searchOverride } : {},
+    }),
+  })
+
+  return (
+    <li className="border-b border-border/50 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate flex items-center gap-1.5">
+          <ImageOff size={12} className="text-muted-foreground shrink-0" />
+          {item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}
+        </span>
+        <button className="text-muted-foreground hover:text-foreground shrink-0" onClick={() => setExpanded((e) => !e)}>
+          {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="mt-2 space-y-2">
+          <div className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">search TMDB as:</span>
+            <input
+              className={inputCls('w-40')}
+              placeholder={item.name}
+              defaultValue={searchOverride}
+              onKeyDown={(e) => { if (e.key === 'Enter') setSearchOverride((e.target as HTMLInputElement).value.trim()) }}
+              onBlur={(e) => setSearchOverride(e.target.value.trim())}
+              title="Try a cleaned-up or differently-punctuated title if the stored name looks mangled — that's usually why the match failed"
+            />
+            <Button size="sm" variant="outline" disabled={!suggestionsQuery.data?.length || aiSuggest.isPending} onClick={() => aiSuggest.mutate()}>
+              {aiSuggest.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} className="mr-1" />Ask AI</>}
+            </Button>
+          </div>
+          {aiSuggest.isError && (
+            <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
+          )}
+          {aiSuggest.data && (
+            <p className="text-muted-foreground border border-border rounded px-2 py-1">
+              <Sparkles size={11} className="inline mr-1" />
+              {aiSuggest.data.data.best_match_index != null && suggestionsQuery.data?.[aiSuggest.data.data.best_match_index]
+                ? <>AI suggests <strong className="text-foreground">{suggestionsQuery.data[aiSuggest.data.data.best_match_index].name}</strong> ({aiSuggest.data.data.confidence} confidence) — {aiSuggest.data.data.reasoning}</>
+                : <>AI found no confident match — {aiSuggest.data.data.reasoning}</>}
+            </p>
+          )}
+          {suggestionsQuery.isLoading && <p className="text-muted-foreground">Searching TMDB…</p>}
+          {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the TMDB API key in API Keys settings.</p>}
+          {!!suggestionsQuery.data?.length && (
+            <div className="space-y-1.5">
+              {suggestionsQuery.data.map((s) => (
+                <button
+                  key={s.tmdb_id}
+                  disabled={resolve.isPending || !s.poster_url}
+                  title={s.poster_url ? undefined : "TMDB has no poster for this candidate either — try another match or enter one manually below"}
+                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left disabled:opacity-50 disabled:hover:bg-transparent"
+                  onClick={() => resolve.mutate({
+                    poster_url: s.poster_url!,
+                    tmdb_id: s.tmdb_id,
+                    name: s.name !== item.name ? s.name : undefined,
+                    year: s.year ?? undefined,
+                  })}
+                >
+                  {s.poster_url
+                    ? <img src={s.poster_url} alt="" className="w-10 h-14 object-cover rounded shrink-0" />
+                    : <div className="w-10 h-14 rounded bg-muted shrink-0 flex items-center justify-center"><ImageOff size={14} className="text-muted-foreground" /></div>}
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{s.name} {s.year ? `(${s.year})` : ''}</span>
+                      {s.vote_average != null && <span className="text-muted-foreground">★ {s.vote_average.toFixed(1)}</span>}
+                    </div>
+                    {!!s.cast.length && <p className="text-muted-foreground">Cast: {s.cast.join(', ')}</p>}
+                    {s.overview && <p className="text-muted-foreground line-clamp-2">{s.overview}</p>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+          {suggestionsQuery.data && suggestionsQuery.data.length === 0 && (
+            <p className="text-muted-foreground">No TMDB matches found for this name.</p>
+          )}
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">or paste a poster URL manually:</span>
+            <input
+              className={inputCls('flex-1')}
+              placeholder="https://..."
+              value={manualPosterUrl}
+              onChange={(e) => setManualPosterUrl(e.target.value)}
+            />
+            <Button
+              size="sm"
+              disabled={!manualPosterUrl.trim() || resolve.isPending}
+              onClick={() => resolve.mutate({ poster_url: manualPosterUrl.trim() })}
+            >
+              Apply
             </Button>
           </div>
         </div>
@@ -1394,6 +1537,51 @@ function NeedsReviewModal({ contentType, items, qc, xcCredentials, onClose }: {
   )
 }
 
+// Unlike Needs Review (a small hand-curated flag list), missing-artwork can
+// be thousands of items -- paginated server-side with its own search, same
+// shape as the main Movies/TV Shows lists, rather than ever loading it whole.
+function MissingArtworkModal({ contentType, qc, onClose }: {
+  contentType: 'movie' | 'series'
+  qc: ReturnType<typeof useQueryClient>
+  onClose: () => void
+}) {
+  const [search, setSearch] = useState('')
+  const [offset, setOffset] = useState(0)
+  const LIMIT = 25
+  const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
+    queryKey: ['vod-missing-artwork', contentType, search, offset],
+    queryFn:  () => api.get('/vod/missing-artwork/', {
+      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset },
+    }).then((r) => r.data),
+  })
+
+  return (
+    <Modal onClose={onClose} maxWidth="max-w-2xl">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
+        <span className="text-sm font-medium shrink-0">
+          Missing Artwork — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({query.data?.total ?? '…'})
+        </span>
+        <input
+          className={inputCls('w-40')}
+          placeholder="Search…"
+          defaultValue={search}
+          onKeyDown={(e) => { if (e.key === 'Enter') { setSearch((e.target as HTMLInputElement).value.trim()); setOffset(0) } }}
+          onBlur={(e) => { setSearch(e.target.value.trim()); setOffset(0) }}
+        />
+      </div>
+      <div className="p-4 text-xs overflow-y-auto">
+        {query.data?.items.length === 0 && <p className="text-muted-foreground">Nothing missing artwork right now.</p>}
+        <ul>
+          {query.data?.items.map((item) => (
+            <MissingArtworkRow key={item.id} contentType={contentType} item={item} qc={qc} />
+          ))}
+        </ul>
+        {query.data && <div className="pt-2"><Pager total={query.data.total} limit={LIMIT} offset={offset} onOffset={setOffset} /></div>}
+      </div>
+    </Modal>
+  )
+}
+
 export default function VodManager() {
   const qc = useQueryClient()
 
@@ -1422,6 +1610,7 @@ export default function VodManager() {
   }
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
 
   // ── Activity (currently open stream relays) ──
   const activityQuery = useQuery<ActivitySession[]>({
@@ -1546,16 +1735,33 @@ export default function VodManager() {
       setTmdbApiKeyInput('')
     },
   })
-  const aiSettingsQuery = useQuery<{ has_api_key: boolean }>({
+  const aiSettingsQuery = useQuery<{
+    provider: 'anthropic' | 'openai' | 'gemini'
+    model: string
+    has_anthropic_key: boolean
+    has_openai_key: boolean
+    has_gemini_key: boolean
+  }>({
     queryKey: ['vod-ai-settings'],
     queryFn:  () => api.get('/vod/ai-settings/').then((r) => r.data),
   })
-  const [aiApiKeyInput, setAiApiKeyInput] = useState('')
-  const saveAiApiKey = useMutation({
-    mutationFn: () => api.post('/vod/ai-settings/', { api_key: aiApiKeyInput }),
+  const [aiModelInput, setAiModelInput] = useState('')
+  const saveAiProvider = useMutation({
+    mutationFn: (body: { provider: string; model?: string }) => api.post('/vod/ai-settings/', body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-ai-settings'] })
-      setAiApiKeyInput('')
+      setAiModelInput('')
+    },
+  })
+  const [aiKeyInputs, setAiKeyInputs] = useState<{ anthropic: string; openai: string; gemini: string }>({
+    anthropic: '', openai: '', gemini: '',
+  })
+  const saveAiKey = useMutation({
+    mutationFn: (provider: 'anthropic' | 'openai' | 'gemini') =>
+      api.post('/vod/ai-settings/key/', { provider, api_key: aiKeyInputs[provider] }),
+    onSuccess: (_res, provider) => {
+      qc.invalidateQueries({ queryKey: ['vod-ai-settings'] })
+      setAiKeyInputs((prev) => ({ ...prev, [provider]: '' }))
     },
   })
   const lockoutSettingsQuery = useQuery<LockoutSettings>({
@@ -1869,6 +2075,18 @@ export default function VodManager() {
     queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
   })
 
+  // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
+  const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
+    queryKey: ['vod-missing-artwork-counts'],
+    queryFn: async () => {
+      const [movies, series] = await Promise.all([
+        api.get('/vod/missing-artwork/', { params: { content_type: 'movie', limit: 1 } }).then((r) => r.data.total),
+        api.get('/vod/missing-artwork/', { params: { content_type: 'series', limit: 1 } }).then((r) => r.data.total),
+      ])
+      return { movies, series }
+    },
+  })
+
   // ── Orphan checker (dead rows a provider deletion, or a bug, can leave behind) ──
   const orphansQuery = useQuery<OrphanReport>({
     queryKey: ['vod-orphans'],
@@ -2058,24 +2276,60 @@ export default function VodManager() {
           )}
         </div>
         <p className="text-xs text-muted-foreground pt-2">
-          Anthropic API key — powers AI-assisted smart category suggestions and Needs Review disambiguation
-          (see Categories and Needs Year Review below).
+          AI provider — powers AI-assisted smart category suggestions, Needs Review disambiguation, and Missing
+          Artwork matching (see Categories, Needs Year Review, and Missing Artwork below). Configure a key for
+          any of these you have access to, then pick which one is active.
         </p>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {(['anthropic', 'openai', 'gemini'] as const).map((p) => (
+            <Button
+              key={p}
+              size="sm"
+              variant={aiSettingsQuery.data?.provider === p ? 'default' : 'outline'}
+              disabled={saveAiProvider.isPending}
+              onClick={() => saveAiProvider.mutate({ provider: p })}
+            >
+              {p === 'anthropic' ? 'Anthropic' : p === 'openai' ? 'OpenAI' : 'Gemini'}
+            </Button>
+          ))}
+          <span className="text-xs text-muted-foreground">— active provider</span>
+        </div>
         <div className="flex items-center gap-1.5">
           <input
             className={inputCls()}
-            type="password"
-            placeholder={aiSettingsQuery.data?.has_api_key ? '••••••••••••••••' : 'Anthropic API Key'}
-            value={aiApiKeyInput}
-            onChange={(e) => setAiApiKeyInput(e.target.value)}
+            placeholder={aiSettingsQuery.data?.model ? `Model (default: ${aiSettingsQuery.data.model})` : 'Model override'}
+            value={aiModelInput}
+            onChange={(e) => setAiModelInput(e.target.value)}
           />
-          <Button size="sm" disabled={!aiApiKeyInput || saveAiApiKey.isPending} onClick={() => saveAiApiKey.mutate()}>
-            {saveAiApiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          <Button
+            size="sm"
+            disabled={!aiSettingsQuery.data || saveAiProvider.isPending}
+            onClick={() => saveAiProvider.mutate({ provider: aiSettingsQuery.data!.provider, model: aiModelInput || undefined })}
+          >
+            {saveAiProvider.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Set Model'}
           </Button>
-          {aiSettingsQuery.data?.has_api_key && (
-            <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
-          )}
         </div>
+        {([
+          { key: 'anthropic' as const, label: 'Anthropic API Key', has: aiSettingsQuery.data?.has_anthropic_key },
+          { key: 'openai' as const, label: 'OpenAI API Key', has: aiSettingsQuery.data?.has_openai_key },
+          { key: 'gemini' as const, label: 'Google Gemini API Key', has: aiSettingsQuery.data?.has_gemini_key },
+        ]).map(({ key, label, has }) => (
+          <div key={key} className="flex items-center gap-1.5">
+            <input
+              className={inputCls()}
+              type="password"
+              placeholder={has ? '••••••••••••••••' : label}
+              value={aiKeyInputs[key]}
+              onChange={(e) => setAiKeyInputs((prev) => ({ ...prev, [key]: e.target.value }))}
+            />
+            <Button size="sm" disabled={!aiKeyInputs[key] || saveAiKey.isPending} onClick={() => saveAiKey.mutate(key)}>
+              {saveAiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+            </Button>
+            {has && (
+              <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
+            )}
+          </div>
+        ))}
       </SectionCard>
 
       <SectionCard title="Security" icon={<ShieldCheck size={14} />}>
@@ -2997,6 +3251,9 @@ export default function VodManager() {
           <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('movie')}>
             Needs Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('movie')}>
+            Missing Artwork{missingArtworkCountsQuery.data?.movies ? ` (${missingArtworkCountsQuery.data.movies})` : ''}
+          </Button>
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -3104,6 +3361,9 @@ export default function VodManager() {
           <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('series')}>
             Needs Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('series')}>
+            Missing Artwork{missingArtworkCountsQuery.data?.series ? ` (${missingArtworkCountsQuery.data.series})` : ''}
+          </Button>
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -3198,6 +3458,13 @@ export default function VodManager() {
           qc={qc}
           xcCredentials={xcCredentialsQuery.data}
           onClose={() => setNeedsReviewModalOpen(null)}
+        />
+      )}
+      {missingArtworkModalOpen && (
+        <MissingArtworkModal
+          contentType={missingArtworkModalOpen}
+          qc={qc}
+          onClose={() => setMissingArtworkModalOpen(null)}
         />
       )}
     </div>

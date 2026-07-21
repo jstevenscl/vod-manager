@@ -2532,6 +2532,98 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
     return {"resolved_id": item_id}
 
 
+# ── Missing artwork ──────────────────────────────────────────────────────────
+# Poster/tmdb_id normally come straight from the XC provider's own metadata
+# (see vod_importer.enrich_movie/enrich_series) -- when a provider's catalog
+# just doesn't have artwork for something (or its title is mangled enough
+# that the provider's own match failed), this is the browse-and-fix queue: a
+# real TMDB search (tmdb_sync.search_title) a human or the AI picks from,
+# same review-before-apply shape as needs_year_review above.
+
+def list_missing_artwork(content_type: str, limit: int = 50, offset: int = 0, search: str | None = None) -> list[dict]:
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    where = ["(poster_url IS NULL OR poster_url = '')"]
+    params: list = []
+    if search:
+        where.append("name LIKE ?")
+        params.append(f"%{search}%")
+    clause = f"WHERE {' AND '.join(where)}"
+    rows = conn.execute(
+        f"SELECT * FROM {table} {clause} ORDER BY name LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_missing_artwork(content_type: str, search: str | None = None) -> int:
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    where = ["(poster_url IS NULL OR poster_url = '')"]
+    params: list = []
+    if search:
+        where.append("name LIKE ?")
+        params.append(f"%{search}%")
+    clause = f"WHERE {' AND '.join(where)}"
+    n = conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
+    conn.close()
+    return n
+
+
+def resolve_missing_artwork(
+    content_type: str, item_id: int, poster_url: str,
+    tmdb_id: str | None = None, name: str | None = None, year: int | None = None,
+) -> dict:
+    """Applies a chosen TMDB match (or a manually-entered poster URL) to a
+    missing-artwork item. name/year are optional -- a corrected search query
+    often reveals the *stored* name was the actual problem, so a reviewer or
+    the AI can fix that at the same time, not just the poster. Same
+    merge-on-collision safety as resolve_year_review: if the corrected
+    name/year now matches an existing pool entry exactly, merge into it
+    rather than leaving two rows with the same identity."""
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+
+    final_name = name.strip() if name and name.strip() else row["name"]
+    final_year = year if year is not None else row["year"]
+
+    existing = None
+    if (final_name, final_year) != (row["name"], row["year"]):
+        existing = conn.execute(
+            f"SELECT id FROM {table} WHERE name=? AND year IS ? AND id != ?", (final_name, final_year, item_id),
+        ).fetchone()
+
+    if existing:
+        # Give the surviving row the poster/tmdb_id before folding this one
+        # into it, in case it was ALSO missing artwork.
+        conn.execute(
+            f"UPDATE {table} SET poster_url=COALESCE(NULLIF(poster_url,''), ?), "
+            f"tmdb_id=COALESCE(tmdb_id, ?), updated_at=? WHERE id=?",
+            (poster_url, tmdb_id, _now(), existing["id"]),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+        if content_type == "movie":
+            merge_movie(item_id, existing["id"])
+        else:
+            merge_series(item_id, existing["id"])
+        return {"merged_into": existing["id"]}
+
+    fields = {"poster_url": poster_url, "name": final_name, "year": final_year}
+    if tmdb_id:
+        fields["tmdb_id"] = tmdb_id
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
+    _commit_with_retry(conn)
+    conn.close()
+    return {"resolved_id": item_id}
+
+
 # ── Smart categories ─────────────────────────────────────────────────────────
 # rule_json shape: {"match": "all"|"any", "conditions": [{"field", "op", "value"}, ...]}
 # field: name | genre | year | country | director (movies/series share these)
