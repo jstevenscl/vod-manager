@@ -15,7 +15,7 @@ from config import (
     save_refresh_settings,
     save_tmdb_api_key,
 )
-from routes import require_auth, require_configured
+from routes import require_auth
 import ai_assist
 import emby_vod_importer
 import plex_importer
@@ -28,7 +28,7 @@ from xc_server import get_active_sessions, kill_session
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/vod", tags=["vod-manager"])
 
-_GUARDS = [Depends(require_configured), Depends(require_auth)]
+_GUARDS = [Depends(require_auth)]
 
 vod_db.init_db()
 

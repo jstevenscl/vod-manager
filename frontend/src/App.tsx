@@ -37,6 +37,10 @@ export default function App() {
     setThemeState(t)
   }
 
+  const [firstRunDismissed, setFirstRunDismissed] = useState(
+    () => localStorage.getItem('vodmanager-firstrun-dismissed') === '1'
+  )
+
   const { data: settings, isLoading } = useQuery({
     queryKey: ['settings'],
     queryFn:  () => api.get('/settings/').then((r) => r.data),
@@ -55,7 +59,12 @@ export default function App() {
     api.get('/auth/verify/')
       .then((r) => setAuthState(r.data.valid ? 'ready' : 'login'))
       .catch(() => setAuthState('login'))
-  }, [isLoading, settings?.has_credentials, settings?.configured])
+  }, [isLoading, settings?.has_credentials])
+
+  function handleSkipFirstRun() {
+    localStorage.setItem('vodmanager-firstrun-dismissed', '1')
+    setFirstRunDismissed(true)
+  }
 
   function handleLogin() {
     setAuthState('ready')
@@ -82,15 +91,16 @@ export default function App() {
     )
   }
 
-  if (!settings?.configured || showSettings) {
+  const needsFirstRun = !settings?.has_credentials && !firstRunDismissed
+
+  if (needsFirstRun || showSettings) {
     return (
       <Settings
-        firstRun={!settings?.configured}
-        fromEnv={settings?.from_env}
-        currentUrl={settings?.dispatcharr_url}
+        firstRun={needsFirstRun}
         hasCredentials={settings?.has_credentials ?? false}
         onSaved={handleSettingsSaved}
-        onBack={settings?.configured ? () => setShowSettings(false) : undefined}
+        onBack={!needsFirstRun ? () => setShowSettings(false) : undefined}
+        onSkip={needsFirstRun ? handleSkipFirstRun : undefined}
       />
     )
   }
@@ -127,7 +137,7 @@ export default function App() {
           </div>
           <button
             className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-accent"
-            title="Connection settings"
+            title="Account settings"
             onClick={() => setShowSettings(true)}
           >
             <SettingsIcon size={15} />

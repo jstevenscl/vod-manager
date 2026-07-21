@@ -27,12 +27,12 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from config import DATA_DIR
-from routes import require_auth, require_configured
+from routes import require_auth
 import vod_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/backup", tags=["backup"])
-_GUARDS = [Depends(require_configured), Depends(require_auth)]
+_GUARDS = [Depends(require_auth)]
 
 _BACKUP_DIR = DATA_DIR / "backups"
 
