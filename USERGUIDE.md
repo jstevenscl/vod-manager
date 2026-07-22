@@ -103,7 +103,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   vod-manager:
-    image: vod-manager:dev   # build locally from this repo, or your own tag
+    image: ghcr.io/jstevenscl/vod-manager:latest
     container_name: vod-manager
     restart: unless-stopped
     ports:
@@ -115,11 +115,17 @@ volumes:
   vod_manager_data:
 ```
 
-Build and start it:
+Start it:
+
+```bash
+docker compose up -d
+```
+
+Building from source instead of pulling the published image — e.g. for
+local development against this repo — works too:
 
 ```bash
 docker build -t vod-manager:dev .
-docker compose up -d
 ```
 
 The app listens on port `8282`. All persistent state (config, credentials,

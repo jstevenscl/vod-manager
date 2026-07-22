@@ -34,8 +34,15 @@ concise technical reference for people already up and running.
 ## Quick start
 
 ```bash
-docker build -t vod-manager:dev .
 docker compose up -d
+```
+
+This pulls the published `ghcr.io/jstevenscl/vod-manager:latest` image (see
+`docker-compose.yml`). Building from source instead — e.g. for local
+development against this repo — works too:
+
+```bash
+docker build -t vod-manager:dev .
 ```
 
 The app listens on port `8282`. First run asks you to set an admin
