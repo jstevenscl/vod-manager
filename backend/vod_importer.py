@@ -36,6 +36,27 @@ _YEAR_SUFFIX_RE = re.compile(
 _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 
+def _coerce_year(value) -> int | None:
+    """Some XC providers send the series "year" field as a string (or an
+    empty string, or junk like "N/A") rather than a number -- SQLite's
+    INTEGER column affinity happens to silently coerce a clean numeric
+    string on insert, which is exactly why this went unnoticed here, but
+    anything that doesn't look like a plain year would still get stored
+    as-is and quietly break every exact (name, year) match downstream
+    (series import's own dedup lookup, needs_year_review, the duplicate
+    finder's group scan)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_name_year(raw_name: str) -> tuple[str, int | None]:
     """Real XC providers commonly bake the year into the title string itself,
     not always as a clean trailing "(YYYY)" -- also seen: "Title - YYYY",
@@ -134,7 +155,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         series_items.append({
             "name": name,
-            "year": year or s.get("year"),
+            "year": year or _coerce_year(s.get("year")),
             "provider_series_id": str(s["series_id"]),
             "provider_category_name": series_category_names.get(str(s.get("category_id"))),
         })

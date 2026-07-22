@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -2390,6 +2390,24 @@ export default function VodManager() {
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-components'] }),
   })
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false)
+  async function downloadDiagnostics() {
+    setDiagnosticsBusy(true)
+    try {
+      const res = await api.get('/diagnostics/logs/', { responseType: 'blob' })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      a.download = `vod-manager-diagnostics-${stamp}.log`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } finally {
+      setDiagnosticsBusy(false)
+    }
+  }
   const resetBackup = useMutation({
     mutationFn: (id: string) => api.post(`/backup/reset/${id}/`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backup-components'] }),
@@ -3375,6 +3393,17 @@ export default function VodManager() {
             ))}
           </tbody>
         </table>
+      </SectionCard>
+
+      <SectionCard title="Diagnostics" icon={<Stethoscope size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Downloads this app's own log history with provider credentials, hostnames, and IP addresses
+          scrubbed — safe to share when reporting a bug or asking for help.
+        </p>
+        <Button size="sm" variant="outline" className="gap-1" disabled={diagnosticsBusy} onClick={downloadDiagnostics}>
+          {diagnosticsBusy ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+          Download Diagnostic Logs
+        </Button>
       </SectionCard>
       </>
       )}

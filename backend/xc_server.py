@@ -247,6 +247,42 @@ def _log_hit(request: Request, password: str | None = None) -> None:
     logger.info("[xc_server] %s %s", path, params)
 
 
+# VOD Manager serves no live TV at all -- get_live_categories/get_live_streams
+# are unimplemented on purpose. But Dispatcharr's own XC-account sync always
+# fetches live categories/streams *first*, and its own safety guard treats a
+# fully-empty live result as fatal ("No streams collected from XC provider ...
+# aborting refresh"), which sets the account to ERROR and returns *before* it
+# ever reaches the code that queues the actual VOD refresh -- meaning VOD
+# content silently never syncs at all, for any account, ever (confirmed by
+# reading Dispatcharr's apps/m3u/tasks.py: the VOD-refresh trigger is the last
+# statement in that function, unreachable once the live-stream check aborts
+# and returns early). Answering these two actions with one clearly-fake,
+# never-playable placeholder is the only way to satisfy that guard from our
+# side -- Dispatcharr has no "VOD-only account" flag to skip the live check
+# instead. Stream id sits well clear of vod_db's own export id ranges
+# (movies/series/episodes: 900_000_000/910_000_000/920_000_000) so it can
+# never collide with a real pool item.
+_LIVE_PLACEHOLDER_CATEGORY_ID = "999999"
+_LIVE_PLACEHOLDER_STREAM_ID = 999_000_000
+_LIVE_PLACEHOLDER_CATEGORY = {
+    "category_id": _LIVE_PLACEHOLDER_CATEGORY_ID,
+    "category_name": "VOD Manager (no live TV)",
+    "parent_id": 0,
+}
+_LIVE_PLACEHOLDER_STREAM = {
+    "num": 1,
+    "name": "VOD Manager does not provide live TV",
+    "stream_type": "live",
+    "stream_id": _LIVE_PLACEHOLDER_STREAM_ID,
+    "stream_icon": "",
+    "epg_channel_id": "",
+    "added": "0",
+    "category_id": _LIVE_PLACEHOLDER_CATEGORY_ID,
+    "custom_sid": "",
+    "is_adult": "0",
+}
+
+
 def _handle_player_api_action(action: str, params, authenticated: dict) -> dict | list:
     """All the actual catalog work for player_api.php, as a plain synchronous
     function run off the event loop via asyncio.to_thread (see the route
@@ -258,6 +294,12 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
     sync froze the whole server, including totally unrelated requests like
     a login, until the sync's burst of get_series_info calls finished."""
     allowed_category_ids = _allowed_category_ids(authenticated)
+
+    if action == "get_live_categories":
+        return [_LIVE_PLACEHOLDER_CATEGORY]
+
+    if action == "get_live_streams":
+        return [_LIVE_PLACEHOLDER_STREAM]
 
     if action == "get_vod_categories":
         return [
@@ -588,6 +630,21 @@ async def _emby_heartbeat_loop(
         pass
 
 
+_UPSTREAM_XC_PATH_RE = re.compile(r"/(live|movie|series)/[^/\s\"]+/[^/\s\"]+/")
+_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_key)=[^&\s\"]*", re.IGNORECASE)
+
+
+def _redact_upstream_url(url: str) -> str:
+    """Upstream provider URLs embed real, working credentials -- XC as
+    /live|movie|series/{username}/{password}/..., Plex/Emby/Jellyfin as a
+    token/api_key query param. Every log line that includes upstream_url
+    must go through this first, or a real paid-subscription login ends up
+    in plaintext in stdout/container logs (and now, diagnostic exports)."""
+    url = _UPSTREAM_XC_PATH_RE.sub(r"/\1/***/***/", url)
+    url = _UPSTREAM_TOKEN_QS_RE.sub(r"\1=***", url)
+    return url
+
+
 def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
     if provider.get("provider_type") == "plex":
         # provider_stream_id holds the Plex Part key (e.g.
@@ -636,7 +693,7 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request, start
         return Response(status_code=404, content="not found")
     upstream_url = _build_upstream_url(kind, provider, source)
     conn_id = f"transcode-{time.time():.3f}"
-    logger.info("[xc_server] %s transcode OPEN id=%s start=%ds upstream=%s", kind, conn_id, start_secs, upstream_url)
+    logger.info("[xc_server] %s transcode OPEN id=%s start=%ds upstream=%s", kind, conn_id, start_secs, _redact_upstream_url(upstream_url))
 
     _active_sessions[conn_id] = {
         "conn_id": conn_id, "kind": kind, "title": f"{title} (transcoded)", "provider_name": provider["name"],
@@ -775,7 +832,7 @@ async def _start_hls_session(kind: str, source: dict, request: Request, username
         "range_start_byte": 0, "plex_reported": False, "emby_reported": False,
         "_hls_id": hls_id,
     }
-    logger.info("[xc_server] %s HLS OPEN id=%s start=%ds upstream=%s", kind, hls_id, start_secs, upstream_url)
+    logger.info("[xc_server] %s HLS OPEN id=%s start=%ds upstream=%s", kind, hls_id, start_secs, _redact_upstream_url(upstream_url))
     return hls_id
 
 
@@ -951,7 +1008,7 @@ async def _proxy_vod_stream(
             last_error = str(exc)
             logger.warning("[xc_server] %s stream source %d/%d (%s) connect FAILED id=%s after %.1fs: %s: %s",
                             kind, idx + 1, len(sources), provider["name"], conn_id,
-                            time.monotonic() - t_connect_start, type(exc).__name__, exc)
+                            time.monotonic() - t_connect_start, type(exc).__name__, _redact_upstream_url(str(exc)))
             continue
 
         if upstream_resp.status_code >= 400:
@@ -965,7 +1022,7 @@ async def _proxy_vod_stream(
         logger.info(
             "[xc_server] %s stream OPEN id=%s -> provider=%s (source %d/%d) status=%s connect=%.2fs upstream=%s",
             kind, conn_id, provider["name"], idx + 1, len(sources),
-            upstream_resp.status_code, time.monotonic() - t_connect_start, upstream_url,
+            upstream_resp.status_code, time.monotonic() - t_connect_start, _redact_upstream_url(upstream_url),
         )
         _active_vod_streams[provider["id"]] = _active_vod_streams.get(provider["id"], 0) + 1
 

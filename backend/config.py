@@ -4,9 +4,19 @@ import json
 import secrets
 from pathlib import Path
 
+from cryptography.fernet import Fernet
+
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/app/data"))
 CONFIG_FILE = DATA_DIR / "config.json"
 APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
+
+# Persisted log file for main.py's rotating file handler -- the app previously
+# only logged to stdout, so a container restart (or just not having docker
+# logs handy) lost all history. Also the source diagnostics.py reads from for
+# the "download diagnostic logs" export.
+LOG_DIR         = DATA_DIR / "logs"
+LOG_FILE        = LOG_DIR / "vod_manager.log"
+LOG_BACKUP_COUNT = 5
 
 
 def _read_raw() -> dict:
@@ -47,6 +57,27 @@ def config_from_env() -> bool:
 def is_configured() -> bool:
     url, token = get_config()
     return bool(url and token)
+
+
+# ── Encryption key ───────────────────────────────────────────────────────────
+# Lives inside config.json rather than its own file specifically so it rides
+# along with config's existing backup/restore/reset lifecycle -- restoring a
+# config backup onto a fresh instance needs to bring the same key with it, or
+# every already-encrypted provider password / Dispatcharr token in the
+# restored database becomes permanently undecryptable. A config reset wiping
+# the key too is a foreseeable consequence of the same action already
+# destroying the Dispatcharr connection / TMDB key / admin login, not a new
+# separate footgun.
+
+def get_or_create_encryption_key() -> bytes:
+    data = _read_raw()
+    key = data.get("encryption_key")
+    if key:
+        return key.encode()
+    new_key = Fernet.generate_key()
+    data["encryption_key"] = new_key.decode()
+    _write_raw(data)
+    return new_key
 
 
 # ── VOD manager ──────────────────────────────────────────────────────────────

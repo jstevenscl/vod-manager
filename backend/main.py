@@ -4,6 +4,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -11,7 +12,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backup import router as backup_router
-from config import get_last_enrichment_run, save_last_enrichment_run
+from config import LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
+from diagnostics import router as diagnostics_router
 import emby_vod_importer
 import plex_importer
 from routes import router
@@ -19,12 +21,21 @@ import tmdb_sync
 import vod_db
 import vod_importer
 from vod_routes import router as vod_router
-from xc_server import hls_sweep_loop, router as xc_router
+from xc_server import _redact_upstream_url, hls_sweep_loop, router as xc_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
+_LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+logging.getLogger().addHandler(_file_handler)
+# uvicorn configures "uvicorn.access"/"uvicorn.error" with propagate=False and
+# their own stdout/stderr handlers *before* this module is imported -- adding
+# the file handler to the root logger alone would silently miss both, so it
+# has to be attached to them directly too.
+logging.getLogger("uvicorn.access").addHandler(_file_handler)
+logging.getLogger("uvicorn.error").addHandler(_file_handler)
 
 _PASSWORD_QS_RE = re.compile(r"(password=)[^&\s\"]*")
 # xc_server.py's stream/preview routes are all /.../{username}/{password}/...
@@ -51,6 +62,39 @@ class _RedactPasswordFilter(logging.Filter):
 
 
 logging.getLogger("uvicorn.access").addFilter(_RedactPasswordFilter())
+
+
+def _redact_arg(arg):
+    if isinstance(arg, str):
+        return _redact_upstream_url(arg)
+    if isinstance(arg, (int, float, bool)) or arg is None:
+        return arg
+    # httpx logs its request URL as an httpx.URL object, not a str -- an
+    # isinstance(arg, str) check alone silently skips it, and the raw
+    # credential-bearing URL only becomes a plain string when the handler
+    # later formats the record (str(arg)), by which point this filter has
+    # already returned. Any other non-scalar arg gets the same treatment
+    # since %s accepts a pre-stringified value fine; only numeric/bool/None
+    # args are left untouched since httpx's own format string uses %d for
+    # the status code and would raise if that arg became a str.
+    return _redact_upstream_url(str(arg))
+
+
+class _RedactUpstreamCredentialsFilter(logging.Filter):
+    """httpx logs every outgoing request URL at INFO level by default --
+    upstream provider URLs embed real, working credentials (see
+    xc_server._redact_upstream_url), so without this a real paid-subscription
+    login lands in plaintext in stdout/container logs on every stream open."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = _redact_upstream_url(record.msg)
+        if record.args:
+            record.args = tuple(_redact_arg(arg) for arg in record.args)
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactUpstreamCredentialsFilter())
 
 logger     = logging.getLogger("vod_manager")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -174,6 +218,7 @@ app.include_router(router)
 app.include_router(vod_router)
 app.include_router(xc_router)
 app.include_router(backup_router)
+app.include_router(diagnostics_router)
 
 if os.environ.get("VODMANAGER_TEST_UPSTREAM"):
     from test_upstream import router as test_upstream_router

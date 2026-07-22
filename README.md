@@ -42,7 +42,7 @@ This pulls the published `ghcr.io/jstevenscl/vod-manager:latest` image (see
 development against this repo — works too:
 
 ```bash
-docker build -t vod-manager:dev .
+docker build -t vod-manager:local .
 ```
 
 The app listens on port `8282`. First run asks you to set an admin
@@ -190,6 +190,11 @@ of exceeding the real limit.
 - **Login passwords are hashed with PBKDF2-HMAC-SHA256** (260,000
   iterations), not a fast general-purpose hash — resistant to offline
   brute-forcing if the config file ever leaked.
+- **Provider passwords, Dispatcharr tokens, and XC client secrets are
+  encrypted at rest** in the database, not stored in plaintext. The
+  encryption key lives in `config.json` so it travels with that file's own
+  backup/restore/reset flow; existing plaintext values from before this was
+  added upgrade automatically on next startup.
 - **Both the admin login and the XC (streaming) login have brute-force
   lockout** — repeated failed attempts from one address get temporarily
   locked out (XC lockout is configurable under Configuration → Security;
@@ -237,6 +242,10 @@ database) — e.g. reset a corrupted database without touching saved
 credentials, or roll back just the config. Database downloads use SQLite's
 `VACUUM INTO` for a consistent snapshot even while the app is actively
 writing to it.
+
+Configuration → Diagnostics downloads the app's own log history with
+credentials, hostnames, and IP addresses scrubbed — safe to share when
+reporting a bug or asking for help.
 
 ## Curation tools
 

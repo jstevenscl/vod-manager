@@ -12,6 +12,7 @@ it lands as its own distinct catalog entry in Dispatcharr while still
 resolving back to the same real provider source.
 """
 
+from contextlib import contextmanager
 import logging
 import re
 import secrets
@@ -20,6 +21,7 @@ import time
 from pathlib import Path
 
 from config import DATA_DIR, get_config, get_refresh_settings, get_vod_xc_account_id
+from secrets_util import decrypt_value, encrypt_value, is_encrypted
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +232,7 @@ def init_db() -> None:
     _commit_with_retry(conn)
     _migrate(conn)
     _migrate_primary_dispatcharr_connection(conn)
+    _migrate_encrypt_plaintext_credentials(conn)
     conn.close()
 
 
@@ -252,7 +255,7 @@ def _migrate_primary_dispatcharr_connection(conn: sqlite3.Connection) -> None:
         return
     cur = conn.execute(
         "INSERT INTO dispatcharr_connections (label, url, token, vod_relay_account_id, created_at) VALUES (?,?,?,?,?)",
-        ("Primary", url, token, get_vod_xc_account_id(), _now()),
+        ("Primary", url, encrypt_value(token), get_vod_xc_account_id(), _now()),
     )
     connection_id = cur.lastrowid
     for row in conn.execute("SELECT id, dispatcharr_profile_id FROM providers WHERE dispatcharr_profile_id IS NOT NULL").fetchall():
@@ -260,6 +263,31 @@ def _migrate_primary_dispatcharr_connection(conn: sqlite3.Connection) -> None:
             "INSERT INTO provider_sync_profiles (provider_id, dispatcharr_connection_id, dispatcharr_profile_id) VALUES (?,?,?)",
             (row["id"], connection_id, row["dispatcharr_profile_id"]),
         )
+    _commit_with_retry(conn)
+
+
+def _migrate_encrypt_plaintext_credentials(conn: sqlite3.Connection) -> None:
+    """One-time upgrade: encrypt any provider password / Dispatcharr token /
+    XC client secret that predates encrypt-at-rest support. Every read path
+    already tolerates plaintext via decrypt_value's InvalidToken fallback,
+    so this isn't required for correctness -- it's what actually closes the
+    gap for installs that already have real credentials sitting in
+    plaintext on disk, not just new ones going forward."""
+    for table, column in (
+        ("providers", "password"),
+        ("dispatcharr_connections", "token"),
+        ("xc_clients", "password"),
+    ):
+        rows = conn.execute(f"SELECT id, {column} FROM {table}").fetchall()
+        migrated = 0
+        for row in rows:
+            value = row[column]
+            if not value or is_encrypted(value):
+                continue
+            conn.execute(f"UPDATE {table} SET {column}=? WHERE id=?", (encrypt_value(value), row["id"]))
+            migrated += 1
+        if migrated:
+            logger.info("[vod_db] encrypted %d pre-existing plaintext %s.%s value(s) at rest", migrated, table, column)
     _commit_with_retry(conn)
 
 
@@ -327,24 +355,46 @@ def _commit_with_retry(conn: sqlite3.Connection, retries: int = 5) -> None:
             time.sleep(0.5 * (attempt + 1))
 
 
+@contextmanager
+def _item_savepoint(conn: sqlite3.Connection):
+    """Isolates one item's writes within a bulk_import_* loop's single shared
+    transaction -- a real provider catalog is 1000s of items from a source we
+    don't control, and one malformed row (a missing key, an unexpected type)
+    must not either lose the whole batch (bulk_import_movies/series commit
+    only once, at the very end) or silently leave a half-written item behind
+    (an INSERT that succeeded followed by one that raised, in the
+    multi-statement plex variants). ROLLBACK TO undoes just this item's
+    writes and leaves the rest of the already-processed batch, still
+    uncommitted, intact for the final commit."""
+    conn.execute("SAVEPOINT item")
+    try:
+        yield
+    except Exception:
+        conn.execute("ROLLBACK TO item")
+        raise
+    finally:
+        conn.execute("RELEASE item")
+
+
 # ── Providers ────────────────────────────────────────────────────────────────
 
 def upsert_provider(
     name: str, base_url: str, username: str, password: str, max_streams: int = 0, priority: int = 0,
     provider_type: str = "xc",
 ) -> int:
+    encrypted_password = encrypt_value(password)
     conn = _connect()
     row = conn.execute("SELECT id FROM providers WHERE name = ?", (name,)).fetchone()
     if row:
         conn.execute(
             "UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?, updated_at=? WHERE id=?",
-            (base_url, username, password, max_streams, priority, provider_type, _now(), row["id"]),
+            (base_url, username, encrypted_password, max_streams, priority, provider_type, _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
         cur = conn.execute(
             "INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (name, base_url, username, password, max_streams, priority, provider_type, _now()),
+            (name, base_url, username, encrypted_password, max_streams, priority, provider_type, _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -421,12 +471,18 @@ def get_provider(provider_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    d["password"] = decrypt_value(d["password"])
+    return d
 
 
 def list_providers() -> list[dict]:
     conn = _connect()
     rows = [dict(r) for r in conn.execute("SELECT * FROM providers ORDER BY name").fetchall()]
+    for r in rows:
+        r["password"] = decrypt_value(r["password"])
     movie_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM movie_sources GROUP BY provider_id"
     ).fetchall()}
@@ -744,7 +800,7 @@ def create_xc_client(label: str, ip_allowlist: str | None = None) -> dict:
     conn = _connect()
     cur = conn.execute(
         "INSERT INTO xc_clients (label, username, password, enabled, ip_allowlist, created_at) VALUES (?,?,?,1,?,?)",
-        (label, username, password, ip_allowlist, _now()),
+        (label, username, encrypt_value(password), ip_allowlist, _now()),
     )
     client_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -756,6 +812,8 @@ def list_xc_clients() -> list[dict]:
     conn = _connect()
     rows = [dict(r) for r in conn.execute("SELECT * FROM xc_clients ORDER BY created_at ASC").fetchall()]
     conn.close()
+    for r in rows:
+        r["password"] = decrypt_value(r["password"])
     return rows
 
 
@@ -763,6 +821,8 @@ def list_enabled_xc_clients() -> list[dict]:
     conn = _connect()
     rows = [dict(r) for r in conn.execute("SELECT * FROM xc_clients WHERE enabled=1 ORDER BY created_at ASC").fetchall()]
     conn.close()
+    for r in rows:
+        r["password"] = decrypt_value(r["password"])
     return rows
 
 
@@ -770,7 +830,11 @@ def get_xc_client(client_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("SELECT * FROM xc_clients WHERE id=?", (client_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    d["password"] = decrypt_value(d["password"])
+    return d
 
 
 def get_default_xc_client() -> dict | None:
@@ -781,7 +845,11 @@ def get_default_xc_client() -> dict | None:
     conn = _connect()
     row = conn.execute("SELECT * FROM xc_clients WHERE enabled=1 ORDER BY created_at ASC LIMIT 1").fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    d["password"] = decrypt_value(d["password"])
+    return d
 
 
 def update_xc_client(
@@ -809,7 +877,7 @@ def update_xc_client(
 def regenerate_xc_client_secret(client_id: int) -> dict:
     password = _generate_xc_password()
     conn = _connect()
-    conn.execute("UPDATE xc_clients SET password=? WHERE id=?", (password, client_id))
+    conn.execute("UPDATE xc_clients SET password=? WHERE id=?", (encrypt_value(password), client_id))
     _commit_with_retry(conn)
     conn.close()
     return get_xc_client(client_id)
@@ -847,7 +915,7 @@ def create_dispatcharr_connection(label: str, url: str, token: str) -> int:
     conn = _connect()
     cur = conn.execute(
         "INSERT INTO dispatcharr_connections (label, url, token, created_at) VALUES (?,?,?,?)",
-        (label, url.rstrip("/"), token, _now()),
+        (label, url.rstrip("/"), encrypt_value(token), _now()),
     )
     connection_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -859,6 +927,8 @@ def list_dispatcharr_connections() -> list[dict]:
     conn = _connect()
     rows = [dict(r) for r in conn.execute("SELECT * FROM dispatcharr_connections ORDER BY created_at ASC").fetchall()]
     conn.close()
+    for r in rows:
+        r["token"] = decrypt_value(r["token"])
     return rows
 
 
@@ -866,7 +936,11 @@ def get_dispatcharr_connection(connection_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("SELECT * FROM dispatcharr_connections WHERE id=?", (connection_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    d["token"] = decrypt_value(d["token"])
+    return d
 
 
 def update_dispatcharr_connection(
@@ -880,7 +954,7 @@ def update_dispatcharr_connection(
     if url is not None:
         conn.execute("UPDATE dispatcharr_connections SET url=? WHERE id=?", (url.rstrip("/"), connection_id))
     if token is not None:
-        conn.execute("UPDATE dispatcharr_connections SET token=? WHERE id=?", (token, connection_id))
+        conn.execute("UPDATE dispatcharr_connections SET token=? WHERE id=?", (encrypt_value(token), connection_id))
     if clear_vod_relay_account_id:
         conn.execute("UPDATE dispatcharr_connections SET vod_relay_account_id=NULL WHERE id=?", (connection_id,))
     elif vod_relay_account_id is not None:
@@ -1402,13 +1476,27 @@ def place_movie_in_category(movie_id: int, category_id: int) -> int:
     ).fetchone()["c"]
     name_suffix = _ZW_MARKER * placement_count  # 0 suffixes for the 1st placement, 1 for the 2nd, ...
 
-    export_stream_id = _EXPORT_STREAM_ID_BASE + _next_placement_seq(conn)
-    conn.execute(
-        "INSERT INTO movie_category_placements (movie_id, category_id, export_stream_id, name_suffix) VALUES (?,?,?,?)",
-        (movie_id, category_id, export_stream_id, name_suffix),
-    )
-    _commit_with_retry(conn)
-    conn.close()
+    # BEGIN IMMEDIATE around the read-then-insert: without it, two concurrent
+    # placements (e.g. a scheduled refresh auto-placing while a user runs
+    # "Place all filtered") can both read the same MAX(export_stream_id) and
+    # try to insert the same value -- caught by the UNIQUE constraint, but as
+    # an unhandled IntegrityError rather than being serialized cleanly. This
+    # forces the write lock before the read, so the second caller blocks
+    # (and retries via _commit_with_retry) instead of racing.
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        export_stream_id = _EXPORT_STREAM_ID_BASE + _next_placement_seq(conn)
+        conn.execute(
+            "INSERT INTO movie_category_placements (movie_id, category_id, export_stream_id, name_suffix) VALUES (?,?,?,?)",
+            (movie_id, category_id, export_stream_id, name_suffix),
+        )
+        _commit_with_retry(conn)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return export_stream_id
 
 
@@ -1871,18 +1959,26 @@ def place_series_in_category(series_id: int, category_id: int) -> int:
     ).fetchone()["c"]
     name_suffix = _ZW_MARKER * placement_count
 
-    row = conn.execute(
-        "SELECT COALESCE(MAX(export_series_id), ?) m FROM series_category_placements",
-        (_SERIES_EXPORT_BASE - 1,),
-    ).fetchone()
-    export_series_id = max(row["m"] + 1, _SERIES_EXPORT_BASE)
+    # See place_movie_in_category's matching comment -- same race, same fix.
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(export_series_id), ?) m FROM series_category_placements",
+            (_SERIES_EXPORT_BASE - 1,),
+        ).fetchone()
+        export_series_id = max(row["m"] + 1, _SERIES_EXPORT_BASE)
 
-    conn.execute(
-        "INSERT INTO series_category_placements (series_id, category_id, export_series_id, name_suffix) VALUES (?,?,?,?)",
-        (series_id, category_id, export_series_id, name_suffix),
-    )
-    _commit_with_retry(conn)
-    conn.close()
+        conn.execute(
+            "INSERT INTO series_category_placements (series_id, category_id, export_series_id, name_suffix) VALUES (?,?,?,?)",
+            (series_id, category_id, export_series_id, name_suffix),
+        )
+        _commit_with_retry(conn)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return export_series_id
 
 
@@ -2107,90 +2203,110 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
     created = 0
     matched = 0
     flagged = 0
+    errors = 0
     for item in items:
-        name = item["name"]
-        year = item.get("year")
-        category_looks_adult = _looks_adult(item.get("provider_category_name"))
-        if not name.strip():
-            # A blank provider-supplied name has no real identity to match
-            # on -- treating "" like any other string let unrelated titles
-            # silently collapse into one shared row (a real corruption found
-            # in production: 3 completely unrelated movies from the same
-            # provider, different genres, merged into a single blank-named
-            # entry because they all matched (name='', year=NULL) exactly).
-            # Never match a blank name against anything, including another
-            # blank one -- but do
-            # reuse this exact stream's own existing row across re-syncs
-            # (looked up by provider+stream_id, not by name), or a periodic
-            # catalog refresh would mint a fresh orphaned row every pass.
-            existing_source = conn.execute(
-                "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
-                (provider_id, item["provider_stream_id"]),
-            ).fetchone()
-            if existing_source:
-                movie_id = existing_source["movie_id"]
-                matched += 1
-            else:
-                placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
-                cur = conn.execute(
-                    "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
-                    (placeholder, year, int(category_looks_adult), 1, now),
+        try:
+            with _item_savepoint(conn):
+                name = item["name"]
+                year = item.get("year")
+                category_looks_adult = _looks_adult(item.get("provider_category_name"))
+                # Counted locally and only folded into the real created/matched/
+                # flagged totals once this item's last statement has actually
+                # succeeded -- incrementing the outer counters immediately would
+                # drift them out of sync with what's really in the DB if a later
+                # statement in this same item (e.g. the movie_sources insert
+                # below) goes on to raise and roll this item back.
+                did_create = did_match = did_flag = False
+                if not name.strip():
+                    # A blank provider-supplied name has no real identity to match
+                    # on -- treating "" like any other string let unrelated titles
+                    # silently collapse into one shared row (a real corruption found
+                    # in production: 3 completely unrelated movies from the same
+                    # provider, different genres, merged into a single blank-named
+                    # entry because they all matched (name='', year=NULL) exactly).
+                    # Never match a blank name against anything, including another
+                    # blank one -- but do
+                    # reuse this exact stream's own existing row across re-syncs
+                    # (looked up by provider+stream_id, not by name), or a periodic
+                    # catalog refresh would mint a fresh orphaned row every pass.
+                    existing_source = conn.execute(
+                        "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+                        (provider_id, item["provider_stream_id"]),
+                    ).fetchone()
+                    if existing_source:
+                        movie_id = existing_source["movie_id"]
+                        did_match = True
+                    else:
+                        placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
+                        cur = conn.execute(
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, now),
+                        )
+                        movie_id = cur.lastrowid
+                        did_create = True
+                        did_flag = True
+                    conn.execute(
+                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
+                           VALUES (?,?,?,?,?,?,?)
+                           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
+                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
+                         item.get("provider_category_name"), now, now),
+                    )
+                    created += did_create
+                    matched += did_match
+                    flagged += did_flag
+                    continue
+                row = conn.execute("SELECT id, is_adult, is_adult_manual FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
+                if row:
+                    movie_id = row["id"]
+                    did_match = True
+                    if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
+                        conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+                elif year is None:
+                    # No exact (name, NULL) row, and no year to key an exact match
+                    # on -- same reasoning as upsert_movie: exactly one same-named
+                    # candidate means this is almost certainly it, just missing year
+                    # metadata from this provider; two or more is genuinely
+                    # ambiguous, flag rather than silently duplicate.
+                    candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
+                    if len(candidates) == 1:
+                        movie_id = candidates[0]["id"]
+                        did_match = True
+                    else:
+                        cur = conn.execute(
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
+                            (name, year, int(category_looks_adult), 1 if candidates else 0, now),
+                        )
+                        movie_id = cur.lastrowid
+                        did_create = True
+                        if candidates:
+                            did_flag = True
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO movies (name, year, is_adult, created_at) VALUES (?,?,?,?)",
+                        (name, year, int(category_looks_adult), now),
+                    )
+                    movie_id = cur.lastrowid
+                    did_create = True
+                conn.execute(
+                    """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
+                       VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                           movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
+                    (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
+                     item.get("provider_category_name"), now, now),
                 )
-                movie_id = cur.lastrowid
-                created += 1
-                flagged += 1
-            conn.execute(
-                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                       movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
-                (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                 item.get("provider_category_name"), now, now),
-            )
-            continue
-        row = conn.execute("SELECT id, is_adult, is_adult_manual FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
-        if row:
-            movie_id = row["id"]
-            matched += 1
-            if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
-                conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
-        elif year is None:
-            # No exact (name, NULL) row, and no year to key an exact match
-            # on -- same reasoning as upsert_movie: exactly one same-named
-            # candidate means this is almost certainly it, just missing year
-            # metadata from this provider; two or more is genuinely
-            # ambiguous, flag rather than silently duplicate.
-            candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
-            if len(candidates) == 1:
-                movie_id = candidates[0]["id"]
-                matched += 1
-            else:
-                cur = conn.execute(
-                    "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
-                    (name, year, int(category_looks_adult), 1 if candidates else 0, now),
-                )
-                movie_id = cur.lastrowid
-                created += 1
-                if candidates:
-                    flagged += 1
-        else:
-            cur = conn.execute(
-                "INSERT INTO movies (name, year, is_adult, created_at) VALUES (?,?,?,?)",
-                (name, year, int(category_looks_adult), now),
-            )
-            movie_id = cur.lastrowid
-            created += 1
-        conn.execute(
-            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
-               VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
-            (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-             item.get("provider_category_name"), now, now),
-        )
+                created += did_create
+                matched += did_match
+                flagged += did_flag
+        except Exception as exc:
+            errors += 1
+            logger.warning("[vod_db] bulk_import_movies: skipped item name=%r stream_id=%r: %s",
+                            item.get("name"), item.get("provider_stream_id"), exc)
     _commit_with_retry(conn)
     conn.close()
-    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged}
+    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
@@ -2206,73 +2322,90 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
     created = 0
     matched = 0
     flagged = 0
+    errors = 0
     for item in items:
-        name = item["name"]
-        year = item.get("year")
-        category_looks_adult = _looks_adult(item.get("provider_category_name"))
-        if not name.strip():
-            # Same reasoning as bulk_import_movies's identical guard -- a
-            # blank name has no real identity to match on, so never match it
-            # against anything, including another blank one. Reuse this
-            # exact series' own existing row across re-syncs (looked up by
-            # provider+series_id, not by name) to avoid minting a fresh
-            # orphaned row every periodic catalog refresh.
-            existing = conn.execute(
-                "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
-                (provider_id, item.get("provider_series_id")),
-            ).fetchone()
-            if existing:
-                matched += 1
-            else:
-                placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
-                conn.execute(
-                    "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
-                    (placeholder, year, int(category_looks_adult), 1, provider_id, item.get("provider_series_id"), now),
-                )
-                created += 1
-                flagged += 1
-            continue
-        row = conn.execute("SELECT id, is_adult, is_adult_manual, import_provider_id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
-        if row:
-            matched += 1
-            if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
-                conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
-            if row["import_provider_id"] is None:
-                # This series previously had no working way to fetch episode
-                # detail (e.g. its only prior source's provider was later
-                # deleted) -- this provider can, so give it one rather than
-                # leaving it permanently stuck.
-                conn.execute(
-                    "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
-                    (provider_id, item.get("provider_series_id"), row["id"]),
-                )
-        elif year is None:
-            # Same reasoning as bulk_import_movies above.
-            candidates = conn.execute("SELECT id, import_provider_id FROM series WHERE name=?", (name,)).fetchall()
-            if len(candidates) == 1:
-                matched += 1
-                if candidates[0]["import_provider_id"] is None:
+        try:
+            with _item_savepoint(conn):
+                name = item["name"]
+                year = item.get("year")
+                category_looks_adult = _looks_adult(item.get("provider_category_name"))
+                # See bulk_import_movies's identical did_create/did_match/did_flag
+                # comment -- folded into the real counters only after this item's
+                # last statement has actually succeeded.
+                did_create = did_match = did_flag = False
+                if not name.strip():
+                    # Same reasoning as bulk_import_movies's identical guard -- a
+                    # blank name has no real identity to match on, so never match it
+                    # against anything, including another blank one. Reuse this
+                    # exact series' own existing row across re-syncs (looked up by
+                    # provider+series_id, not by name) to avoid minting a fresh
+                    # orphaned row every periodic catalog refresh.
+                    existing = conn.execute(
+                        "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                        (provider_id, item.get("provider_series_id")),
+                    ).fetchone()
+                    if existing:
+                        did_match = True
+                    else:
+                        placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
+                        conn.execute(
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, provider_id, item.get("provider_series_id"), now),
+                        )
+                        did_create = True
+                        did_flag = True
+                    created += did_create
+                    matched += did_match
+                    flagged += did_flag
+                    continue
+                row = conn.execute("SELECT id, is_adult, is_adult_manual, import_provider_id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+                if row:
+                    did_match = True
+                    if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
+                        conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
+                    if row["import_provider_id"] is None:
+                        # This series previously had no working way to fetch episode
+                        # detail (e.g. its only prior source's provider was later
+                        # deleted) -- this provider can, so give it one rather than
+                        # leaving it permanently stuck.
+                        conn.execute(
+                            "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
+                            (provider_id, item.get("provider_series_id"), row["id"]),
+                        )
+                elif year is None:
+                    # Same reasoning as bulk_import_movies above.
+                    candidates = conn.execute("SELECT id, import_provider_id FROM series WHERE name=?", (name,)).fetchall()
+                    if len(candidates) == 1:
+                        did_match = True
+                        if candidates[0]["import_provider_id"] is None:
+                            conn.execute(
+                                "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
+                                (provider_id, item.get("provider_series_id"), candidates[0]["id"]),
+                            )
+                    else:
+                        conn.execute(
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                            (name, year, int(category_looks_adult), 1 if candidates else 0, provider_id, item.get("provider_series_id"), now),
+                        )
+                        did_create = True
+                        if candidates:
+                            did_flag = True
+                else:
                     conn.execute(
-                        "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
-                        (provider_id, item.get("provider_series_id"), candidates[0]["id"]),
+                        "INSERT INTO series (name, year, is_adult, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?)",
+                        (name, year, int(category_looks_adult), provider_id, item.get("provider_series_id"), now),
                     )
-            else:
-                conn.execute(
-                    "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
-                    (name, year, int(category_looks_adult), 1 if candidates else 0, provider_id, item.get("provider_series_id"), now),
-                )
-                created += 1
-                if candidates:
-                    flagged += 1
-        else:
-            conn.execute(
-                "INSERT INTO series (name, year, is_adult, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?)",
-                (name, year, int(category_looks_adult), provider_id, item.get("provider_series_id"), now),
-            )
-            created += 1
+                    did_create = True
+                created += did_create
+                matched += did_match
+                flagged += did_flag
+        except Exception as exc:
+            errors += 1
+            logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
+                            item.get("name"), item.get("provider_series_id"), exc)
     _commit_with_retry(conn)
     conn.close()
-    return {"series_created": created, "series_matched": matched, "total": len(items), "flagged_for_review": flagged}
+    return {"series_created": created, "series_matched": matched, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at")
@@ -2291,88 +2424,103 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
     created = 0
     matched = 0
     flagged = 0
+    errors = 0
     batch_size = 200
     for i, item in enumerate(items):
-        name = item["name"]
-        year = item.get("year")
-        detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
-        if not name.strip():
-            # Same guard as bulk_import_movies -- a blank name has no real
-            # identity to match on, so never match it against anything,
-            # including another blank one. Reuse this exact stream's own
-            # existing row across re-syncs so a refresh doesn't mint a
-            # fresh orphaned row every pass.
-            existing_source = conn.execute(
-                "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
-                (provider_id, item["provider_stream_id"]),
-            ).fetchone()
-            if existing_source:
-                movie_id = existing_source["movie_id"]
-                matched += 1
-                sets = ", ".join(f"{k}=?" for k in detail)
-                conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
-            else:
-                placeholder = f"[Untitled] Plex · stream {item['provider_stream_id']}"
-                cur = conn.execute(
-                    "INSERT INTO movies (name, year, needs_year_review, created_at) VALUES (?,?,?,?)",
-                    (placeholder, year, 1, now),
+        try:
+            with _item_savepoint(conn):
+                name = item["name"]
+                year = item.get("year")
+                detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
+                # See bulk_import_movies's identical did_create/did_match/did_flag
+                # comment -- folded into the real counters only after this item's
+                # last statement has actually succeeded.
+                did_create = did_match = did_flag = False
+                if not name.strip():
+                    # Same guard as bulk_import_movies -- a blank name has no real
+                    # identity to match on, so never match it against anything,
+                    # including another blank one. Reuse this exact stream's own
+                    # existing row across re-syncs so a refresh doesn't mint a
+                    # fresh orphaned row every pass.
+                    existing_source = conn.execute(
+                        "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+                        (provider_id, item["provider_stream_id"]),
+                    ).fetchone()
+                    if existing_source:
+                        movie_id = existing_source["movie_id"]
+                        did_match = True
+                        sets = ", ".join(f"{k}=?" for k in detail)
+                        conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+                    else:
+                        placeholder = f"[Untitled] Plex · stream {item['provider_stream_id']}"
+                        cur = conn.execute(
+                            "INSERT INTO movies (name, year, needs_year_review, created_at) VALUES (?,?,?,?)",
+                            (placeholder, year, 1, now),
+                        )
+                        movie_id = cur.lastrowid
+                        did_create = True
+                        did_flag = True
+                    conn.execute(
+                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
+                           VALUES (?,?,?,?,?,?,?)
+                           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
+                    )
+                    created += did_create
+                    matched += did_match
+                    flagged += did_flag
+                    continue
+                row = conn.execute("SELECT id FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
+                if row:
+                    movie_id = row["id"]
+                    did_match = True
+                    sets = ", ".join(f"{k}=?" for k in detail)
+                    conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+                elif year is None:
+                    # Same reasoning as bulk_import_movies. Still writes full detail
+                    # even when flagged -- more info for whoever reviews it later.
+                    candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
+                    if len(candidates) == 1:
+                        movie_id = candidates[0]["id"]
+                        did_match = True
+                        sets = ", ".join(f"{k}=?" for k in detail)
+                        conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
+                    else:
+                        cols = ["name", "year", "needs_year_review", *detail.keys()]
+                        vals = [name, year, 1 if candidates else 0, *detail.values()]
+                        placeholders = ", ".join("?" for _ in cols)
+                        cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                        movie_id = cur.lastrowid
+                        did_create = True
+                        if candidates:
+                            did_flag = True
+                else:
+                    cols = ["name", "year", *detail.keys()]
+                    vals = [name, year, *detail.values()]
+                    placeholders = ", ".join("?" for _ in cols)
+                    cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                    movie_id = cur.lastrowid
+                    did_create = True
+                conn.execute(
+                    """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
+                       VALUES (?,?,?,?,?,?,?)
+                       ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                           movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+                    (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
                 )
-                movie_id = cur.lastrowid
-                created += 1
-                flagged += 1
-            conn.execute(
-                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                       movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-                (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
-            )
-            if (i + 1) % batch_size == 0:
-                _commit_with_retry(conn)
-            continue
-        row = conn.execute("SELECT id FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
-        if row:
-            movie_id = row["id"]
-            matched += 1
-            sets = ", ".join(f"{k}=?" for k in detail)
-            conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
-        elif year is None:
-            # Same reasoning as bulk_import_movies. Still writes full detail
-            # even when flagged -- more info for whoever reviews it later.
-            candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
-            if len(candidates) == 1:
-                movie_id = candidates[0]["id"]
-                matched += 1
-                sets = ", ".join(f"{k}=?" for k in detail)
-                conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, movie_id))
-            else:
-                cols = ["name", "year", "needs_year_review", *detail.keys()]
-                vals = [name, year, 1 if candidates else 0, *detail.values()]
-                placeholders = ", ".join("?" for _ in cols)
-                cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
-                movie_id = cur.lastrowid
-                created += 1
-                if candidates:
-                    flagged += 1
-        else:
-            cols = ["name", "year", *detail.keys()]
-            vals = [name, year, *detail.values()]
-            placeholders = ", ".join("?" for _ in cols)
-            cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
-            movie_id = cur.lastrowid
-            created += 1
-        conn.execute(
-            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-               VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-            (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
-        )
+                created += did_create
+                matched += did_match
+                flagged += did_flag
+        except Exception as exc:
+            errors += 1
+            logger.warning("[vod_db] bulk_import_plex_movies: skipped item name=%r stream_id=%r: %s",
+                            item.get("name"), item.get("provider_stream_id"), exc)
         if (i + 1) % batch_size == 0:
             _commit_with_retry(conn)
     _commit_with_retry(conn)
     conn.close()
-    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged}
+    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
@@ -2388,78 +2536,102 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
     series_created = 0
     series_matched = 0
     episodes_total = 0
+    errors = 0
+    episode_errors = 0
     batch_size = 20
     for i, item in enumerate(items):
-        name = item["name"]
-        year = item.get("year")
-        detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
-        if not name.strip():
-            # Same guard as bulk_import_series -- a blank name has no real
-            # identity to match on, so never match it against anything,
-            # including another blank one. Reuse this exact series' own
-            # existing row across re-syncs (looked up by provider+series_id).
-            existing = conn.execute(
-                "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
-                (provider_id, item.get("provider_series_id")),
-            ).fetchone()
-            if existing:
-                series_id = existing["id"]
-                series_matched += 1
-                sets = ", ".join(f"{k}=?" for k in detail)
-                conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
-            else:
-                placeholder = f"[Untitled] Plex · series {item.get('provider_series_id')}"
-                cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
-                vals = [placeholder, year, 1, provider_id, item.get("provider_series_id"), *detail.values()]
-                placeholders_sql = ", ".join("?" for _ in cols)
-                cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders_sql}, ?)", (*vals, now))
-                series_id = cur.lastrowid
-                series_created += 1
-        else:
-            row = conn.execute("SELECT id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
-            if row:
-                series_id = row["id"]
-                series_matched += 1
-                sets = ", ".join(f"{k}=?" for k in detail)
-                conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
-            else:
-                cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
-                vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
-                placeholders = ", ".join("?" for _ in cols)
-                cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
-                series_id = cur.lastrowid
-                series_created += 1
+        try:
+            with _item_savepoint(conn):
+                name = item["name"]
+                year = item.get("year")
+                detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
+                # See bulk_import_movies's identical did_create/did_match comment --
+                # folded into the real counters only once the series-level
+                # statement that follows has actually succeeded.
+                did_create = did_match = False
+                if not name.strip():
+                    # Same guard as bulk_import_series -- a blank name has no real
+                    # identity to match on, so never match it against anything,
+                    # including another blank one. Reuse this exact series' own
+                    # existing row across re-syncs (looked up by provider+series_id).
+                    existing = conn.execute(
+                        "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                        (provider_id, item.get("provider_series_id")),
+                    ).fetchone()
+                    if existing:
+                        series_id = existing["id"]
+                        sets = ", ".join(f"{k}=?" for k in detail)
+                        conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
+                        did_match = True
+                    else:
+                        placeholder = f"[Untitled] Plex · series {item.get('provider_series_id')}"
+                        cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                        vals = [placeholder, year, 1, provider_id, item.get("provider_series_id"), *detail.values()]
+                        placeholders_sql = ", ".join("?" for _ in cols)
+                        cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders_sql}, ?)", (*vals, now))
+                        series_id = cur.lastrowid
+                        did_create = True
+                else:
+                    row = conn.execute("SELECT id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+                    if row:
+                        series_id = row["id"]
+                        sets = ", ".join(f"{k}=?" for k in detail)
+                        conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*detail.values(), now, series_id))
+                        did_match = True
+                    else:
+                        cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                        vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
+                        placeholders = ", ".join("?" for _ in cols)
+                        cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                        series_id = cur.lastrowid
+                        did_create = True
+                series_created += did_create
+                series_matched += did_match
 
-        for ep in item.get("episodes", []):
-            erow = conn.execute(
-                "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
-                (series_id, ep["season_number"], ep["episode_number"]),
-            ).fetchone()
-            if erow:
-                episode_id = erow["id"]
-                conn.execute(
-                    "UPDATE episodes SET name=?, description=?, duration_secs=?, updated_at=? WHERE id=?",
-                    (ep["name"], ep.get("description"), ep.get("duration_secs"), now, episode_id),
-                )
-            else:
-                cur = conn.execute(
-                    "INSERT INTO episodes (series_id, season_number, episode_number, name, description, duration_secs, created_at) VALUES (?,?,?,?,?,?,?)",
-                    (series_id, ep["season_number"], ep["episode_number"], ep["name"], ep.get("description"), ep.get("duration_secs"), now),
-                )
-                episode_id = cur.lastrowid
-            conn.execute(
-                """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                       episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-                (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), now, now),
-            )
-            episodes_total += 1
+                for ep in item.get("episodes", []):
+                    # A separate inner savepoint -- one malformed episode
+                    # (missing season/episode number, bad stream id) must not
+                    # roll back the series row or its other, good episodes.
+                    try:
+                        with _item_savepoint(conn):
+                            erow = conn.execute(
+                                "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+                                (series_id, ep["season_number"], ep["episode_number"]),
+                            ).fetchone()
+                            if erow:
+                                episode_id = erow["id"]
+                                conn.execute(
+                                    "UPDATE episodes SET name=?, description=?, duration_secs=?, updated_at=? WHERE id=?",
+                                    (ep["name"], ep.get("description"), ep.get("duration_secs"), now, episode_id),
+                                )
+                            else:
+                                cur = conn.execute(
+                                    "INSERT INTO episodes (series_id, season_number, episode_number, name, description, duration_secs, created_at) VALUES (?,?,?,?,?,?,?)",
+                                    (series_id, ep["season_number"], ep["episode_number"], ep["name"], ep.get("description"), ep.get("duration_secs"), now),
+                                )
+                                episode_id = cur.lastrowid
+                            conn.execute(
+                                """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
+                                   VALUES (?,?,?,?,?,?,?)
+                                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                                       episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
+                                (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), now, now),
+                            )
+                            episodes_total += 1
+                    except Exception as exc:
+                        episode_errors += 1
+                        logger.warning("[vod_db] bulk_import_plex_series: skipped episode series=%r s%re%r: %s",
+                                        name, ep.get("season_number"), ep.get("episode_number"), exc)
+        except Exception as exc:
+            errors += 1
+            logger.warning("[vod_db] bulk_import_plex_series: skipped item name=%r series_id=%r: %s",
+                            item.get("name"), item.get("provider_series_id"), exc)
         if (i + 1) % batch_size == 0:
             _commit_with_retry(conn)
     _commit_with_retry(conn)
     conn.close()
-    return {"series_created": series_created, "series_matched": series_matched, "episodes_imported": episodes_total}
+    return {"series_created": series_created, "series_matched": series_matched, "episodes_imported": episodes_total,
+            "errors": errors, "episode_errors": episode_errors}
 
 
 # ── Metadata rewrite rules ───────────────────────────────────────────────────

@@ -125,7 +125,7 @@ Building from source instead of pulling the published image — e.g. for
 local development against this repo — works too:
 
 ```bash
-docker build -t vod-manager:dev .
+docker build -t vod-manager:local .
 ```
 
 The app listens on port `8282`. All persistent state (config, credentials,
@@ -316,6 +316,11 @@ it's reachable from the public internet at all — do these:
    slows down a sustained automated attacker; it isn't a substitute for
    putting this behind a VPN/tunnel once it's reachable beyond your own
    network.
+7. **Provider passwords, Dispatcharr tokens, and XC client secrets are
+   encrypted at rest** in the database (not just hashed logins) — the
+   encryption key lives in `config.json` so it travels with that file's own
+   backup/restore lifecycle (§12). Existing plaintext values from before
+   this was added upgrade automatically on next startup, no action needed.
 
 ---
 
@@ -483,6 +488,12 @@ catalog database. Useful for resetting a corrupted database without losing
 saved credentials, or rolling back just the config. Database downloads use
 SQLite's `VACUUM INTO` for a consistent snapshot even while the app is
 actively writing to it.
+
+**Diagnostics.** Configuration → Diagnostics has a "Download Diagnostic
+Logs" button — it exports the app's own log history with provider
+credentials, hostnames, and IP addresses scrubbed, safe to attach to a bug
+report or support request without exposing anything sensitive about your
+setup.
 
 ---
 
