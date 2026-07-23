@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Clapperboard, Loader2, LogOut, Moon, Palette, Settings as SettingsIcon, Sun } from 'lucide-react'
+import { Loader2, LogOut, Moon, Palette, Settings as SettingsIcon, Sun } from 'lucide-react'
 import VodManager from '@/pages/VodManager'
 import Login from '@/pages/Login'
 import Settings from '@/pages/Settings'
@@ -112,7 +112,7 @@ export default function App() {
   return (
     <div className="min-h-screen p-4 space-y-3">
       <div className="flex items-center gap-2">
-        <Clapperboard size={20} className="text-primary" />
+        <img src="/favicon.svg" width={28} height={28} alt="" className="rounded-sm" />
         <h1 className="text-xl font-semibold">VOD Manager</h1>
         <div className="ml-auto flex items-center gap-3">
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">

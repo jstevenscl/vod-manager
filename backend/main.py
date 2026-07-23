@@ -235,4 +235,14 @@ if STATIC_DIR.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):
+        # Anything Vite copied from frontend/public/ to the dist root (e.g.
+        # favicon.svg) lands directly under STATIC_DIR, not under /assets --
+        # without this check it fell through to the SPA fallback below and
+        # got served as index.html (wrong content-type, wrong bytes). Real
+        # client-side routes (e.g. /settings) don't correspond to a file, so
+        # they still correctly fall through to the index.html fallback.
+        if full_path:
+            candidate = (STATIC_DIR / full_path).resolve()
+            if candidate.is_file() and candidate.is_relative_to(STATIC_DIR.resolve()):
+                return FileResponse(str(candidate))
         return FileResponse(str(STATIC_DIR / "index.html"))

@@ -631,15 +631,18 @@ async def _emby_heartbeat_loop(
 
 
 _UPSTREAM_XC_PATH_RE = re.compile(r"/(live|movie|series)/[^/\s\"]+/[^/\s\"]+/")
-_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_key)=[^&\s\"]*", re.IGNORECASE)
+_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_key|username|password)=[^&\s\"]*", re.IGNORECASE)
 
 
 def _redact_upstream_url(url: str) -> str:
     """Upstream provider URLs embed real, working credentials -- XC as
-    /live|movie|series/{username}/{password}/..., Plex/Emby/Jellyfin as a
-    token/api_key query param. Every log line that includes upstream_url
-    must go through this first, or a real paid-subscription login ends up
-    in plaintext in stdout/container logs (and now, diagnostic exports)."""
+    /live|movie|series/{username}/{password}/... for stream URLs, or as
+    plain username=/password= query params for player_api.php calls (used
+    by XCProviderClient for catalog/metadata lookups like get_vod_info);
+    Plex/Emby/Jellyfin as a token/api_key query param. Every log line that
+    includes upstream_url must go through this first, or a real
+    paid-subscription login ends up in plaintext in stdout/container logs
+    (and now, diagnostic exports)."""
     url = _UPSTREAM_XC_PATH_RE.sub(r"/\1/***/***/", url)
     url = _UPSTREAM_TOKEN_QS_RE.sub(r"\1=***", url)
     return url

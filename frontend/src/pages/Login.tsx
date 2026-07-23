@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { AlertCircle, Clapperboard, Loader2, Lock } from 'lucide-react'
+import { AlertCircle, Loader2, Lock } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -34,14 +34,14 @@ export default function Login({ onLogin }: Props) {
     <div className="min-h-screen flex items-center justify-center p-6 bg-background">
       <div className="w-full max-w-sm space-y-6">
 
-        <div className="text-center space-y-2">
-          <div className="flex items-center justify-center gap-2">
-            <Clapperboard size={26} className="text-primary" />
+        <div className="flex items-center justify-center gap-3">
+          <img src="/favicon.svg" width={84} height={84} alt="" className="rounded-lg" />
+          <div className="text-left">
             <h1 className="text-2xl font-semibold">VOD Manager</h1>
+            <p className="text-sm text-muted-foreground flex items-center gap-1.5">
+              <Lock size={12} /> Sign in to continue
+            </p>
           </div>
-          <p className="text-sm text-muted-foreground flex items-center justify-center gap-1.5">
-            <Lock size={12} /> Sign in to continue
-          </p>
         </div>
 
         <Card>
