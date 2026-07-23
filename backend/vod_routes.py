@@ -9,6 +9,7 @@ from config import (
     get_ai_model,
     get_ai_provider,
     get_anthropic_api_key,
+    get_default_categories_prompt_dismissed,
     get_gemini_api_key,
     get_lockout_settings,
     get_openai_api_key,
@@ -21,6 +22,7 @@ from config import (
     save_openai_api_key,
     save_refresh_settings,
     save_tmdb_api_key,
+    set_default_categories_prompt_dismissed,
 )
 from routes import require_auth
 import ai_assist
@@ -54,6 +56,10 @@ class AiProviderRequest(BaseModel):
 class AiApiKeyRequest(BaseModel):
     provider: str
     api_key: str
+
+
+class DefaultCategoriesAdultRequest(BaseModel):
+    include_adult: bool
 
 
 class SuggestCategoryRuleRequest(BaseModel):
@@ -423,6 +429,18 @@ async def get_tmdb_settings():
 async def save_tmdb_settings(body: TmdbApiKeyRequest):
     save_tmdb_api_key(body.api_key)
     return {"ok": True}
+
+
+@router.get("/default-categories-prompt/", dependencies=_GUARDS)
+async def get_default_categories_prompt():
+    return {"show": not get_default_categories_prompt_dismissed()}
+
+
+@router.post("/default-categories-prompt/", dependencies=_GUARDS)
+async def answer_default_categories_prompt(body: DefaultCategoriesAdultRequest):
+    results = await asyncio.to_thread(vod_db.set_catchall_include_adult, body.include_adult)
+    set_default_categories_prompt_dismissed()
+    return {"ok": True, "results": results}
 
 
 @router.get("/ai-settings/", dependencies=_GUARDS)

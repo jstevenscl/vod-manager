@@ -19,6 +19,17 @@ import httpx
 
 import vod_db
 
+
+def _as_dict(value) -> dict:
+    """get_vod_info/get_series_info are documented as returning an object,
+    but at least one real provider returns a bare list (e.g. `[]`) instead
+    of `{}` for "no data" -- either at the top level or nested under
+    "info" -- which crashed every .get() downstream with 'list' object has
+    no attribute 'get', silently failing that item's whole enrichment (and,
+    for series, its episodes -- see enrich_series). Treat anything that
+    isn't actually a dict as "no data" instead of raising."""
+    return value if isinstance(value, dict) else {}
+
 logger = logging.getLogger(__name__)
 
 _YEAR_SUFFIX_RE = re.compile(
@@ -205,8 +216,8 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
 
     client = XCProviderClient(provider)
 
-    info = await client.get_vod_info(source["provider_stream_id"])
-    detail = info.get("info", {})
+    info = _as_dict(await client.get_vod_info(source["provider_stream_id"]))
+    detail = _as_dict(info.get("info"))
 
     await asyncio.to_thread(
         vod_db.set_movie_enrichment,
@@ -267,8 +278,8 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         return {"fetched": True, "reason": None}
 
     client = XCProviderClient(provider)
-    info = await client.get_series_info(str(series["import_provider_series_id"]))
-    detail = info.get("info", {})
+    info = _as_dict(await client.get_series_info(str(series["import_provider_series_id"])))
+    detail = _as_dict(info.get("info"))
 
     await asyncio.to_thread(
         vod_db.set_series_enrichment,

@@ -137,6 +137,18 @@ async def _vod_catalog_refresher() -> None:
                         logger.info("[vod_catalog_refresher] %s: %s", p["name"], result)
                     except Exception as exc:
                         logger.warning("[vod_catalog_refresher] provider=%s failed: %s", p["name"], exc)
+                # Catch-all smart categories (the built-in "All Movies"/"All TV
+                # Shows", see vod_db._seed_default_categories) don't get the
+                # manual "click evaluate" treatment ordinary smart categories
+                # rely on -- nobody's expected to remember to keep them
+                # current. Re-evaluate just those after new content actually
+                # landed this cycle.
+                for category_id in await asyncio.to_thread(vod_db.list_catchall_category_ids):
+                    try:
+                        result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
+                        logger.info("[vod_catalog_refresher] catch-all category=%s: %s", category_id, result)
+                    except Exception as exc:
+                        logger.warning("[vod_catalog_refresher] catch-all category=%s failed: %s", category_id, exc)
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 

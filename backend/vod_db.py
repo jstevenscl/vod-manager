@@ -233,7 +233,37 @@ def init_db() -> None:
     _migrate(conn)
     _migrate_primary_dispatcharr_connection(conn)
     _migrate_encrypt_plaintext_credentials(conn)
+    _seed_default_categories(conn)
     conn.close()
+
+
+def _seed_default_categories(conn: sqlite3.Connection) -> None:
+    """First-run only, one category per content_type: an empty category list
+    isn't just unfriendly, it's a hard blocker -- Dispatcharr's VOD refresh
+    aborts entirely rather than sync when its get_vod_categories call comes
+    back empty (it reads that as "something's wrong upstream", not
+    "genuinely no categories configured yet"). Seed a smart catch-all per
+    content type so a fresh instance is never in that broken state.
+
+    Defaults to excluding 18+ content (safer default for something created
+    without the admin's explicit input) -- the first-run prompt lets them
+    flip that per category afterward. Marked with match_all in rule_json
+    (see _rule_matches) so the periodic catalog refresh can find and
+    re-evaluate just these two, keeping them current as new content is
+    imported, without making ordinary user-created smart categories
+    auto-evaluate too."""
+    import json
+    for content_type, name in (("movie", "All Movies"), ("series", "All TV Shows")):
+        existing = conn.execute(
+            "SELECT COUNT(*) c FROM categories WHERE content_type=?", (content_type,)
+        ).fetchone()["c"]
+        if existing > 0:
+            continue
+        conn.execute(
+            "INSERT INTO categories (name, content_type, is_smart, rule_json, sort_order, created_at) VALUES (?,?,?,?,?,?)",
+            (name, content_type, 1, json.dumps({"match_all": True, "exclude_adult": True}), 0, _now()),
+        )
+    _commit_with_retry(conn)
 
 
 def _migrate_primary_dispatcharr_connection(conn: sqlite3.Connection) -> None:
@@ -3403,11 +3433,65 @@ def _condition_matches(row: dict, cond: dict) -> bool:
 
 
 def _rule_matches(row: dict, rule: dict) -> bool:
+    # match_all: true is a distinct opt-in mode (used by the built-in "All
+    # Movies"/"All TV Shows" catch-all categories) -- deliberately separate
+    # from conditions=[] below, which stays "matches nothing" so a
+    # user-created smart category with no conditions configured yet doesn't
+    # silently swallow the whole pool.
+    if rule.get("match_all"):
+        if rule.get("exclude_adult") and row.get("is_adult"):
+            return False
+        return True
     conditions = rule.get("conditions") or []
     if not conditions:
         return False
     checks = (_condition_matches(row, c) for c in conditions)
     return all(checks) if rule.get("match", "all") == "all" else any(checks)
+
+
+def list_catchall_category_ids() -> list[int]:
+    """The match_all smart categories from _seed_default_categories (and any
+    a user has since built the same way) -- what the periodic catalog
+    refresh re-evaluates automatically so they stay current as new content
+    is imported, unlike ordinary smart categories which only update when a
+    user manually clicks evaluate."""
+    import json
+    conn = _connect()
+    rows = conn.execute("SELECT id, rule_json FROM categories WHERE is_smart=1 AND rule_json IS NOT NULL").fetchall()
+    conn.close()
+    ids = []
+    for r in rows:
+        try:
+            if json.loads(r["rule_json"]).get("match_all"):
+                ids.append(r["id"])
+        except (ValueError, TypeError):
+            continue
+    return ids
+
+
+def set_catchall_include_adult(include_adult: bool) -> list[dict]:
+    """Answers the first-run "include 18+ in the built-in All Movies/All TV
+    Shows categories?" prompt -- flips exclude_adult on every match_all
+    category (there are exactly two, seeded together) and re-evaluates them
+    immediately so the change is visible right away instead of waiting for
+    the next periodic refresh cycle."""
+    import json
+    conn = _connect()
+    rows = conn.execute("SELECT id, rule_json FROM categories WHERE is_smart=1 AND rule_json IS NOT NULL").fetchall()
+    results = []
+    for r in rows:
+        try:
+            rule = json.loads(r["rule_json"])
+        except (ValueError, TypeError):
+            continue
+        if not rule.get("match_all"):
+            continue
+        rule["exclude_adult"] = not include_adult
+        conn.execute("UPDATE categories SET rule_json=? WHERE id=?", (json.dumps(rule), r["id"]))
+        results.append(r["id"])
+    _commit_with_retry(conn)
+    conn.close()
+    return [evaluate_smart_category(cid) for cid in results]
 
 
 def evaluate_smart_category(category_id: int) -> dict:

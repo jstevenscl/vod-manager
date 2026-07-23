@@ -428,6 +428,25 @@ interface Category {
 const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin', string> = {
   xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin',
 }
+type AiProvider = 'anthropic' | 'openai' | 'gemini'
+const AI_PROVIDER_DEFAULT_MODELS: Record<AiProvider, string> = {
+  anthropic: 'claude-haiku-4-5-20251001', openai: 'gpt-5-mini', gemini: 'gemini-2.5-flash',
+}
+const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string }[]> = {
+  anthropic: [
+    { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — cheapest, fastest (default)' },
+    { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 — balanced' },
+    { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable, priciest' },
+  ],
+  openai: [
+    { id: 'gpt-5-mini', label: 'GPT-5 Mini — cheapest, fastest (default)' },
+    { id: 'gpt-5', label: 'GPT-5 — most capable, priciest' },
+  ],
+  gemini: [
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash — cheapest, fastest (default)' },
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable, priciest' },
+  ],
+}
 const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult'] as const
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
@@ -2281,7 +2300,7 @@ export default function VodManager() {
     },
   })
   const aiSettingsQuery = useQuery<{
-    provider: 'anthropic' | 'openai' | 'gemini'
+    provider: AiProvider
     model: string
     has_anthropic_key: boolean
     has_openai_key: boolean
@@ -2296,6 +2315,17 @@ export default function VodManager() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-ai-settings'] })
       setAiModelInput('')
+    },
+  })
+  const defaultCategoriesPromptQuery = useQuery<{ show: boolean }>({
+    queryKey: ['vod-default-categories-prompt'],
+    queryFn:  () => api.get('/vod/default-categories-prompt/').then((r) => r.data),
+  })
+  const answerDefaultCategoriesPrompt = useMutation({
+    mutationFn: (includeAdult: boolean) => api.post('/vod/default-categories-prompt/', { include_adult: includeAdult }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-default-categories-prompt'] })
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
     },
   })
   const [aiKeyInputs, setAiKeyInputs] = useState<{ anthropic: string; openai: string; gemini: string }>({
@@ -2792,6 +2822,35 @@ export default function VodManager() {
 
   return (
     <div className="space-y-4 max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto">
+      {defaultCategoriesPromptQuery.data?.show && (
+        <Modal onClose={() => answerDefaultCategoriesPrompt.mutate(false)} maxWidth="max-w-md">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">Include 18+ content in the default categories?</h2>
+            <p className="text-sm text-muted-foreground">
+              VOD Manager just created two starting categories — "All Movies" and "All TV Shows" — so Dispatcharr has
+              something to sync against right away. By default they exclude 18+ titles. You can change this later,
+              per category, in Manage Categories.
+            </p>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={answerDefaultCategoriesPrompt.isPending}
+                onClick={() => answerDefaultCategoriesPrompt.mutate(false)}
+              >
+                Keep excluded
+              </Button>
+              <Button
+                size="sm"
+                disabled={answerDefaultCategoriesPrompt.isPending}
+                onClick={() => answerDefaultCategoriesPrompt.mutate(true)}
+              >
+                {answerDefaultCategoriesPrompt.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Include 18+ content'}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
       <SectionCard title="Activity" icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
@@ -2896,21 +2955,26 @@ export default function VodManager() {
           ))}
           <span className="text-xs text-muted-foreground">— active provider</span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <input
-            className={inputCls()}
-            placeholder={aiSettingsQuery.data?.model ? `Model (default: ${aiSettingsQuery.data.model})` : 'Model override'}
-            value={aiModelInput}
-            onChange={(e) => setAiModelInput(e.target.value)}
-          />
-          <Button
-            size="sm"
-            disabled={!aiSettingsQuery.data || saveAiProvider.isPending}
-            onClick={() => saveAiProvider.mutate({ provider: aiSettingsQuery.data!.provider, model: aiModelInput || undefined })}
-          >
-            {saveAiProvider.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Set Model'}
-          </Button>
-        </div>
+        {aiSettingsQuery.data && (
+          <div className="flex items-center gap-1.5">
+            <select
+              className={inputCls() + ' flex-1'}
+              value={aiModelInput || aiSettingsQuery.data.model || AI_PROVIDER_DEFAULT_MODELS[aiSettingsQuery.data.provider]}
+              onChange={(e) => setAiModelInput(e.target.value)}
+            >
+              {AI_PROVIDER_MODEL_OPTIONS[aiSettingsQuery.data.provider].map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+            <Button
+              size="sm"
+              disabled={saveAiProvider.isPending}
+              onClick={() => saveAiProvider.mutate({ provider: aiSettingsQuery.data!.provider, model: aiModelInput || undefined })}
+            >
+              {saveAiProvider.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Set Model'}
+            </Button>
+          </div>
+        )}
         {([
           { key: 'anthropic' as const, label: 'Anthropic API Key', has: aiSettingsQuery.data?.has_anthropic_key },
           { key: 'openai' as const, label: 'OpenAI API Key', has: aiSettingsQuery.data?.has_openai_key },

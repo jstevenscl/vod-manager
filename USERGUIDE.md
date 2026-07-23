@@ -215,6 +215,17 @@ Manager only reaches out to for coordination.
 
 ![Connected Instances and Dispatcharr Connections](docs/screenshots/configuration-dispatcharr.png)
 
+**A fresh install starts with two categories already in place**: "All
+Movies" and "All TV Shows", smart categories that automatically include
+everything in your pool and stay current as new content is imported — no
+manual step needed. This exists because Dispatcharr's VOD refresh aborts
+entirely (rather than syncing an empty catalog) if it gets back zero
+categories, so a brand-new instance always has something to sync against
+from the start. The first time you see the app, you'll be asked once
+whether 18+ content should be included in those two categories — it's
+excluded by default until you answer. You can still build your own
+categories (Manage Categories) on top of, or instead of, these two.
+
 ### Before you start: remove existing provider VOD from Dispatcharr
 
 If any of your providers are already connected directly in Dispatcharr with
@@ -376,9 +387,12 @@ you still review and confirm yourself:
   its reasoning and a confidence level. You still click a candidate
   yourself to apply it.
 
-A model override field is available per provider if you want something
-other than the default (e.g. a cheaper or newer model as providers release
-them) — leave it blank to use the built-in default.
+Each provider has a model dropdown (Configuration → API Keys) with a
+curated set of options, from cheapest/fastest to most capable — defaults to
+the cheapest tier, since most of these features make many small requests
+rather than needing flagship-level reasoning per call. Switching provider
+resets the model choice to that provider's own default rather than carrying
+over a model id that belongs to a different provider.
 
 ---
 
@@ -508,6 +522,12 @@ regular XC client first, to rule out a provider-side issue.
 `VODMANAGER_ADMIN_PASSWORD` as environment variables on the container and
 restart — this overrides the stored login while set, letting you sign in
 and set a new one from the UI. Remove the environment variables afterward.
+
+**Dispatcharr says "Provider returned no VOD categories... aborting VOD
+refresh."** This means VOD Manager currently has zero categories — normally
+impossible since a fresh install auto-seeds "All Movies"/"All TV Shows"
+(§6), but it can happen if every category was manually deleted. Create at
+least one category (Manage Categories) and re-run the Dispatcharr sync.
 
 **A Dispatcharr instance can't reach VOD Manager.** Double check the URL
 you gave it during "Connect a new instance" is reachable *from that

@@ -142,9 +142,9 @@ def save_anthropic_api_key(api_key: str) -> None:
 AI_PROVIDERS = ("anthropic", "openai", "gemini")
 
 _AI_DEFAULT_MODELS = {
-    "anthropic": "claude-sonnet-5",
-    "openai": "gpt-5",
-    "gemini": "gemini-2.5-pro",
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openai": "gpt-5-mini",
+    "gemini": "gemini-2.5-flash",
 }
 
 
@@ -165,6 +165,21 @@ def save_ai_provider(provider: str, model: str | None = None) -> None:
     data = _read_raw()
     data["ai_provider"] = provider
     data["ai_model"] = model.strip() if model and model.strip() else _AI_DEFAULT_MODELS[provider]
+    _write_raw(data)
+
+
+def get_default_categories_prompt_dismissed() -> bool:
+    """Whether the admin has already answered the one-time "include 18+ in
+    the built-in All Movies/All TV Shows categories?" prompt (see
+    vod_db._seed_default_categories) -- distinct from whether they changed
+    the default, since leaving it on the safe default is a valid answer
+    too and shouldn't keep re-prompting."""
+    return bool(_read_raw().get("default_categories_prompt_dismissed"))
+
+
+def set_default_categories_prompt_dismissed() -> None:
+    data = _read_raw()
+    data["default_categories_prompt_dismissed"] = True
     _write_raw(data)
 
 
