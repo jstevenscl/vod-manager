@@ -433,7 +433,14 @@ async def save_tmdb_settings(body: TmdbApiKeyRequest):
 
 @router.get("/default-categories-prompt/", dependencies=_GUARDS)
 async def get_default_categories_prompt():
-    return {"show": not get_default_categories_prompt_dismissed()}
+    # Only relevant if seeding actually created a catch-all category --
+    # on an upgrade where categories already existed, seeding is a correct
+    # no-op (see vod_db._seed_default_categories), and without this check
+    # the prompt would still fire for a category that was never created.
+    if get_default_categories_prompt_dismissed():
+        return {"show": False}
+    has_catchall = bool(await asyncio.to_thread(vod_db.list_catchall_category_ids))
+    return {"show": has_catchall}
 
 
 @router.post("/default-categories-prompt/", dependencies=_GUARDS)
@@ -733,6 +740,15 @@ async def import_provider_catalog(provider_id: int):
     except Exception as exc:
         logger.error("[vod_routes] import_provider_catalog(%s) failed: %s", provider_id, exc)
         raise HTTPException(502, detail=str(exc))
+    # Without this, the periodic catalog refresher (main.py) treats a
+    # manually-imported provider as still "never refreshed" and redundantly
+    # re-imports it again on its very next cycle -- a real, if minor, wasted
+    # hit against the actual provider's API. Also re-evaluate the catch-all
+    # categories now rather than waiting for that same background cycle, so
+    # a manual import's content shows up in Dispatcharr-visible categories
+    # right away instead of up to a full refresh interval later.
+    await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
+    await vod_importer.refresh_catchall_categories()
     return result
 
 

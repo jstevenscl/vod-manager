@@ -18,6 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./
 COPY --from=frontend-build /frontend/dist ./static
 
+ARG GIT_SHA=dev
+ARG GIT_REF=local
+ENV GIT_SHA=$GIT_SHA
+ENV GIT_REF=$GIT_REF
+
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8282

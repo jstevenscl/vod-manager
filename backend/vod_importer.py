@@ -402,3 +402,20 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
             _ENRICH_PROGRESS["movies_done"], _ENRICH_PROGRESS["movies_total"], _ENRICH_PROGRESS["movies_errors"],
             _ENRICH_PROGRESS["series_done"], _ENRICH_PROGRESS["series_total"], _ENRICH_PROGRESS["series_errors"],
         )
+
+
+async def refresh_catchall_categories() -> None:
+    """Re-evaluate the built-in "All Movies"/"All TV Shows" catch-all
+    categories (see vod_db._seed_default_categories) so newly imported
+    content actually shows up in them without a manual "evaluate" click --
+    unlike ordinary smart categories, these are meant to always be current.
+    Shared by both the periodic catalog refresher (main.py) and the manual
+    "Import catalog" button (vod_routes.py) -- calling it from both means a
+    manual import doesn't have to wait for the next background cycle to be
+    reflected."""
+    for category_id in await asyncio.to_thread(vod_db.list_catchall_category_ids):
+        try:
+            result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
+            logger.info("[vod_importer] catch-all category=%s: %s", category_id, result)
+        except Exception as exc:
+            logger.warning("[vod_importer] catch-all category=%s failed: %s", category_id, exc)

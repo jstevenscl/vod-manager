@@ -507,7 +507,9 @@ actively writing to it.
 Logs" button — it exports the app's own log history with provider
 credentials, hostnames, and IP addresses scrubbed, safe to attach to a bug
 report or support request without exposing anything sensitive about your
-setup.
+setup. The version shown in the top header (hover it for the branch/tag it
+was built from) is worth including too, especially when running a `:dev`
+build rather than a tagged release.
 
 ---
 

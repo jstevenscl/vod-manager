@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backup import router as backup_router
-from config import LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
+from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
 import emby_vod_importer
 import plex_importer
@@ -142,13 +142,10 @@ async def _vod_catalog_refresher() -> None:
                 # manual "click evaluate" treatment ordinary smart categories
                 # rely on -- nobody's expected to remember to keep them
                 # current. Re-evaluate just those after new content actually
-                # landed this cycle.
-                for category_id in await asyncio.to_thread(vod_db.list_catchall_category_ids):
-                    try:
-                        result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
-                        logger.info("[vod_catalog_refresher] catch-all category=%s: %s", category_id, result)
-                    except Exception as exc:
-                        logger.warning("[vod_catalog_refresher] catch-all category=%s failed: %s", category_id, exc)
+                # landed this cycle. (Also called directly after a manual
+                # "Import catalog" click -- see vod_routes.py -- so that
+                # doesn't have to wait for this loop's next cycle either.)
+                await vod_importer.refresh_catchall_categories()
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 
@@ -225,7 +222,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="VOD Manager", version="0.1.00", lifespan=lifespan)
+app = FastAPI(title="VOD Manager", version=APP_VERSION, lifespan=lifespan)
 app.include_router(router)
 app.include_router(vod_router)
 app.include_router(xc_router)

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from auth import create_session, revoke_session, verify_session
-from config import has_credentials, set_credentials, verify_credentials
+from config import APP_VERSION, has_credentials, set_credentials, verify_credentials
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["vod-manager-core"])
@@ -161,7 +161,14 @@ async def set_credentials_endpoint(
 
 
 # ── Version endpoint ──────────────────────────────────────────────────────────
+# Public on purpose (no auth) -- useful for confirming which build is actually
+# deployed even before logging in. GIT_SHA/GIT_REF are baked in at image
+# build time (see Dockerfile, docker-build.yml), not secrets.
 
 @router.get("/version/")
 async def get_version():
-    return {"version": "0.1.00"}
+    return {
+        "version": APP_VERSION,
+        "commit": os.environ.get("GIT_SHA", "dev")[:7],
+        "ref": os.environ.get("GIT_REF", "local"),
+    }

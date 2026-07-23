@@ -10,6 +10,12 @@ DATA_DIR    = Path(os.environ.get("DATA_DIR", "/app/data"))
 CONFIG_FILE = DATA_DIR / "config.json"
 APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 
+# Single source of truth for the semantic version -- this already drifted out
+# of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
+# endpoint each having their own independent hardcoded literal), so both now
+# import this instead of repeating the string.
+APP_VERSION = "0.1.00"
+
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
 # logs handy) lost all history. Also the source diagnostics.py reads from for

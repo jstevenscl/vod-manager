@@ -41,6 +41,12 @@ export default function App() {
     () => localStorage.getItem('vodmanager-firstrun-dismissed') === '1'
   )
 
+  const versionQuery = useQuery<{ version: string; commit: string; ref: string }>({
+    queryKey: ['app-version'],
+    queryFn:  () => api.get('/version/').then((r) => r.data),
+    staleTime: Infinity,
+  })
+
   const { data: settings, isLoading } = useQuery({
     queryKey: ['settings'],
     queryFn:  () => api.get('/settings/').then((r) => r.data),
@@ -114,6 +120,14 @@ export default function App() {
       <div className="flex items-center gap-2">
         <img src="/favicon.svg" width={28} height={28} alt="" className="rounded-sm" />
         <h1 className="text-xl font-semibold">VOD Manager</h1>
+        {versionQuery.data && (
+          <span
+            className="text-[10px] text-muted-foreground font-mono"
+            title={`ref: ${versionQuery.data.ref}`}
+          >
+            v{versionQuery.data.version} · {versionQuery.data.commit}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-3">
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             {(THEMES as readonly Theme[]).map((t) => {
