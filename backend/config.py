@@ -174,6 +174,24 @@ def save_ai_provider(provider: str, model: str | None = None) -> None:
     _write_raw(data)
 
 
+def get_import_language_exclusion() -> dict:
+    """Global (not per-provider) since the same admin almost always wants the
+    same languages excluded everywhere -- unlike categories, which genuinely
+    differ provider to provider. See vod_importer._should_auto_archive."""
+    data = _read_raw()
+    return {
+        "exclude_prefixes": data.get("import_exclude_language_prefixes") or [],
+        "exclude_non_latin": bool(data.get("import_exclude_non_latin")),
+    }
+
+
+def save_import_language_exclusion(exclude_prefixes: list[str], exclude_non_latin: bool) -> None:
+    data = _read_raw()
+    data["import_exclude_language_prefixes"] = [p.strip().upper() for p in exclude_prefixes if p.strip()]
+    data["import_exclude_non_latin"] = bool(exclude_non_latin)
+    _write_raw(data)
+
+
 def get_default_categories_prompt_dismissed() -> bool:
     """Whether the admin has already answered the one-time "include 18+ in
     the built-in All Movies/All TV Shows categories?" prompt (see

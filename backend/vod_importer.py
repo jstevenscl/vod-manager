@@ -17,7 +17,29 @@ import time
 
 import httpx
 
+import config
 import vod_db
+
+
+def _should_auto_archive(name: str, provider_category_name: str | None, provider_exclude_categories: list[str]) -> bool:
+    """Import-time equivalent of the manual Language Filter archive tool --
+    deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
+    for that tool's "don't archive the only copy" behavior): an explicit
+    exclusion rule means "I don't want this content in my library at all",
+    not "prefer another language's copy if one exists". Language rules are
+    global (config.get_import_language_exclusion); category rules are
+    per-provider (providers.import_exclude_categories), since available
+    categories genuinely differ provider to provider."""
+    lang = config.get_import_language_exclusion()
+    if lang["exclude_prefixes"]:
+        code = vod_db._name_prefix_code(name)
+        if code and code in lang["exclude_prefixes"]:
+            return True
+    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
+        return True
+    if provider_category_name and provider_category_name in provider_exclude_categories:
+        return True
+    return False
 
 
 def _as_dict(value) -> dict:
@@ -136,6 +158,8 @@ async def import_provider_catalog(provider_id: int) -> dict:
 
     client = XCProviderClient(provider)
 
+    exclude_categories = provider.get("import_exclude_categories") or []
+
     categories = await client.get_vod_categories()
     category_names = {str(c["category_id"]): c["category_name"] for c in categories}
 
@@ -145,12 +169,14 @@ async def import_provider_catalog(provider_id: int) -> dict:
     for s in streams:
         name, year = parse_name_year(s.get("name", ""))
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
+        category_name = category_names.get(str(s.get("category_id")))
         movie_items.append({
             "name": name,
             "year": year,
             "provider_stream_id": str(s["stream_id"]),
             "container_extension": s.get("container_extension") or "mp4",
-            "provider_category_name": category_names.get(str(s.get("category_id"))),
+            "provider_category_name": category_name,
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
     logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
@@ -164,11 +190,13 @@ async def import_provider_catalog(provider_id: int) -> dict:
     for s in series_list:
         name, year = parse_name_year(s.get("name", ""))
         name = vod_db.apply_rules_to_value(name, series_name_rules)
+        category_name = series_category_names.get(str(s.get("category_id")))
         series_items.append({
             "name": name,
             "year": year or _coerce_year(s.get("year")),
             "provider_series_id": str(s["series_id"]),
-            "provider_category_name": series_category_names.get(str(s.get("category_id"))),
+            "provider_category_name": category_name,
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
         })
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)

@@ -356,6 +356,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("categories", "ai_description", "TEXT"),
         ("movies", "review_excluded", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "review_excluded", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "review_excluded_manual", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "review_excluded_manual", "INTEGER NOT NULL DEFAULT 0"),
+        ("providers", "import_exclude_categories", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -490,11 +493,38 @@ def set_provider_custom_user_agent(provider_id: int, custom_user_agent: str | No
     conn.close()
 
 
+def set_provider_import_exclude_categories(provider_id: int, category_names: list[str]) -> None:
+    """Provider category names (as this provider itself names them, e.g.
+    "Movies - Spanish") to auto-archive on import -- unlike the language
+    exclusion rules (config.get/save_import_language_exclusion), this is
+    per-provider since available categories genuinely differ provider to
+    provider. See vod_importer._should_auto_archive."""
+    import json
+    conn = _connect()
+    conn.execute(
+        "UPDATE providers SET import_exclude_categories=?, updated_at=? WHERE id=?",
+        (json.dumps([c.strip() for c in category_names if c.strip()]), _now(), provider_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
 def set_provider_dispatcharr_profile(provider_id: int, profile_id: int) -> None:
     conn = _connect()
     conn.execute("UPDATE providers SET dispatcharr_profile_id=?, updated_at=? WHERE id=?", (profile_id, _now(), provider_id))
     _commit_with_retry(conn)
     conn.close()
+
+
+def _parse_json_list(value: str | None) -> list:
+    import json
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (ValueError, TypeError):
+        return []
 
 
 def get_provider(provider_id: int) -> dict | None:
@@ -505,6 +535,7 @@ def get_provider(provider_id: int) -> dict | None:
         return None
     d = dict(row)
     d["password"] = decrypt_value(d["password"])
+    d["import_exclude_categories"] = _parse_json_list(d.get("import_exclude_categories"))
     return d
 
 
@@ -513,6 +544,7 @@ def list_providers() -> list[dict]:
     rows = [dict(r) for r in conn.execute("SELECT * FROM providers ORDER BY name").fetchall()]
     for r in rows:
         r["password"] = decrypt_value(r["password"])
+        r["import_exclude_categories"] = _parse_json_list(r.get("import_exclude_categories"))
     movie_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM movie_sources GROUP BY provider_id"
     ).fetchall()}
@@ -2220,13 +2252,20 @@ def _looks_adult(*category_names) -> bool:
 
 
 def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
-    """items: [{name, year, provider_stream_id, container_extension, provider_category_name}, ...]
+    """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...]
 
     Adult-content auto-detection runs on every import pass (not just first
     creation) so a provider re-categorizing something later still gets
     picked up on the next scheduled/manual refresh — but only ever upgrades
     is_adult to True from a matching category name, never downgrades, and
     never touches a row a human has manually corrected (is_adult_manual=1).
+
+    auto_archive (see vod_importer._should_auto_archive) follows the exact
+    same upgrade-only, manual-override-respecting pattern for
+    review_excluded/review_excluded_manual -- a language/category exclusion
+    rule can archive an item, but never un-archives one on its own (a human
+    restoring it via bulk_set_review_excluded is what review_excluded_manual
+    protects against being silently overridden).
     """
     conn = _connect()
     now = _now()
@@ -2240,6 +2279,7 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                 name = item["name"]
                 year = item.get("year")
                 category_looks_adult = _looks_adult(item.get("provider_category_name"))
+                should_archive = bool(item.get("auto_archive"))
                 # Counted locally and only folded into the real created/matched/
                 # flagged totals once this item's last statement has actually
                 # succeeded -- incrementing the outer counters immediately would
@@ -2269,8 +2309,8 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                     else:
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
                         cur = conn.execute(
-                            "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, now),
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), now),
                         )
                         movie_id = cur.lastrowid
                         did_create = True
@@ -2287,12 +2327,17 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                     matched += did_match
                     flagged += did_flag
                     continue
-                row = conn.execute("SELECT id, is_adult, is_adult_manual FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
+                row = conn.execute(
+                    "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM movies WHERE name=? AND year IS ?",
+                    (name, year),
+                ).fetchone()
                 if row:
                     movie_id = row["id"]
                     did_match = True
                     if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                         conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+                    if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
+                        conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                 elif year is None:
                     # No exact (name, NULL) row, and no year to key an exact match
                     # on -- same reasoning as upsert_movie: exactly one same-named
@@ -2305,8 +2350,8 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                         did_match = True
                     else:
                         cur = conn.execute(
-                            "INSERT INTO movies (name, year, is_adult, needs_year_review, created_at) VALUES (?,?,?,?,?)",
-                            (name, year, int(category_looks_adult), 1 if candidates else 0, now),
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
+                            (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), now),
                         )
                         movie_id = cur.lastrowid
                         did_create = True
@@ -2314,8 +2359,8 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                             did_flag = True
                 else:
                     cur = conn.execute(
-                        "INSERT INTO movies (name, year, is_adult, created_at) VALUES (?,?,?,?)",
-                        (name, year, int(category_looks_adult), now),
+                        "INSERT INTO movies (name, year, is_adult, review_excluded, created_at) VALUES (?,?,?,?,?)",
+                        (name, year, int(category_looks_adult), int(should_archive), now),
                     )
                     movie_id = cur.lastrowid
                     did_create = True
@@ -2359,6 +2404,7 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
                 name = item["name"]
                 year = item.get("year")
                 category_looks_adult = _looks_adult(item.get("provider_category_name"))
+                should_archive = bool(item.get("auto_archive"))
                 # See bulk_import_movies's identical did_create/did_match/did_flag
                 # comment -- folded into the real counters only after this item's
                 # last statement has actually succeeded.
@@ -2379,8 +2425,8 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
                     else:
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
                         conn.execute(
-                            "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, provider_id, item.get("provider_series_id"), now),
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), now),
                         )
                         did_create = True
                         did_flag = True
@@ -2388,11 +2434,16 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
                     matched += did_match
                     flagged += did_flag
                     continue
-                row = conn.execute("SELECT id, is_adult, is_adult_manual, import_provider_id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+                row = conn.execute(
+                    "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id FROM series WHERE name=? AND year IS ?",
+                    (name, year),
+                ).fetchone()
                 if row:
                     did_match = True
                     if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                         conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
+                    if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
+                        conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (row["id"],))
                     if row["import_provider_id"] is None:
                         # This series previously had no working way to fetch episode
                         # detail (e.g. its only prior source's provider was later
@@ -2414,16 +2465,16 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
                             )
                     else:
                         conn.execute(
-                            "INSERT INTO series (name, year, is_adult, needs_year_review, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
-                            (name, year, int(category_looks_adult), 1 if candidates else 0, provider_id, item.get("provider_series_id"), now),
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), now),
                         )
                         did_create = True
                         if candidates:
                             did_flag = True
                 else:
                     conn.execute(
-                        "INSERT INTO series (name, year, is_adult, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?)",
-                        (name, year, int(category_looks_adult), provider_id, item.get("provider_series_id"), now),
+                        "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                        (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), now),
                     )
                     did_create = True
                 created += did_create
@@ -3121,14 +3172,21 @@ def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) 
     content itself: still fully browsable/playable/categorizable, just no
     longer flagged as something that needs attention. For content a given
     deployment doesn't care to curate (e.g. a foreign-language catalog a
-    user has no interest in enriching) rather than something to delete."""
+    user has no interest in enriching) rather than something to delete.
+
+    Every caller of this is a human clicking an archive/un-archive control,
+    so this always stamps review_excluded_manual=1 too -- the signal that
+    stops import-time auto-archive (see vod_importer._should_auto_archive)
+    from silently re-archiving something a human deliberately restored, the
+    same is_adult/is_adult_manual pattern already used for adult-content
+    auto-detection."""
     if not ids:
         return 0
     table = "movies" if content_type == "movie" else "series"
     conn = _connect()
     placeholders = ",".join("?" for _ in ids)
     conn.execute(
-        f"UPDATE {table} SET review_excluded=?, updated_at=? WHERE id IN ({placeholders})",
+        f"UPDATE {table} SET review_excluded=?, review_excluded_manual=1, updated_at=? WHERE id IN ({placeholders})",
         (1 if excluded else 0, _now(), *ids),
     )
     _commit_with_retry(conn)

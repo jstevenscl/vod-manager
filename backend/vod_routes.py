@@ -11,6 +11,7 @@ from config import (
     get_anthropic_api_key,
     get_default_categories_prompt_dismissed,
     get_gemini_api_key,
+    get_import_language_exclusion,
     get_lockout_settings,
     get_openai_api_key,
     get_refresh_settings,
@@ -18,6 +19,7 @@ from config import (
     save_ai_provider,
     save_anthropic_api_key,
     save_gemini_api_key,
+    save_import_language_exclusion,
     save_lockout_settings,
     save_openai_api_key,
     save_refresh_settings,
@@ -60,6 +62,15 @@ class AiApiKeyRequest(BaseModel):
 
 class DefaultCategoriesAdultRequest(BaseModel):
     include_adult: bool
+
+
+class ImportLanguageExclusionRequest(BaseModel):
+    exclude_prefixes: list[str] = []
+    exclude_non_latin: bool = False
+
+
+class ProviderImportExcludeCategoriesRequest(BaseModel):
+    category_names: list[str] = []
 
 
 class SuggestCategoryRuleRequest(BaseModel):
@@ -450,6 +461,45 @@ async def answer_default_categories_prompt(body: DefaultCategoriesAdultRequest):
     return {"ok": True, "results": results}
 
 
+@router.get("/import-language-exclusion/", dependencies=_GUARDS)
+async def get_import_language_exclusion_settings():
+    return get_import_language_exclusion()
+
+
+@router.post("/import-language-exclusion/", dependencies=_GUARDS)
+async def save_import_language_exclusion_settings(body: ImportLanguageExclusionRequest):
+    save_import_language_exclusion(body.exclude_prefixes, body.exclude_non_latin)
+    return {"ok": True}
+
+
+@router.post("/import-exclusions/apply-now/", dependencies=_GUARDS)
+async def apply_import_exclusions_now():
+    """Retroactively applies the current global language rules and every
+    provider's own category rules across the WHOLE existing pool, not just
+    future imports -- for someone turning this on after already having a
+    large catalog. Just re-runs the normal import for every active
+    provider: bulk_import_movies/series already apply the archive-upgrade
+    check on already-existing matched rows (see vod_db.bulk_import_movies),
+    so this reuses that exact logic instead of a separate bespoke purge
+    path, and correctly picks up series category names too (which aren't
+    persisted anywhere, only known live from the provider at import time)."""
+    providers = [p for p in await asyncio.to_thread(vod_db.list_providers) if p["is_active"]]
+    results = []
+    for p in providers:
+        try:
+            if p.get("provider_type") == "plex":
+                result = await plex_importer.import_plex_library(p["id"])
+            elif p.get("provider_type") in ("emby", "jellyfin"):
+                result = await emby_vod_importer.import_emby_library(p["id"])
+            else:
+                result = await vod_importer.import_provider_catalog(p["id"])
+            results.append({"provider": p["name"], **result})
+        except Exception as exc:
+            logger.error("[vod_routes] apply_import_exclusions_now: provider=%s failed: %s", p["name"], exc)
+            results.append({"provider": p["name"], "error": str(exc)})
+    return {"results": results}
+
+
 @router.get("/ai-settings/", dependencies=_GUARDS)
 async def get_ai_settings():
     return {
@@ -687,6 +737,32 @@ async def set_provider_custom_user_agent(provider_id: int, custom_user_agent: Op
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
     vod_db.set_provider_custom_user_agent(provider_id, custom_user_agent.strip() if custom_user_agent else None)
+    return {"ok": True}
+
+
+@router.get("/providers/{provider_id}/available-categories/", dependencies=_GUARDS)
+async def get_provider_available_categories(provider_id: int):
+    """Live category names from the provider itself (both movie and series
+    categories, combined/deduped) -- powers the exclude-categories picker
+    with what this specific provider actually calls things, not a guessed
+    or stale list. XC-only: Plex/Emby don't have this category concept."""
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(404, detail="provider not found")
+    if provider.get("provider_type") not in (None, "xc"):
+        return {"categories": []}
+    client = vod_importer.XCProviderClient(provider)
+    movie_categories = await client.get_vod_categories()
+    series_categories = await client.get_series_categories()
+    names = sorted({c["category_name"] for c in movie_categories} | {c["category_name"] for c in series_categories})
+    return {"categories": names}
+
+
+@router.post("/providers/{provider_id}/import-exclude-categories/", dependencies=_GUARDS)
+async def set_provider_import_exclude_categories(provider_id: int, body: ProviderImportExcludeCategoriesRequest):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    vod_db.set_provider_import_exclude_categories(provider_id, body.category_names)
     return {"ok": True}
 
 

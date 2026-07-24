@@ -24,6 +24,7 @@ interface Provider {
   episode_count: number
   synced_connection_count: number
   live_account_count: number
+  import_exclude_categories: string[]
 }
 
 interface DispatcharrConnection {
@@ -2328,6 +2329,27 @@ export default function VodManager() {
       qc.invalidateQueries({ queryKey: ['vod-categories'] })
     },
   })
+  const importLanguageExclusionQuery = useQuery<{ exclude_prefixes: string[]; exclude_non_latin: boolean }>({
+    queryKey: ['vod-import-language-exclusion'],
+    queryFn:  () => api.get('/vod/import-language-exclusion/').then((r) => r.data),
+  })
+  const [languagePrefixInput, setLanguagePrefixInput] = useState('')
+  const saveImportLanguageExclusion = useMutation({
+    mutationFn: (body: { exclude_prefixes: string[]; exclude_non_latin: boolean }) =>
+      api.post('/vod/import-language-exclusion/', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-import-language-exclusion'] })
+      setLanguagePrefixInput('')
+    },
+  })
+  const applyImportExclusionsNow = useMutation({
+    mutationFn: () => api.post('/vod/import-exclusions/apply-now/'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
   const [aiKeyInputs, setAiKeyInputs] = useState<{ anthropic: string; openai: string; gemini: string }>({
     anthropic: '', openai: '', gemini: '',
   })
@@ -2563,6 +2585,21 @@ export default function VodManager() {
     mutationFn: ({ id, shared_connection_limit }: { id: number; shared_connection_limit: number }) =>
       api.post(`/vod/providers/${id}/shared-limit/`, null, { params: { shared_connection_limit } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
+  const [excludeCategoriesProviderId, setExcludeCategoriesProviderId] = useState<number | null>(null)
+  const [excludeCategoriesDraft, setExcludeCategoriesDraft] = useState<Set<string>>(new Set())
+  const providerAvailableCategoriesQuery = useQuery<{ categories: string[] }>({
+    queryKey: ['vod-provider-available-categories', excludeCategoriesProviderId],
+    queryFn:  () => api.get(`/vod/providers/${excludeCategoriesProviderId}/available-categories/`).then((r) => r.data),
+    enabled:  excludeCategoriesProviderId != null,
+  })
+  const setProviderImportExcludeCategories = useMutation({
+    mutationFn: ({ id, category_names }: { id: number; category_names: string[] }) =>
+      api.post(`/vod/providers/${id}/import-exclude-categories/`, { category_names }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setExcludeCategoriesProviderId(null)
+    },
   })
   const [expandedLiveAccountsProviderId, setExpandedLiveAccountsProviderId] = useState<number | null>(null)
   const providerLiveAccountsQuery = useQuery<ProviderLiveAccount[]>({
@@ -3708,6 +3745,13 @@ export default function VodManager() {
                     Import catalog
                   </Button>
                   <Button
+                    size="sm" variant="outline"
+                    title="Categories to auto-archive on import, as this provider itself names them"
+                    onClick={() => { setExcludeCategoriesProviderId(p.id); setExcludeCategoriesDraft(new Set(p.import_exclude_categories)) }}
+                  >
+                    Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
+                  </Button>
+                  <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
                   >
@@ -3766,6 +3810,103 @@ export default function VodManager() {
           </Button>
         </div>
       </SectionCard>
+
+      <SectionCard title="Import Language Exclusion" icon={<Trash2 size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Auto-archives matching movies/series the moment they're imported (or re-imported) — global across every
+          provider, since the languages you don't want almost never depend on which provider it came from. Per-provider
+          category exclusion is the "Exclude Categories" button on each provider above. Same rule either way: it
+          archives (still browsable/playable/categorizable if you change your mind), never deletes, and never
+          overrides an item you've manually un-archived.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <input
+            className={inputCls('w-64')}
+            placeholder="Excluded prefixes, comma-separated (e.g. AR, FR, RU)"
+            value={languagePrefixInput}
+            onChange={(e) => setLanguagePrefixInput(e.target.value)}
+          />
+          <Button
+            size="sm"
+            disabled={saveImportLanguageExclusion.isPending}
+            onClick={() => saveImportLanguageExclusion.mutate({
+              exclude_prefixes: languagePrefixInput.split(',').map((s) => s.trim()).filter(Boolean),
+              exclude_non_latin: importLanguageExclusionQuery.data?.exclude_non_latin ?? false,
+            })}
+          >
+            {saveImportLanguageExclusion.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save prefixes'}
+          </Button>
+        </div>
+        {!!importLanguageExclusionQuery.data?.exclude_prefixes.length && (
+          <p className="text-xs text-muted-foreground">Currently excluded: {importLanguageExclusionQuery.data.exclude_prefixes.join(', ')}</p>
+        )}
+        <label className="flex items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={importLanguageExclusionQuery.data?.exclude_non_latin ?? false}
+            onChange={(e) => saveImportLanguageExclusion.mutate({
+              exclude_prefixes: importLanguageExclusionQuery.data?.exclude_prefixes ?? [],
+              exclude_non_latin: e.target.checked,
+            })}
+          />
+          Also exclude non-Latin-script titles (Arabic, Thai, Chinese/Japanese/Korean, Cyrillic, Greek, Hebrew, Devanagari)
+        </label>
+        <div className="flex items-center gap-1.5 pt-1">
+          <Button
+            size="sm" variant="outline"
+            disabled={applyImportExclusionsNow.isPending}
+            onClick={() => { if (confirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.')) applyImportExclusionsNow.mutate() }}
+          >
+            {applyImportExclusionsNow.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            Apply rules to existing catalog now
+          </Button>
+          {applyImportExclusionsNow.isSuccess && <span className="text-xs text-muted-foreground">Done — re-imported {applyImportExclusionsNow.data?.data?.results?.length ?? 0} provider(s).</span>}
+        </div>
+      </SectionCard>
+
+      {excludeCategoriesProviderId != null && (
+        <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-md">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">
+              Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Movies/series in a checked category get auto-archived on import, using this provider's own category
+              names. Archived, not deleted — still browsable if you change your mind.
+            </p>
+            {providerAvailableCategoriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading this provider's categories…</p>}
+            {providerAvailableCategoriesQuery.data && !providerAvailableCategoriesQuery.data.categories.length && (
+              <p className="text-xs text-muted-foreground">No categories reported by this provider.</p>
+            )}
+            <div className="max-h-64 overflow-y-auto space-y-1 border border-border rounded p-2">
+              {providerAvailableCategoriesQuery.data?.categories.map((name) => (
+                <label key={name} className="flex items-center gap-1.5 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={excludeCategoriesDraft.has(name)}
+                    onChange={(e) => {
+                      const next = new Set(excludeCategoriesDraft)
+                      if (e.target.checked) next.add(name); else next.delete(name)
+                      setExcludeCategoriesDraft(next)
+                    }}
+                  />
+                  {name}
+                </label>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
+              <Button
+                size="sm"
+                disabled={setProviderImportExcludeCategories.isPending}
+                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft) })}
+              >
+                {setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">

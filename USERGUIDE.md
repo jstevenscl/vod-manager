@@ -197,6 +197,39 @@ that (see *Rich Metadata* at the top of the same tab for a manual bulk-fetch
 button, or just let the background refresh schedule handle it — §6 in
 [README.md](README.md#refresh-schedule)).
 
+### Excluding content on import
+
+If a provider's catalog includes languages or categories you don't want in
+your library at all — especially relevant for a provider with a very large
+catalog, where manually cleaning up after the fact isn't practical — VOD
+Manager can auto-archive matching titles the moment they're imported (or
+re-imported), instead of only being able to filter them out after the fact.
+Archived, never deleted: still fully browsable/playable/categorizable if you
+ever change your mind, just out of the way by default.
+
+**Language** (Curation & Maintenance → *Import Language Exclusion*) is
+global — the same rule applies to every provider, since the languages you
+don't want almost never depend on which provider a title came from. Two
+independent ways to match: a comma-separated list of language-prefix codes
+(the same `AR|`, `FR|`, `EN|`-style tags used by Language Filter, §10), and/or
+a toggle to exclude any title with non-Latin-script characters in its name.
+
+![Import Language Exclusion settings](docs/screenshots/import-language-exclusion.png)
+
+**Category** (the **Exclude Categories** button on each provider row) is
+per-provider, since available categories genuinely differ from one provider
+to the next — the picker shows exactly what that provider itself calls its
+categories, fetched live, not a guessed or fixed list.
+
+![Exclude Categories picker for a provider](docs/screenshots/exclude-categories-modal.png)
+
+Turning either of these on only affects **future** imports by default. If
+you already have a large catalog and want the new rules applied
+retroactively, click **Apply rules to existing catalog now** — this
+re-imports every active provider to pick up the current rules across
+everything already in your pool, which for a very large catalog can take a
+while (the same cost as a normal full catalog import).
+
 ---
 
 ## 6. Connecting Dispatcharr
