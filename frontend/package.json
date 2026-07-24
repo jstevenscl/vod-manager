@@ -1,7 +1,7 @@
 {
   "name": "vod-manager",
   "private": true,
-  "version": "0.1.00",
+  "version": "0.1.03",
   "type": "module",
   "scripts": {
     "dev": "vite",
