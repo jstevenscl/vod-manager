@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -132,6 +132,9 @@ interface MissingArtworkItem {
 interface DuplicateGroupItem {
   id: number
   name: string
+  year: number
+  tmdb_id: string | null
+  poster_url: string | null
   source_count: number
   category_count: number
 }
@@ -424,10 +427,43 @@ interface Category {
   sync_source: string | null
   sort_order: number
   ai_description: string | null
+  is_active: number
+  schedule_start_mmdd: string | null
+  schedule_end_mmdd: string | null
 }
 
 const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin', string> = {
   xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin',
+}
+
+// Best-effort friendly names for provider name-prefix codes (e.g. "AR|",
+// "EN|"). These are arbitrary provider-chosen tags, not a real standard --
+// mostly ISO 639-1 language codes, but IPTV providers also commonly use
+// country-style or regional codes (BR, EXYU, ALB, MULTI-LANG...) that have
+// no ISO equivalent. Unknown codes just show their raw form, never hidden.
+const LANGUAGE_CODE_NAMES: Record<string, string> = {
+  EN: 'English', AR: 'Arabic', FR: 'French', ES: 'Spanish', DE: 'German',
+  IT: 'Italian', PT: 'Portuguese', BR: 'Brazilian Portuguese', RU: 'Russian',
+  TR: 'Turkish', PL: 'Polish', NL: 'Dutch', GR: 'Greek', HU: 'Hungarian',
+  BG: 'Bulgarian', RO: 'Romanian', SE: 'Swedish', NO: 'Norwegian', DK: 'Danish',
+  FI: 'Finnish', CZ: 'Czech', SK: 'Slovak', HR: 'Croatian', SR: 'Serbian',
+  SL: 'Slovenian', UA: 'Ukrainian', IN: 'Hindi/Indian', HI: 'Hindi',
+  ZH: 'Chinese', CN: 'Chinese', JA: 'Japanese', JP: 'Japanese', KO: 'Korean',
+  KR: 'Korean', TH: 'Thai', VI: 'Vietnamese', ID: 'Indonesian', MY: 'Malay',
+  HE: 'Hebrew', FA: 'Persian/Farsi', UR: 'Urdu', BN: 'Bengali', TA: 'Tamil',
+  TE: 'Telugu', PK: 'Pakistani', AF: 'Afrikaans', SW: 'Swahili',
+  ALB: 'Albanian', EXYU: 'Ex-Yugoslavia (regional)', LT: 'Lithuanian',
+  LV: 'Latvian', EE: 'Estonian', GE: 'Georgian', AM: 'Armenian',
+  AZ: 'Azerbaijani', KZ: 'Kazakh', 'MULTI-LANG': 'Multi-language/Undetermined',
+  MULTI: 'Multi-language/Undetermined', SC: 'Subtitled/Sub-Content',
+  IR: 'Iranian', KU: 'Kurdish', PH: 'Filipino', AL: 'Albanian',
+  SOM: 'Somali', MT: 'Maltese', MA: 'Moroccan', IL: 'Israeli', GB: 'British English',
+  CHI: 'Chinese', LAT: 'Latin America (regional)',
+  // CH, BL, NF, INI, JK, ENN, UXYU, ENYU intentionally left unlabeled --
+  // no confident real-world meaning (could be Chinese/Swiss/something
+  // else entirely for CH, and the rest look like provider-specific
+  // shorthand with no reliable interpretation). A wrong guess here is
+  // worse than just showing the raw code.
 }
 type AiProvider = 'anthropic' | 'openai' | 'gemini'
 const AI_PROVIDER_DEFAULT_MODELS: Record<AiProvider, string> = {
@@ -462,6 +498,7 @@ interface Movie {
   description: string | null
   poster_url: string | null
   is_adult: number
+  review_excluded: number
   sources: MovieSource[]
   placements: MoviePlacement[]
 }
@@ -487,6 +524,7 @@ interface Series {
   description: string | null
   poster_url: string | null
   is_adult: number
+  review_excluded: number
   import_provider_name: string | null
   episodes: Episode[]
   placements: SeriesPlacement[]
@@ -896,38 +934,206 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
   )
 }
 
-function DuplicateGroupRow({ group, onMerge, isPending }: {
-  group: DuplicateGroup
-  onMerge: (keepId: number, mergeIds: number[]) => void
-  isPending: boolean
+// Non-modal preview, deliberately -- the point of this one (unlike the
+// single-item VodPlayer) is that two candidates can be open side by side at
+// once for real visual/audio comparison before merging. Same Direct/
+// Transcoded/HLS fallback modes as VodPlayer, reusing the same URL builders
+// (buildPreviewUrl/buildTranscodedPreviewSourceUrl/buildHlsPreviewSourceUrl)
+// -- resolved client-side from item id + XC credentials, no extra backend
+// round-trip needed.
+function DuplicateInlinePreview({ kind, itemId, xcCredentials }: {
+  kind: 'movie' | 'series'
+  itemId: number
+  xcCredentials?: XcCredentials
 }) {
-  // Backend already sorts most-sourced/most-placed first -- the obvious
-  // default "keep" pick, but still a human decision the reviewer can override.
-  const [keepId, setKeepId] = useState(group.items[0].id)
+  const [mode, setMode] = useState<'direct' | 'transcode' | 'hls'>('direct')
+  const [error, setError] = useState<string | null>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef = useRef<Hls | null>(null)
+
+  const directUrl = buildPreviewUrl(kind, itemId, 'mp4', xcCredentials)
+  const transcodedUrl = buildTranscodedPreviewSourceUrl(kind, itemId, xcCredentials)
+  const hlsUrl = buildHlsPreviewSourceUrl(kind, itemId, xcCredentials)
+  const activeUrl = mode === 'transcode' ? transcodedUrl : mode === 'hls' ? null : directUrl
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || mode !== 'hls' || !hlsUrl) return
+    setError(null)
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: false })
+      hlsRef.current = hls
+      hls.loadSource(hlsUrl)
+      hls.attachMedia(video)
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (data.fatal) setError('HLS playback failed — the transcode may have failed to start or the source is unreachable.')
+      })
+      return () => { hls.destroy(); hlsRef.current = null }
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl
+    } else {
+      setError('This browser has no HLS support.')
+    }
+  }, [mode, hlsUrl])
+
   return (
-    <div className="border border-border rounded px-2 py-1.5 space-y-1">
-      {group.items.map((item) => (
-        <label key={item.id} className="flex items-center gap-2 cursor-pointer">
-          <input type="radio" checked={keepId === item.id} onChange={() => setKeepId(item.id)} />
-          <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}</span>
-          <span className="text-muted-foreground">
-            {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
-          </span>
-        </label>
-      ))}
-      <Button
-        size="sm"
-        disabled={isPending}
-        onClick={() => onMerge(keepId, group.items.filter((i) => i.id !== keepId).map((i) => i.id))}
-      >
-        {isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-        Merge into selected
-      </Button>
+    <div className="mt-1 space-y-1">
+      <div className="relative aspect-video bg-black rounded overflow-hidden">
+        {mode === 'hls' ? (
+          <video ref={videoRef} controls playsInline className="w-full h-full" />
+        ) : (
+          <video
+            ref={videoRef} src={activeUrl ?? undefined} controls autoPlay playsInline className="w-full h-full"
+            onError={() => setError(mode === 'direct' ? 'Playback failed — try Transcoded or HLS below.' : 'Playback failed.')}
+          />
+        )}
+      </div>
+      {!directUrl && <p className="text-[10px] text-destructive">Could not build a preview URL (no XC client configured yet).</p>}
+      {error && <p className="text-[10px] text-destructive">{error}</p>}
+      <div className="flex items-center gap-1">
+        {(['direct', 'transcode', 'hls'] as const).map((m) => (
+          <button
+            key={m}
+            className={`px-1.5 py-0.5 rounded text-[10px] border ${mode === m ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:text-foreground'}`}
+            onClick={() => { setMode(m); setError(null) }}
+          >
+            {m === 'direct' ? 'Direct' : m === 'transcode' ? 'Transcoded' : 'HLS'}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
 
-function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list' }: {
+function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPending, onIgnore, isIgnorePending, tmdbDetails }: {
+  group: DuplicateGroup
+  contentType: 'movie' | 'series'
+  xcCredentials?: XcCredentials
+  onMerge: (keepId: number, mergeIds: number[]) => void
+  isPending: boolean
+  onIgnore: (itemIds: number[]) => void
+  isIgnorePending: boolean
+  tmdbDetails?: Record<string, { year: number | null; title: string | null }>
+}) {
+  // Backend already sorts most-sourced/most-placed first -- the obvious
+  // default "keep" pick, but still a human decision the reviewer can override.
+  const [keepId, setKeepId] = useState(group.items[0].id)
+  const [previewIds, setPreviewIds] = useState<Set<number>>(new Set())
+  const togglePreview = (id: number) => setPreviewIds((prev) => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+
+  // Identical (non-null) poster art across 2+ candidates is strong
+  // confirming evidence they're the same real release, not just a title
+  // collision -- a known limitation: same image hosted on two different
+  // source servers won't match by URL even if the pixels are identical.
+  const posterCounts = new Map<string, number>()
+  for (const item of group.items) {
+    if (item.poster_url) posterCounts.set(item.poster_url, (posterCounts.get(item.poster_url) ?? 0) + 1)
+  }
+  const artworkMatches = group.items.some((item) => item.poster_url && (posterCounts.get(item.poster_url) ?? 0) > 1)
+
+  // A shared tmdb_id across 2+ candidates means TMDB itself confirms
+  // they're the same real title. A CONFLICTING (different) tmdb_id never
+  // reaches this component at all -- that's positive proof they're
+  // different content, so the backend splits it into separate groups
+  // before this ever renders (see vod_db._split_by_tmdb_conflict).
+  const tmdbIdCounts = new Map<string, number>()
+  for (const item of group.items) {
+    if (item.tmdb_id) tmdbIdCounts.set(item.tmdb_id, (tmdbIdCounts.get(item.tmdb_id) ?? 0) + 1)
+  }
+  const sameTmdbMatch = [...tmdbIdCounts.values()].some((c) => c > 1)
+
+  return (
+    <div className="border border-border rounded px-2 py-1.5 space-y-1.5">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {sameTmdbMatch && (
+          <span className="text-[10px] font-normal px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30">
+            same TMDB match
+          </span>
+        )}
+        {artworkMatches && (
+          <span className="text-[10px] font-normal px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">
+            matching artwork
+          </span>
+        )}
+      </div>
+      {group.items.map((item) => {
+        // trueYear is TMDB's own canonical release year for this item's
+        // tmdb_id -- undefined while loading, null if the lookup failed, a
+        // real year once resolved. Only a real year that equals this
+        // item's OWN year field is the "true" match -- sharing the
+        // tmdb_id alone just means the TITLE was matched correctly, not
+        // that this row's year is.
+        const trueYear = item.tmdb_id ? tmdbDetails?.[item.tmdb_id]?.year : undefined
+        const isTrueYearMatch = trueYear != null && item.year === trueYear
+        const isYearMismatch = trueYear != null && item.year !== trueYear
+        return (
+          <div key={item.id} className="flex gap-2">
+            {item.poster_url && (
+              <img src={item.poster_url} alt="" className="w-12 h-[72px] object-cover rounded shrink-0" loading="lazy" />
+            )}
+            <div className="flex-1 min-w-0">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="radio" checked={keepId === item.id} onChange={() => setKeepId(item.id)} />
+                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name} ({item.year})</span>
+                <span className="text-muted-foreground">
+                  {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
+                </span>
+              </label>
+              {!!item.tmdb_id && (
+                <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                  <span className="inline-block text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${item.tmdb_id}`}>
+                    TMDB #{item.tmdb_id}
+                  </span>
+                  {isTrueYearMatch && (
+                    <span className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">
+                      true match — TMDB confirms {trueYear}
+                    </span>
+                  )}
+                  {isYearMismatch && (
+                    <span className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/30">
+                      year mismatch — TMDB says {trueYear}
+                    </span>
+                  )}
+                </div>
+              )}
+              <button className="text-[11px] text-primary hover:underline mt-0.5" onClick={() => togglePreview(item.id)}>
+                {previewIds.has(item.id) ? 'Hide preview' : 'Preview'}
+              </button>
+              {previewIds.has(item.id) && <DuplicateInlinePreview kind={contentType} itemId={item.id} xcCredentials={xcCredentials} />}
+            </div>
+          </div>
+        )
+      })}
+      <div className="flex items-center gap-1.5">
+        <Button
+          size="sm"
+          disabled={isPending}
+          onClick={() => onMerge(keepId, group.items.filter((i) => i.id !== keepId).map((i) => i.id))}
+        >
+          {isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Merge into selected
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={isIgnorePending}
+          title="Not actually duplicates -- dismiss this group so it stops resurfacing"
+          onClick={() => onIgnore(group.items.map((i) => i.id))}
+        >
+          {isIgnorePending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Ignore
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived }: {
   movie: Movie
   movieCategories: Category[]
   providers: Provider[]
@@ -936,6 +1142,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   selected: boolean
   onToggleSelect: () => void
   mode?: 'list' | 'grid'
+  onToggleArchived: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [sourceForm, setSourceForm] = useState({ provider_id: '', provider_stream_id: '', container_extension: 'mp4' })
@@ -976,6 +1183,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   const deleteMovie = useMutation({
     mutationFn: () => api.delete(`/vod/movies/${movie.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const toggleAdult = useMutation({
     mutationFn: (is_adult: boolean) => api.post(`/vod/movies/${movie.id}/adult/`, null, { params: { is_adult } }),
@@ -1097,6 +1305,13 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
         {!!movie.is_adult && (
           <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
         )}
+        <button
+          title={movie.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
+          className="absolute top-1 left-6 z-10 bg-background/80 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          onClick={(e) => { e.stopPropagation(); onToggleArchived() }}
+        >
+          {movie.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
+        </button>
         <button className="block w-full text-left" onClick={() => setOpen(true)}>
           {movie.poster_url ? (
             <img src={movie.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
@@ -1168,9 +1383,19 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
             18+
           </button>
           <button
-            title="Delete movie"
-            className="text-muted-foreground hover:text-destructive"
-            onClick={() => { if (confirm(`Delete "${movie.name}"? This removes all its sources and category placements.`)) deleteMovie.mutate() }}
+            title={movie.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
+            className="text-muted-foreground hover:text-foreground"
+            onClick={onToggleArchived}
+          >
+            {movie.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
+          </button>
+          <button
+            title={movie.sources.length > 0
+              ? `Has ${movie.sources.length} active source(s) — the next catalog sync would just re-import it fresh. Archive instead; only sourceless orphans can be deleted.`
+              : 'Delete movie (sourceless orphan)'}
+            className={movie.sources.length > 0 ? 'text-muted-foreground/40 cursor-not-allowed' : 'text-muted-foreground hover:text-destructive'}
+            disabled={movie.sources.length > 0}
+            onClick={() => { if (confirm(`Delete "${movie.name}"? This removes all its category placements. It has no sources, so nothing will bring it back on the next sync.`)) deleteMovie.mutate() }}
           >
             <Trash2 size={12} />
           </button>
@@ -1191,7 +1416,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   )
 }
 
-function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect, mode = 'list' }: {
+function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived }: {
   series: Series
   seriesCategories: Category[]
   qc: ReturnType<typeof useQueryClient>
@@ -1199,6 +1424,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   selected: boolean
   onToggleSelect: () => void
   mode?: 'list' | 'grid'
+  onToggleArchived: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [categoryPick, setCategoryPick] = useState('')
@@ -1228,6 +1454,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   const deleteSeries = useMutation({
     mutationFn: () => api.delete(`/vod/series/${series.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const toggleAdult = useMutation({
     mutationFn: (is_adult: boolean) => api.post(`/vod/series/${series.id}/adult/`, null, { params: { is_adult } }),
@@ -1337,6 +1564,13 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         {!!series.is_adult && (
           <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
         )}
+        <button
+          title={series.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
+          className="absolute top-1 left-6 z-10 bg-background/80 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          onClick={(e) => { e.stopPropagation(); onToggleArchived() }}
+        >
+          {series.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
+        </button>
         <button className="block w-full text-left" onClick={() => setOpen(true)}>
           {series.poster_url ? (
             <img src={series.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
@@ -1387,12 +1621,27 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
             18+
           </button>
           <button
-            title="Delete series"
-            className="text-muted-foreground hover:text-destructive"
-            onClick={() => { if (confirm(`Delete "${series.name}"? This removes all its episodes and category placements.`)) deleteSeries.mutate() }}
+            title={series.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
+            className="text-muted-foreground hover:text-foreground"
+            onClick={onToggleArchived}
           >
-            <Trash2 size={12} />
+            {series.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
           </button>
+          {(() => {
+            const seriesSourceCount = series.episodes.reduce((n, e) => n + e.sources.length, 0)
+            return (
+              <button
+                title={seriesSourceCount > 0
+                  ? `Has ${seriesSourceCount} active episode source(s) — the next catalog sync would just re-import it fresh. Archive instead; only sourceless orphans can be deleted.`
+                  : 'Delete series (sourceless orphan)'}
+                className={seriesSourceCount > 0 ? 'text-muted-foreground/40 cursor-not-allowed' : 'text-muted-foreground hover:text-destructive'}
+                disabled={seriesSourceCount > 0}
+                onClick={() => { if (confirm(`Delete "${series.name}"? This removes all its episodes and category placements. It has no sources, so nothing will bring it back on the next sync.`)) deleteSeries.mutate() }}
+              >
+                <Trash2 size={12} />
+              </button>
+            )
+          })()}
         </span>
       </div>
       {series.genre && <div className="text-muted-foreground mt-0.5">genre: {series.genre}</div>}
@@ -1457,6 +1706,97 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
       api.post(`/vod/categories/${id}/name/`, null, { params: { name } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
   })
+  const [categoryActiveError, setCategoryActiveError] = useState<string | null>(null)
+  const setCategoryActive = useMutation({
+    mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
+      api.post(`/vod/categories/${id}/active/`, null, { params: { is_active } }),
+    onSuccess: () => {
+      setCategoryActiveError(null)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => setCategoryActiveError(e?.response?.data?.detail ?? e.message),
+  })
+  const [categoryScheduleError, setCategoryScheduleError] = useState<string | null>(null)
+  const setCategorySchedule = useMutation({
+    mutationFn: ({ id, start_mmdd, end_mmdd }: { id: number; start_mmdd: string | null; end_mmdd: string | null }) =>
+      api.post(`/vod/categories/${id}/schedule/`, null, { params: { start_mmdd: start_mmdd ?? undefined, end_mmdd: end_mmdd ?? undefined } }),
+    onSuccess: () => {
+      setCategoryScheduleError(null)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => setCategoryScheduleError(e?.response?.data?.detail ?? e.message),
+  })
+  function promptSchedule(c: Category) {
+    const start = window.prompt(
+      `Annual auto-enable date for "${c.name}" (MM-DD, e.g. 10-01 for Oct 1). Leave blank to clear the schedule entirely.`,
+      c.schedule_start_mmdd ?? '',
+    )
+    if (start === null) return
+    if (!start.trim()) {
+      setCategorySchedule.mutate({ id: c.id, start_mmdd: null, end_mmdd: null })
+      return
+    }
+    const end = window.prompt(
+      `Annual auto-disable date for "${c.name}" (MM-DD, e.g. 11-01 for Nov 1):`,
+      c.schedule_end_mmdd ?? '',
+    )
+    if (end === null) return
+    setCategorySchedule.mutate({ id: c.id, start_mmdd: start.trim(), end_mmdd: end.trim() })
+  }
+
+  // ── Multi-select (search + Select/Deselect visible + shift-click) ──
+  // Same Dispatcharr-style pattern as the provider Exclude Categories
+  // modal -- a generic selection, with separate bulk-action buttons below
+  // consuming whatever's currently selected (not tied to one single action).
+  const [categorySearch, setCategorySearch] = useState('')
+  const [categoryShowFilter, setCategoryShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [selectedCategoryIds, setSelectedCategoryIds] = useState<Set<number>>(new Set())
+  const [categoryLastClickedIndex, setCategoryLastClickedIndex] = useState<number | null>(null)
+  const visibleCategories = categories.filter((c) => {
+    if (categorySearch && !c.name.toLowerCase().includes(categorySearch.toLowerCase())) return false
+    if (categoryShowFilter === 'selected' && !selectedCategoryIds.has(c.id)) return false
+    if (categoryShowFilter === 'unselected' && selectedCategoryIds.has(c.id)) return false
+    return true
+  })
+  function toggleCategorySelected(id: number, index: number, shiftKey: boolean) {
+    const willBeChecked = !selectedCategoryIds.has(id)
+    const next = new Set(selectedCategoryIds)
+    if (shiftKey && categoryLastClickedIndex != null) {
+      const [start, end] = [categoryLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const cid = visibleCategories[j]?.id
+        if (cid == null) continue
+        if (willBeChecked) next.add(cid); else next.delete(cid)
+      }
+    } else {
+      if (willBeChecked) next.add(id); else next.delete(id)
+    }
+    setSelectedCategoryIds(next)
+    setCategoryLastClickedIndex(index)
+  }
+  const [categoryBulkError, setCategoryBulkError] = useState<string | null>(null)
+  const [categoryBulkResult, setCategoryBulkResult] = useState<string | null>(null)
+  const bulkSetCategoriesActive = useMutation({
+    mutationFn: (is_active: boolean) => api.post('/vod/categories/bulk-active/', { category_ids: [...selectedCategoryIds], is_active }),
+    onSuccess: (r, is_active) => {
+      setCategoryBulkError(null)
+      setCategoryBulkResult(`${is_active ? 'Enabled' : 'Disabled'} ${r.data.changed} categor${r.data.changed === 1 ? 'y' : 'ies'}.`)
+      setSelectedCategoryIds(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => { setCategoryBulkResult(null); setCategoryBulkError(e?.response?.data?.detail ?? e.message) },
+  })
+  const bulkDeleteCategories = useMutation({
+    mutationFn: () => api.post('/vod/categories/bulk-delete/', { category_ids: [...selectedCategoryIds] }),
+    onSuccess: (r) => {
+      setCategoryBulkError(null)
+      setCategoryBulkResult(`Deleted ${r.data.deleted} categor${r.data.deleted === 1 ? 'y' : 'ies'}.`)
+      setSelectedCategoryIds(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => { setCategoryBulkResult(null); setCategoryBulkError(e?.response?.data?.detail ?? e.message) },
+  })
+
   const [tmdbSyncResult, setTmdbSyncResult] = useState<string | null>(null)
   const syncCategoryNow = useMutation({
     mutationFn: (id: number) => api.post(`/vod/categories/${id}/sync-now/`),
@@ -1522,10 +1862,75 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
         <span className="text-sm font-medium">{contentType === 'movie' ? 'Movie Categories' : 'TV Show Categories'}</span>
       </div>
       <div className="p-4 text-xs space-y-3 overflow-y-auto">
+        {categories.length > 1 && (
+          <>
+            <div className="flex items-center gap-1.5">
+              <input
+                className={inputCls('flex-1')}
+                placeholder="Search categories…"
+                value={categorySearch}
+                onChange={(e) => setCategorySearch(e.target.value)}
+              />
+              <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                {(['all', 'selected', 'unselected'] as const).map((f) => (
+                  <button
+                    key={f}
+                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${categoryShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setCategoryShowFilter(f)}
+                  >
+                    {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => setSelectedCategoryIds(new Set([...selectedCategoryIds, ...visibleCategories.map((c) => c.id)]))}
+              >
+                Select visible ({visibleCategories.length})
+              </button>
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => { const next = new Set(selectedCategoryIds); visibleCategories.forEach((c) => next.delete(c.id)); setSelectedCategoryIds(next) }}
+              >
+                Deselect visible ({visibleCategories.filter((c) => selectedCategoryIds.has(c.id)).length})
+              </button>
+              <span className="text-muted-foreground ml-auto">{selectedCategoryIds.size} selected total · shift-click to select a range</span>
+            </div>
+          </>
+        )}
+        {selectedCategoryIds.size > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
+            <Button size="sm" variant="outline" disabled={bulkSetCategoriesActive.isPending} onClick={() => bulkSetCategoriesActive.mutate(true)}>
+              <Power size={12} className="mr-1" /> Enable selected
+            </Button>
+            <Button size="sm" variant="outline" disabled={bulkSetCategoriesActive.isPending} onClick={() => bulkSetCategoriesActive.mutate(false)}>
+              <PowerOff size={12} className="mr-1" /> Disable selected
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={bulkDeleteCategories.isPending}
+              onClick={() => { if (confirm(`Delete ${selectedCategoryIds.size} categor${selectedCategoryIds.size === 1 ? 'y' : 'ies'}? Items stay in the pool, just unplaced from these categories.`)) bulkDeleteCategories.mutate() }}
+            >
+              <Trash2 size={12} className="mr-1" /> Delete selected
+            </Button>
+            {categoryBulkError && <span className="text-destructive">{categoryBulkError}</span>}
+            {categoryBulkResult && <span className="text-muted-foreground">{categoryBulkResult}</span>}
+          </div>
+        )}
         <ul className="space-y-0.5">
-          {categories.map((c) => (
-            <li key={c.id} className="flex items-center justify-between gap-2">
+          {visibleCategories.map((c, i) => (
+            <li key={c.id} className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
               <span className="flex items-center gap-1 min-w-0">
+                <input
+                  type="checkbox"
+                  className="shrink-0"
+                  checked={selectedCategoryIds.has(c.id)}
+                  onChange={() => {}}
+                  onClick={(e) => toggleCategorySelected(c.id, i, e.shiftKey)}
+                />
                 <input
                   className={inputCls('w-32')}
                   defaultValue={c.name}
@@ -1576,6 +1981,22 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 >
                   <Eye size={12} />
                 </button>
+                <button
+                  title={c.is_active ? 'Disable — stops exporting to Dispatcharr, keeps everything for later (e.g. a seasonal category)' : 'Enable — resumes exporting to Dispatcharr'}
+                  className={c.is_active ? 'text-muted-foreground hover:text-foreground' : 'text-amber-500 hover:text-foreground'}
+                  disabled={setCategoryActive.isPending}
+                  onClick={() => setCategoryActive.mutate({ id: c.id, is_active: !c.is_active })}
+                >
+                  {c.is_active ? <Power size={12} /> : <PowerOff size={12} />}
+                </button>
+                <button
+                  title={c.schedule_start_mmdd ? `Annual schedule: enable ${c.schedule_start_mmdd} → disable ${c.schedule_end_mmdd}` : 'Set an annual enable/disable schedule (e.g. a seasonal category)'}
+                  className={c.schedule_start_mmdd ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                  disabled={setCategorySchedule.isPending}
+                  onClick={() => promptSchedule(c)}
+                >
+                  <CalendarClock size={12} />
+                </button>
                 <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
                   <Trash2 size={12} />
                 </button>
@@ -1583,7 +2004,10 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
             </li>
           ))}
           {categories.length === 0 && <p className="text-muted-foreground">No categories yet.</p>}
+          {categories.length > 0 && visibleCategories.length === 0 && <p className="text-muted-foreground">No categories match.</p>}
         </ul>
+        {categoryScheduleError && <p className="text-destructive">{categoryScheduleError}</p>}
+        {categoryActiveError && <p className="text-destructive">{categoryActiveError}</p>}
         {evaluateResult && <p className="text-muted-foreground">{evaluateResult}</p>}
         {aiEvaluateResult && <p className="text-muted-foreground">{aiEvaluateResult}</p>}
         {tmdbSyncResult && <p className="text-muted-foreground">{tmdbSyncResult}</p>}
@@ -2333,23 +2757,89 @@ export default function VodManager() {
     queryKey: ['vod-import-language-exclusion'],
     queryFn:  () => api.get('/vod/import-language-exclusion/').then((r) => r.data),
   })
-  const [languagePrefixInput, setLanguagePrefixInput] = useState('')
+  const languagePrefixesQuery = useQuery<{ code: string; count: number }[]>({
+    queryKey: ['vod-import-language-prefixes'],
+    queryFn:  () => api.get('/vod/import-language-exclusion/prefixes/').then((r) => r.data),
+  })
   const saveImportLanguageExclusion = useMutation({
     mutationFn: (body: { exclude_prefixes: string[]; exclude_non_latin: boolean }) =>
       api.post('/vod/import-language-exclusion/', body),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-import-language-exclusion'] })
-      setLanguagePrefixInput('')
-    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-import-language-exclusion'] }),
   })
+  // Draft selection, committed only on Save -- codes are whatever a
+  // provider happens to tag content with (not a fixed list), so the picker
+  // is built from what's actually seen in the pool right now, unioned with
+  // whatever's already saved (a previously-excluded code a provider no
+  // longer uses should still show up, checked, not silently vanish).
+  const [languageSearch, setLanguageSearch] = useState('')
+  const [languageShowFilter, setLanguageShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [languageDraft, setLanguageDraft] = useState<Set<string>>(new Set())
+  const [languageLastClickedIndex, setLanguageLastClickedIndex] = useState<number | null>(null)
+  const languageDraftInitialized = useRef(false)
+  useEffect(() => {
+    if (languageDraftInitialized.current || !importLanguageExclusionQuery.data) return
+    languageDraftInitialized.current = true
+    setLanguageDraft(new Set(importLanguageExclusionQuery.data.exclude_prefixes))
+  }, [importLanguageExclusionQuery.data])
+  const allLanguageCodes = (() => {
+    const counts = new Map((languagePrefixesQuery.data ?? []).map((p) => [p.code, p.count]))
+    for (const code of importLanguageExclusionQuery.data?.exclude_prefixes ?? []) {
+      if (!counts.has(code)) counts.set(code, 0)
+    }
+    return [...counts.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
+  })()
+  const visibleLanguageCodes = allLanguageCodes.filter((c) => {
+    const label = `${c.code} ${LANGUAGE_CODE_NAMES[c.code] ?? ''}`.toLowerCase()
+    if (languageSearch && !label.includes(languageSearch.toLowerCase())) return false
+    if (languageShowFilter === 'selected' && !languageDraft.has(c.code)) return false
+    if (languageShowFilter === 'unselected' && languageDraft.has(c.code)) return false
+    return true
+  })
+  function toggleLanguageSelected(code: string, index: number, shiftKey: boolean) {
+    const willBeChecked = !languageDraft.has(code)
+    const next = new Set(languageDraft)
+    if (shiftKey && languageLastClickedIndex != null) {
+      const [start, end] = [languageLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const c = visibleLanguageCodes[j]?.code
+        if (c == null) continue
+        if (willBeChecked) next.add(c); else next.delete(c)
+      }
+    } else {
+      if (willBeChecked) next.add(code); else next.delete(code)
+    }
+    setLanguageDraft(next)
+    setLanguageLastClickedIndex(index)
+  }
+  const [applyExclusionsJobId, setApplyExclusionsJobId] = useState<string | null>(null)
   const applyImportExclusionsNow = useMutation({
     mutationFn: () => api.post('/vod/import-exclusions/apply-now/'),
-    onSuccess: () => {
+    onSuccess: (r) => setApplyExclusionsJobId(r.data.job_id),
+  })
+  type ApplyExclusionsProviderResult = {
+    provider: string; error?: string
+    movies_created?: number; movies_matched?: number; movies_archived?: number
+    series_created?: number; series_matched?: number; series_archived?: number
+  }
+  const applyExclusionsJobQuery = useQuery<{
+    status: string; total: number; completed: number; current_provider: string | null
+    results: ApplyExclusionsProviderResult[]; error: string | null
+  }>({
+    queryKey: ['vod-apply-exclusions-job', applyExclusionsJobId],
+    queryFn:  () => api.get(`/vod/import-exclusions/apply-now/${applyExclusionsJobId}/`).then((r) => r.data),
+    enabled:  !!applyExclusionsJobId,
+    refetchInterval: (query) => (query.state.data?.status === 'running' ? 1200 : false),
+  })
+  useEffect(() => {
+    if (applyExclusionsJobQuery.data?.status === 'done') {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
-    },
-  })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyExclusionsJobQuery.data?.status])
   const [aiKeyInputs, setAiKeyInputs] = useState<{ anthropic: string; openai: string; gemini: string }>({
     anthropic: '', openai: '', gemini: '',
   })
@@ -2588,6 +3078,9 @@ export default function VodManager() {
   })
   const [excludeCategoriesProviderId, setExcludeCategoriesProviderId] = useState<number | null>(null)
   const [excludeCategoriesDraft, setExcludeCategoriesDraft] = useState<Set<string>>(new Set())
+  const [excludeCategoriesSearch, setExcludeCategoriesSearch] = useState('')
+  const [excludeCategoriesShowFilter, setExcludeCategoriesShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [excludeCategoriesLastClickedIndex, setExcludeCategoriesLastClickedIndex] = useState<number | null>(null)
   const providerAvailableCategoriesQuery = useQuery<{ categories: string[] }>({
     queryKey: ['vod-provider-available-categories', excludeCategoriesProviderId],
     queryFn:  () => api.get(`/vod/providers/${excludeCategoriesProviderId}/available-categories/`).then((r) => r.data),
@@ -2684,6 +3177,43 @@ export default function VodManager() {
       api.post(`/vod/categories/${id}/name/`, null, { params: { name } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
   })
+  const [categoryActiveError2, setCategoryActiveError2] = useState<string | null>(null)
+  const setCategoryActive2 = useMutation({
+    mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
+      api.post(`/vod/categories/${id}/active/`, null, { params: { is_active } }),
+    onSuccess: () => {
+      setCategoryActiveError2(null)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => setCategoryActiveError2(e?.response?.data?.detail ?? e.message),
+  })
+  const [categoryScheduleError2, setCategoryScheduleError2] = useState<string | null>(null)
+  const setCategorySchedule2 = useMutation({
+    mutationFn: ({ id, start_mmdd, end_mmdd }: { id: number; start_mmdd: string | null; end_mmdd: string | null }) =>
+      api.post(`/vod/categories/${id}/schedule/`, null, { params: { start_mmdd: start_mmdd ?? undefined, end_mmdd: end_mmdd ?? undefined } }),
+    onSuccess: () => {
+      setCategoryScheduleError2(null)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => setCategoryScheduleError2(e?.response?.data?.detail ?? e.message),
+  })
+  function promptSchedule2(c: Category) {
+    const start = window.prompt(
+      `Annual auto-enable date for "${c.name}" (MM-DD, e.g. 10-01 for Oct 1). Leave blank to clear the schedule entirely.`,
+      c.schedule_start_mmdd ?? '',
+    )
+    if (start === null) return
+    if (!start.trim()) {
+      setCategorySchedule2.mutate({ id: c.id, start_mmdd: null, end_mmdd: null })
+      return
+    }
+    const end = window.prompt(
+      `Annual auto-disable date for "${c.name}" (MM-DD, e.g. 11-01 for Nov 1):`,
+      c.schedule_end_mmdd ?? '',
+    )
+    if (end === null) return
+    setCategorySchedule2.mutate({ id: c.id, start_mmdd: start.trim(), end_mmdd: end.trim() })
+  }
   const setCategorySyncSource = useMutation({
     mutationFn: ({ id, sync_source }: { id: number; sync_source: string | null }) =>
       api.post(`/vod/categories/${id}/sync-source/`, null, { params: sync_source ? { sync_source } : {} }),
@@ -2733,7 +3263,7 @@ export default function VodManager() {
     },
   })
 
-  // ── Duplicate finder (same-year entries differing only by punctuation) ──
+  // ── Duplicate finder (punctuation variants + adjacent-year mislabeling) ──
   const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
   const [duplicatesOffset, setDuplicatesOffset] = useState(0)
   const DUPLICATES_PAGE_SIZE = 20
@@ -2757,12 +3287,71 @@ export default function VodManager() {
     },
     onError: (e: any) => setDuplicatesMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
   })
+  const ignoreDuplicateGroup = useMutation({
+    mutationFn: (item_ids: number[]) => api.post('/vod/duplicates/ignore/', { content_type: duplicatesContentType, item_ids }),
+    onSuccess: () => duplicatesQuery.refetch(),
+  })
+  const groupSignature = (items: { id: number }[]) => items.map((i) => i.id).sort((a, b) => a - b).join('-')
+
+  // TMDB-confirmed-match check: a real catalog scan can surface thousands
+  // of candidate tmdb_ids (one real GET per id, no bulk endpoint exists),
+  // far too slow/rate-limit-risky to check inline -- runs as a polled
+  // background job instead (see duplicate_confirm.py). Opt-in, separate
+  // from Scan -- not everyone wants to wait minutes for this every time.
+  const [duplicatesConfirmJobId, setDuplicatesConfirmJobId] = useState<string | null>(null)
+  const startConfirmScan = useMutation({
+    mutationFn: () => api.post('/vod/duplicates/confirm-scan/', null, { params: { content_type: duplicatesContentType } }),
+    onSuccess: (r) => setDuplicatesConfirmJobId(r.data.job_id),
+  })
+  const confirmScanQuery = useQuery<{ status: string; checked: number; total: number; confirmed: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string }[]; error: string | null }>({
+    queryKey: ['vod-duplicates-confirm-scan', duplicatesConfirmJobId],
+    queryFn:  () => api.get(`/vod/duplicates/confirm-scan/${duplicatesConfirmJobId}/`).then((r) => r.data),
+    enabled:  !!duplicatesConfirmJobId,
+    refetchInterval: (query) => (query.state.data?.status === 'running' ? 1200 : false),
+  })
+  const cancelConfirmScan = useMutation({
+    mutationFn: () => api.post(`/vod/duplicates/confirm-scan/${duplicatesConfirmJobId}/cancel/`),
+  })
+  const duplicatesConfirmed = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.confirmed : []
+  const duplicatesConfirmedKeys = new Set(duplicatesConfirmed.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
+  const duplicatesNeedsReview = (duplicatesQuery.data ?? []).filter((g) => !duplicatesConfirmedKeys.has(groupSignature(g.items)))
+
+  const [duplicatesConfirmMergeResult, setDuplicatesConfirmMergeResult] = useState<string | null>(null)
+  const mergeConfirmedDuplicates = useMutation({
+    mutationFn: () => api.post('/vod/duplicates/merge-confirmed/', {
+      content_type: duplicatesContentType,
+      groups: duplicatesConfirmed.map((c) => ({ keep_id: c.keep_id, merge_ids: c.merge_ids })),
+    }),
+    onSuccess: (r) => {
+      setDuplicatesConfirmMergeResult(`Merged ${r.data.merged_groups} confirmed group${r.data.merged_groups === 1 ? '' : 's'} (${r.data.merged_items} item${r.data.merged_items === 1 ? '' : 's'}).`)
+      setDuplicatesConfirmJobId(null)
+      duplicatesQuery.refetch()
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setDuplicatesConfirmMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+
+  // Scoped to just the tmdb_ids actually visible on the current results page
+  // (post-scan, post-pagination, post-confirmed-filter), not the whole scan
+  // -- keeps this to a handful of real TMDB requests instead of one per
+  // group in the pool.
+  const duplicatesPageItems = duplicatesNeedsReview.slice(duplicatesOffset, duplicatesOffset + DUPLICATES_PAGE_SIZE)
+  const duplicatesTmdbIdsKey = [...new Set(
+    duplicatesPageItems.flatMap((g) => g.items.map((i) => i.tmdb_id).filter((id): id is string => !!id))
+  )].sort().join(',')
+  const duplicatesTmdbDetailsQuery = useQuery<Record<string, { year: number | null; title: string | null }>>({
+    queryKey: ['vod-duplicates-tmdb-details', duplicatesContentType, duplicatesTmdbIdsKey],
+    queryFn:  () => api.get('/vod/duplicates/tmdb-details/', { params: { content_type: duplicatesContentType, tmdb_ids: duplicatesTmdbIdsKey } }).then((r) => r.data),
+    enabled:  !!duplicatesTmdbIdsKey,
+  })
 
   // ── Movies ──
   const [movieSearch, setMovieSearch] = useState('')
   const [movieOffset, setMovieOffset] = useState(0)
   const [movieCategoryFilter, setMovieCategoryFilter] = useState<number | null>(null)
   const [movieProviderFilter, setMovieProviderFilter] = useState<number | null>(null)
+  const [movieShowArchived, setMovieShowArchived] = useState(false)
   const [MOVIE_LIMIT, setMovieLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-movies-limit')) || 25
   )
@@ -2772,8 +3361,12 @@ export default function VodManager() {
     setMovieOffset(0)
   }
   const moviesQuery = useQuery<Page<Movie>>({
-    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, MOVIE_LIMIT],
-    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined } }).then((r) => r.data),
+    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, movieShowArchived, MOVIE_LIMIT],
+    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined, archived: movieShowArchived } }).then((r) => r.data),
+  })
+  const toggleMovieArchived = useMutation({
+    mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/movies/${id}/archive/`, null, { params: { archived } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
   const [movieForm, setMovieForm] = useState({ name: '', year: '' })
   const addMovie = useMutation({
@@ -2807,6 +3400,7 @@ export default function VodManager() {
   const [seriesOffset, setSeriesOffset] = useState(0)
   const [seriesCategoryFilter, setSeriesCategoryFilter] = useState<number | null>(null)
   const [seriesProviderFilter, setSeriesProviderFilter] = useState<number | null>(null)
+  const [seriesShowArchived, setSeriesShowArchived] = useState(false)
   const [SERIES_LIMIT, setSeriesLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-series-limit')) || 25
   )
@@ -2816,8 +3410,12 @@ export default function VodManager() {
     setSeriesOffset(0)
   }
   const seriesQuery = useQuery<Page<Series>>({
-    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, SERIES_LIMIT],
-    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined } }).then((r) => r.data),
+    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, seriesShowArchived, SERIES_LIMIT],
+    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined, archived: seriesShowArchived } }).then((r) => r.data),
+  })
+  const toggleSeriesArchived = useMutation({
+    mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/series/${id}/archive/`, null, { params: { archived } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
   const [seriesForm, setSeriesForm] = useState({ name: '', year: '' })
   const addSeries = useMutation({
@@ -3747,7 +4345,13 @@ export default function VodManager() {
                   <Button
                     size="sm" variant="outline"
                     title="Categories to auto-archive on import, as this provider itself names them"
-                    onClick={() => { setExcludeCategoriesProviderId(p.id); setExcludeCategoriesDraft(new Set(p.import_exclude_categories)) }}
+                    onClick={() => {
+                      setExcludeCategoriesProviderId(p.id)
+                      setExcludeCategoriesDraft(new Set(p.import_exclude_categories))
+                      setExcludeCategoriesSearch('')
+                      setExcludeCategoriesShowFilter('all')
+                      setExcludeCategoriesLastClickedIndex(null)
+                    }}
                   >
                     Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
                   </Button>
@@ -3819,33 +4423,79 @@ export default function VodManager() {
           archives (still browsable/playable/categorizable if you change your mind), never deletes, and never
           overrides an item you've manually un-archived.
         </p>
-        <div className="flex items-center gap-1.5">
-          <input
-            className={inputCls('w-64')}
-            placeholder="Excluded prefixes, comma-separated (e.g. AR, FR, RU)"
-            value={languagePrefixInput}
-            onChange={(e) => setLanguagePrefixInput(e.target.value)}
-          />
-          <Button
-            size="sm"
-            disabled={saveImportLanguageExclusion.isPending}
-            onClick={() => saveImportLanguageExclusion.mutate({
-              exclude_prefixes: languagePrefixInput.split(',').map((s) => s.trim()).filter(Boolean),
-              exclude_non_latin: importLanguageExclusionQuery.data?.exclude_non_latin ?? false,
-            })}
-          >
-            {saveImportLanguageExclusion.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save prefixes'}
-          </Button>
-        </div>
-        {!!importLanguageExclusionQuery.data?.exclude_prefixes.length && (
-          <p className="text-xs text-muted-foreground">Currently excluded: {importLanguageExclusionQuery.data.exclude_prefixes.join(', ')}</p>
+        {allLanguageCodes.length > 0 ? (
+          <>
+            <div className="flex items-center gap-1.5">
+              <input
+                className={inputCls('flex-1')}
+                placeholder="Search languages…"
+                value={languageSearch}
+                onChange={(e) => setLanguageSearch(e.target.value)}
+              />
+              <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                {(['all', 'selected', 'unselected'] as const).map((f) => (
+                  <button
+                    key={f}
+                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${languageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setLanguageShowFilter(f)}
+                  >
+                    {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 text-xs">
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => setLanguageDraft(new Set([...languageDraft, ...visibleLanguageCodes.map((c) => c.code)]))}
+              >
+                Select visible ({visibleLanguageCodes.length})
+              </button>
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => { const next = new Set(languageDraft); visibleLanguageCodes.forEach((c) => next.delete(c.code)); setLanguageDraft(next) }}
+              >
+                Deselect visible ({visibleLanguageCodes.filter((c) => languageDraft.has(c.code)).length})
+              </button>
+              <span className="text-muted-foreground ml-auto">{languageDraft.size} selected total · shift-click to select a range</span>
+            </div>
+            <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+              {visibleLanguageCodes.map((c, i) => (
+                <label key={c.code} className="flex items-center gap-1.5 select-none">
+                  <input
+                    type="checkbox"
+                    checked={languageDraft.has(c.code)}
+                    onChange={() => {}}
+                    onClick={(e) => toggleLanguageSelected(c.code, i, e.shiftKey)}
+                  />
+                  <span className="font-mono">{c.code}</span>
+                  {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+                  <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+                </label>
+              ))}
+              {visibleLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
+            </div>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">No language-tagged titles ("AR| ...", "EN| ...") found in the pool yet — import a catalog first.</p>
         )}
+        <Button
+          size="sm"
+          disabled={saveImportLanguageExclusion.isPending}
+          onClick={() => saveImportLanguageExclusion.mutate({
+            exclude_prefixes: [...languageDraft],
+            exclude_non_latin: importLanguageExclusionQuery.data?.exclude_non_latin ?? false,
+          })}
+        >
+          {saveImportLanguageExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Save selected languages
+        </Button>
         <label className="flex items-center gap-1.5 text-xs">
           <input
             type="checkbox"
             checked={importLanguageExclusionQuery.data?.exclude_non_latin ?? false}
             onChange={(e) => saveImportLanguageExclusion.mutate({
-              exclude_prefixes: importLanguageExclusionQuery.data?.exclude_prefixes ?? [],
+              exclude_prefixes: [...languageDraft],
               exclude_non_latin: e.target.checked,
             })}
           />
@@ -3854,18 +4504,50 @@ export default function VodManager() {
         <div className="flex items-center gap-1.5 pt-1">
           <Button
             size="sm" variant="outline"
-            disabled={applyImportExclusionsNow.isPending}
+            disabled={applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running'}
             onClick={() => { if (confirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.')) applyImportExclusionsNow.mutate() }}
           >
-            {applyImportExclusionsNow.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            {applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running' ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
             Apply rules to existing catalog now
           </Button>
-          {applyImportExclusionsNow.isSuccess && <span className="text-xs text-muted-foreground">Done — re-imported {applyImportExclusionsNow.data?.data?.results?.length ?? 0} provider(s).</span>}
+          {applyExclusionsJobQuery.data?.status === 'running' && (
+            <span className="text-xs text-muted-foreground">
+              Provider {applyExclusionsJobQuery.data.completed + 1} of {applyExclusionsJobQuery.data.total}
+              {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+            </span>
+          )}
+          {applyExclusionsJobQuery.data?.status === 'error' && (
+            <span className="text-xs text-destructive">Failed: {applyExclusionsJobQuery.data.error}</span>
+          )}
         </div>
+        {applyExclusionsJobQuery.data?.status === 'done' && !!applyExclusionsJobQuery.data.results.length && (
+          <div className="text-xs border border-border rounded p-2 space-y-1">
+            <p className="text-muted-foreground">
+              Done — {applyExclusionsJobQuery.data.results.length} provider(s), {
+                applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_archived ?? 0) + (r.series_archived ?? 0), 0)
+              } newly archived by the current rules.
+            </p>
+            {applyExclusionsJobQuery.data.results.map((r) => (
+              <p key={r.provider} className="text-muted-foreground">
+                {r.provider}: {r.error
+                  ? <span className="text-destructive">{r.error}</span>
+                  : <>{(r.movies_archived ?? 0) + (r.series_archived ?? 0)} archived · {(r.movies_matched ?? 0) + (r.series_matched ?? 0)} matched · {(r.movies_created ?? 0) + (r.series_created ?? 0)} new</>}
+              </p>
+            ))}
+          </div>
+        )}
       </SectionCard>
 
-      {excludeCategoriesProviderId != null && (
-        <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-md">
+      {excludeCategoriesProviderId != null && (() => {
+        const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
+        const visible = allNames.filter((name) => {
+          if (excludeCategoriesSearch && !name.toLowerCase().includes(excludeCategoriesSearch.toLowerCase())) return false
+          if (excludeCategoriesShowFilter === 'selected' && !excludeCategoriesDraft.has(name)) return false
+          if (excludeCategoriesShowFilter === 'unselected' && excludeCategoriesDraft.has(name)) return false
+          return true
+        })
+        return (
+        <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-lg">
           <div className="p-5 space-y-3">
             <h2 className="text-base font-semibold">
               Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
@@ -3878,21 +4560,70 @@ export default function VodManager() {
             {providerAvailableCategoriesQuery.data && !providerAvailableCategoriesQuery.data.categories.length && (
               <p className="text-xs text-muted-foreground">No categories reported by this provider.</p>
             )}
+            {!!allNames.length && (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    className={inputCls('flex-1')}
+                    placeholder="Search categories…"
+                    value={excludeCategoriesSearch}
+                    onChange={(e) => setExcludeCategoriesSearch(e.target.value)}
+                  />
+                  <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                    {(['all', 'selected', 'unselected'] as const).map((f) => (
+                      <button
+                        key={f}
+                        className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${excludeCategoriesShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                        onClick={() => setExcludeCategoriesShowFilter(f)}
+                      >
+                        {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5 text-xs">
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                    onClick={() => setExcludeCategoriesDraft(new Set([...excludeCategoriesDraft, ...visible]))}
+                  >
+                    Select visible ({visible.length})
+                  </button>
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                    onClick={() => { const next = new Set(excludeCategoriesDraft); visible.forEach((n) => next.delete(n)); setExcludeCategoriesDraft(next) }}
+                  >
+                    Deselect visible ({visible.filter((n) => excludeCategoriesDraft.has(n)).length})
+                  </button>
+                  <span className="text-muted-foreground ml-auto">{excludeCategoriesDraft.size} selected total · shift-click to select a range</span>
+                </div>
+              </>
+            )}
             <div className="max-h-64 overflow-y-auto space-y-1 border border-border rounded p-2">
-              {providerAvailableCategoriesQuery.data?.categories.map((name) => (
-                <label key={name} className="flex items-center gap-1.5 text-xs">
+              {visible.map((name, i) => (
+                <label key={name} className="flex items-center gap-1.5 text-xs select-none">
                   <input
                     type="checkbox"
                     checked={excludeCategoriesDraft.has(name)}
-                    onChange={(e) => {
+                    onChange={() => {}}
+                    onClick={(e) => {
+                      const willBeChecked = !excludeCategoriesDraft.has(name)
                       const next = new Set(excludeCategoriesDraft)
-                      if (e.target.checked) next.add(name); else next.delete(name)
+                      if (e.shiftKey && excludeCategoriesLastClickedIndex != null) {
+                        const [start, end] = [excludeCategoriesLastClickedIndex, i].sort((a, b) => a - b)
+                        for (let j = start; j <= end; j++) {
+                          if (willBeChecked) next.add(visible[j]); else next.delete(visible[j])
+                        }
+                      } else {
+                        if (willBeChecked) next.add(name); else next.delete(name)
+                      }
                       setExcludeCategoriesDraft(next)
+                      setExcludeCategoriesLastClickedIndex(i)
                     }}
                   />
                   {name}
                 </label>
               ))}
+              {!!allNames.length && !visible.length && <p className="text-muted-foreground">No categories match.</p>}
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
@@ -3906,7 +4637,8 @@ export default function VodManager() {
             </div>
           </div>
         </Modal>
-      )}
+        )
+      })()}
 
       <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
@@ -3953,53 +4685,101 @@ export default function VodManager() {
 
       <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Finds same-year pool entries whose names only differ by cosmetic punctuation (a colon, a dash, quote
-          style) — real providers sometimes format the same title slightly differently, splitting what should be
-          one pool entry with multiple sources into two "duplicates". Pick which spelling to keep for each group;
-          the rest merge into it (sources, categories, and episodes move over, nothing is lost).
+          Finds pool entries that look like the same real title split into two rows: names that only differ by
+          cosmetic punctuation (a colon, a dash, quote style), or the same name with years one apart (a provider
+          mislabeling a release year). A shared TMDB id confirms a match even across a bigger year gap; a
+          conflicting TMDB id rules a pair out entirely. Pick which candidate to keep for each group — the rest
+          merge into it (sources, categories, and episodes move over, nothing is lost) — or Ignore a group that
+          isn't actually a duplicate so it stops resurfacing.
         </p>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             <button
               className={`px-2 py-0.5 rounded text-xs ${duplicatesContentType === 'movie' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-              onClick={() => { setDuplicatesContentType('movie'); setDuplicatesOffset(0) }}
+              onClick={() => { setDuplicatesContentType('movie'); setDuplicatesOffset(0); setDuplicatesConfirmJobId(null) }}
             >
               Movies
             </button>
             <button
               className={`px-2 py-0.5 rounded text-xs ${duplicatesContentType === 'series' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-              onClick={() => { setDuplicatesContentType('series'); setDuplicatesOffset(0) }}
+              onClick={() => { setDuplicatesContentType('series'); setDuplicatesOffset(0); setDuplicatesConfirmJobId(null) }}
             >
               TV Shows
             </button>
           </div>
-          <Button size="sm" variant="outline" disabled={duplicatesQuery.isFetching} onClick={() => { setDuplicatesOffset(0); duplicatesQuery.refetch() }}>
+          <Button size="sm" variant="outline" disabled={duplicatesQuery.isFetching} onClick={() => { setDuplicatesOffset(0); setDuplicatesConfirmJobId(null); duplicatesQuery.refetch() }}>
             {duplicatesQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
             Scan
           </Button>
           {duplicatesQuery.data && duplicatesQuery.data.length === 0 && (
             <span className="text-xs text-muted-foreground">Clean — nothing found.</span>
           )}
-          {!!duplicatesQuery.data?.length && (
+          {!!duplicatesNeedsReview.length && (
             <>
-              <span className="text-xs text-muted-foreground">{duplicatesQuery.data.length} group{duplicatesQuery.data.length === 1 ? '' : 's'} found</span>
-              <Pager total={duplicatesQuery.data.length} limit={DUPLICATES_PAGE_SIZE} offset={duplicatesOffset} onOffset={setDuplicatesOffset} />
+              <span className="text-xs text-muted-foreground">{duplicatesNeedsReview.length} group{duplicatesNeedsReview.length === 1 ? '' : 's'} need review</span>
+              <Pager total={duplicatesNeedsReview.length} limit={DUPLICATES_PAGE_SIZE} offset={duplicatesOffset} onOffset={setDuplicatesOffset} />
             </>
           )}
           {duplicatesMergeResult && <span className="text-xs text-destructive">{duplicatesMergeResult}</span>}
         </div>
         {!!duplicatesQuery.data?.length && (
+          <div className="flex items-center gap-1.5 rounded border border-green-500/30 bg-green-500/5 px-2 py-1.5">
+            {!duplicatesConfirmJobId ? (
+              <>
+                <span className="text-xs text-muted-foreground">Check every group in this scan against TMDB to find airtight matches (shared tmdb_id + exact title match) that can merge without a manual pick.</span>
+                <Button size="sm" variant="outline" disabled={startConfirmScan.isPending} onClick={() => startConfirmScan.mutate()}>
+                  {startConfirmScan.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                  Check TMDB-confirmed matches
+                </Button>
+              </>
+            ) : confirmScanQuery.data?.status === 'running' || !confirmScanQuery.data ? (
+              <>
+                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Loader2 size={12} className="animate-spin" />
+                  Checking {confirmScanQuery.data?.checked ?? 0}/{confirmScanQuery.data?.total ?? '…'} against TMDB…
+                </span>
+                <Button size="sm" variant="outline" onClick={() => { cancelConfirmScan.mutate(); setDuplicatesConfirmJobId(null) }}>
+                  Cancel
+                </Button>
+              </>
+            ) : confirmScanQuery.data.status === 'error' ? (
+              <span className="text-xs text-destructive">TMDB check failed: {confirmScanQuery.data.error}</span>
+            ) : confirmScanQuery.data.status === 'cancelled' ? (
+              <span className="text-xs text-muted-foreground">Cancelled.</span>
+            ) : (
+              <>
+                <span className="text-xs text-green-400">✓ {duplicatesConfirmed.length} TMDB-confirmed match{duplicatesConfirmed.length === 1 ? '' : 'es'} found (of {confirmScanQuery.data.total} candidate{confirmScanQuery.data.total === 1 ? '' : 's'} checked)</span>
+                <Button
+                  size="sm"
+                  disabled={!duplicatesConfirmed.length || mergeConfirmedDuplicates.isPending}
+                  onClick={() => mergeConfirmedDuplicates.mutate()}
+                  title="Every candidate here shares a confirmed TMDB id, and one name matches TMDB's own title exactly -- no manual pick needed"
+                >
+                  {mergeConfirmedDuplicates.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                  Merge all confirmed matches ({duplicatesConfirmed.length})
+                </Button>
+              </>
+            )}
+            {duplicatesConfirmMergeResult && <span className="text-xs text-muted-foreground">{duplicatesConfirmMergeResult}</span>}
+          </div>
+        )}
+        {!!duplicatesPageItems.length && (
           // Client-side slice, not a second network round-trip -- the scan
           // already walked the whole pool in one query; thousands of groups
           // in the DOM at once (not just in memory) is what actually made
           // the page unusably slow, so only render one page's worth.
           <div className="text-xs space-y-1.5">
-            {duplicatesQuery.data.slice(duplicatesOffset, duplicatesOffset + DUPLICATES_PAGE_SIZE).map((group) => (
+            {duplicatesPageItems.map((group) => (
               <DuplicateGroupRow
                 key={group.items.map((i) => i.id).join('-')}
                 group={group}
+                contentType={duplicatesContentType}
+                xcCredentials={xcCredentialsQuery.data}
                 isPending={mergeDuplicateGroup.isPending}
                 onMerge={(keepId, mergeIds) => mergeDuplicateGroup.mutate({ keep_id: keepId, merge_ids: mergeIds })}
+                onIgnore={(itemIds) => ignoreDuplicateGroup.mutate(itemIds)}
+                isIgnorePending={ignoreDuplicateGroup.isPending}
+                tmdbDetails={duplicatesTmdbDetailsQuery.data}
               />
             ))}
           </div>
@@ -4018,7 +4798,7 @@ export default function VodManager() {
             <div key={g.sync_source} className="rounded border border-border/50 p-2 text-xs space-y-1">
               <p className="text-muted-foreground">List ID: {g.sync_source.replace('tmdb_list:', '')}</p>
               {g.categories.map((c) => (
-                <div key={c.id} className="flex items-center justify-between gap-2">
+                <div key={c.id} className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
                   <span className="flex items-center gap-1 min-w-0">
                     <input
                       className={inputCls('w-40')}
@@ -4057,6 +4837,22 @@ export default function VodManager() {
                     >
                       <Eye size={12} />
                     </button>
+                    <button
+                      title={c.is_active ? 'Disable — stops exporting to Dispatcharr, keeps everything for later (e.g. a seasonal category)' : 'Enable — resumes exporting to Dispatcharr'}
+                      className={c.is_active ? 'text-muted-foreground hover:text-foreground' : 'text-amber-500 hover:text-foreground'}
+                      disabled={setCategoryActive2.isPending}
+                      onClick={() => setCategoryActive2.mutate({ id: c.id, is_active: !c.is_active })}
+                    >
+                      {c.is_active ? <Power size={12} /> : <PowerOff size={12} />}
+                    </button>
+                    <button
+                      title={c.schedule_start_mmdd ? `Annual schedule: enable ${c.schedule_start_mmdd} → disable ${c.schedule_end_mmdd}` : 'Set an annual enable/disable schedule (e.g. a seasonal category)'}
+                      className={c.schedule_start_mmdd ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                      disabled={setCategorySchedule2.isPending}
+                      onClick={() => promptSchedule2(c)}
+                    >
+                      <CalendarClock size={12} />
+                    </button>
                     <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
                       <Trash2 size={12} />
                     </button>
@@ -4066,6 +4862,8 @@ export default function VodManager() {
             </div>
           ))}
         </div>
+        {categoryScheduleError2 && <p className="text-xs text-destructive">{categoryScheduleError2}</p>}
+        {categoryActiveError2 && <p className="text-xs text-destructive">{categoryActiveError2}</p>}
         {tmdbSyncResult && <p className="text-xs text-muted-foreground">{tmdbSyncResult}</p>}
         <div className="flex flex-wrap items-center gap-1.5 pt-1">
           <input className={inputCls('w-28')} placeholder="TMDB List ID" value={tmdbListForm.list_id} onChange={(e) => setTmdbListForm({ ...tmdbListForm, list_id: e.target.value })} />
@@ -4109,6 +4907,14 @@ export default function VodManager() {
             <option value="">All providers</option>
             {(providersQuery.data ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
+          <Button
+            size="sm"
+            variant={movieShowArchived ? 'default' : 'outline'}
+            onClick={() => { setMovieShowArchived((v) => !v); setMovieOffset(0) }}
+            title={movieShowArchived ? 'Showing archived movies — click to return to the active pool' : 'Show only archived movies'}
+          >
+            <Archive size={12} className="mr-1" />Archived
+          </Button>
           {movieCategoryFilter != null && (
             <span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
               Viewing: {movieCategories.find((c) => c.id === movieCategoryFilter)?.name ?? movieCategoryFilter}
@@ -4191,6 +4997,7 @@ export default function VodManager() {
               selected={selectedMovieIds.has(m.id)}
               onToggleSelect={() => toggleMovieSelected(m.id)}
               mode={movieViewMode}
+              onToggleArchived={() => toggleMovieArchived.mutate({ id: m.id, archived: !m.review_excluded })}
             />
           ))}
         </div>
@@ -4229,6 +5036,14 @@ export default function VodManager() {
             <option value="">All providers</option>
             {(providersQuery.data ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
+          <Button
+            size="sm"
+            variant={seriesShowArchived ? 'default' : 'outline'}
+            onClick={() => { setSeriesShowArchived((v) => !v); setSeriesOffset(0) }}
+            title={seriesShowArchived ? 'Showing archived series — click to return to the active pool' : 'Show only archived series'}
+          >
+            <Archive size={12} className="mr-1" />Archived
+          </Button>
           {seriesCategoryFilter != null && (
             <span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
               Viewing: {seriesCategories.find((c) => c.id === seriesCategoryFilter)?.name ?? seriesCategoryFilter}
@@ -4310,6 +5125,7 @@ export default function VodManager() {
               selected={selectedSeriesIds.has(s.id)}
               onToggleSelect={() => toggleSeriesSelected(s.id)}
               mode={seriesViewMode}
+              onToggleArchived={() => toggleSeriesArchived.mutate({ id: s.id, archived: !s.review_excluded })}
             />
           ))}
         </div>

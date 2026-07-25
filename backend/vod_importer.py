@@ -440,7 +440,20 @@ async def refresh_catchall_categories() -> None:
     Shared by both the periodic catalog refresher (main.py) and the manual
     "Import catalog" button (vod_routes.py) -- calling it from both means a
     manual import doesn't have to wait for the next background cycle to be
-    reflected."""
+    reflected.
+
+    Also retroactively purges any already-review_excluded item still sitting
+    in a category (vod_db.purge_excluded_from_categories) -- covers an
+    install that ran import-time exclusion before that bug was fixed, so
+    already-wrongly-placed rows actually get cleaned up here rather than
+    needing a separate one-off action."""
+    try:
+        purge_result = await asyncio.to_thread(vod_db.purge_excluded_from_categories)
+        if purge_result["movies_removed"] or purge_result["series_removed"]:
+            logger.info("[vod_importer] purged already-excluded items from categories: %s", purge_result)
+    except Exception as exc:
+        logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
+
     for category_id in await asyncio.to_thread(vod_db.list_catchall_category_ids):
         try:
             result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)

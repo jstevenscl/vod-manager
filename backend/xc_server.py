@@ -304,7 +304,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
     if action == "get_vod_categories":
         return [
             {"category_id": str(c["id"]), "category_name": c["name"], "parent_id": 0}
-            for c in vod_db.list_categories(content_type="movie")
+            for c in vod_db.list_categories(content_type="movie", active_only=True)
             if allowed_category_ids is None or c["id"] in allowed_category_ids
         ]
 
@@ -361,7 +361,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
     if action == "get_series_categories":
         return [
             {"category_id": str(c["id"]), "category_name": c["name"], "parent_id": 0}
-            for c in vod_db.list_categories(content_type="series")
+            for c in vod_db.list_categories(content_type="series", active_only=True)
             if allowed_category_ids is None or c["id"] in allowed_category_ids
         ]
 

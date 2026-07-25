@@ -91,6 +91,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         "director": fields["director"],
                         "cast_list": fields["cast_list"],
                         "poster_url": emby_vod_client.build_poster_url(provider, item.get("Id")),
+                        "tmdb_id": fields["tmdb_id"],
                         "last_enriched_at": now,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
@@ -121,6 +122,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         "director": fields["director"],
                         "cast_list": fields["cast_list"],
                         "poster_url": emby_vod_client.build_poster_url(provider, series_id),
+                        "tmdb_id": fields["tmdb_id"],
                         "last_enriched_at": now,
                         "episodes": episodes,
                     })

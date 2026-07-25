@@ -83,11 +83,11 @@ class PlexClient:
         return (data.get("MediaContainer", {}) or {}).get("Directory", []) or []
 
     async def list_movies(self, section_key: str) -> list[dict]:
-        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 1})
+        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 1, "includeGuids": 1})
         return (data.get("MediaContainer", {}) or {}).get("Metadata", []) or []
 
     async def list_shows(self, section_key: str) -> list[dict]:
-        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 2})
+        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 2, "includeGuids": 1})
         return (data.get("MediaContainer", {}) or {}).get("Metadata", []) or []
 
     async def list_episodes(self, show_rating_key: str) -> list[dict]:
@@ -140,6 +140,19 @@ def extract_part(item: dict) -> tuple[str | None, str]:
     return part.get("key"), (media[0].get("container") or "mp4")
 
 
+def extract_tmdb_id(item: dict) -> str | None:
+    """Plex's Guid array (only present with includeGuids=1) holds one entry
+    per external id source, e.g. [{"id": "imdb://tt123"}, {"id": "tmdb://584"},
+    {"id": "tvdb://20800"}] — pull out the tmdb:// one."""
+    for guid in item.get("Guid") or []:
+        gid = guid.get("id") or ""
+        if gid.startswith("tmdb://"):
+            rest = gid[len("tmdb://"):]
+            if rest.isdigit():
+                return rest
+    return None
+
+
 def extract_common_fields(item: dict) -> dict:
     """Metadata fields shared by movies and shows — Plex hands these back
     fully populated in the library listing itself, no separate detail call
@@ -153,4 +166,5 @@ def extract_common_fields(item: dict) -> dict:
         "director": ", ".join(directors) or None,
         "cast_list": ", ".join(cast) or None,
         "poster_url": item.get("thumb") or None,
+        "tmdb_id": extract_tmdb_id(item),
     }

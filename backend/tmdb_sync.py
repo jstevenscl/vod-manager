@@ -23,6 +23,7 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
+_YEAR_LOOKUP_CONCURRENCY = 6
 
 
 async def fetch_list_items(list_id: str) -> list[dict]:
@@ -121,6 +122,46 @@ async def search_title(query: str, content_type: str) -> list[dict]:
         results.sort(key=_not_exact)  # stable sort: exact matches (False) float ahead of fuzzy ones (True)
         candidates = results[:5]
         return list(await asyncio.gather(*[_build(item) for item in candidates]))
+
+
+async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:
+    """TMDB's own canonical title and release year per id. Two Duplicate
+    Finder candidates sharing a tmdb_id confirms they're the same real
+    title, but doesn't say which candidate's OWN name/year fields are
+    actually correct -- a provider-mislabeled year or a punctuation-variant
+    name still carries a valid tmdb_id, just matched by title, so the id
+    alone can't distinguish which candidate is the "true" one. The title is
+    what lets Duplicate Finder auto-suggest a merge target with confidence
+    (exact string match against TMDB's own title) instead of falling back
+    to a weaker heuristic like source count. No bulk-lookup-by-ids endpoint
+    exists on TMDB, so this is one real GET per distinct id, capped at
+    modest concurrency since this only ever runs against a small, bounded
+    set (the ids actually surfaced by one Duplicate Finder scan), never the
+    whole catalog."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        raise ValueError("TMDB API key not configured")
+
+    endpoint = "movie" if content_type == "movie" else "tv"
+    semaphore = asyncio.Semaphore(_YEAR_LOOKUP_CONCURRENCY)
+
+    async def _fetch(client: httpx.AsyncClient, tmdb_id: str) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                r = await client.get(f"{_API_BASE}/{endpoint}/{tmdb_id}", params={"api_key": api_key})
+                r.raise_for_status()
+                data = r.json()
+                date = data.get("release_date") if content_type == "movie" else data.get("first_air_date")
+                year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
+                title = data.get("title") if content_type == "movie" else data.get("name")
+                return tmdb_id, {"year": year, "title": title or None}
+            except Exception as exc:
+                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", tmdb_id, exc)
+                return tmdb_id, {"year": None, "title": None}
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        results = await asyncio.gather(*[_fetch(client, tid) for tid in set(tmdb_ids)])
+    return dict(results)
 
 
 def _parse_sync_source(sync_source: str) -> tuple[str, str] | None:

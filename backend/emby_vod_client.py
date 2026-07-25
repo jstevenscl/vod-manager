@@ -132,7 +132,7 @@ class EmbyVodClient:
             "ParentId": library_id,
             "IncludeItemTypes": "Movie",
             "Recursive": "true",
-            "Fields": "Overview,Genres,ProductionYear,People,MediaSources",
+            "Fields": "Overview,Genres,ProductionYear,People,MediaSources,ProviderIds",
         })
         return (data or {}).get("Items", []) or []
 
@@ -141,7 +141,7 @@ class EmbyVodClient:
             "ParentId": library_id,
             "IncludeItemTypes": "Series",
             "Recursive": "true",
-            "Fields": "Overview,Genres,ProductionYear,People",
+            "Fields": "Overview,Genres,ProductionYear,People,ProviderIds",
         })
         return (data or {}).get("Items", []) or []
 
@@ -176,11 +176,13 @@ def extract_common_fields(item: dict) -> dict:
     people = item.get("People") or []
     directors = [p["Name"] for p in people if p.get("Type") == "Director" and p.get("Name")]
     cast = [p["Name"] for p in people if p.get("Type") == "Actor" and p.get("Name")]
+    tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
     return {
         "genre": ", ".join(genres) or None,
         "description": item.get("Overview") or None,
         "director": ", ".join(directors) or None,
         "cast_list": ", ".join(cast) or None,
+        "tmdb_id": str(tmdb_raw) if tmdb_raw and str(tmdb_raw).isdigit() else None,
     }
 
 

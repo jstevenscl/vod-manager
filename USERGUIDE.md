@@ -209,17 +209,27 @@ ever change your mind, just out of the way by default.
 
 **Language** (Curation & Maintenance → *Import Language Exclusion*) is
 global — the same rule applies to every provider, since the languages you
-don't want almost never depend on which provider a title came from. Two
-independent ways to match: a comma-separated list of language-prefix codes
-(the same `AR|`, `FR|`, `EN|`-style tags used by Language Filter, §10), and/or
-a toggle to exclude any title with non-Latin-script characters in its name.
+don't want almost never depend on which provider a title came from. A
+searchable checklist, not a typed list: it shows every language-style prefix
+code actually seen across your pool right now (`AR`, `FR`, `EN`, and so on),
+each with a friendly name where one's known and a live count of how many
+titles currently carry it, so you're picking from what's really there instead
+of guessing codes. Search, **Select visible** / **Deselect visible**, and
+shift-click to select a range all work the same way as the provider category
+picker below. Codes are recognized whether a provider tags titles with a pipe
+(`AR| Movie Title`) or a colon (`AR: Movie Title`) — colon-style matching only
+ever applies to a known language code, never any two-to-six-letter prefix, so
+it won't misfire on a real title like *Kill Bill: Volume 1* or *CSI: Miami*.
+There's also a toggle to exclude any title with non-Latin-script characters in
+its name.
 
 ![Import Language Exclusion settings](docs/screenshots/import-language-exclusion.png)
 
 **Category** (the **Exclude Categories** button on each provider row) is
 per-provider, since available categories genuinely differ from one provider
 to the next — the picker shows exactly what that provider itself calls its
-categories, fetched live, not a guessed or fixed list.
+categories, fetched live, not a guessed or fixed list. Same search/select-
+visible/shift-click pattern as the language picker.
 
 ![Exclude Categories picker for a provider](docs/screenshots/exclude-categories-modal.png)
 
@@ -228,7 +238,14 @@ you already have a large catalog and want the new rules applied
 retroactively, click **Apply rules to existing catalog now** — this
 re-imports every active provider to pick up the current rules across
 everything already in your pool, which for a very large catalog can take a
-while (the same cost as a normal full catalog import).
+while (the same cost as a normal full catalog import). Progress shows live
+("Provider 2 of 5 — syncing Mega-OTT…"), and the final summary reports real
+per-provider counts: how many titles were newly archived by the rules you
+just set, not just how many providers finished.
+
+Import exclusion currently applies to Xtream-Codes (XC) providers only —
+Plex/Emby/Jellyfin libraries are typically your own personal media, so this
+isn't wired into those import paths yet.
 
 ---
 
@@ -391,6 +408,19 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
 
 ![Renaming a movie](docs/screenshots/rename-movie.png)
 
+- **Archive** (the archive-box icon on each row) is a true archive: an
+  archived item is immediately removed from every category placement (so
+  Dispatcharr stops seeing it right away, not just eventually) and hidden
+  from the normal Movies/TV Shows view — click the **Archived** toggle in the
+  filter bar to see only what's archived. Nothing is deleted; sources,
+  metadata, and history all stay intact, and restoring is one click.
+- **Delete** only works on genuine orphans — an item with zero sources.
+  Anything a provider still actively serves can't be deleted (the button is
+  disabled with an explanation): a real provider will just re-import it on
+  the next sync no matter how many times you delete it locally, so Archive is
+  the only way to durably hide something that's still provider-backed. Use
+  the **Orphan Checker** (§10) to find and clean up genuine orphans in bulk.
+
 ---
 
 ## 9. AI-assisted features
@@ -436,6 +466,30 @@ All of these live under the **Movies**/**TV Shows** toolbars or the
 *scan or filter first, review what's found, then apply* — nothing runs
 automatically against your whole library without you seeing what it found
 first.
+
+### Managing categories
+
+**Manage Categories** (Movies/TV Shows toolbar) is where you rename, reorder,
+enable/disable, schedule, and delete your own categories — separate from the
+provider-side Exclude Categories picker (§5), which controls what gets
+imported in the first place.
+
+- **Enable/disable** (power icon) is a soft on/off switch, not a delete: a
+  disabled category stops being exported to Dispatcharr but keeps everything
+  already in it, so a seasonal category (Halloween, Christmas) can be turned
+  off after the season and back on next year without rebuilding it. You can't
+  disable the last active category for movies or series — Dispatcharr's own
+  VOD sync fails outright against an empty category list, so this is blocked
+  with an explanation rather than letting you accidentally break it.
+- **Annual schedule** (calendar icon) automates that same on/off switch —
+  set a start and end date (month-day, e.g. `10-01` → `11-01`) and the
+  category enables/disables itself on those dates every year going forward,
+  no need to remember it each season.
+- **Search, select, and bulk actions** — the same search bar, **Select
+  visible**/**Deselect visible**, and shift-click range-select as the Exclude
+  Categories picker, plus bulk **Enable selected**/**Disable selected**/
+  **Delete selected** buttons once you've checked a few. Deleting a category
+  only unplaces items from it — nothing in your pool is touched.
 
 ### Missing Artwork
 
@@ -486,13 +540,45 @@ commit to it.
 
 ### Duplicate Finder
 
-Finds same-year pool entries whose names differ only by cosmetic
-punctuation — a colon, a dash, quote style — which happens because real
-providers format the same title slightly differently from each other. Pick
-which spelling to keep per group; the rest merge into it (sources,
-categories, and episodes all move over automatically, nothing is lost).
+Finds pool entries that look like the same real title split into two rows,
+three ways at once:
+
+- **Cosmetic punctuation** — a colon, a dash, quote style — the same title
+  formatted slightly differently by different providers.
+- **Adjacent-year mislabeling** — the same name with years one apart (a
+  provider getting a release year wrong by one is a common, real pattern).
+  A gap of two or more years never clusters — that's almost always two
+  different films that happen to share a title, not a duplicate.
+- **A shared TMDB id** — when two candidates carry the same TMDB id, that's
+  confirmed proof they're the same real title, even across a bigger year
+  gap than the rule above alone would allow. A *conflicting* TMDB id is
+  treated the opposite way: proof they're genuinely different, so that pair
+  is ruled out and never shown as a duplicate at all.
+
+Each candidate shows its poster, a **same TMDB match** badge when a shared id
+confirms the group, and a per-candidate **true match**/**year mismatch** badge
+comparing that candidate's own year against TMDB's real release year for that
+id — a shared id only proves the title matched, not that a given row's year
+field is correct. An inline **Preview** (Direct/Transcoded/HLS, same as the
+main player) lets you play more than one candidate side by side before
+deciding. Pick which candidate to keep — the rest merge into it (sources,
+categories, and episodes all move over automatically, nothing is lost) — or
+**Ignore** a group that isn't actually a duplicate so it stops resurfacing on
+future scans.
+
+**Check TMDB-confirmed matches** goes a step further: it checks every group in
+the current scan against TMDB in the background (a real API call per
+candidate id, so it can take a few minutes on a large scan — progress shows
+live). A group only counts as confirmed when every candidate shares the same
+TMDB id *and* one candidate's name matches TMDB's own title exactly — that
+candidate becomes the confident merge target, not whichever happens to have
+the most sources. Confirmed groups are pulled out of the manual review list
+entirely and offered as a single **Merge all confirmed matches** action — one
+click merges the whole batch, since there's no real ambiguity left for a
+human to resolve.
 
 ![Orphan Checker, Duplicate Finder, and TMDB Lists](docs/screenshots/curation-tools.png)
+![Duplicate Finder with TMDB-confirmed matches](docs/screenshots/duplicate-finder.png)
 
 ### Needs Review
 

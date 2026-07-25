@@ -179,6 +179,29 @@ async def _vod_enrichment_scheduler() -> None:
         await asyncio.sleep(vod_db.get_enrichment_ttl_seconds())
 
 
+_CATEGORY_SCHEDULE_POLL_SECONDS = 3600  # hourly is plenty -- apply_category_schedules
+# only actually acts on the exact calendar day a transition is due, and is a
+# no-op (cheap DB scan) every other check; checking hourly rather than once
+# a day just bounds how late a transition can land after a container restart
+# without adding meaningful load.
+
+
+async def _category_schedule_loop() -> None:
+    """Background task: applies any due annual category on/off schedule
+    (Halloween/Christmas/etc. -- see vod_db.set_category_schedule). Fires the
+    transition only on its exact scheduled day, so a manual toggle in
+    between two transitions is never fought -- see apply_category_schedules's
+    own docstring for why that's deliberate, not an oversight."""
+    while True:
+        try:
+            results = await asyncio.to_thread(vod_db.apply_category_schedules)
+            if results:
+                logger.info("[category_schedule_loop] applied: %s", results)
+        except Exception as exc:
+            logger.warning("[category_schedule_loop] run failed: %s", exc)
+        await asyncio.sleep(_CATEGORY_SCHEDULE_POLL_SECONDS)
+
+
 _TMDB_SYNC_DISABLED_POLL_SECONDS = 300
 
 
@@ -210,6 +233,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
+        asyncio.create_task(_category_schedule_loop()),
         asyncio.create_task(hls_sweep_loop()),
     ]
     yield

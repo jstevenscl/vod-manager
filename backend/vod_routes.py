@@ -28,6 +28,8 @@ from config import (
 )
 from routes import require_auth
 import ai_assist
+import apply_exclusions_job
+import duplicate_confirm
 import emby_vod_importer
 import plex_importer
 import tmdb_sync
@@ -180,6 +182,16 @@ class ResolveMissingArtworkRequest(BaseModel):
 
 class MergeDuplicateGroupRequest(BaseModel):
     content_type: str
+    keep_id: int
+    merge_ids: list[int]
+
+
+class IgnoreDuplicateGroupRequest(BaseModel):
+    content_type: str
+    item_ids: list[int]
+
+
+class MergeDuplicateGroupPair(BaseModel):
     keep_id: int
     merge_ids: list[int]
 
@@ -472,6 +484,11 @@ async def save_import_language_exclusion_settings(body: ImportLanguageExclusionR
     return {"ok": True}
 
 
+@router.get("/import-language-exclusion/prefixes/", dependencies=_GUARDS)
+async def list_import_language_exclusion_prefixes():
+    return vod_db.list_all_pool_prefixes()
+
+
 @router.post("/import-exclusions/apply-now/", dependencies=_GUARDS)
 async def apply_import_exclusions_now():
     """Retroactively applies the current global language rules and every
@@ -482,22 +499,23 @@ async def apply_import_exclusions_now():
     check on already-existing matched rows (see vod_db.bulk_import_movies),
     so this reuses that exact logic instead of a separate bespoke purge
     path, and correctly picks up series category names too (which aren't
-    persisted anywhere, only known live from the provider at import time)."""
-    providers = [p for p in await asyncio.to_thread(vod_db.list_providers) if p["is_active"]]
-    results = []
-    for p in providers:
-        try:
-            if p.get("provider_type") == "plex":
-                result = await plex_importer.import_plex_library(p["id"])
-            elif p.get("provider_type") in ("emby", "jellyfin"):
-                result = await emby_vod_importer.import_emby_library(p["id"])
-            else:
-                result = await vod_importer.import_provider_catalog(p["id"])
-            results.append({"provider": p["name"], **result})
-        except Exception as exc:
-            logger.error("[vod_routes] apply_import_exclusions_now: provider=%s failed: %s", p["name"], exc)
-            results.append({"provider": p["name"], "error": str(exc)})
-    return {"results": results}
+    persisted anywhere, only known live from the provider at import time).
+    Runs as a background job (see apply_exclusions_job.py) since a real
+    catalog re-import across every provider can take minutes -- returns
+    immediately with a job id the frontend polls for progress."""
+    job_id = apply_exclusions_job.start_job()
+    return {"job_id": job_id}
+
+
+@router.get("/import-exclusions/apply-now/{job_id}/", dependencies=_GUARDS)
+async def get_apply_import_exclusions_status(job_id: str):
+    job = apply_exclusions_job.get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail="job not found")
+    return {
+        "status": job["status"], "total": job["total"], "completed": job["completed"],
+        "current_provider": job["current_provider"], "results": job["results"], "error": job["error"],
+    }
 
 
 @router.get("/ai-settings/", dependencies=_GUARDS)
@@ -866,6 +884,51 @@ async def rename_category(category_id: int, name: str):
     return {"ok": True}
 
 
+@router.post("/categories/{category_id}/active/", dependencies=_GUARDS)
+async def set_category_active(category_id: int, is_active: bool):
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    try:
+        vod_db.set_category_active(category_id, is_active)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True}
+
+
+class BulkCategoryActiveRequest(BaseModel):
+    category_ids: list[int]
+    is_active: bool
+
+
+class BulkCategoryIdsRequest(BaseModel):
+    category_ids: list[int]
+
+
+@router.post("/categories/bulk-active/", dependencies=_GUARDS)
+async def bulk_set_categories_active(body: BulkCategoryActiveRequest):
+    try:
+        return vod_db.bulk_set_category_active(body.category_ids, body.is_active)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+@router.post("/categories/bulk-delete/", dependencies=_GUARDS)
+async def bulk_delete_categories(body: BulkCategoryIdsRequest):
+    deleted = vod_db.bulk_delete_categories(body.category_ids)
+    return {"deleted": deleted}
+
+
+@router.post("/categories/{category_id}/schedule/", dependencies=_GUARDS)
+async def set_category_schedule(category_id: int, start_mmdd: Optional[str] = None, end_mmdd: Optional[str] = None):
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    try:
+        vod_db.set_category_schedule(category_id, start_mmdd or None, end_mmdd or None)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True}
+
+
 @router.post("/categories/{category_id}/sort-order/", dependencies=_GUARDS)
 async def set_category_sort_order(category_id: int, sort_order: int):
     if not vod_db.get_category(category_id):
@@ -911,9 +974,9 @@ async def purge_orphans_route():
 
 
 # ── Duplicate finder ─────────────────────────────────────────────────────────
-# Self-service scan/merge for same-year pool entries that only differ by
-# cosmetic punctuation (a colon, a dash, quote style) -- see
-# vod_db.find_duplicate_groups/merge_duplicate_group.
+# Self-service scan/merge for pool entries that look like the same real
+# title split into two rows -- cosmetic punctuation variants, adjacent-year
+# mislabeling, or both -- see vod_db.find_duplicate_groups/merge_duplicate_group.
 
 @router.get("/duplicates/", dependencies=_GUARDS)
 async def scan_duplicates(content_type: str):
@@ -927,6 +990,90 @@ async def merge_duplicates(body: MergeDuplicateGroupRequest):
     if body.content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     return vod_db.merge_duplicate_group(body.content_type, body.keep_id, body.merge_ids)
+
+
+@router.get("/duplicates/ignored/", dependencies=_GUARDS)
+async def list_ignored_duplicates(content_type: str):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.list_ignored_duplicate_signatures(content_type)
+
+
+@router.post("/duplicates/ignore/", dependencies=_GUARDS)
+async def ignore_duplicate_group(body: IgnoreDuplicateGroupRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    vod_db.ignore_duplicate_group(body.content_type, body.item_ids)
+    return {"ok": True}
+
+
+@router.get("/duplicates/tmdb-details/", dependencies=_GUARDS)
+async def duplicate_tmdb_details(content_type: str, tmdb_ids: str):
+    """Lets the frontend flag which candidate in a duplicate group actually
+    matches TMDB, on both the year (a provider can mislabel a year while
+    still getting the title match right) and the title itself (used to
+    pick a confident auto-merge target rather than falling back to a
+    weaker heuristic like source count)."""
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    ids = [i for i in tmdb_ids.split(",") if i.strip()]
+    if not ids:
+        return {}
+    try:
+        return await tmdb_sync.get_tmdb_details_for_ids(ids, content_type)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+class MergeConfirmedDuplicatesRequest(BaseModel):
+    content_type: str
+    groups: list[MergeDuplicateGroupPair]
+
+
+@router.post("/duplicates/merge-confirmed/", dependencies=_GUARDS)
+async def merge_confirmed_duplicates(body: MergeConfirmedDuplicatesRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    merged_groups = 0
+    merged_items = 0
+    for pair in body.groups:
+        result = vod_db.merge_duplicate_group(body.content_type, pair.keep_id, pair.merge_ids)
+        merged_groups += 1
+        merged_items += result["merged_count"]
+    return {"merged_groups": merged_groups, "merged_items": merged_items}
+
+
+@router.post("/duplicates/confirm-scan/", dependencies=_GUARDS)
+async def start_duplicate_confirm_scan(content_type: str):
+    """Kicks off the background TMDB-confirmed-match check (see
+    duplicate_confirm.py) -- a real catalog scan can surface thousands of
+    candidate tmdb_ids, far too slow/rate-limit-risky to check inline in
+    one blocking request, so this returns immediately with a job id the
+    frontend polls for progress."""
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if not get_tmdb_api_key():
+        raise HTTPException(400, detail="Set the TMDB API key in Configuration first")
+    job_id = duplicate_confirm.start_job(content_type)
+    return {"job_id": job_id}
+
+
+@router.get("/duplicates/confirm-scan/{job_id}/", dependencies=_GUARDS)
+async def get_duplicate_confirm_scan(job_id: str):
+    job = duplicate_confirm.get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail="job not found")
+    return {
+        "status": job["status"], "checked": job["checked"], "total": job["total"],
+        "confirmed": job["confirmed"] if job["status"] == "done" else [],
+        "error": job["error"],
+    }
+
+
+@router.post("/duplicates/confirm-scan/{job_id}/cancel/", dependencies=_GUARDS)
+async def cancel_duplicate_confirm_scan(job_id: str):
+    duplicate_confirm.cancel_job(job_id)
+    return {"ok": True}
 
 
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
@@ -1155,9 +1302,9 @@ async def resolve_missing_artwork(content_type: str, item_id: int, body: Resolve
 @router.get("/movies/", dependencies=_GUARDS)
 async def list_movies(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
-    provider_id: Optional[int] = None,
+    provider_id: Optional[int] = None, archived: bool = False,
 ):
-    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id)
+    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived)
     ids = [m["id"] for m in movies]
     sources_by_id    = vod_db.list_movie_sources_for_ids(ids)
     placements_by_id = vod_db.list_movie_placements_for_ids(ids)
@@ -1166,10 +1313,18 @@ async def list_movies(
         m["placements"] = placements_by_id.get(m["id"], [])
     return {
         "items": movies,
-        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id),
+        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id, archived=archived),
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.post("/movies/{movie_id}/archive/", dependencies=_GUARDS)
+async def set_movie_archived(movie_id: int, archived: bool):
+    if not vod_db.get_movie(movie_id):
+        raise HTTPException(404, detail="movie not found")
+    vod_db.bulk_set_review_excluded("movie", [movie_id], archived)
+    return {"ok": True}
 
 
 @router.post("/movies/bulk-place/", dependencies=_GUARDS)
@@ -1250,7 +1405,10 @@ async def rename_movie(movie_id: int, body: RenameRequest):
 async def delete_movie(movie_id: int):
     if not vod_db.get_movie(movie_id):
         raise HTTPException(404, detail="movie not found")
-    vod_db.delete_movie(movie_id)
+    try:
+        vod_db.delete_movie(movie_id)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
     return {"ok": True}
 
 
@@ -1267,9 +1425,9 @@ async def enrich_movie(movie_id: int, force: bool = False):
 @router.get("/series/", dependencies=_GUARDS)
 async def list_series(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
-    provider_id: Optional[int] = None,
+    provider_id: Optional[int] = None, archived: bool = False,
 ):
-    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id)
+    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived)
     ids = [s["id"] for s in series]
     episodes_by_id   = vod_db.list_episodes_for_series_ids(ids)
     placements_by_id = vod_db.list_series_placements_for_ids(ids)
@@ -1282,10 +1440,18 @@ async def list_series(
         s["placements"] = placements_by_id.get(s["id"], [])
     return {
         "items": series,
-        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id),
+        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id, archived=archived),
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.post("/series/{series_id}/archive/", dependencies=_GUARDS)
+async def set_series_archived(series_id: int, archived: bool):
+    if not vod_db.get_series(series_id):
+        raise HTTPException(404, detail="series not found")
+    vod_db.bulk_set_review_excluded("series", [series_id], archived)
+    return {"ok": True}
 
 
 @router.post("/series/bulk-place/", dependencies=_GUARDS)
@@ -1374,7 +1540,10 @@ async def rename_series(series_id: int, body: RenameRequest):
 async def delete_series(series_id: int):
     if not vod_db.get_series(series_id):
         raise HTTPException(404, detail="series not found")
-    vod_db.delete_series(series_id)
+    try:
+        vod_db.delete_series(series_id)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
     return {"ok": True}
 
 

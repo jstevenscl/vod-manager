@@ -253,8 +253,9 @@ Curation & Maintenance and the Movies/TV Shows toolbars host a set of
 catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
 language-aware filter and sibling-safe bulk archiving), **Language Filter**
 (the same language filtering over your whole library, not just
-poster-missing items), **Duplicate Finder** (merges same-year entries that
-only differ by punctuation), **Needs Review** (resolves year-ambiguous
+poster-missing items), **Duplicate Finder** (matches on punctuation
+variants, adjacent-year mislabeling, and TMDB id, with a one-click bulk
+merge for TMDB-confirmed matches), **Needs Review** (resolves year-ambiguous
 imports), and **Orphan Checker** (finds dead rows a provider deletion can
 leave behind — a series whose only source provider no longer exists, or
 movies/episodes with zero sources at all). Every movie/series can also be
