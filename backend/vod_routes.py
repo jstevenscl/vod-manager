@@ -264,6 +264,12 @@ class BulkPlaceRequest(BaseModel):
     source_provider_id: Optional[int] = None
 
 
+class BulkArchiveRequest(BaseModel):
+    content_type: str  # 'movie' or 'series'
+    ids: list[int]
+    archived: bool
+
+
 class SeriesRequest(BaseModel):
     name: str
     year: Optional[int] = None
@@ -1338,6 +1344,18 @@ async def bulk_place_movies(body: BulkPlaceRequest):
     ids = body.ids if body.ids is not None else vod_db.list_all_movie_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id)
     newly_placed = vod_db.bulk_place_movies_in_category(ids, body.category_id)
     return {"matched": len(ids), "newly_placed": newly_placed}
+
+
+@router.post("/bulk-archive/", dependencies=_GUARDS)
+async def bulk_archive(body: BulkArchiveRequest):
+    """Movies/TV list's multi-select 'Archive selected'/'Un-archive selected'
+    -- same underlying action as each row's own single-item archive toggle
+    (see set_movie_archived/set_series_archived), just applied to many rows
+    at once from the picked-checkbox set."""
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    changed = vod_db.bulk_set_review_excluded(body.content_type, body.ids, body.archived)
+    return {"changed": changed}
 
 
 @router.post("/movies/", dependencies=_GUARDS)

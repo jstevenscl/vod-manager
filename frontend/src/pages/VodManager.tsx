@@ -1140,7 +1140,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
   selected: boolean
-  onToggleSelect: () => void
+  onToggleSelect: (shiftKey: boolean) => void
   mode?: 'list' | 'grid'
   onToggleArchived: () => void
 }) {
@@ -1300,7 +1300,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
     return (
       <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
         <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
-          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" className="w-3.5 h-3.5" />
+          <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" className="w-3.5 h-3.5" />
         </div>
         {!!movie.is_adult && (
           <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
@@ -1351,7 +1351,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
 
   return (
     <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
-      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" />
+      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
       {movie.poster_url && (
         <img src={movie.poster_url} alt="" className="w-8 h-12 object-cover rounded shrink-0" loading="lazy" />
       )}
@@ -1422,7 +1422,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
   selected: boolean
-  onToggleSelect: () => void
+  onToggleSelect: (shiftKey: boolean) => void
   mode?: 'list' | 'grid'
   onToggleArchived: () => void
 }) {
@@ -1559,7 +1559,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     return (
       <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
         <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
-          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" className="w-3.5 h-3.5" />
+          <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" className="w-3.5 h-3.5" />
         </div>
         {!!series.is_adult && (
           <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
@@ -1600,7 +1600,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 
   return (
     <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
-      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={onToggleSelect} title="Select for bulk placement" />
+      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
       {series.poster_url && (
         <img src={series.poster_url} alt="" className="w-8 h-12 object-cover rounded shrink-0" loading="lazy" />
       )}
@@ -3383,11 +3383,24 @@ export default function VodManager() {
     },
   })
   const [selectedMovieIds, setSelectedMovieIds] = useState<Set<number>>(new Set())
-  const toggleMovieSelected = (id: number) => setSelectedMovieIds((prev) => {
-    const next = new Set(prev)
-    if (next.has(id)) next.delete(id); else next.add(id)
-    return next
-  })
+  const [movieLastClickedIndex, setMovieLastClickedIndex] = useState<number | null>(null)
+  const toggleMovieSelected = (id: number, index: number, shiftKey: boolean) => {
+    setSelectedMovieIds((prev) => {
+      const next = new Set(prev)
+      const willBeChecked = !prev.has(id)
+      if (shiftKey && movieLastClickedIndex != null) {
+        const pageIds = moviesQuery.data?.items.map((m) => m.id) ?? []
+        const [start, end] = [movieLastClickedIndex, index].sort((a, b) => a - b)
+        for (let j = start; j <= end; j++) {
+          if (willBeChecked) next.add(pageIds[j]); else next.delete(pageIds[j])
+        }
+      } else {
+        if (willBeChecked) next.add(id); else next.delete(id)
+      }
+      return next
+    })
+    setMovieLastClickedIndex(index)
+  }
   const [bulkMovieTargetCategory, setBulkMovieTargetCategory] = useState('')
   const [bulkMovieResult, setBulkMovieResult] = useState<string | null>(null)
   const bulkPlaceMovies = useMutation({
@@ -3395,6 +3408,15 @@ export default function VodManager() {
       api.post('/vod/movies/bulk-place/', body),
     onSuccess: (r) => {
       setBulkMovieResult(`Matched ${r.data.matched} · newly placed ${r.data.newly_placed}.`)
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      setSelectedMovieIds(new Set())
+    },
+    onError: (e: any) => setBulkMovieResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const bulkArchiveMovies = useMutation({
+    mutationFn: (body: { ids: number[]; archived: boolean }) => api.post('/vod/bulk-archive/', { content_type: 'movie', ...body }),
+    onSuccess: (r) => {
+      setBulkMovieResult(`${movieShowArchived ? 'Un-archived' : 'Archived'} ${r.data.changed}.`)
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       setSelectedMovieIds(new Set())
     },
@@ -3432,11 +3454,24 @@ export default function VodManager() {
     },
   })
   const [selectedSeriesIds, setSelectedSeriesIds] = useState<Set<number>>(new Set())
-  const toggleSeriesSelected = (id: number) => setSelectedSeriesIds((prev) => {
-    const next = new Set(prev)
-    if (next.has(id)) next.delete(id); else next.add(id)
-    return next
-  })
+  const [seriesLastClickedIndex, setSeriesLastClickedIndex] = useState<number | null>(null)
+  const toggleSeriesSelected = (id: number, index: number, shiftKey: boolean) => {
+    setSelectedSeriesIds((prev) => {
+      const next = new Set(prev)
+      const willBeChecked = !prev.has(id)
+      if (shiftKey && seriesLastClickedIndex != null) {
+        const pageIds = seriesQuery.data?.items.map((s) => s.id) ?? []
+        const [start, end] = [seriesLastClickedIndex, index].sort((a, b) => a - b)
+        for (let j = start; j <= end; j++) {
+          if (willBeChecked) next.add(pageIds[j]); else next.delete(pageIds[j])
+        }
+      } else {
+        if (willBeChecked) next.add(id); else next.delete(id)
+      }
+      return next
+    })
+    setSeriesLastClickedIndex(index)
+  }
   const [bulkSeriesTargetCategory, setBulkSeriesTargetCategory] = useState('')
   const [bulkSeriesResult, setBulkSeriesResult] = useState<string | null>(null)
   const bulkPlaceSeries = useMutation({
@@ -3444,6 +3479,15 @@ export default function VodManager() {
       api.post('/vod/series/bulk-place/', body),
     onSuccess: (r) => {
       setBulkSeriesResult(`Matched ${r.data.matched} · newly placed ${r.data.newly_placed}.`)
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      setSelectedSeriesIds(new Set())
+    },
+    onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const bulkArchiveSeries = useMutation({
+    mutationFn: (body: { ids: number[]; archived: boolean }) => api.post('/vod/bulk-archive/', { content_type: 'series', ...body }),
+    onSuccess: (r) => {
+      setBulkSeriesResult(`${seriesShowArchived ? 'Un-archived' : 'Archived'} ${r.data.changed}.`)
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       setSelectedSeriesIds(new Set())
     },
@@ -4963,7 +5007,19 @@ export default function VodManager() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
-          <span className="text-xs text-muted-foreground">{selectedMovieIds.size} selected</span>
+          <span className="text-xs text-muted-foreground">{selectedMovieIds.size} selected · shift-click to select a range</span>
+          <button
+            className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setSelectedMovieIds(new Set((moviesQuery.data?.items ?? []).map((m) => m.id)))}
+          >
+            Select all visible ({moviesQuery.data?.items.length ?? 0})
+          </button>
+          <button
+            className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setSelectedMovieIds(new Set())}
+          >
+            Clear
+          </button>
           <select className={inputCls()} value={bulkMovieTargetCategory} onChange={(e) => setBulkMovieTargetCategory(e.target.value)}>
             <option value="">Place in category…</option>
             {movieCategories.filter((c) => !c.is_smart).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -4990,11 +5046,19 @@ export default function VodManager() {
           >
             Place all filtered ({moviesQuery.data?.total ?? 0})
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={selectedMovieIds.size === 0 || bulkArchiveMovies.isPending}
+            onClick={() => bulkArchiveMovies.mutate({ ids: Array.from(selectedMovieIds), archived: !movieShowArchived })}
+          >
+            {movieShowArchived ? 'Un-archive' : 'Archive'} selected ({selectedMovieIds.size})
+          </Button>
           {bulkMovieResult && <span className="text-xs text-muted-foreground">{bulkMovieResult}</span>}
         </div>
         <div className={movieViewMode === 'grid' ? 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2' : 'space-y-2'}>
           {moviesQuery.isFetching && <p className="text-xs text-muted-foreground">Loading…</p>}
-          {moviesQuery.data?.items.map((m) => (
+          {moviesQuery.data?.items.map((m, i) => (
             <MovieRow
               key={m.id}
               movie={m}
@@ -5003,7 +5067,7 @@ export default function VodManager() {
               qc={qc}
               xcCredentials={xcCredentialsQuery.data}
               selected={selectedMovieIds.has(m.id)}
-              onToggleSelect={() => toggleMovieSelected(m.id)}
+              onToggleSelect={(shiftKey) => toggleMovieSelected(m.id, i, shiftKey)}
               mode={movieViewMode}
               onToggleArchived={() => toggleMovieArchived.mutate({ id: m.id, archived: !m.review_excluded })}
             />
@@ -5092,7 +5156,19 @@ export default function VodManager() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
-          <span className="text-xs text-muted-foreground">{selectedSeriesIds.size} selected</span>
+          <span className="text-xs text-muted-foreground">{selectedSeriesIds.size} selected · shift-click to select a range</span>
+          <button
+            className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setSelectedSeriesIds(new Set((seriesQuery.data?.items ?? []).map((s) => s.id)))}
+          >
+            Select all visible ({seriesQuery.data?.items.length ?? 0})
+          </button>
+          <button
+            className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setSelectedSeriesIds(new Set())}
+          >
+            Clear
+          </button>
           <select className={inputCls()} value={bulkSeriesTargetCategory} onChange={(e) => setBulkSeriesTargetCategory(e.target.value)}>
             <option value="">Place in category…</option>
             {seriesCategories.filter((c) => !c.is_smart).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -5119,11 +5195,19 @@ export default function VodManager() {
           >
             Place all filtered ({seriesQuery.data?.total ?? 0})
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={selectedSeriesIds.size === 0 || bulkArchiveSeries.isPending}
+            onClick={() => bulkArchiveSeries.mutate({ ids: Array.from(selectedSeriesIds), archived: !seriesShowArchived })}
+          >
+            {seriesShowArchived ? 'Un-archive' : 'Archive'} selected ({selectedSeriesIds.size})
+          </Button>
           {bulkSeriesResult && <span className="text-xs text-muted-foreground">{bulkSeriesResult}</span>}
         </div>
         <div className={seriesViewMode === 'grid' ? 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2' : 'space-y-2'}>
           {seriesQuery.isFetching && <p className="text-xs text-muted-foreground">Loading…</p>}
-          {seriesQuery.data?.items.map((s) => (
+          {seriesQuery.data?.items.map((s, i) => (
             <SeriesRow
               key={s.id}
               series={s}
@@ -5131,7 +5215,7 @@ export default function VodManager() {
               qc={qc}
               xcCredentials={xcCredentialsQuery.data}
               selected={selectedSeriesIds.has(s.id)}
-              onToggleSelect={() => toggleSeriesSelected(s.id)}
+              onToggleSelect={(shiftKey) => toggleSeriesSelected(s.id, i, shiftKey)}
               mode={seriesViewMode}
               onToggleArchived={() => toggleSeriesArchived.mutate({ id: s.id, archived: !s.review_excluded })}
             />
