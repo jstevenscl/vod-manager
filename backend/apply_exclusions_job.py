@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 
+import dispatcharr_dvr_importer
 import emby_vod_importer
 import plex_importer
 import vod_db
@@ -40,6 +41,12 @@ async def _run_job(job_id: str) -> None:
                     result = await plex_importer.import_plex_library(p["id"])
                 elif p.get("provider_type") in ("emby", "jellyfin"):
                     result = await emby_vod_importer.import_emby_library(p["id"])
+                elif p.get("provider_type") == "dispatcharr_dvr":
+                    # DVR recordings have no language/category exclusion rules
+                    # to retroactively apply yet -- this just re-runs the same
+                    # idempotent import, and exists so a DVR provider doesn't
+                    # fall into the XC branch below and error out.
+                    result = await dispatcharr_dvr_importer.import_dvr_recordings(p["id"])
                 else:
                     result = await vod_importer.import_provider_catalog(p["id"])
                 job["results"].append({"provider": p["name"], **result})

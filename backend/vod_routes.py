@@ -29,6 +29,7 @@ from config import (
 from routes import require_auth
 import ai_assist
 import apply_exclusions_job
+import dispatcharr_dvr_importer
 import duplicate_confirm
 import emby_vod_importer
 import plex_importer
@@ -131,6 +132,13 @@ class ProviderRequest(BaseModel):
     max_streams: int = 0
     priority: int = 0
     provider_type: str = "xc"
+    # Only meaningful for provider_type='dispatcharr_dvr' -- base_url/
+    # username/password are left blank by the frontend for a DVR provider,
+    # same convention as Plex (blank username) and Emby/Jellyfin (both blank).
+    dispatcharr_connection_id: Optional[int] = None
+    dvr_local_path: Optional[str] = None
+    dvr_movie_category_id: Optional[int] = None
+    dvr_series_category_id: Optional[int] = None
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -673,6 +681,8 @@ async def upsert_provider(body: ProviderRequest):
         password = existing["password"] if existing else ""
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
+        dispatcharr_connection_id=body.dispatcharr_connection_id, dvr_local_path=body.dvr_local_path,
+        dvr_movie_category_id=body.dvr_movie_category_id, dvr_series_category_id=body.dvr_series_category_id,
     )
 
     sync_error = None
@@ -839,6 +849,8 @@ async def import_provider_catalog(provider_id: int):
             result = await plex_importer.import_plex_library(provider_id)
         elif provider.get("provider_type") in ("emby", "jellyfin"):
             result = await emby_vod_importer.import_emby_library(provider_id)
+        elif provider.get("provider_type") == "dispatcharr_dvr":
+            result = await dispatcharr_dvr_importer.import_dvr_recordings(provider_id)
         else:
             result = await vod_importer.import_provider_catalog(provider_id)
     except Exception as exc:

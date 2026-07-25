@@ -15,7 +15,7 @@ interface Provider {
   max_streams: number
   is_active: number
   priority: number
-  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin'
+  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr'
   shared_connection_limit: number | null
   custom_user_agent: string | null
   has_password: boolean
@@ -25,6 +25,10 @@ interface Provider {
   synced_connection_count: number
   live_account_count: number
   import_exclude_categories: string[]
+  dispatcharr_connection_id: number | null
+  dvr_local_path: string | null
+  dvr_movie_category_id: number | null
+  dvr_series_category_id: number | null
 }
 
 interface DispatcharrConnection {
@@ -75,7 +79,7 @@ interface ActivitySession {
   kind: 'movie' | 'series'
   title: string
   provider_name: string
-  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin'
+  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr'
   started_at: number
   bytes_sent: number
   total_bytes: number
@@ -433,8 +437,8 @@ interface Category {
   schedule_end_mmdd: string | null
 }
 
-const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin', string> = {
-  xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin',
+const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr', string> = {
+  xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin', dispatcharr_dvr: 'Dispatcharr DVR',
 }
 
 // Best-effort friendly names for provider name-prefix codes (e.g. "AR|",
@@ -3061,18 +3065,34 @@ export default function VodManager() {
   })
   const [providerForm, setProviderForm] = useState({
     name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0',
-    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin',
+    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr',
+    dispatcharr_connection_id: '', dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '',
   })
   const addProvider = useMutation({
     mutationFn: () => api.post('/vod/providers/', {
-      name: providerForm.name, base_url: providerForm.base_url,
+      name: providerForm.name,
+      // base_url/username/password are meaningless for a DVR provider --
+      // it reuses an existing Dispatcharr Connection's own url/token
+      // instead (see vod_db.upsert_provider's docstring).
+      base_url: providerForm.provider_type === 'dispatcharr_dvr' ? '' : providerForm.base_url,
       username: providerForm.provider_type === 'xc' ? providerForm.username : '',
-      password: providerForm.password, max_streams: Number(providerForm.max_streams) || 0,
+      password: providerForm.provider_type === 'dispatcharr_dvr' ? '' : providerForm.password,
+      max_streams: Number(providerForm.max_streams) || 0,
       priority: Number(providerForm.priority) || 0, provider_type: providerForm.provider_type,
+      dispatcharr_connection_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dispatcharr_connection_id
+        ? Number(providerForm.dispatcharr_connection_id) : null,
+      dvr_local_path: providerForm.provider_type === 'dispatcharr_dvr' ? providerForm.dvr_local_path.trim() || null : null,
+      dvr_movie_category_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dvr_movie_category_id
+        ? Number(providerForm.dvr_movie_category_id) : null,
+      dvr_series_category_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dvr_series_category_id
+        ? Number(providerForm.dvr_series_category_id) : null,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
-      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc' })
+      setProviderForm({
+        name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc',
+        dispatcharr_connection_id: '', dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '',
+      })
     },
   })
   const syncProvider = useMutation({
@@ -4468,35 +4488,82 @@ export default function VodManager() {
           <select
             className={inputCls()}
             value={providerForm.provider_type}
-            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' })}
+            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr' })}
           >
             <option value="xc">Xtream-Codes</option>
             <option value="plex">Plex</option>
             <option value="emby">Emby</option>
             <option value="jellyfin">Jellyfin</option>
+            <option value="dispatcharr_dvr">Dispatcharr DVR</option>
           </select>
           <input className={inputCls()} placeholder="Name" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} />
-          <input
-            className={inputCls()}
-            placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : 'Base URL (e.g. http://host:8096)'}
-            value={providerForm.base_url}
-            onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
-          />
-          {providerForm.provider_type === 'xc' && (
-            <input className={inputCls()} placeholder="Username" value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
+          {providerForm.provider_type === 'dispatcharr_dvr' ? (
+            <>
+              <select
+                className={inputCls()}
+                value={providerForm.dispatcharr_connection_id}
+                onChange={(e) => setProviderForm({ ...providerForm, dispatcharr_connection_id: e.target.value })}
+                title="The Dispatcharr instance whose finished DVR recordings this pulls from"
+              >
+                <option value="">Dispatcharr connection…</option>
+                {dispatcharrConnectionsQuery.data?.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+              </select>
+              <input
+                className={inputCls('w-56')}
+                placeholder="Local path (e.g. /mnt/dispatcharr-recordings)"
+                value={providerForm.dvr_local_path}
+                onChange={(e) => setProviderForm({ ...providerForm, dvr_local_path: e.target.value })}
+                title="Where Dispatcharr's recordings folder is mounted inside this container -- same-host/shared-volume setups only (Phase 1a)"
+              />
+              <select
+                className={inputCls()}
+                value={providerForm.dvr_movie_category_id}
+                onChange={(e) => setProviderForm({ ...providerForm, dvr_movie_category_id: e.target.value })}
+                title="Recorded movies are placed here automatically on import"
+              >
+                <option value="">Movie category (optional)…</option>
+                {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              <select
+                className={inputCls()}
+                value={providerForm.dvr_series_category_id}
+                onChange={(e) => setProviderForm({ ...providerForm, dvr_series_category_id: e.target.value })}
+                title="Recorded TV episodes' series are placed here automatically on import"
+              >
+                <option value="">TV category (optional)…</option>
+                {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </>
+          ) : (
+            <>
+              <input
+                className={inputCls()}
+                placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : 'Base URL (e.g. http://host:8096)'}
+                value={providerForm.base_url}
+                onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
+              />
+              {providerForm.provider_type === 'xc' && (
+                <input className={inputCls()} placeholder="Username" value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
+              )}
+              <input
+                className={inputCls()}
+                type="password"
+                placeholder={providerForm.provider_type === 'plex' ? 'Plex token (X-Plex-Token)' : providerForm.provider_type === 'xc' ? 'Password' : 'API key'}
+                value={providerForm.password}
+                onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
+              />
+            </>
           )}
-          <input
-            className={inputCls()}
-            type="password"
-            placeholder={providerForm.provider_type === 'plex' ? 'Plex token (X-Plex-Token)' : providerForm.provider_type === 'xc' ? 'Password' : 'API key'}
-            value={providerForm.password}
-            onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
-          />
           <input className={inputCls('w-24')} type="number" placeholder="Max streams" value={providerForm.max_streams} onChange={(e) => setProviderForm({ ...providerForm, max_streams: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Priority" value={providerForm.priority} onChange={(e) => setProviderForm({ ...providerForm, priority: e.target.value })} />
           <Button
             size="sm"
-            disabled={!providerForm.name || !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username) || addProvider.isPending}
+            disabled={
+              !providerForm.name || addProvider.isPending ||
+              (providerForm.provider_type === 'dispatcharr_dvr'
+                ? !providerForm.dispatcharr_connection_id || !providerForm.dvr_local_path.trim()
+                : !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username))
+            }
             onClick={() => addProvider.mutate()}
           >
             <Plus size={12} className="mr-1" /> Add

@@ -18,6 +18,7 @@ or CGNAT'd instances routinely aren't). See _authenticate.
 import asyncio
 import ipaddress
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -649,6 +650,14 @@ def _redact_upstream_url(url: str) -> str:
 
 
 def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
+    if provider.get("provider_type") == "dispatcharr_dvr":
+        # A plain local disk path, not a URL -- correct for ffmpeg's -i
+        # (transcode/HLS paths, which accept a local path untouched, no
+        # further change needed there). _proxy_vod_stream's direct-relay
+        # path can't GET a bare path over httpx, so it short-circuits to a
+        # FileResponse before ever calling this for a dispatcharr_dvr source
+        # -- see its own dispatcharr_dvr branch.
+        return source["local_file_path"]
     if provider.get("provider_type") == "plex":
         # provider_stream_id holds the Plex Part key (e.g.
         # "/library/parts/12345/file.mkv") captured at import time —
@@ -984,6 +993,25 @@ async def _proxy_vod_stream(
         provider = vod_db.get_provider(source["provider_id"])
         if not provider:
             continue
+
+        if provider.get("provider_type") == "dispatcharr_dvr":
+            # A local file on disk, not an upstream to relay -- httpx can't
+            # GET a bare path, and none of the shared-connection-capacity/
+            # heartbeat machinery below applies to a file VOD Manager already
+            # has locally. Range requests (seeking) are handled by
+            # FileResponse itself. A missing file (recording deleted/moved
+            # outside VOD Manager) falls through to the next source, same
+            # failover behavior as an unreachable upstream.
+            local_path = source.get("local_file_path")
+            if not local_path or not os.path.isfile(local_path):
+                last_error = "local file not found"
+                logger.warning("[xc_server] %s stream source %d/%d (%s) local file missing id=%s: %s, trying next",
+                                kind, idx + 1, len(sources), provider["name"], conn_id, local_path)
+                continue
+            media_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
+            logger.info("[xc_server] %s stream OPEN id=%s -> provider=%s (source %d/%d) local file=%s",
+                        kind, conn_id, provider["name"], idx + 1, len(sources), local_path)
+            return FileResponse(local_path, media_type=media_type)
 
         if not await _has_capacity(provider):
             last_error = "at shared connection capacity"

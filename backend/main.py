@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from backup import router as backup_router
 from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
+import dispatcharr_dvr_importer
 import emby_vod_importer
 import plex_importer
 from routes import router
@@ -116,7 +117,14 @@ async def _vod_catalog_refresher() -> None:
     await asyncio.sleep(15)
     while True:
         try:
-            providers = [p for p in await asyncio.to_thread(vod_db.list_providers) if p["is_active"]]
+            # dispatcharr_dvr providers are refreshed by their own dedicated
+            # _dispatcharr_dvr_poller loop instead -- this loop's dispatch
+            # below has no branch for them and would otherwise try (and
+            # fail) to build an XC URL from their blank base_url every cycle.
+            providers = [
+                p for p in await asyncio.to_thread(vod_db.list_providers)
+                if p["is_active"] and p.get("provider_type") != "dispatcharr_dvr"
+            ]
             now = time.time()
             due = [
                 p for p in providers
@@ -150,6 +158,37 @@ async def _vod_catalog_refresher() -> None:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 
         await asyncio.sleep(_CATALOG_REFRESH_POLL_SECONDS)
+
+
+_DVR_POLL_SECONDS = 300  # kept separate from the configurable XC/Plex/Emby
+# refresh-interval settings -- Phase 1a scope only, a fixed cadence rather
+# than a new Settings->Refresh Schedule slider. Recordings finish at
+# unpredictable times, so a short fixed poll keeps the visible-in-VOD-Manager
+# delay small without needing per-deployment tuning yet.
+
+
+async def _dispatcharr_dvr_poller() -> None:
+    """Background task: pulls newly-finished Dispatcharr DVR recordings into
+    the VOD pool. Kept as its own loop rather than folded into
+    _vod_catalog_refresher -- that refresher's due-time tracking is keyed off
+    provider_type-specific Settings intervals (XC/Plex/Emby/Jellyfin only),
+    and DVR's Phase 1a scope doesn't need that configurability yet."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            providers = [
+                p for p in await asyncio.to_thread(vod_db.list_providers)
+                if p["is_active"] and p.get("provider_type") == "dispatcharr_dvr"
+            ]
+            for p in providers:
+                try:
+                    result = await dispatcharr_dvr_importer.import_dvr_recordings(p["id"])
+                    logger.info("[dispatcharr_dvr_poller] %s: %s", p["name"], result)
+                except Exception as exc:
+                    logger.warning("[dispatcharr_dvr_poller] provider=%s failed: %s", p["name"], exc)
+        except Exception as exc:
+            logger.warning("[dispatcharr_dvr_poller] cycle failed: %s", exc)
+        await asyncio.sleep(_DVR_POLL_SECONDS)
 
 
 async def _vod_enrichment_scheduler() -> None:
@@ -231,6 +270,7 @@ async def lifespan(app: FastAPI):
     logger.info("VOD Manager started")
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
+        asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(_category_schedule_loop()),

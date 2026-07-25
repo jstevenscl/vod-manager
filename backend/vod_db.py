@@ -382,6 +382,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("categories", "is_active", "INTEGER NOT NULL DEFAULT 1"),
         ("categories", "schedule_start_mmdd", "TEXT"),
         ("categories", "schedule_end_mmdd", "TEXT"),
+        ("providers", "dispatcharr_connection_id", "INTEGER"),
+        ("providers", "dvr_local_path", "TEXT"),
+        ("providers", "dvr_movie_category_id", "INTEGER"),
+        ("providers", "dvr_series_category_id", "INTEGER"),
+        ("movie_sources", "local_file_path", "TEXT"),
+        ("episode_sources", "local_file_path", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -440,25 +446,99 @@ def _item_savepoint(conn: sqlite3.Connection):
 def upsert_provider(
     name: str, base_url: str, username: str, password: str, max_streams: int = 0, priority: int = 0,
     provider_type: str = "xc",
+    dispatcharr_connection_id: int | None = None, dvr_local_path: str | None = None,
+    dvr_movie_category_id: int | None = None, dvr_series_category_id: int | None = None,
 ) -> int:
+    """base_url/username/password are meaningless for provider_type='dispatcharr_dvr'
+    (empty strings from the caller) -- a DVR source reuses an existing
+    dispatcharr_connections row for its actual url/token instead of storing
+    its own, the same way Plex leaves username blank and Emby/Jellyfin leave
+    both blank. The dispatcharr_connection_id/dvr_* fields are ignored for
+    every other provider_type."""
     encrypted_password = encrypt_value(password)
     conn = _connect()
     row = conn.execute("SELECT id FROM providers WHERE name = ?", (name,)).fetchone()
     if row:
         conn.execute(
-            "UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?, updated_at=? WHERE id=?",
-            (base_url, username, encrypted_password, max_streams, priority, provider_type, _now(), row["id"]),
+            """UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?,
+               dispatcharr_connection_id=?, dvr_local_path=?, dvr_movie_category_id=?, dvr_series_category_id=?,
+               updated_at=? WHERE id=?""",
+            (base_url, username, encrypted_password, max_streams, priority, provider_type,
+             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
+             _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
         cur = conn.execute(
-            "INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (name, base_url, username, encrypted_password, max_streams, priority, provider_type, _now()),
+            """INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type,
+               dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, base_url, username, encrypted_password, max_streams, priority, provider_type,
+             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id, _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)
     conn.close()
     return provider_id
+
+
+def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> list[int]:
+    """Applied as a separate pass after bulk_import_plex_movies (see
+    dispatcharr_dvr_importer.py) -- local_file_path is DVR-specific and kept
+    out of that shared Plex/Emby function on purpose. Matches movie_sources
+    rows by the same (provider_id, provider_stream_id) key the import just
+    wrote them under; entries with no matching row (e.g. a series episode's
+    stream id, since callers pass one dict covering both movies and
+    episodes) are silently skipped. Returns the distinct movie_ids touched,
+    for direct use with bulk_place_movies_in_category -- no separate lookup
+    pass needed."""
+    if not path_by_stream_id:
+        return []
+    conn = _connect()
+    movie_ids = []
+    for stream_id, local_path in path_by_stream_id.items():
+        row = conn.execute(
+            "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+            (provider_id, stream_id),
+        ).fetchone()
+        if not row:
+            continue
+        conn.execute(
+            "UPDATE movie_sources SET local_file_path=? WHERE provider_id=? AND provider_stream_id=?",
+            (local_path, provider_id, stream_id),
+        )
+        movie_ids.append(row["movie_id"])
+    _commit_with_retry(conn)
+    conn.close()
+    return list(dict.fromkeys(movie_ids))
+
+
+def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> list[int]:
+    """Episode counterpart to set_movie_source_local_paths. Returns the
+    distinct series_ids touched (not episode_ids) -- DVR category placement
+    targets a whole series, matching bulk_place_series_in_category's shape,
+    the same as every other series import path in this codebase."""
+    if not path_by_stream_id:
+        return []
+    conn = _connect()
+    series_ids = []
+    for stream_id, local_path in path_by_stream_id.items():
+        row = conn.execute(
+            """SELECT episodes.series_id AS series_id FROM episode_sources
+               JOIN episodes ON episodes.id = episode_sources.episode_id
+               WHERE episode_sources.provider_id=? AND episode_sources.provider_stream_id=?""",
+            (provider_id, stream_id),
+        ).fetchone()
+        if not row:
+            continue
+        conn.execute(
+            "UPDATE episode_sources SET local_file_path=? WHERE provider_id=? AND provider_stream_id=?",
+            (local_path, provider_id, stream_id),
+        )
+        series_ids.append(row["series_id"])
+    _commit_with_retry(conn)
+    conn.close()
+    return list(dict.fromkeys(series_ids))
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:
@@ -2071,7 +2151,7 @@ def get_movie_source_for_streaming(source_id: int) -> dict | None:
     title without a second lookup."""
     conn = _connect()
     row = conn.execute("""
-        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key,
+        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path,
                m.id AS movie_id, m.name AS movie_name, m.year AS movie_year, m.duration_secs AS duration_secs
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
@@ -2090,7 +2170,7 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
     so the proxy can try them in order."""
     conn = _connect()
     rows = conn.execute("""
-        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key
+        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
         WHERE ms.movie_id = ? AND p.is_active = 1
@@ -2587,7 +2667,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
     """Episode equivalent of get_movie_source_for_streaming — see there."""
     conn = _connect()
     row = conn.execute("""
-        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key,
+        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path,
                e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
                e.duration_secs AS duration_secs, s.id AS series_id, s.name AS series_name
         FROM episode_sources es
@@ -2604,7 +2684,7 @@ def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
     """Episode equivalent of list_movie_sources_for_streaming — see there."""
     conn = _connect()
     rows = conn.execute("""
-        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key
+        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
         WHERE es.episode_id = ? AND p.is_active = 1
