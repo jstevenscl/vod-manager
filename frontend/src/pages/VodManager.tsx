@@ -2820,8 +2820,8 @@ export default function VodManager() {
   })
   type ApplyExclusionsProviderResult = {
     provider: string; error?: string
-    movies_created?: number; movies_matched?: number; movies_archived?: number
-    series_created?: number; series_matched?: number; series_archived?: number
+    movies_created?: number; movies_matched?: number; movies_archived?: number; movies_unarchived?: number
+    series_created?: number; series_matched?: number; series_archived?: number; series_unarchived?: number
   }
   const applyExclusionsJobQuery = useQuery<{
     status: string; total: number; completed: number; current_provider: string | null
@@ -3138,7 +3138,12 @@ export default function VodManager() {
   const importCatalog = useMutation({
     mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 180_000 }) },
     onSuccess: (r) => {
-      setImportResult(`Imported: ${r.data.movies_created} new movies (${r.data.movies_matched} already known), ${r.data.series_created} new series (${r.data.series_matched} already known).`)
+      const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
+      const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
+      setImportResult(
+        `Imported: ${r.data.movies_created} new movies (${r.data.movies_matched} already known), ${r.data.series_created} new series (${r.data.series_matched} already known)`
+        + (archived || unarchived ? ` — ${archived} archived, ${unarchived} restored by the current exclusion rules.` : '.')
+      )
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
@@ -4576,13 +4581,15 @@ export default function VodManager() {
             <p className="text-muted-foreground">
               Done — {applyExclusionsJobQuery.data.results.length} provider(s), {
                 applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_archived ?? 0) + (r.series_archived ?? 0), 0)
-              } newly archived by the current rules.
+              } newly archived and {
+                applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0), 0)
+              } restored (no longer matched) by the current rules.
             </p>
             {applyExclusionsJobQuery.data.results.map((r) => (
               <p key={r.provider} className="text-muted-foreground">
                 {r.provider}: {r.error
                   ? <span className="text-destructive">{r.error}</span>
-                  : <>{(r.movies_archived ?? 0) + (r.series_archived ?? 0)} archived · {(r.movies_matched ?? 0) + (r.series_matched ?? 0)} matched · {(r.movies_created ?? 0) + (r.series_created ?? 0)} new</>}
+                  : <>{(r.movies_archived ?? 0) + (r.series_archived ?? 0)} archived · {(r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0)} restored · {(r.movies_matched ?? 0) + (r.series_matched ?? 0)} matched · {(r.movies_created ?? 0) + (r.series_created ?? 0)} new</>}
               </p>
             ))}
           </div>

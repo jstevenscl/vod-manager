@@ -2678,12 +2678,15 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
     is_adult to True from a matching category name, never downgrades, and
     never touches a row a human has manually corrected (is_adult_manual=1).
 
-    auto_archive (see vod_importer._should_auto_archive) follows the exact
-    same upgrade-only, manual-override-respecting pattern for
-    review_excluded/review_excluded_manual -- a language/category exclusion
-    rule can archive an item, but never un-archives one on its own (a human
-    restoring it via bulk_set_review_excluded is what review_excluded_manual
-    protects against being silently overridden).
+    auto_archive (see vod_importer._should_auto_archive) mirrors the
+    is_adult/is_adult_manual upgrade-only pattern in BOTH directions: it can
+    archive an item, and if the item is already archived but was archived
+    automatically (review_excluded_manual=0), it can also un-archive it once
+    no active rule matches it any more -- e.g. an admin removes a category
+    from a provider's exclude list, then re-imports. A human's manual
+    archive/restore (bulk_set_review_excluded, review_excluded_manual=1) is
+    never touched in either direction -- that's what review_excluded_manual
+    exists to protect.
     """
     conn = _connect()
     now = _now()
@@ -2692,6 +2695,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
     flagged = 0
     errors = 0
     archived = 0
+    unarchived = 0
     lock_retry_items = []
     batch_size = 200
     # Committed every batch_size items rather than once at the very end (see
@@ -2716,7 +2720,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                 # in the DB if a later statement in this same item (e.g. the
                 # movie_sources insert below) goes on to raise and roll this
                 # item back.
-                did_create = did_match = did_flag = did_archive = False
+                did_create = did_match = did_flag = did_archive = did_unarchive = False
                 if not name.strip():
                     # A blank provider-supplied name has no real identity to match
                     # on -- treating "" like any other string let unrelated titles
@@ -2747,6 +2751,13 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                             conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                             did_archive = True
+                        elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
+                            # Mirror of the archive branch above -- no active
+                            # rule matches this item any more (see this
+                            # function's docstring), so lift an
+                            # automatically-applied archive.
+                            conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                            did_unarchive = True
                     else:
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
                         cur = conn.execute(
@@ -2768,6 +2779,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     created += did_create
                     matched += did_match
                     archived += did_archive
+                    unarchived += did_unarchive
                     flagged += did_flag
                     continue
                 row = conn.execute(
@@ -2788,6 +2800,12 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         # to fix -- see evaluate_smart_category's docstring).
                         conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                         did_archive = True
+                    elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
+                        # Mirror of the archive branch above -- see this
+                        # function's docstring for why an automatically
+                        # applied archive can be automatically lifted too.
+                        conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                        did_unarchive = True
                 elif year is None:
                     # No exact (name, NULL) row, and no year to key an exact match
                     # on -- same reasoning as upsert_movie: exactly one same-named
@@ -2812,6 +2830,9 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                             conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                             did_archive = True
+                        elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                            conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                            did_unarchive = True
                     else:
                         cur = conn.execute(
                             "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
@@ -2842,6 +2863,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                 matched += did_match
                 flagged += did_flag
                 archived += did_archive
+                unarchived += did_unarchive
         except sqlite3.OperationalError as exc:
             # A periodic commit (above) frees the write lock regularly, but a
             # concurrent writer can still grab it in the gap between this
@@ -2880,10 +2902,11 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
         created += retry_result["movies_created"]
         matched += retry_result["movies_matched"]
         archived += retry_result["movies_archived"]
+        unarchived += retry_result["movies_unarchived"]
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
 
-    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
@@ -2901,6 +2924,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
     flagged = 0
     errors = 0
     archived = 0
+    unarchived = 0
     lock_retry_items = []
     batch_size = 200
     # See bulk_import_movies's identical comment -- same fix, same reason.
@@ -2914,7 +2938,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                 # See bulk_import_movies's identical did_create/did_match/did_flag
                 # comment -- folded into the real counters only after this item's
                 # last statement has actually succeeded.
-                did_create = did_match = did_flag = did_archive = False
+                did_create = did_match = did_flag = did_archive = did_unarchive = False
                 if not name.strip():
                     # Same reasoning as bulk_import_movies's identical guard -- a
                     # blank name has no real identity to match on, so never match it
@@ -2935,6 +2959,13 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (existing["id"],))
                             conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (existing["id"],))
                             did_archive = True
+                        elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
+                            # Mirror of the archive branch above -- see
+                            # bulk_import_movies's docstring for why an
+                            # automatically applied archive can be
+                            # automatically lifted too.
+                            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (existing["id"],))
+                            did_unarchive = True
                     else:
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
                         conn.execute(
@@ -2948,6 +2979,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     matched += did_match
                     flagged += did_flag
                     archived += did_archive
+                    unarchived += did_unarchive
                     continue
                 row = conn.execute(
                     "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id FROM series WHERE name=? AND year IS ?",
@@ -2964,6 +2996,9 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # Dispatcharr, not just the flag on its own.
                         conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (row["id"],))
                         did_archive = True
+                    elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
+                        conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
+                        did_unarchive = True
                     if row["import_provider_id"] is None:
                         # This series previously had no working way to fetch episode
                         # detail (e.g. its only prior source's provider was later
@@ -2993,6 +3028,9 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (candidates[0]["id"],))
                             conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (candidates[0]["id"],))
                             did_archive = True
+                        elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (candidates[0]["id"],))
+                            did_unarchive = True
                     else:
                         conn.execute(
                             "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -3013,6 +3051,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                 matched += did_match
                 flagged += did_flag
                 archived += did_archive
+                unarchived += did_unarchive
         except sqlite3.OperationalError as exc:
             # See bulk_import_movies's identical handler -- transient lock
             # contention gets a retry pass instead of a permanent, silent
@@ -3043,10 +3082,11 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
         created += retry_result["series_created"]
         matched += retry_result["series_matched"]
         archived += retry_result["series_archived"]
+        unarchived += retry_result["series_unarchived"]
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
 
-    return {"series_created": created, "series_matched": matched, "series_archived": archived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at")
