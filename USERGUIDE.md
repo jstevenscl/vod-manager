@@ -396,9 +396,13 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
 - **Manage Categories**, **Needs Review**, **Missing Artwork**, **Language
   Filter** — open the curation tool modals covered in §10, scoped to
   whichever tab (movies vs. series) you opened them from.
-- **Bulk category placement** — select items (checkbox) or use "Place all
-  filtered" to place everything matching the current search/filter into a
-  category in one action, without paging through results manually.
+- **Bulk actions** — check items individually, shift-click to select a range,
+  or **Select all visible** to grab everything on the current page. **Place
+  selected**/**Place all filtered** place into a category ("all filtered"
+  covers everything matching the current search/filter, not just the current
+  page, without paging through results manually); **Archive selected**
+  (**Un-archive selected** when viewing the Archived toggle) applies the same
+  archive action described below to the whole selection at once.
 - **Rename / fix year** — every item's detail view (click a row, or a tile
   in grid mode) has this. Providers occasionally send a blank, garbled, or
   otherwise wrong title/year with no other way to correct it — this fixes
