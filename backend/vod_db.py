@@ -947,6 +947,28 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
         all_ids,
     ).fetchall()
     cat_count_by_id = {r["id"]: r["c"] for r in cat_counts}
+
+    # A "duplicate" backed by 1 source from a single provider is a very
+    # different trust level than one with several sources across several
+    # providers -- invisible from source_count alone, so the reviewer sees
+    # which providers actually back each candidate, not just how many.
+    if content_type == "movie":
+        provider_rows = conn.execute(f"""
+            SELECT DISTINCT ms.movie_id AS id, p.name AS provider_name
+            FROM movie_sources ms JOIN providers p ON p.id = ms.provider_id
+            WHERE ms.movie_id IN ({placeholders})
+        """, all_ids).fetchall()
+    else:
+        provider_rows = conn.execute(f"""
+            SELECT DISTINCT e.series_id AS id, p.name AS provider_name
+            FROM episode_sources es
+            JOIN episodes e ON e.id = es.episode_id
+            JOIN providers p ON p.id = es.provider_id
+            WHERE e.series_id IN ({placeholders})
+        """, all_ids).fetchall()
+    provider_names_by_id: dict[int, list[str]] = {}
+    for r in provider_rows:
+        provider_names_by_id.setdefault(r["id"], []).append(r["provider_name"])
     conn.close()
 
     result = []
@@ -954,6 +976,7 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
         for i in items:
             i["source_count"] = src_count_by_id.get(i["id"], 0)
             i["category_count"] = cat_count_by_id.get(i["id"], 0)
+            i["provider_names"] = provider_names_by_id.get(i["id"], [])
         # Most-sourced/most-placed first -- the obvious default "keep" pick.
         items.sort(key=lambda i: (-i["source_count"], -i["category_count"]))
         result.append({"items": items})

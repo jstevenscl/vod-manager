@@ -137,6 +137,7 @@ interface DuplicateGroupItem {
   poster_url: string | null
   source_count: number
   category_count: number
+  provider_names: string[]
 }
 
 interface DuplicateGroup {
@@ -1071,6 +1072,20 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
         const trueYear = item.tmdb_id ? tmdbDetails?.[item.tmdb_id]?.year : undefined
         const isTrueYearMatch = trueYear != null && item.year === trueYear
         const isYearMismatch = trueYear != null && item.year !== trueYear
+        // isTrueYearMatch on its own only says THIS candidate's own tmdb_id
+        // is self-consistent -- it says nothing about whether any other
+        // candidate in the group actually corroborates it. A lone
+        // self-consistent id next to a sibling with no id at all (or the
+        // sibling just hasn't loaded a poster/other evidence) used to render
+        // an unqualified green "true match" that read as a confirmed pairing
+        // when it's actually the weakest signal available -- split into
+        // three real tiers instead: shared-and-confirmed (green),
+        // self-consistent-but-uncorroborated (amber), and no-id-at-all-while-
+        // a-sibling-has-one (red, the strongest negative signal short of an
+        // actual conflicting id, which never reaches this component at all --
+        // see _split_by_tmdb_conflict).
+        const isCorroborated = item.tmdb_id != null && (tmdbIdCounts.get(item.tmdb_id) ?? 0) > 1
+        const otherHasTmdbId = group.items.some((other) => other.id !== item.id && other.tmdb_id != null)
         return (
           <div key={item.id} className="flex gap-2">
             {item.poster_url && (
@@ -1082,16 +1097,25 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
                 <span className={keepId === item.id ? 'font-medium' : ''}>{item.name} ({item.year})</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
+                  {!!item.provider_names.length && <> ({item.provider_names.join(', ')})</>}
                 </span>
               </label>
-              {!!item.tmdb_id && (
+              {!!item.tmdb_id ? (
                 <div className="flex items-center gap-1 flex-wrap mt-0.5">
                   <span className="inline-block text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${item.tmdb_id}`}>
                     TMDB #{item.tmdb_id}
                   </span>
-                  {isTrueYearMatch && (
+                  {isTrueYearMatch && isCorroborated && (
                     <span className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">
                       true match — TMDB confirms {trueYear}
+                    </span>
+                  )}
+                  {isTrueYearMatch && !isCorroborated && (
+                    <span
+                      className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30"
+                      title="This candidate's own TMDB id checks out, but no other candidate in this group shares it -- not cross-confirmed, verify manually"
+                    >
+                      unconfirmed — TMDB confirms only this candidate ({trueYear})
                     </span>
                   )}
                   {isYearMismatch && (
@@ -1099,6 +1123,15 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
                       year mismatch — TMDB says {trueYear}
                     </span>
                   )}
+                </div>
+              ) : otherHasTmdbId && (
+                <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                  <span
+                    className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/30"
+                    title="Another candidate in this group has a confirmed TMDB id; this one has none at all -- a real duplicate almost always both match, so this is the biggest reason to doubt the pairing"
+                  >
+                    no TMDB match — unconfirmed
+                  </span>
                 </div>
               )}
               <button className="text-[11px] text-primary hover:underline mt-0.5" onClick={() => togglePreview(item.id)}>
