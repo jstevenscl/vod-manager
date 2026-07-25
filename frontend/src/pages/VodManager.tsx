@@ -3081,6 +3081,7 @@ export default function VodManager() {
   const [excludeCategoriesSearch, setExcludeCategoriesSearch] = useState('')
   const [excludeCategoriesShowFilter, setExcludeCategoriesShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
   const [excludeCategoriesLastClickedIndex, setExcludeCategoriesLastClickedIndex] = useState<number | null>(null)
+  const [excludeCategoriesError, setExcludeCategoriesError] = useState<string | null>(null)
   const providerAvailableCategoriesQuery = useQuery<{ categories: string[] }>({
     queryKey: ['vod-provider-available-categories', excludeCategoriesProviderId],
     queryFn:  () => api.get(`/vod/providers/${excludeCategoriesProviderId}/available-categories/`).then((r) => r.data),
@@ -3089,10 +3090,15 @@ export default function VodManager() {
   const setProviderImportExcludeCategories = useMutation({
     mutationFn: ({ id, category_names }: { id: number; category_names: string[] }) =>
       api.post(`/vod/providers/${id}/import-exclude-categories/`, { category_names }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    onSuccess: async () => {
+      // Awaited, not fire-and-forget -- closing the dialog before this
+      // resolves let a reopen race the refetch and show stale (pre-save)
+      // categories, which looked exactly like "my selection didn't stick".
+      await qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setExcludeCategoriesError(null)
       setExcludeCategoriesProviderId(null)
     },
+    onError: (e: any) => setExcludeCategoriesError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
   })
   const [expandedLiveAccountsProviderId, setExpandedLiveAccountsProviderId] = useState<number | null>(null)
   const providerLiveAccountsQuery = useQuery<ProviderLiveAccount[]>({
@@ -4351,6 +4357,7 @@ export default function VodManager() {
                       setExcludeCategoriesSearch('')
                       setExcludeCategoriesShowFilter('all')
                       setExcludeCategoriesLastClickedIndex(null)
+                      setExcludeCategoriesError(null)
                     }}
                   >
                     Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
@@ -4625,6 +4632,7 @@ export default function VodManager() {
               ))}
               {!!allNames.length && !visible.length && <p className="text-muted-foreground">No categories match.</p>}
             </div>
+            {excludeCategoriesError && <p className="text-xs text-destructive">{excludeCategoriesError}</p>}
             <div className="flex justify-end gap-2 pt-2">
               <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
               <Button

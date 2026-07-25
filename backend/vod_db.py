@@ -237,6 +237,17 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
+        -- SQLite never auto-indexes a foreign key column (only the referenced
+        -- side's PRIMARY KEY gets one) -- movie_id/episode_id had no index of
+        -- their own, only the unrelated (provider_id, provider_stream_id)
+        -- UNIQUE constraint. Every _purge_if_sourceless_movie/episode call
+        -- (delete_provider's cleanup loop runs one per affected item -- up to
+        -- one per movie/episode a deleted provider ever touched) was a full
+        -- table scan of movie_sources/episode_sources without these, turning
+        -- a provider with a large catalog into a synchronous, unlogged,
+        -- event-loop-blocking O(n*m) scan that looked like a hang.
+        CREATE INDEX IF NOT EXISTS idx_movie_sources_movie_id ON movie_sources(movie_id);
+        CREATE INDEX IF NOT EXISTS idx_episode_sources_episode_id ON episode_sources(episode_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
@@ -398,6 +409,9 @@ def _commit_with_retry(conn: sqlite3.Connection, retries: int = 5) -> None:
             if "locked" not in str(exc).lower() or attempt == retries - 1:
                 raise
             time.sleep(0.5 * (attempt + 1))
+
+
+_MAX_LOCK_RETRY_DEPTH = 3  # see bulk_import_movies/series's lock_retry_items handling
 
 
 @contextmanager
@@ -681,6 +695,8 @@ def delete_provider(provider_id: int) -> None:
     )
     conn.execute("DELETE FROM providers WHERE id=?", (provider_id,))
 
+    logger.info("[vod_db] delete_provider(%s): purging %d movie(s), %d episode(s)",
+                provider_id, len(affected_movie_ids), len(affected_episode_rows))
     for movie_id in affected_movie_ids:
         _purge_if_sourceless_movie(conn, movie_id)
     affected_series_ids = {r["series_id"] for r in affected_episode_rows}
@@ -691,6 +707,7 @@ def delete_provider(provider_id: int) -> None:
 
     _commit_with_retry(conn)
     conn.close()
+    logger.info("[vod_db] delete_provider(%s): done", provider_id)
 
 
 # ── Orphan checker ───────────────────────────────────────────────────────────
@@ -2652,7 +2669,7 @@ def _looks_adult(*category_names) -> bool:
     return False
 
 
-def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
+def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...]
 
     Adult-content auto-detection runs on every import pass (not just first
@@ -2675,7 +2692,17 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
     flagged = 0
     errors = 0
     archived = 0
-    for item in items:
+    lock_retry_items = []
+    batch_size = 200
+    # Committed every batch_size items rather than once at the very end (see
+    # _commit_with_retry's docstring) -- a real XC catalog is thousands of
+    # items, and holding one uncommitted transaction open for the whole loop
+    # made this a bad neighbor to every other background writer (enrichment,
+    # TMDB sync, category schedules, a concurrent provider's own import):
+    # they'd block on the write lock for the full 30s connect timeout and
+    # then fail with "database is locked" -- confirmed as the root cause of a
+    # real user's flood of exactly that warning during import.
+    for i, item in enumerate(items):
         try:
             with _item_savepoint(conn):
                 name = item["name"]
@@ -2815,16 +2842,51 @@ def bulk_import_movies(provider_id: int, items: list[dict]) -> dict:
                 matched += did_match
                 flagged += did_flag
                 archived += did_archive
+        except sqlite3.OperationalError as exc:
+            # A periodic commit (above) frees the write lock regularly, but a
+            # concurrent writer can still grab it in the gap between this
+            # item's statements and the next periodic commit -- that's
+            # transient contention, not a bad item, so it gets one more pass
+            # after this batch finishes instead of being counted as a
+            # permanent failure (this is the exact "database is locked"
+            # flood a real user hit during import -- items were being
+            # silently and permanently dropped by this, not actually
+            # malformed).
+            if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
+                lock_retry_items.append(item)
+            else:
+                errors += 1
+                logger.warning("[vod_db] bulk_import_movies: skipped item name=%r stream_id=%r: %s",
+                                item.get("name"), item.get("provider_stream_id"), exc)
         except Exception as exc:
             errors += 1
             logger.warning("[vod_db] bulk_import_movies: skipped item name=%r stream_id=%r: %s",
                             item.get("name"), item.get("provider_stream_id"), exc)
+        finally:
+            # In a `finally` (not inline after the try/except) so this still
+            # fires on the blank-name branch's `continue` -- that continue
+            # jumps straight to the next loop iteration and would otherwise
+            # skip this check entirely for that item's index.
+            if (i + 1) % batch_size == 0:
+                _commit_with_retry(conn)
     _commit_with_retry(conn)
     conn.close()
+
+    if lock_retry_items:
+        time.sleep(0.5 * (_retry_depth + 1))
+        logger.info("[vod_db] bulk_import_movies: retrying %d item(s) after transient lock contention (pass %d/%d)",
+                     len(lock_retry_items), _retry_depth + 1, _MAX_LOCK_RETRY_DEPTH)
+        retry_result = bulk_import_movies(provider_id, lock_retry_items, _retry_depth=_retry_depth + 1)
+        created += retry_result["movies_created"]
+        matched += retry_result["movies_matched"]
+        archived += retry_result["movies_archived"]
+        flagged += retry_result["flagged_for_review"]
+        errors += retry_result["errors"]
+
     return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
-def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
+def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_series_id, provider_category_name}, ...]
 
     Series-level only (XC series don't carry a directly-playable stream_id —
@@ -2839,7 +2901,10 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
     flagged = 0
     errors = 0
     archived = 0
-    for item in items:
+    lock_retry_items = []
+    batch_size = 200
+    # See bulk_import_movies's identical comment -- same fix, same reason.
+    for i, item in enumerate(items):
         try:
             with _item_savepoint(conn):
                 name = item["name"]
@@ -2948,12 +3013,39 @@ def bulk_import_series(provider_id: int, items: list[dict]) -> dict:
                 matched += did_match
                 flagged += did_flag
                 archived += did_archive
+        except sqlite3.OperationalError as exc:
+            # See bulk_import_movies's identical handler -- transient lock
+            # contention gets a retry pass instead of a permanent, silent
+            # data loss.
+            if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
+                lock_retry_items.append(item)
+            else:
+                errors += 1
+                logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
+                                item.get("name"), item.get("provider_series_id"), exc)
         except Exception as exc:
             errors += 1
             logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
                             item.get("name"), item.get("provider_series_id"), exc)
+        finally:
+            # See bulk_import_movies's identical comment -- must be `finally`
+            # so the blank-name branch's `continue` doesn't skip it.
+            if (i + 1) % batch_size == 0:
+                _commit_with_retry(conn)
     _commit_with_retry(conn)
     conn.close()
+
+    if lock_retry_items:
+        time.sleep(0.5 * (_retry_depth + 1))
+        logger.info("[vod_db] bulk_import_series: retrying %d item(s) after transient lock contention (pass %d/%d)",
+                     len(lock_retry_items), _retry_depth + 1, _MAX_LOCK_RETRY_DEPTH)
+        retry_result = bulk_import_series(provider_id, lock_retry_items, _retry_depth=_retry_depth + 1)
+        created += retry_result["series_created"]
+        matched += retry_result["series_matched"]
+        archived += retry_result["series_archived"]
+        flagged += retry_result["flagged_for_review"]
+        errors += retry_result["errors"]
+
     return {"series_created": created, "series_matched": matched, "series_archived": archived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 

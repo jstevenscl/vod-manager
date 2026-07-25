@@ -804,7 +804,11 @@ async def activate_provider(provider_id: int):
 async def delete_provider(provider_id: int):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
-    vod_db.delete_provider(provider_id)
+    # A large provider's sourceless-purge cleanup (see delete_provider's own
+    # docstring) can take real time even with the movie_id/episode_id
+    # indexes -- off the event loop so it doesn't stall every other request
+    # (including the Activity poll) while it runs.
+    await asyncio.to_thread(vod_db.delete_provider, provider_id)
     return {"ok": True}
 
 
