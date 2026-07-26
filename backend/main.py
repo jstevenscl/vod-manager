@@ -169,7 +169,15 @@ _DVR_POLL_SECONDS = 300  # kept separate from the configurable XC/Plex/Emby
 
 async def _dispatcharr_dvr_poller() -> None:
     """Background task: pulls newly-finished Dispatcharr DVR recordings into
-    the VOD pool. Kept as its own loop rather than folded into
+    the VOD pool, then rescans every channel-scoped recording profile for
+    newly-visible upcoming episodes to schedule (dispatcharr_dvr_importer.
+    rescan_recording_profiles) -- both are "did anything change on
+    Dispatcharr's side" checks for the same provider, so they share this
+    loop and cadence rather than each getting their own. The rescan exists
+    because VOD Manager's own direct-Recording scheduling (see
+    dispatcharr_dvr_client.schedule_channel_recordings) bypasses Dispatcharr's
+    own recurring series-rules re-evaluation entirely -- see that function's
+    docstring for why. Kept as its own loop rather than folded into
     _vod_catalog_refresher -- that refresher's due-time tracking is keyed off
     provider_type-specific Settings intervals (XC/Plex/Emby/Jellyfin only),
     and DVR's Phase 1a scope doesn't need that configurability yet."""
@@ -186,6 +194,12 @@ async def _dispatcharr_dvr_poller() -> None:
                     logger.info("[dispatcharr_dvr_poller] %s: %s", p["name"], result)
                 except Exception as exc:
                     logger.warning("[dispatcharr_dvr_poller] provider=%s failed: %s", p["name"], exc)
+                try:
+                    rescan = await dispatcharr_dvr_importer.rescan_recording_profiles(p["id"])
+                    if rescan["scheduled"]:
+                        logger.info("[dispatcharr_dvr_poller] %s: rescan %s", p["name"], rescan)
+                except Exception as exc:
+                    logger.warning("[dispatcharr_dvr_poller] provider=%s rescan failed: %s", p["name"], exc)
         except Exception as exc:
             logger.warning("[dispatcharr_dvr_poller] cycle failed: %s", exc)
         await asyncio.sleep(_DVR_POLL_SECONDS)

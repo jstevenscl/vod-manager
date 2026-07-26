@@ -134,139 +134,181 @@ async def download_recording_file(connection: dict, recording_id: int, dest_path
     os.replace(tmp_path, dest_path)
 
 
-def _series_rule_body(
-    title: str, tvg_id: str | None, title_mode: str, description: str | None,
-    description_mode: str, mode: str, channel_id: int | None,
-) -> dict:
-    """Field names match Dispatcharr's own SeriesRuleRequest body exactly
-    (confirmed via its OpenAPI schema, GET /api/schema/, dispatch-test
-    v0.27.2, 2026-07-26) -- no translation layer needed. Blank/None tvg_id
-    genuinely means "omit the field" (matches across all EPG channels,
-    Dispatcharr's own default), not an empty string sent over the wire."""
-    body = {"title": title, "title_mode": title_mode, "description_mode": description_mode, "mode": mode}
-    if tvg_id:
-        body["tvg_id"] = tvg_id
-    if description:
-        body["description"] = description
-    if channel_id:
-        body["channel_id"] = channel_id
-    return body
+async def search_epg_programs(
+    connection: dict, title: str, limit: int = 50, channel_id: int | None = None,
+) -> list[dict]:
+    """Real upcoming EPG airings for a title -- GET /api/epg/programs/search/,
+    confirmed live (dispatch-test v0.27.2 and v0.28.2, 2026-07-26). Bounded to
+    the same 7-day horizon Dispatcharr itself schedules against so results
+    only ever show things that could actually be recorded. title_whole_words
+    =true avoids the same over-broad substring matching a caller wouldn't
+    want when they typed a real show name.
 
-
-async def create_series_rule(
-    connection: dict, title: str, tvg_id: str | None = None, title_mode: str = "exact",
-    description: str | None = None, description_mode: str = "contains",
-    mode: str = "all", channel_id: int | None = None,
-) -> dict:
-    """Creates (or updates, per Dispatcharr's own description: "Add a new
-    series recording rule or update an existing one") a recurring Series
-    Rule. No id is returned or needed: see vod_db.match_recording_profiles'
-    docstring for why VOD Manager's own dvr_recording_profiles keys on
-    (title, tvg_id) instead, the same pair Dispatcharr's own
-    delete_series_rule below uses.
-
-    channel_id, when known, should always be passed -- pinning by
-    Dispatcharr's own numeric Channel id is an unambiguous direct lookup.
-    tvg_id alone is NOT safe: confirmed live (dispatch-test, 2026-07-26,
-    via docker exec into its Django shell) that a single tvg_id STRING can
-    be shared by multiple EPGData rows (one per EPG source), only one of
-    which may actually have a Channel wired to it -- Dispatcharr's own
-    tvg_id-scoped evaluation (EPGData.objects.filter(tvg_id=...).first())
-    has no way to disambiguate and can silently pick a dead one. A blank
-    rule (matches any channel) sidesteps this because it resolves each
-    match's channel per-program instead, which is exactly why a title-only
-    rule "just worked" immediately after a channel-scoped one for the same
-    content failed with no visible error. tvg_id is still passed/stored
-    for VOD Manager's own later matching in match_recording_profiles.
-
-    Saving the rule does NOT by itself schedule anything -- confirmed by
-    reading Dispatcharr's own source (apps/channels/api_views.py,
-    SeriesRulesAPIView.post, dispatch-test v0.27.2, 2026-07-26): it only
-    writes the rule into CoreSettings, with an explicit code comment that
-    its own frontend calls the separate evaluate endpoint right after
-    saving ("do NOT fire evaluate_series_rules.delay() here"). Verified
-    live: without the second call below, a saved rule produced zero
-    scheduled recordings; calling POST .../series-rules/evaluate/
-    immediately created real ones. So this function does both steps,
-    mirroring Dispatcharr's own frontend -- a caller here should never have
-    to know evaluation is a separate step. Returns the evaluate response
-    ({"success", "scheduled", "details": [...]}) so a caller can tell the
-    difference between "saved and 0 currently schedulable" (e.g. a
-    dead/ambiguous channel, or a "new episodes only" rule with nothing new
-    airing right now) and a genuine failure, instead of reporting bare
-    success either way."""
-    client = DispatcharrClient(connection["url"], connection["token"])
-    body = _series_rule_body(title, tvg_id, title_mode, description, description_mode, mode, channel_id)
-    await client.post("/api/channels/series-rules/", body)
-    # Scoped to this rule's own channel (or, when blank, to the other
-    # blank-tvg_id "any channel" rules) rather than every rule on the
-    # instance -- evaluation is idempotent either way (Dispatcharr's own
-    # dedup is keyed by stable program attributes, confirmed via its test
-    # suite), this just avoids doing unrelated work on every single
-    # profile creation.
-    return await client.post("/api/channels/series-rules/evaluate/", {"tvg_id": tvg_id} if tvg_id else {})
-
-
-async def delete_series_rule(connection: dict, title: str, tvg_id: str | None = None) -> None:
-    """Confirmed via the OpenAPI schema: series rules are identified purely
-    by (title, tvg_id) -- there's no synthetic id for this resource at all."""
-    params = {"title": title}
-    if tvg_id:
-        params["tvg_id"] = tvg_id
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.delete(
-            f"{connection['url'].rstrip('/')}/api/channels/series-rules/",
-            headers={"X-API-Key": connection["token"]}, params=params,
-        )
-        resp.raise_for_status()
-
-
-async def preview_series_rule(
-    connection: dict, title: str, tvg_id: str | None = None, title_mode: str = "exact",
-    description: str | None = None, description_mode: str = "contains", limit: int = 25,
-) -> dict:
-    """Upcoming programs this rule would match, without persisting it --
-    powers the same live preview Dispatcharr's own "Customize rule..." UI
-    shows (confirmed live). Used by VOD Manager's own recording-profile form
-    to show the same preview before saving. Returns the full response dict
-    as-is: {"matches": [...], "total": int, "limit": int, "epg_found": bool,
-    "warn": bool} (confirmed live -- the list itself is under "matches", not
-    "results" like most of Dispatcharr's other list endpoints); epg_found in
-    particular is a real, useful signal a caller can't derive from an empty
-    "matches" list alone -- False means Dispatcharr has no EPG data at all
-    for this title, not just "nothing airing soon"."""
-    client = DispatcharrClient(connection["url"], connection["token"])
-    body = {"title": title, "title_mode": title_mode, "description_mode": description_mode, "limit": limit}
-    if tvg_id:
-        body["tvg_id"] = tvg_id
-    if description:
-        body["description"] = description
-    return await client.post("/api/channels/series-rules/preview/", body)
-
-
-async def search_epg_programs(connection: dict, title: str, limit: int = 50) -> list[dict]:
-    """Real upcoming EPG airings for a title, across every channel that
-    carries it -- GET /api/epg/programs/search/, confirmed live (dispatch-
-    test v0.27.2, 2026-07-26). Bounded to the same 7-day horizon Dispatcharr
-    itself schedules against so results only ever show things that could
-    actually be recorded. title_whole_words=true avoids the same over-broad
-    substring matching a caller wouldn't want when they typed a real show
-    name. Each result includes tvg_id (this specific airing's own EPG
-    channel string) and a 'channels' array of real Channel objects
-    ({id, name, channel_number, channel_group, tvg_id}) -- confirmed live
-    this is a genuine array despite the OpenAPI schema documenting it as a
-    plain string, so don't trust that doc field's type. The channel id in
-    that array is what create_series_rule's channel_id param needs (see its
-    docstring for why tvg_id alone isn't a safe pin)."""
+    channel_id, when passed, scopes results to just that one real Channel --
+    confirmed live this filters correctly via the channel's own actual
+    assignment (unlike Dispatcharr's own Series Rules feature, which
+    resolves an ambiguous tvg_id string instead -- see create_recording's
+    docstring), which is exactly why schedule_channel_recordings below uses
+    this instead of Series Rules for the real scheduling work. Without
+    channel_id, results span every channel
+    carrying the title, each result's own 'channels' array of real Channel
+    objects ({id, name, channel_number, channel_group, tvg_id}) -- confirmed
+    live this is a genuine array despite the OpenAPI schema documenting it as
+    a plain string, so don't trust that doc field's type."""
     from datetime import datetime, timedelta, timezone as _tz
     now = datetime.now(_tz.utc)
     client = DispatcharrClient(connection["url"], connection["token"])
-    data = await client.get("/api/epg/programs/search/", params={
+    params = {
         "title": title, "title_whole_words": "true",
         "start_after": now.isoformat(), "start_before": (now + timedelta(days=7)).isoformat(),
         "page_size": limit,
-    })
+    }
+    if channel_id:
+        params["channel_id"] = channel_id
+    data = await client.get("/api/epg/programs/search/", params=params)
     return data.get("results", []) if isinstance(data, dict) else data
+
+
+def _episode_identity_key(program: dict) -> str:
+    """Same identity heuristic Dispatcharr's own series-rules evaluator uses
+    to tell two airings of the same episode apart from two genuinely
+    different programs (apps/channels/tasks.py's _episode_key, dispatch-test
+    v0.28.2): season+episode when known, else onscreen_episode, else
+    sub_title -- all scoped by (tvg_id, title) -- else this specific
+    airing's own (start_time, end_time) so two programs are never collapsed
+    together just because neither carries season/episode metadata.
+
+    Works identically whether called on a fresh search_epg_programs() result
+    or on an existing Recording's custom_properties.program (see
+    create_recording below) -- both use the same nested shape
+    {tvg_id, title, sub_title, start_time, end_time, custom_properties:
+    {season, episode, onscreen_episode}} deliberately, so
+    schedule_channel_recordings' dedup check compares like with like."""
+    props = program.get("custom_properties") or {}
+    season = props.get("season")
+    episode = props.get("episode")
+    onscreen = props.get("onscreen_episode")
+    tvg_id = program.get("tvg_id") or ""
+    title = (program.get("title") or "").strip().lower()
+    base = f"{tvg_id}|{title}"
+    if season is not None and episode is not None:
+        return f"{base}|s{season}e{episode}"
+    if onscreen:
+        return f"{base}|{str(onscreen).strip().lower()}"
+    sub_title = program.get("sub_title")
+    if sub_title:
+        return f"{base}|{sub_title.strip().lower()}"
+    return f"{base}|{program.get('start_time')}|{program.get('end_time')}"
+
+
+async def create_recording(connection: dict, channel_id: int, program: dict) -> dict:
+    """Creates a single one-off Recording directly against Dispatcharr's
+    plain Recording model (POST /api/channels/recordings/) -- channel id +
+    start/end time only, with NO tvg_id-based matching anywhere in the path.
+    This is the fix for a real tvg_id-collision bug in Dispatcharr's own
+    Series Rules feature: confirmed live (dispatch-test v0.28.2,
+    2026-07-26, both via direct API calls and by driving Dispatcharr's own
+    native "Customize Rule" UI and capturing its real network requests) that
+    scoping a Series Rule to one channel can silently schedule 0 recordings
+    even when a real matching program exists on that exact channel right
+    now -- Dispatcharr's own series-rules evaluator re-derives the EPG
+    source from an ambiguous tvg_id STRING lookup (EPGData.objects.filter(
+    tvg_id=...).first(), no order_by, picks whichever of several same-string
+    rows comes first, dead or not) instead of the channel's own already-
+    resolved epg_data_id. Confirmed live in Django shell: the buggy lookup
+    resolved to a dead EPGData row with 0 programs; Channel.epg_data_id
+    resolved to the correct one with 4 real upcoming episodes, all correctly
+    scoped to just that channel. This function bypasses the ambiguous path
+    entirely -- the caller already has the real numeric channel id (from a
+    channel_id-scoped search_epg_programs call, itself confirmed correct),
+    so there's nothing left to disambiguate. Works regardless of whether the
+    underlying EPG source is set up via tvg_id, Gracenote station id
+    (Channel.tvc_guide_stationid), or both, since none of that is ever
+    touched here.
+
+    custom_properties.program mirrors the shape Dispatcharr's own evaluator
+    writes (confirmed live -- RecordingSerializer.validate only applies the
+    global pre/post-roll offsets when custom_properties.program is present
+    as a dict), nested the same way search_epg_programs' own results are, so
+    _episode_identity_key produces the same key whether it's reading a fresh
+    search result or an already-created Recording."""
+    props = program.get("custom_properties") or {}
+    client = DispatcharrClient(connection["url"], connection["token"])
+    body = {
+        "channel": channel_id,
+        "start_time": program["start_time"],
+        "end_time": program["end_time"],
+        "custom_properties": {
+            "program": {
+                "tvg_id": program.get("tvg_id"),
+                "title": program.get("title"),
+                "sub_title": program.get("sub_title"),
+                "start_time": program["start_time"],
+                "end_time": program["end_time"],
+                "custom_properties": {
+                    "season": props.get("season"),
+                    "episode": props.get("episode"),
+                    "onscreen_episode": props.get("onscreen_episode"),
+                },
+            },
+        },
+    }
+    return await client.post("/api/channels/recordings/", body)
+
+
+async def delete_recording(connection: dict, recording_id: int) -> None:
+    client = DispatcharrClient(connection["url"], connection["token"])
+    await client.delete(f"/api/channels/recordings/{recording_id}/")
+
+
+async def schedule_channel_recordings(
+    connection: dict, channel_id: int, title: str, mode: str = "all", limit: int = 50,
+) -> dict:
+    """Replaces Dispatcharr's own Series Rules feature entirely -- searches
+    this one channel's own real EPG (search_epg_programs, channel-scoped,
+    confirmed correct) for upcoming airings of title, and directly creates a
+    Recording (create_recording, above) for each one not already scheduled
+    from a previous call. Safe to call repeatedly -- e.g. from a periodic
+    background scan, since Dispatcharr's own recurring series-rules
+    re-evaluation is what's being bypassed here, so VOD Manager now owns
+    rediscovering newly-visible episodes as the EPG horizon rolls forward.
+    Already-scheduled airings are skipped via _episode_identity_key
+    (compared against every existing Recording on this same channel, not
+    just ones VOD Manager itself created), not re-created.
+
+    mode="new" mirrors Dispatcharr's own series-rules "new episodes only"
+    semantics -- only programs whose own EPG data marks custom_properties.
+    new truthy are considered, the same field _evaluate_series_rules_locked
+    checks (apps/channels/tasks.py, dispatch-test v0.28.2)."""
+    matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id)
+    if mode == "new":
+        matches = [m for m in matches if (m.get("custom_properties") or {}).get("new")]
+
+    existing = await _list_all_recordings(connection)
+    existing_keys = {
+        _episode_identity_key((r.get("custom_properties") or {}).get("program") or {})
+        for r in existing
+        if r.get("channel") == channel_id
+    }
+
+    created, skipped = [], 0
+    for program in matches:
+        key = _episode_identity_key(program)
+        if key in existing_keys:
+            skipped += 1
+            continue
+        try:
+            recording = await create_recording(connection, channel_id, program)
+        except Exception as exc:
+            logger.warning(
+                "[dispatcharr_dvr_client] schedule_channel_recordings: failed to create recording for %r at %s: %s",
+                title, program.get("start_time"), exc,
+            )
+            continue
+        existing_keys.add(key)
+        created.append(recording)
+
+    return {"total_matches": len(matches), "scheduled": len(created), "skipped_existing": skipped, "created": created}
 
 
 async def list_channel_profiles(connection: dict) -> list[dict]:

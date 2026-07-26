@@ -234,13 +234,15 @@ def init_db() -> None:
             UNIQUE(content_type, signature)
         );
 
-        -- Phase 2 DVR scheduling. Field names (tvg_id/title/title_mode/
-        -- description/description_mode/mode/channel_id) match Dispatcharr's
-        -- own SeriesRuleRequest API body exactly (confirmed via its OpenAPI
-        -- schema, dispatch-test v0.27.2, 2026-07-26) so create_series_rule
-        -- passes them straight through with zero translation. tvg_id blank
-        -- means match across all EPG channels, same as leaving it blank in
-        -- Dispatcharr's own "Customize rule..." UI.
+        -- Phase 2 DVR scheduling. channel_id is required for a new profile
+        -- (see vod_routes.create_recording_profile) -- scheduling goes
+        -- through dispatcharr_dvr_client.schedule_channel_recordings
+        -- (channel-scoped EPG search + a direct Recording per airing), not
+        -- Dispatcharr's own Series Rules feature, which is confirmed broken
+        -- for channel-scoped matching (dispatch-test v0.27.2 and v0.28.2,
+        -- 2026-07-26). tvg_id is still stored -- unused for scheduling now,
+        -- but still the key match_recording_profiles uses to route a
+        -- completed recording back to the profile(s) that scheduled it.
         CREATE TABLE IF NOT EXISTS dvr_recording_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -607,10 +609,8 @@ def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str
 
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
 # Per-person/per-schedule routing on top of a DVR provider's own default
-# categories -- see dispatcharr_dvr_client.create_series_rule and
-# dispatcharr_dvr_importer's profile-matching pass. Field names deliberately
-# mirror Dispatcharr's own SeriesRuleRequest body exactly (see the schema
-# comment on the table itself).
+# categories -- see dispatcharr_dvr_client.schedule_channel_recordings and
+# dispatcharr_dvr_importer's profile-matching pass.
 
 def create_recording_profile(
     provider_id: int, label: str, title: str,
@@ -702,29 +702,6 @@ def match_recording_profiles(provider_id: int, title: str, tvg_id: str | None) -
     conn.close()
     candidates = [dict(r) for r in rows]
     return [c for c in candidates if not c["tvg_id"] or c["tvg_id"] == tvg_id]
-
-
-def find_recording_profile_by_rule_key(provider_id: int, title: str, tvg_id: str | None) -> dict | None:
-    """Dispatcharr identifies a series rule purely by (title, tvg_id) -- no
-    synthetic id -- so two profiles sharing that exact pair wouldn't create
-    two independent Dispatcharr-side rules; the second create_series_rule
-    call would just silently re-save (and potentially alter the mode/
-    description/channel of) the first one. Used by create_recording_profile
-    to block that collision before it happens, rather than let the second
-    creator quietly steal the first one's rule."""
-    conn = _connect()
-    if tvg_id:
-        row = conn.execute(
-            "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=? AND tvg_id=?",
-            (provider_id, title, tvg_id),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=? AND (tvg_id IS NULL OR tvg_id='')",
-            (provider_id, title),
-        ).fetchone()
-    conn.close()
-    return dict(row) if row else None
 
 
 # ── DVR per-person resource limits ──────────────────────────────────────────

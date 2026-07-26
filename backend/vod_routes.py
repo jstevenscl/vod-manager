@@ -162,6 +162,7 @@ class RecordingProfileRequest(BaseModel):
 class RecordingProfilePreviewRequest(BaseModel):
     provider_id: int
     title: str
+    channel_id: Optional[int] = None
     tvg_id: Optional[str] = None
     title_mode: str = "exact"
     description: Optional[str] = None
@@ -912,7 +913,7 @@ async def import_provider_catalog(provider_id: int):
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
 # Per-person/per-schedule routing on top of a DVR provider's own default
 # categories -- see vod_db.match_recording_profiles and
-# dispatcharr_dvr_client.create_series_rule.
+# dispatcharr_dvr_client.schedule_channel_recordings.
 
 def _require_dvr_connection(provider_id: int) -> tuple[dict, dict]:
     provider = vod_db.get_provider(provider_id)
@@ -998,22 +999,30 @@ async def _predict_stream_conflict(
         if p.get("dispatcharr_user_id") == dispatcharr_user_id
     ]
     rule_specs = [candidate] + [
-        {"title": p["title"], "tvg_id": p["tvg_id"], "title_mode": p["title_mode"],
-         "description": p["description"], "description_mode": p["description_mode"]}
+        {"title": p["title"], "channel_id": p["channel_id"]}
         for p in other_profiles
     ]
 
+    # search_epg_programs, channel-scoped, not preview_series_rule -- see
+    # dispatcharr_dvr_client.create_recording's docstring for why Series
+    # Rules' own preview endpoint is confirmed unreliable for a channel-
+    # scoped rule (can silently return 0 matches for a real, currently-
+    # airing program). A spec with no channel_id can't be scoped safely
+    # either way, so it's skipped rather than searched unscoped -- an
+    # unscoped search would pull in every affiliate/feed carrying the title,
+    # wildly overcounting this person's real simultaneous-recording risk.
     intervals: list[tuple[datetime, datetime]] = []
     for spec in rule_specs:
+        if not spec.get("channel_id"):
+            continue
         try:
-            preview = await dispatcharr_dvr_client.preview_series_rule(
-                connection, spec["title"], spec.get("tvg_id"), spec.get("title_mode", "exact"),
-                spec.get("description"), spec.get("description_mode", "contains"), limit=100,
+            matches = await dispatcharr_dvr_client.search_epg_programs(
+                connection, spec["title"], limit=100, channel_id=spec["channel_id"],
             )
         except Exception as exc:
-            logger.warning("[vod_routes] _predict_stream_conflict: preview failed for %r: %s", spec["title"], exc)
+            logger.warning("[vod_routes] _predict_stream_conflict: search failed for %r: %s", spec["title"], exc)
             continue
-        for match in preview.get("matches", []):
+        for match in matches:
             start = _parse_epg_datetime(match.get("start_time"))
             end = _parse_epg_datetime(match.get("end_time"))
             if start and end:
@@ -1038,65 +1047,74 @@ async def list_recording_profiles(provider_id: Optional[int] = None):
 
 @router.post("/dvr-recording-profiles/preview/", dependencies=_GUARDS)
 async def preview_recording_profile(body: RecordingProfilePreviewRequest):
-    """What Dispatcharr's own EPG currently says this rule would match,
-    without saving anything -- same live preview Dispatcharr's own
-    "Customize rule..." UI shows, confirmed live against a real instance."""
+    """What this profile would actually schedule, without saving anything --
+    search_epg_programs, channel-scoped when channel_id is given, not
+    Dispatcharr's own Series Rules preview endpoint. See
+    dispatcharr_dvr_client.create_recording's docstring for why that
+    endpoint is confirmed unreliable for a channel-scoped rule (can report 0
+    matches for a program that's really airing right now); this preview
+    needs to show the same thing create_recording_profile will actually do,
+    or it isn't a preview of anything real."""
     _, connection = _require_dvr_connection(body.provider_id)
     try:
-        return await dispatcharr_dvr_client.preview_series_rule(
-            connection, body.title, body.tvg_id, body.title_mode, body.description, body.description_mode,
+        matches = await dispatcharr_dvr_client.search_epg_programs(
+            connection, body.title, limit=100, channel_id=body.channel_id,
         )
     except Exception as exc:
         raise HTTPException(502, detail=str(exc))
+    return {"matches": matches, "total": len(matches)}
 
 
 @router.post("/dvr-recording-profiles/", dependencies=_GUARDS)
 async def create_recording_profile(body: RecordingProfileRequest):
-    """Creates the real Series Rule on Dispatcharr FIRST -- only saves the
-    local profile row once that succeeds, so a failed remote call never
-    leaves a dangling profile pointing at a rule that doesn't actually
-    exist.
+    """Schedules real Dispatcharr Recordings for this profile FIRST -- only
+    saves the local profile row once that succeeds, so a failed remote call
+    never leaves a dangling profile pointing at nothing.
 
-    Blocks an exact (title, tvg_id) collision with an existing profile --
-    Dispatcharr identifies a series rule purely by that pair (no synthetic
-    id), so a second create_series_rule call for the same pair wouldn't add
-    a second independent rule, it would silently re-save (and potentially
-    alter the mode/description/channel of) the first one. Two profiles for
-    the same title are still fine as long as they're scoped to different
-    channels (or one is channel-agnostic and the other isn't) -- see
-    vod_db.match_recording_profiles' fan-out docstring for why both are
-    allowed to route the one resulting recording into their own categories.
+    channel_id is required, not optional, despite being an Optional field on
+    the request/DB schema for backward compatibility with pre-existing rows.
+    A blank-channel profile is exactly the original bug report this
+    redesign exists to fix: matching a title with no channel scope pulls in
+    every affiliate/feed carrying it, producing a separate duplicate
+    recording per channel (confirmed live, multiple times, this session).
+    See dispatcharr_dvr_client.schedule_channel_recordings/create_recording
+    for the channel-scoped approach that replaces Dispatcharr's own Series
+    Rules feature (confirmed broken for channel-scoped matching on both
+    v0.27.2 and v0.28.2) entirely.
+
+    No collision guard against a duplicate (title, channel_id) profile
+    anymore -- schedule_channel_recordings is naturally idempotent (it skips
+    any airing already scheduled, see _episode_identity_key), so a second
+    profile for the same show+channel just means a second person wants it,
+    which vod_db.match_recording_profiles' fan-out already handles by
+    design, not a collision to block.
 
     If dispatcharr_user_id is set AND that person has a dvr_user_limits row,
     also runs a best-effort prediction (_predict_stream_conflict) of whether
     this profile could push their simultaneous-recordings count past their
     assigned Dispatcharr stream budget, before ever touching Dispatcharr --
     opt-in and predictive only, see that function's docstring for why."""
-    existing = vod_db.find_recording_profile_by_rule_key(body.provider_id, body.title, body.tvg_id)
-    if existing:
+    if not body.channel_id:
         raise HTTPException(
-            409,
-            detail=f"A profile for this exact title/channel already exists ('{existing['label']}'). Dispatcharr "
-                   "identifies recording rules by title + channel alone, so a second profile here would silently "
-                   "take over the same rule instead of creating an independent one. Delete the existing profile "
-                   "first if you want to replace it, or pick a specific channel to distinguish this one.",
+            400,
+            detail="A specific channel is required. Search the EPG and pick the exact airing/channel you want "
+                   "recorded -- matching a title with no channel scope records every affiliate carrying it as a "
+                   "separate duplicate.",
         )
     _, connection = _require_dvr_connection(body.provider_id)
     if body.dispatcharr_user_id:
         conflict = await _predict_stream_conflict(
             body.provider_id, connection, body.dispatcharr_user_id,
-            {"title": body.title, "tvg_id": body.tvg_id, "title_mode": body.title_mode,
-             "description": body.description, "description_mode": body.description_mode},
+            {"title": body.title, "channel_id": body.channel_id},
         )
         if conflict:
             raise HTTPException(409, detail=conflict)
     try:
-        evaluate_result = await dispatcharr_dvr_client.create_series_rule(
-            connection, body.title, body.tvg_id, body.title_mode,
-            body.description, body.description_mode, body.mode, body.channel_id,
+        schedule_result = await dispatcharr_dvr_client.schedule_channel_recordings(
+            connection, body.channel_id, body.title, body.mode,
         )
     except Exception as exc:
-        raise HTTPException(502, detail=f"Dispatcharr rejected the rule: {exc}")
+        raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
     profile_id = vod_db.create_recording_profile(
         body.provider_id, body.label, body.title, body.tvg_id, body.title_mode,
         body.description, body.description_mode, body.mode, body.channel_id,
@@ -1104,34 +1122,56 @@ async def create_recording_profile(body: RecordingProfileRequest):
         body.dispatcharr_user_id,
     )
     profile = vod_db.get_recording_profile(profile_id)
-    # Surface whether this rule actually scheduled anything just now, rather
-    # than reporting bare success either way -- confirmed live a channel-
-    # scoped rule can save fine and still schedule 0 (e.g. a dead/ambiguous
-    # tvg_id-to-channel mapping on Dispatcharr's own side, or a genuinely
-    # empty "new episodes only" match right now), with no error unless this
-    # is checked. scheduled_now/schedule_details aren't persisted -- purely
-    # informational for this one response.
-    profile["scheduled_now"] = evaluate_result.get("scheduled", 0)
-    profile["schedule_details"] = evaluate_result.get("details", [])
+    # Surface whether this actually scheduled anything just now, rather than
+    # reporting bare success either way -- a channel-scoped search can
+    # legitimately find 0 (e.g. a "new episodes only" profile with nothing
+    # new airing right now, or a show genuinely on hiatus), which is worth
+    # showing the admin rather than silently implying it worked identically
+    # either way. Not persisted -- purely informational for this response.
+    profile["scheduled_now"] = schedule_result.get("scheduled", 0)
+    profile["total_matches"] = schedule_result.get("total_matches", 0)
     return profile
 
 
 @router.delete("/dvr-recording-profiles/{profile_id}/", dependencies=_GUARDS)
 async def delete_recording_profile(profile_id: int):
-    """Removing a profile also removes the real Dispatcharr rule it created
-    -- best-effort: if the remote call fails (connection gone, rule already
-    removed on Dispatcharr's side, etc.) the local profile is still deleted,
-    since the user's clear intent here is "get rid of this," not to be
-    blocked by a remote cleanup failure."""
+    """Removing a profile also cancels the real Dispatcharr Recordings it
+    scheduled -- best-effort: if the remote call fails (connection gone,
+    etc.) the local profile is still deleted, since the user's clear intent
+    here is "get rid of this," not to be blocked by a remote cleanup
+    failure. There's no single Series Rule resource to delete anymore (see
+    create_recording_profile) -- instead this finds this profile's own
+    still-future, not-yet-started Recordings on its channel by matching
+    custom_properties.program.title (the same shape create_recording writes)
+    and removes each one individually. Already-completed recordings are
+    left alone -- deleting a profile shouldn't touch content already in the
+    VOD pool."""
     profile = vod_db.get_recording_profile(profile_id)
     if not profile:
         raise HTTPException(404, detail="recording profile not found")
-    try:
-        _, connection = _require_dvr_connection(profile["provider_id"])
-        await dispatcharr_dvr_client.delete_series_rule(connection, profile["title"], profile.get("tvg_id"))
-    except Exception as exc:
-        logger.warning("[vod_routes] delete_recording_profile(%s): failed to remove the Dispatcharr-side rule: %s",
-                        profile_id, exc)
+    if profile.get("channel_id"):
+        try:
+            _, connection = _require_dvr_connection(profile["provider_id"])
+            upcoming = await dispatcharr_dvr_client.list_scheduled_recordings(connection)
+            now = datetime.now(timezone.utc)
+            target_title = (profile["title"] or "").strip().lower()
+            for r in upcoming:
+                if r.get("channel") != profile["channel_id"]:
+                    continue
+                program = (r.get("custom_properties") or {}).get("program") or {}
+                if (program.get("title") or "").strip().lower() != target_title:
+                    continue
+                start = _parse_epg_datetime(r.get("start_time"))
+                if start and start <= now:
+                    continue  # already aired/recording -- leave it alone
+                try:
+                    await dispatcharr_dvr_client.delete_recording(connection, r["id"])
+                except Exception as exc:
+                    logger.warning("[vod_routes] delete_recording_profile(%s): failed to remove recording %s: %s",
+                                    profile_id, r.get("id"), exc)
+        except Exception as exc:
+            logger.warning("[vod_routes] delete_recording_profile(%s): failed to clean up Dispatcharr recordings: %s",
+                            profile_id, exc)
     vod_db.delete_recording_profile(profile_id)
     return {"ok": True}
 
@@ -1155,8 +1195,8 @@ async def search_epg_programs(provider_id: int, title: str):
     -- powers the recording-profile form's channel picker so a user selects
     a specific real (title, tvg_id, channel_id) combination instead of
     typing a bare title and leaving channel as an easy-to-skip afterthought.
-    See dispatcharr_dvr_client.search_epg_programs and create_series_rule's
-    docstring for why a specific channel_id (not just tvg_id) matters."""
+    See dispatcharr_dvr_client.create_recording's docstring for why a
+    specific channel_id (not just tvg_id) matters."""
     if not title.strip():
         raise HTTPException(400, detail="title is required")
     _, connection = _require_dvr_connection(provider_id)

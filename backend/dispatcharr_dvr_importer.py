@@ -390,3 +390,52 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
         "downloaded": downloaded,
         "download_errors": download_errors,
     }
+
+
+async def rescan_recording_profiles(provider_id: int) -> dict:
+    """Re-runs every channel-scoped recording profile's own EPG search and
+    schedules any newly-visible episode as a real Recording -- see
+    dispatcharr_dvr_client.schedule_channel_recordings. This is VOD
+    Manager's own replacement for Dispatcharr's recurring series-rules
+    re-evaluation (confirmed broken for channel-scoped matching, see
+    schedule_channel_recordings' docstring) -- new episodes only enter
+    Dispatcharr's 7-day EPG search horizon as time passes, so something has
+    to periodically re-check for them; called from main.py's
+    _dispatcharr_dvr_poller loop on the same cadence as the completed-
+    recordings import, since both are "did anything change on Dispatcharr's
+    side" checks for the same provider.
+
+    Profiles with no channel_id are skipped entirely -- see
+    vod_routes.create_recording_profile for why a channel is required for
+    every new profile; a pre-existing row without one (from before this
+    redesign) has nothing safe to re-scan against and is left alone rather
+    than guessed at."""
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise ValueError(f"provider {provider_id} not found")
+    if not provider.get("dispatcharr_connection_id"):
+        raise ValueError(f"provider {provider_id} has no linked Dispatcharr connection configured")
+    connection = vod_db.get_dispatcharr_connection(provider["dispatcharr_connection_id"])
+    if not connection:
+        raise ValueError(f"provider {provider_id}'s linked Dispatcharr connection no longer exists")
+
+    profiles = [p for p in vod_db.list_recording_profiles(provider_id) if p.get("channel_id")]
+    scheduled_total = 0
+    results = []
+    for profile in profiles:
+        try:
+            result = await dispatcharr_dvr_client.schedule_channel_recordings(
+                connection, profile["channel_id"], profile["title"], profile.get("mode", "all"),
+            )
+        except Exception as exc:
+            logger.warning("[dispatcharr_dvr_importer] rescan_recording_profiles: profile=%r failed: %s",
+                            profile["label"], exc)
+            continue
+        scheduled_total += result["scheduled"]
+        if result["scheduled"]:
+            results.append({"profile": profile["label"], **result})
+
+    if results:
+        logger.info("[dispatcharr_dvr_importer] provider=%s rescanned %d profile(s), %d new recording(s) scheduled: %s",
+                     provider["name"], len(profiles), scheduled_total, results)
+    return {"profiles_scanned": len(profiles), "scheduled": scheduled_total, "details": results}
