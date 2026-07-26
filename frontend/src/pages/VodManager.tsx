@@ -31,6 +31,22 @@ interface Provider {
   dvr_series_category_id: number | null
 }
 
+interface RecordingProfile {
+  id: number
+  provider_id: number
+  label: string
+  tvg_id: string | null
+  title: string
+  title_mode: 'exact' | 'contains' | 'search' | 'regex'
+  description: string | null
+  description_mode: 'contains' | 'search' | 'regex'
+  mode: 'all' | 'new'
+  channel_id: number | null
+  target_movie_category_id: number | null
+  target_series_category_id: number | null
+  created_at: string
+}
+
 interface DispatcharrConnection {
   id: number
   label: string
@@ -3153,6 +3169,60 @@ export default function VodManager() {
     },
     onError: (e: any) => setExcludeCategoriesError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
   })
+  // ── DVR recording profiles (Phase 2) ──
+  const [recordingProfilesProviderId, setRecordingProfilesProviderId] = useState<number | null>(null)
+  const recordingProfilesQuery = useQuery<RecordingProfile[]>({
+    queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId],
+    queryFn:  () => api.get('/vod/dvr-recording-profiles/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled:  recordingProfilesProviderId != null,
+  })
+  const blankRecordingProfileForm = {
+    label: '', title: '', mode: 'all' as 'all' | 'new',
+    target_movie_category_id: '', target_series_category_id: '',
+    advancedOpen: false, tvg_id: '', title_mode: 'exact' as 'exact' | 'contains' | 'search' | 'regex',
+    description: '', description_mode: 'contains' as 'contains' | 'search' | 'regex', channel_id: '',
+  }
+  const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
+  const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
+  const [recordingProfilePreview, setRecordingProfilePreview] = useState<{ matches: any[]; total: number; epg_found: boolean; warn: boolean } | null>(null)
+  const previewRecordingProfile = useMutation({
+    mutationFn: () => api.post('/vod/dvr-recording-profiles/preview/', {
+      provider_id: recordingProfilesProviderId,
+      title: recordingProfileForm.title,
+      tvg_id: recordingProfileForm.tvg_id.trim() || null,
+      title_mode: recordingProfileForm.title_mode,
+      description: recordingProfileForm.description.trim() || null,
+      description_mode: recordingProfileForm.description_mode,
+    }).then((r) => r.data),
+    onSuccess: (data) => { setRecordingProfilePreview(data); setRecordingProfileError(null) },
+    onError:   (e: any) => setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Preview failed.'),
+  })
+  const addRecordingProfile = useMutation({
+    mutationFn: () => api.post('/vod/dvr-recording-profiles/', {
+      provider_id: recordingProfilesProviderId,
+      label: recordingProfileForm.label.trim() || recordingProfileForm.title,
+      title: recordingProfileForm.title,
+      tvg_id: recordingProfileForm.tvg_id.trim() || null,
+      title_mode: recordingProfileForm.title_mode,
+      description: recordingProfileForm.description.trim() || null,
+      description_mode: recordingProfileForm.description_mode,
+      mode: recordingProfileForm.mode,
+      channel_id: recordingProfileForm.channel_id ? Number(recordingProfileForm.channel_id) : null,
+      target_movie_category_id: recordingProfileForm.target_movie_category_id ? Number(recordingProfileForm.target_movie_category_id) : null,
+      target_series_category_id: recordingProfileForm.target_series_category_id ? Number(recordingProfileForm.target_series_category_id) : null,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] })
+      setRecordingProfileForm(blankRecordingProfileForm)
+      setRecordingProfilePreview(null)
+      setRecordingProfileError(null)
+    },
+    onError: (e: any) => setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
+  })
+  const deleteRecordingProfile = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/dvr-recording-profiles/${id}/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] }),
+  })
   const [expandedLiveAccountsProviderId, setExpandedLiveAccountsProviderId] = useState<number | null>(null)
   const providerLiveAccountsQuery = useQuery<ProviderLiveAccount[]>({
     queryKey: ['vod-provider-live-accounts', expandedLiveAccountsProviderId],
@@ -4464,6 +4534,20 @@ export default function VodManager() {
                   >
                     Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
                   </Button>
+                  {p.provider_type === 'dispatcharr_dvr' && (
+                    <Button
+                      size="sm" variant="outline"
+                      title="Per-schedule recording rules that route their completed recordings into their own categories, on top of this provider's default"
+                      onClick={() => {
+                        setRecordingProfilesProviderId(p.id)
+                        setRecordingProfileForm(blankRecordingProfileForm)
+                        setRecordingProfilePreview(null)
+                        setRecordingProfileError(null)
+                      }}
+                    >
+                      Recording Profiles
+                    </Button>
+                  )}
                   <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
@@ -4798,6 +4882,184 @@ export default function VodManager() {
         </Modal>
         )
       })()}
+
+      {recordingProfilesProviderId != null && (
+        <Modal onClose={() => setRecordingProfilesProviderId(null)} maxWidth="max-w-lg">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">
+              Recording Profiles — {providersQuery.data?.find((p) => p.id === recordingProfilesProviderId)?.name}
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Each profile creates a real recurring rule on Dispatcharr for a specific show. When one of its
+              recordings finishes, it's routed into the categories below instead of this provider's own default.
+            </p>
+
+            <div className="space-y-1.5">
+              {recordingProfilesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
+                <p className="text-xs text-muted-foreground">No recording profiles yet.</p>
+              )}
+              {recordingProfilesQuery.data?.map((rp) => (
+                <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                  <span className="flex-1">
+                    <span className="font-medium">{rp.label}</span>{' '}
+                    <span className="text-muted-foreground">
+                      — "{rp.title}" ({rp.title_mode}), {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
+                      {rp.tvg_id ? `, channel ${rp.tvg_id}` : ''}
+                      {' → '}
+                      {[
+                        movieCategories.find((c) => c.id === rp.target_movie_category_id)?.name,
+                        seriesCategories.find((c) => c.id === rp.target_series_category_id)?.name,
+                      ].filter(Boolean).join(' / ') || 'no category set'}
+                    </span>
+                  </span>
+                  <button
+                    title="Delete this recording profile (also removes the rule from Dispatcharr)"
+                    className="text-muted-foreground hover:text-destructive p-1"
+                    onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also removes the rule from Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="border-t border-border pt-3 space-y-1.5">
+              <p className="text-xs font-medium">Add a profile</p>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <input
+                  className={inputCls('flex-1 min-w-[8rem]')}
+                  placeholder="Label (e.g. Bob's Seinfeld)"
+                  value={recordingProfileForm.label}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, label: e.target.value })}
+                />
+                <input
+                  className={inputCls('flex-1 min-w-[8rem]')}
+                  placeholder="Show title (exact match, as it appears in the guide)"
+                  value={recordingProfileForm.title}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, title: e.target.value })}
+                />
+                <select
+                  className={inputCls()}
+                  value={recordingProfileForm.mode}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, mode: e.target.value as 'all' | 'new' })}
+                  title="All episodes vs. new episodes only"
+                >
+                  <option value="all">All episodes</option>
+                  <option value="new">New episodes only</option>
+                </select>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <select
+                  className={inputCls()}
+                  value={recordingProfileForm.target_movie_category_id}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_movie_category_id: e.target.value })}
+                  title="If a matching recording is classified as a movie, place it here"
+                >
+                  <option value="">Movie category (optional)…</option>
+                  {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <select
+                  className={inputCls()}
+                  value={recordingProfileForm.target_series_category_id}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_series_category_id: e.target.value })}
+                  title="If a matching recording is classified as a TV series, place its series here"
+                >
+                  <option value="">TV category (optional)…</option>
+                  {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </div>
+
+              <button
+                className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => setRecordingProfileForm({ ...recordingProfileForm, advancedOpen: !recordingProfileForm.advancedOpen })}
+              >
+                {recordingProfileForm.advancedOpen ? '▾' : '▸'} Advanced options
+              </button>
+              {recordingProfileForm.advancedOpen && (
+                <div className="flex flex-wrap items-center gap-1.5 pl-3 border-l-2 border-border">
+                  <select
+                    className={inputCls()}
+                    value={recordingProfileForm.title_mode}
+                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, title_mode: e.target.value as any })}
+                    title="How the title above is matched against the guide"
+                  >
+                    <option value="exact">Title: exact</option>
+                    <option value="contains">Title: contains</option>
+                    <option value="search">Title: search</option>
+                    <option value="regex">Title: regex</option>
+                  </select>
+                  <input
+                    className={inputCls('w-32')}
+                    placeholder="EPG channel id (tvg_id, optional)"
+                    value={recordingProfileForm.tvg_id}
+                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, tvg_id: e.target.value })}
+                    title="Restrict matches to this EPG channel only -- blank matches across every channel"
+                  />
+                  <input
+                    className={inputCls('w-16')}
+                    type="number"
+                    placeholder="channel id"
+                    value={recordingProfileForm.channel_id}
+                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, channel_id: e.target.value })}
+                    title="Pin the recording to this Dispatcharr channel -- otherwise Dispatcharr picks its own default"
+                  />
+                  <input
+                    className={inputCls('flex-1 min-w-[8rem]')}
+                    placeholder="Description filter (optional)"
+                    value={recordingProfileForm.description}
+                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, description: e.target.value })}
+                  />
+                  <select
+                    className={inputCls()}
+                    value={recordingProfileForm.description_mode}
+                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, description_mode: e.target.value as any })}
+                  >
+                    <option value="contains">Description: contains</option>
+                    <option value="search">Description: search</option>
+                    <option value="regex">Description: regex</option>
+                  </select>
+                </div>
+              )}
+
+              <div className="flex items-center gap-1.5 pt-1">
+                <Button
+                  size="sm" variant="outline"
+                  disabled={!recordingProfileForm.title.trim() || previewRecordingProfile.isPending}
+                  onClick={() => previewRecordingProfile.mutate()}
+                >
+                  {previewRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Preview matches'}
+                </Button>
+                {recordingProfilePreview && (
+                  <span className="text-[10px] text-muted-foreground">
+                    {recordingProfilePreview.epg_found
+                      ? `${recordingProfilePreview.total} upcoming match${recordingProfilePreview.total === 1 ? '' : 'es'}`
+                      : 'No EPG data found for this title'}
+                  </span>
+                )}
+              </div>
+              {recordingProfilePreview && !!recordingProfilePreview.matches?.length && (
+                <ul className="text-[10px] text-muted-foreground list-disc pl-4 max-h-24 overflow-y-auto">
+                  {recordingProfilePreview.matches.slice(0, 8).map((m, i) => (
+                    <li key={i}>{m.title ?? m.sub_title ?? m.name ?? JSON.stringify(m)}</li>
+                  ))}
+                </ul>
+              )}
+
+              {recordingProfileError && <p className="text-xs text-destructive">{recordingProfileError}</p>}
+              <div className="flex justify-end gap-2 pt-1">
+                <Button
+                  size="sm"
+                  disabled={!recordingProfileForm.title.trim() || addRecordingProfile.isPending}
+                  onClick={() => addRecordingProfile.mutate()}
+                >
+                  {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
