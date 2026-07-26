@@ -1175,6 +1175,20 @@ async def delete_dvr_user_limit(limit_id: int):
     return {"ok": True}
 
 
+@router.get("/dvr-user-limits/{limit_id}/usage/", dependencies=_GUARDS)
+async def get_dvr_user_limit_usage(limit_id: int):
+    """Current disk usage for this person -- sum of file_size_bytes across
+    whatever's actually sitting in the categories their profiles target
+    (vod_db.dvr_user_disk_usage_bytes), computed live so it always reflects
+    the current pool state rather than a cached counter that could drift."""
+    limits = [lim for lim in vod_db.list_dvr_user_limits() if lim["id"] == limit_id]
+    if not limits:
+        raise HTTPException(404, detail="DVR limit not found")
+    limit_row = limits[0]
+    usage = vod_db.dvr_user_disk_usage_bytes(limit_row["provider_id"], limit_row["dispatcharr_user_id"])
+    return {"usage_bytes": usage}
+
+
 # ── Categories ───────────────────────────────────────────────────────────────
 
 @router.get("/categories/", dependencies=_GUARDS)

@@ -438,6 +438,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "local_file_path", "TEXT"),
         ("episode_sources", "local_file_path", "TEXT"),
         ("dvr_recording_profiles", "dispatcharr_user_id", "INTEGER"),
+        ("movie_sources", "file_size_bytes", "INTEGER"),
+        ("episode_sources", "file_size_bytes", "INTEGER"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -785,6 +787,48 @@ def delete_dvr_user_limit(limit_id: int) -> None:
     conn.execute("DELETE FROM dvr_user_limits WHERE id=?", (limit_id,))
     _commit_with_retry(conn)
     conn.close()
+
+
+def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> int:
+    """A person's disk usage = sum of file_size_bytes for every movie/episode
+    currently placed in any category that any of their profiles targets --
+    deliberately reuses movie_category_placements/series_category_placements
+    (the same tables Manage Categories/TMDB Lists already read) instead of a
+    separate placement-audit table, so usage is directly auditable: whatever
+    an admin sees sitting in this person's category is exactly what's being
+    summed. Per the fan-out design (c8c6139) and the user's own explicit
+    call, a recording shared with someone else's profile still counts in
+    full here -- no splitting."""
+    conn = _connect()
+    profiles = conn.execute(
+        "SELECT target_movie_category_id, target_series_category_id FROM dvr_recording_profiles "
+        "WHERE provider_id=? AND dispatcharr_user_id=?",
+        (provider_id, dispatcharr_user_id),
+    ).fetchall()
+    movie_cat_ids = {p["target_movie_category_id"] for p in profiles if p["target_movie_category_id"]}
+    series_cat_ids = {p["target_series_category_id"] for p in profiles if p["target_series_category_id"]}
+    total = 0
+    if movie_cat_ids:
+        placeholders = ",".join("?" * len(movie_cat_ids))
+        row = conn.execute(
+            f"""SELECT COALESCE(SUM(ms.file_size_bytes), 0) AS total FROM movie_category_placements mcp
+                JOIN movie_sources ms ON ms.movie_id = mcp.movie_id
+                WHERE mcp.category_id IN ({placeholders})""",
+            tuple(movie_cat_ids),
+        ).fetchone()
+        total += row["total"]
+    if series_cat_ids:
+        placeholders = ",".join("?" * len(series_cat_ids))
+        row = conn.execute(
+            f"""SELECT COALESCE(SUM(es.file_size_bytes), 0) AS total FROM series_category_placements scp
+                JOIN episodes e ON e.series_id = scp.series_id
+                JOIN episode_sources es ON es.episode_id = e.id
+                WHERE scp.category_id IN ({placeholders})""",
+            tuple(series_cat_ids),
+        ).fetchone()
+        total += row["total"]
+    conn.close()
+    return total
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:
@@ -3507,11 +3551,12 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                         did_create = True
                         did_flag = True
                     conn.execute(
-                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-                           VALUES (?,?,?,?,?,?,?)
+                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
+                           VALUES (?,?,?,?,?,?,?,?)
                            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
+                               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key,
+                               file_size_bytes=excluded.file_size_bytes""",
+                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), item.get("file_size_bytes"), now, now),
                     )
                     created += did_create
                     matched += did_match
@@ -3555,11 +3600,12 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                     movie_id = cur.lastrowid
                     did_create = True
                 conn.execute(
-                    """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-                       VALUES (?,?,?,?,?,?,?)
+                    """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
+                       VALUES (?,?,?,?,?,?,?,?)
                        ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                           movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-                    (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), now, now),
+                           movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key,
+                           file_size_bytes=excluded.file_size_bytes""",
+                    (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), item.get("file_size_bytes"), now, now),
                 )
                 created += did_create
                 matched += did_match
@@ -3695,11 +3741,12 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                 )
                                 episode_id = cur.lastrowid
                             conn.execute(
-                                """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, added_at, last_seen_at)
-                                   VALUES (?,?,?,?,?,?,?)
+                                """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
+                                   VALUES (?,?,?,?,?,?,?,?)
                                    ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                                       episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key""",
-                                (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), now, now),
+                                       episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key,
+                                       file_size_bytes=excluded.file_size_bytes""",
+                                (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), ep.get("file_size_bytes"), now, now),
                             )
                             episodes_total += 1
                     except Exception as exc:

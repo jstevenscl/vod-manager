@@ -286,6 +286,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 "name": program.get("sub_title") or f"Episode {episode_number}",
                 "description": program.get("description"), "duration_secs": None,
                 "provider_stream_id": recording_id, "container_extension": container_extension,
+                "file_size_bytes": file_info.get("bytes_written"),
             })
         else:
             movie_items.append({
@@ -293,7 +294,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 "container_extension": container_extension,
                 "description": program.get("description"),
                 "genre": None, "director": None, "cast_list": None, "poster_url": program.get("poster_url"),
-                "last_enriched_at": None,
+                "last_enriched_at": None, "file_size_bytes": file_info.get("bytes_written"),
             })
 
     # TMDB enrichment pass -- one search per distinct title, not per
@@ -320,20 +321,43 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
     series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
 
+    # Disk quota (opt-in, same dvr_user_limits row Part 1's stream check
+    # uses): a person at/over their disk_quota_bytes has NEW category
+    # placements withheld from this point forward -- existing placements and
+    # the underlying imported file are never touched/deleted, only further
+    # growth attributable to them is blocked. Computed once per import pass
+    # (not per recording) since it only needs to reflect state as of the
+    # start of this pass.
+    over_quota_user_ids: set[int] = set()
+    for limit_row in vod_db.list_dvr_user_limits(provider_id):
+        if limit_row.get("disk_quota_bytes") is None:
+            continue
+        usage = vod_db.dvr_user_disk_usage_bytes(provider_id, limit_row["dispatcharr_user_id"])
+        if usage >= limit_row["disk_quota_bytes"]:
+            over_quota_user_ids.add(limit_row["dispatcharr_user_id"])
+            logger.info("[dispatcharr_dvr_importer] %s is over their DVR disk quota (%d >= %d bytes) -- "
+                        "withholding new category placements for them this pass",
+                        limit_row["dispatcharr_username"], usage, limit_row["disk_quota_bytes"])
+
     # Phase 2: a recording matched to one or more profiles (see
     # profile_by_stream_id above) routes into the UNION of those profiles'
     # own target categories instead of the provider-level default -- e.g.
     # two people who each set up their own profile for the same show both
     # get their own copy-into-category out of the one recording. Falls back
     # to the provider default only when nothing matched at all (or the
-    # matched profile(s) left that content-type's category blank). Grouped
-    # by category first so multiple recordings/profiles landing in the same
+    # matched profile(s) left that content-type's category blank). A
+    # profile whose owner is over quota (see above) doesn't contribute its
+    # category here, but other matched profiles still do. Grouped by
+    # category first so multiple recordings/profiles landing in the same
     # category collapse into one bulk_place_*_in_category call rather than
     # one call per recording.
     movie_ids_by_category: dict[int, set[int]] = {}
     for stream_id, movie_id in movie_id_by_stream_id.items():
         profiles = profile_by_stream_id.get(stream_id) or []
-        category_ids = {p["target_movie_category_id"] for p in profiles if p.get("target_movie_category_id")}
+        category_ids = {
+            p["target_movie_category_id"] for p in profiles
+            if p.get("target_movie_category_id") and p.get("dispatcharr_user_id") not in over_quota_user_ids
+        }
         if not category_ids and provider.get("dvr_movie_category_id"):
             category_ids = {provider["dvr_movie_category_id"]}
         for category_id in category_ids:
@@ -344,7 +368,10 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_ids_by_category: dict[int, set[int]] = {}
     for stream_id, series_id in series_id_by_stream_id.items():
         profiles = profile_by_stream_id.get(stream_id) or []
-        category_ids = {p["target_series_category_id"] for p in profiles if p.get("target_series_category_id")}
+        category_ids = {
+            p["target_series_category_id"] for p in profiles
+            if p.get("target_series_category_id") and p.get("dispatcharr_user_id") not in over_quota_user_ids
+        }
         if not category_ids and provider.get("dvr_series_category_id"):
             category_ids = {provider["dvr_series_category_id"]}
         for category_id in category_ids:

@@ -3209,7 +3209,7 @@ export default function VodManager() {
     queryFn:  () => api.get('/vod/dvr-user-limits/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
     enabled:  recordingProfilesProviderId != null,
   })
-  const [dvrLimitForm, setDvrLimitForm] = useState({ dispatcharr_user_id: '', stream_reserve: '0' })
+  const [dvrLimitForm, setDvrLimitForm] = useState({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '' })
   const [dvrLimitError, setDvrLimitError] = useState<string | null>(null)
   const addDvrUserLimit = useMutation({
     mutationFn: () => {
@@ -3219,11 +3219,12 @@ export default function VodManager() {
         dispatcharr_user_id: Number(dvrLimitForm.dispatcharr_user_id),
         dispatcharr_username: user?.username ?? `user ${dvrLimitForm.dispatcharr_user_id}`,
         stream_reserve: Number(dvrLimitForm.stream_reserve) || 0,
+        disk_quota_bytes: dvrLimitForm.disk_quota_gb ? Math.round(Number(dvrLimitForm.disk_quota_gb) * 1024 ** 3) : null,
       })
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] })
-      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0' })
+      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '' })
       setDvrLimitError(null)
     },
     onError: (e: any) => setDvrLimitError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
@@ -3231,6 +3232,18 @@ export default function VodManager() {
   const deleteDvrUserLimit = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/dvr-user-limits/${id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
+  })
+  const dvrUserUsageQuery = useQuery<Record<number, number>>({
+    queryKey: ['vod-dvr-user-usage', recordingProfilesProviderId, dvrUserLimitsQuery.data?.map((l) => l.id).join(',')],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        (dvrUserLimitsQuery.data ?? []).map((lim) =>
+          api.get(`/vod/dvr-user-limits/${lim.id}/usage/`).then((r) => [lim.id, r.data.usage_bytes] as const)
+        )
+      )
+      return Object.fromEntries(entries)
+    },
+    enabled: !!dvrUserLimitsQuery.data?.length,
   })
   const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
   const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
@@ -5134,6 +5147,9 @@ export default function VodManager() {
               )}
               {dvrUserLimitsQuery.data?.map((lim) => {
                 const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
+                const usageBytes = dvrUserUsageQuery.data?.[lim.id]
+                const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
+                const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
                 return (
                   <div key={lim.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
                     <span className="flex-1">
@@ -5141,6 +5157,9 @@ export default function VodManager() {
                       <span className="text-muted-foreground">
                         — stream limit {liveUser?.stream_limit ?? '?'}, reserve {lim.stream_reserve}
                         {' '}(budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
+                        {' · '}
+                        {usageGB != null ? usageGB.toFixed(1) : '?'}GB
+                        {quotaGB != null ? ` / ${quotaGB.toFixed(0)}GB` : ' (no disk quota)'}
                       </span>
                     </span>
                     <button
@@ -5169,6 +5188,14 @@ export default function VodManager() {
                   value={dvrLimitForm.stream_reserve}
                   onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, stream_reserve: e.target.value })}
                   title="Kept free for this person's own live TV watching -- subtracted from their real stream limit to get their DVR budget"
+                />
+                <input
+                  className={inputCls('w-32')}
+                  type="number"
+                  placeholder="Disk quota (GB)"
+                  value={dvrLimitForm.disk_quota_gb}
+                  onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, disk_quota_gb: e.target.value })}
+                  title="Optional -- leave blank for no disk quota. Once their recordings' categories hold this much, new category placements for them are withheld (nothing existing is ever deleted)."
                 />
                 <Button
                   size="sm"
