@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -155,6 +156,7 @@ class RecordingProfileRequest(BaseModel):
     channel_id: Optional[int] = None
     target_movie_category_id: Optional[int] = None
     target_series_category_id: Optional[int] = None
+    dispatcharr_user_id: Optional[int] = None
 
 
 class RecordingProfilePreviewRequest(BaseModel):
@@ -164,6 +166,19 @@ class RecordingProfilePreviewRequest(BaseModel):
     title_mode: str = "exact"
     description: Optional[str] = None
     description_mode: str = "contains"
+
+
+class DvrUserLimitRequest(BaseModel):
+    provider_id: int
+    dispatcharr_user_id: int
+    dispatcharr_username: str
+    stream_reserve: int = 0
+    disk_quota_bytes: Optional[int] = None
+
+
+class DvrUserLimitUpdateRequest(BaseModel):
+    stream_reserve: int = 0
+    disk_quota_bytes: Optional[int] = None
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -911,6 +926,111 @@ def _require_dvr_connection(provider_id: int) -> tuple[dict, dict]:
     return provider, connection
 
 
+def _parse_epg_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _sweep_max_overlap(intervals: list[tuple[datetime, datetime]]) -> tuple[int, Optional[datetime]]:
+    """Classic interval-overlap sweep -- returns (worst-case simultaneous
+    count, the moment it peaks). Touching endpoints (one airing ends exactly
+    when another starts) are treated as NOT overlapping -- back-to-back
+    episodes on the same channel are a real, common EPG shape and shouldn't
+    read as "concurrent." Malformed/zero-length intervals are skipped rather
+    than raising, since this only ever informs a soft prediction."""
+    events: list[tuple[datetime, int]] = []
+    for start, end in intervals:
+        if not start or not end or end <= start:
+            continue
+        events.append((start, 1))
+        events.append((end, 0))  # sorts before a start at the identical instant (0 < 1)
+    events.sort()
+    count = 0
+    max_count = 0
+    max_time: Optional[datetime] = None
+    for t, delta in events:
+        if delta == 0:
+            count -= 1
+        else:
+            count += 1
+            if count > max_count:
+                max_count = count
+                max_time = t
+    return max_count, max_time
+
+
+async def _predict_stream_conflict(
+    provider_id: int, connection: dict, dispatcharr_user_id: int, candidate: dict,
+) -> Optional[str]:
+    """Best-effort, creation-time-only prediction of whether adding this
+    profile could push a person's DVR recordings past their assigned
+    Dispatcharr stream budget -- see dvr_user_limits' docstring for why this
+    can't be a hard runtime guarantee (Dispatcharr never checks User.stream_
+    limit for DVR recordings at all, confirmed live, so nothing enforces this
+    except VOD Manager predicting ahead of time from the same EPG data
+    Dispatcharr itself will schedule against). Returns an error detail string
+    if the prediction exceeds budget, else None (also None -- no check at all
+    -- if this person has no dvr_user_limits row, since the feature is
+    opt-in)."""
+    limit_row = vod_db.get_dvr_user_limit(provider_id, dispatcharr_user_id)
+    if not limit_row:
+        return None
+    try:
+        users = await dispatcharr_dvr_client.list_users(connection)
+    except Exception as exc:
+        logger.warning("[vod_routes] _predict_stream_conflict: couldn't fetch Dispatcharr users: %s", exc)
+        return None
+    user = next((u for u in users if u.get("id") == dispatcharr_user_id), None)
+    stream_limit = (user or {}).get("stream_limit") or 0
+    if stream_limit <= 0:
+        # Dispatcharr's own convention: 0 means unlimited for this account --
+        # nothing to predict against.
+        return None
+    budget = stream_limit - limit_row["stream_reserve"]
+
+    other_profiles = [
+        p for p in vod_db.list_recording_profiles(provider_id)
+        if p.get("dispatcharr_user_id") == dispatcharr_user_id
+    ]
+    rule_specs = [candidate] + [
+        {"title": p["title"], "tvg_id": p["tvg_id"], "title_mode": p["title_mode"],
+         "description": p["description"], "description_mode": p["description_mode"]}
+        for p in other_profiles
+    ]
+
+    intervals: list[tuple[datetime, datetime]] = []
+    for spec in rule_specs:
+        try:
+            preview = await dispatcharr_dvr_client.preview_series_rule(
+                connection, spec["title"], spec.get("tvg_id"), spec.get("title_mode", "exact"),
+                spec.get("description"), spec.get("description_mode", "contains"), limit=100,
+            )
+        except Exception as exc:
+            logger.warning("[vod_routes] _predict_stream_conflict: preview failed for %r: %s", spec["title"], exc)
+            continue
+        for match in preview.get("matches", []):
+            start = _parse_epg_datetime(match.get("start_time"))
+            end = _parse_epg_datetime(match.get("end_time"))
+            if start and end:
+                intervals.append((start, end))
+
+    max_count, max_time = _sweep_max_overlap(intervals)
+    if max_count > budget:
+        username = limit_row["dispatcharr_username"]
+        when = max_time.strftime("%Y-%m-%d %H:%M UTC") if max_time else "an upcoming time"
+        return (
+            f"Adding this profile could require {max_count} simultaneous recordings around {when}, "
+            f"but {username} is only allowed {budget} (stream limit {stream_limit} minus a "
+            f"{limit_row['stream_reserve']}-stream reserve)."
+        )
+    return None
+
+
 @router.get("/dvr-recording-profiles/", dependencies=_GUARDS)
 async def list_recording_profiles(provider_id: Optional[int] = None):
     return vod_db.list_recording_profiles(provider_id)
@@ -945,7 +1065,13 @@ async def create_recording_profile(body: RecordingProfileRequest):
     the same title are still fine as long as they're scoped to different
     channels (or one is channel-agnostic and the other isn't) -- see
     vod_db.match_recording_profiles' fan-out docstring for why both are
-    allowed to route the one resulting recording into their own categories."""
+    allowed to route the one resulting recording into their own categories.
+
+    If dispatcharr_user_id is set AND that person has a dvr_user_limits row,
+    also runs a best-effort prediction (_predict_stream_conflict) of whether
+    this profile could push their simultaneous-recordings count past their
+    assigned Dispatcharr stream budget, before ever touching Dispatcharr --
+    opt-in and predictive only, see that function's docstring for why."""
     existing = vod_db.find_recording_profile_by_rule_key(body.provider_id, body.title, body.tvg_id)
     if existing:
         raise HTTPException(
@@ -956,6 +1082,14 @@ async def create_recording_profile(body: RecordingProfileRequest):
                    "first if you want to replace it, or pick a specific channel to distinguish this one.",
         )
     _, connection = _require_dvr_connection(body.provider_id)
+    if body.dispatcharr_user_id:
+        conflict = await _predict_stream_conflict(
+            body.provider_id, connection, body.dispatcharr_user_id,
+            {"title": body.title, "tvg_id": body.tvg_id, "title_mode": body.title_mode,
+             "description": body.description, "description_mode": body.description_mode},
+        )
+        if conflict:
+            raise HTTPException(409, detail=conflict)
     try:
         await dispatcharr_dvr_client.create_series_rule(
             connection, body.title, body.tvg_id, body.title_mode,
@@ -967,6 +1101,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
         body.provider_id, body.label, body.title, body.tvg_id, body.title_mode,
         body.description, body.description_mode, body.mode, body.channel_id,
         body.target_movie_category_id, body.target_series_category_id,
+        body.dispatcharr_user_id,
     )
     return vod_db.get_recording_profile(profile_id)
 
@@ -988,6 +1123,55 @@ async def delete_recording_profile(profile_id: int):
         logger.warning("[vod_routes] delete_recording_profile(%s): failed to remove the Dispatcharr-side rule: %s",
                         profile_id, exc)
     vod_db.delete_recording_profile(profile_id)
+    return {"ok": True}
+
+
+@router.get("/dispatcharr-users/", dependencies=_GUARDS)
+async def list_dispatcharr_users(provider_id: int):
+    """Real Dispatcharr login accounts for this DVR provider's connection --
+    used both by the recording-profile form's "person" picker and by the DVR
+    limits form (to show someone's real current stream_limit as context when
+    an admin sets their reserve)."""
+    _, connection = _require_dvr_connection(provider_id)
+    try:
+        return await dispatcharr_dvr_client.list_users(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.get("/dvr-user-limits/", dependencies=_GUARDS)
+async def list_dvr_user_limits(provider_id: Optional[int] = None):
+    return vod_db.list_dvr_user_limits(provider_id)
+
+
+@router.post("/dvr-user-limits/", dependencies=_GUARDS)
+async def create_dvr_user_limit(body: DvrUserLimitRequest):
+    """One row per (provider, real Dispatcharr person) -- opt-in, see the
+    table's schema comment. UNIQUE(provider_id, dispatcharr_user_id) means a
+    second attempt for the same person just fails with a clear conflict
+    instead of silently creating a duplicate row an admin would have to
+    puzzle over later."""
+    existing = vod_db.get_dvr_user_limit(body.provider_id, body.dispatcharr_user_id)
+    if existing:
+        raise HTTPException(
+            409, detail=f"{body.dispatcharr_username} already has DVR limits configured for this provider.",
+        )
+    limit_id = vod_db.create_dvr_user_limit(
+        body.provider_id, body.dispatcharr_user_id, body.dispatcharr_username,
+        body.stream_reserve, body.disk_quota_bytes,
+    )
+    return vod_db.get_dvr_user_limit(body.provider_id, body.dispatcharr_user_id) or {"id": limit_id}
+
+
+@router.post("/dvr-user-limits/{limit_id}/", dependencies=_GUARDS)
+async def update_dvr_user_limit(limit_id: int, body: DvrUserLimitUpdateRequest):
+    vod_db.update_dvr_user_limit(limit_id, body.stream_reserve, body.disk_quota_bytes)
+    return {"ok": True}
+
+
+@router.delete("/dvr-user-limits/{limit_id}/", dependencies=_GUARDS)
+async def delete_dvr_user_limit(limit_id: int):
+    vod_db.delete_dvr_user_limit(limit_id)
     return {"ok": True}
 
 

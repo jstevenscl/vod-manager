@@ -44,6 +44,23 @@ interface RecordingProfile {
   channel_id: number | null
   target_movie_category_id: number | null
   target_series_category_id: number | null
+  dispatcharr_user_id: number | null
+  created_at: string
+}
+
+interface DispatcharrUser {
+  id: number
+  username: string
+  stream_limit: number
+}
+
+interface DvrUserLimit {
+  id: number
+  provider_id: number
+  dispatcharr_user_id: number
+  dispatcharr_username: string
+  stream_reserve: number
+  disk_quota_bytes: number | null
   created_at: string
 }
 
@@ -3178,10 +3195,43 @@ export default function VodManager() {
   })
   const blankRecordingProfileForm = {
     label: '', title: '', mode: 'all' as 'all' | 'new',
-    target_movie_category_id: '', target_series_category_id: '',
+    target_movie_category_id: '', target_series_category_id: '', dispatcharr_user_id: '',
     advancedOpen: false, tvg_id: '', title_mode: 'exact' as 'exact' | 'contains' | 'search' | 'regex',
     description: '', description_mode: 'contains' as 'contains' | 'search' | 'regex', channel_id: '',
   }
+  const dispatcharrUsersQuery = useQuery<DispatcharrUser[]>({
+    queryKey: ['vod-dispatcharr-users', recordingProfilesProviderId],
+    queryFn:  () => api.get('/vod/dispatcharr-users/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled:  recordingProfilesProviderId != null,
+  })
+  const dvrUserLimitsQuery = useQuery<DvrUserLimit[]>({
+    queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId],
+    queryFn:  () => api.get('/vod/dvr-user-limits/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled:  recordingProfilesProviderId != null,
+  })
+  const [dvrLimitForm, setDvrLimitForm] = useState({ dispatcharr_user_id: '', stream_reserve: '0' })
+  const [dvrLimitError, setDvrLimitError] = useState<string | null>(null)
+  const addDvrUserLimit = useMutation({
+    mutationFn: () => {
+      const user = dispatcharrUsersQuery.data?.find((u) => u.id === Number(dvrLimitForm.dispatcharr_user_id))
+      return api.post('/vod/dvr-user-limits/', {
+        provider_id: recordingProfilesProviderId,
+        dispatcharr_user_id: Number(dvrLimitForm.dispatcharr_user_id),
+        dispatcharr_username: user?.username ?? `user ${dvrLimitForm.dispatcharr_user_id}`,
+        stream_reserve: Number(dvrLimitForm.stream_reserve) || 0,
+      })
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] })
+      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0' })
+      setDvrLimitError(null)
+    },
+    onError: (e: any) => setDvrLimitError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
+  })
+  const deleteDvrUserLimit = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/dvr-user-limits/${id}/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
+  })
   const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
   const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
   const [recordingProfilePreview, setRecordingProfilePreview] = useState<{ matches: any[]; total: number; epg_found: boolean; warn: boolean } | null>(null)
@@ -3210,6 +3260,7 @@ export default function VodManager() {
       channel_id: recordingProfileForm.channel_id ? Number(recordingProfileForm.channel_id) : null,
       target_movie_category_id: recordingProfileForm.target_movie_category_id ? Number(recordingProfileForm.target_movie_category_id) : null,
       target_series_category_id: recordingProfileForm.target_series_category_id ? Number(recordingProfileForm.target_series_category_id) : null,
+      dispatcharr_user_id: recordingProfileForm.dispatcharr_user_id ? Number(recordingProfileForm.dispatcharr_user_id) : null,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] })
@@ -4911,6 +4962,9 @@ export default function VodManager() {
                         movieCategories.find((c) => c.id === rp.target_movie_category_id)?.name,
                         seriesCategories.find((c) => c.id === rp.target_series_category_id)?.name,
                       ].filter(Boolean).join(' / ') || 'no category set'}
+                      {rp.dispatcharr_user_id != null && (
+                        <> · {dispatcharrUsersQuery.data?.find((u) => u.id === rp.dispatcharr_user_id)?.username ?? `user ${rp.dispatcharr_user_id}`}</>
+                      )}
                     </span>
                   </span>
                   <button
@@ -4967,6 +5021,15 @@ export default function VodManager() {
                 >
                   <option value="">TV category (optional)…</option>
                   {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <select
+                  className={inputCls()}
+                  value={recordingProfileForm.dispatcharr_user_id}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
+                  title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured below, this profile counts against their stream budget"
+                >
+                  <option value="">Person (optional)…</option>
+                  {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
                 </select>
               </div>
 
@@ -5056,6 +5119,66 @@ export default function VodManager() {
                   {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
                 </Button>
               </div>
+            </div>
+
+            <div className="border-t border-border pt-3 space-y-1.5">
+              <p className="text-xs font-medium">DVR limits</p>
+              <p className="text-xs text-muted-foreground">
+                Opt-in per person -- only enforced for someone listed here. Predicts whether a new profile could
+                require more simultaneous recordings than their Dispatcharr account allows (stream limit minus
+                the reserve below, kept free for their own live TV watching). Dispatcharr itself never checks this
+                for recordings, so this is a best-effort warning at the moment a profile is added, not a guarantee.
+              </p>
+              {dvrUserLimitsQuery.data && !dvrUserLimitsQuery.data.length && (
+                <p className="text-xs text-muted-foreground">No one has DVR limits configured yet.</p>
+              )}
+              {dvrUserLimitsQuery.data?.map((lim) => {
+                const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
+                return (
+                  <div key={lim.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                    <span className="flex-1">
+                      <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
+                      <span className="text-muted-foreground">
+                        — stream limit {liveUser?.stream_limit ?? '?'}, reserve {lim.stream_reserve}
+                        {' '}(budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
+                      </span>
+                    </span>
+                    <button
+                      title="Remove this person's DVR limits (their existing profiles are unaffected, just unconstrained again)"
+                      className="text-muted-foreground hover:text-destructive p-1"
+                      onClick={() => { if (confirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`)) deleteDvrUserLimit.mutate(lim.id) }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                )
+              })}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <select
+                  className={inputCls()}
+                  value={dvrLimitForm.dispatcharr_user_id}
+                  onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, dispatcharr_user_id: e.target.value })}
+                >
+                  <option value="">Person…</option>
+                  {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username} (limit {u.stream_limit})</option>)}
+                </select>
+                <input
+                  className={inputCls('w-32')}
+                  type="number"
+                  placeholder="Reserve streams"
+                  value={dvrLimitForm.stream_reserve}
+                  onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, stream_reserve: e.target.value })}
+                  title="Kept free for this person's own live TV watching -- subtracted from their real stream limit to get their DVR budget"
+                />
+                <Button
+                  size="sm"
+                  disabled={!dvrLimitForm.dispatcharr_user_id || addDvrUserLimit.isPending}
+                  onClick={() => addDvrUserLimit.mutate()}
+                >
+                  {addDvrUserLimit.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add</>}
+                </Button>
+              </div>
+              {dvrLimitError && <p className="text-xs text-destructive">{dvrLimitError}</p>}
             </div>
           </div>
         </Modal>

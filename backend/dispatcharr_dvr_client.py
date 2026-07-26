@@ -187,3 +187,20 @@ async def preview_series_rule(
     if description:
         body["description"] = description
     return await client.post("/api/channels/series-rules/preview/", body)
+
+
+async def list_users(connection: dict) -> list[dict]:
+    """Real Dispatcharr login accounts (apps/accounts/models.py's User model,
+    confirmed live -- GET /api/accounts/users/, same X-API-Key auth as
+    everything else, requires admin-level permission which the existing
+    connection token already has since it's already used for account/M3U
+    management elsewhere). Each carries a real stream_limit -- confirmed live
+    that Dispatcharr only enforces this for authenticated live/VOD viewing
+    sessions (apps/proxy/live_proxy/views.py's check_user_stream_limits), NOT
+    for DVR recordings (run_recording's own stream pull isn't an authenticated
+    user request) -- so VOD Manager reads it here to run its own best-effort
+    prediction (see vod_routes.py's create_recording_profile), not because
+    Dispatcharr enforces it for us."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    data = await client.get("/api/accounts/users/")
+    return data if isinstance(data, list) else data.get("results", [])

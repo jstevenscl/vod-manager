@@ -257,6 +257,29 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- Per-person DVR resource limits, one row per (DVR provider, real
+        -- Dispatcharr login user) -- both the stream-concurrency reserve and
+        -- the disk quota live together since they're conceptually "this
+        -- person's DVR allowance," confirmed 2026-07-26 that Dispatcharr's
+        -- own real login Users (apps/accounts/models.py, User.stream_limit)
+        -- are never checked for DVR recordings at all (only for authenticated
+        -- live/VOD viewing sessions) -- so this is VOD Manager's own,
+        -- necessarily predictive, best-effort enforcement, not something
+        -- Dispatcharr does for us. dispatcharr_user_id is intentionally not a
+        -- local FK -- the person themselves lives in Dispatcharr, VOD Manager
+        -- only tracks the limit assigned to them. Opt-in: a person with no
+        -- row here has no DVR limit enforced at all.
+        CREATE TABLE IF NOT EXISTS dvr_user_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_user_id INTEGER NOT NULL,
+            dispatcharr_username TEXT NOT NULL,
+            stream_reserve INTEGER NOT NULL DEFAULT 0,
+            disk_quota_bytes INTEGER,
+            created_at TEXT NOT NULL,
+            UNIQUE(provider_id, dispatcharr_user_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -272,6 +295,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_movie_sources_movie_id ON movie_sources(movie_id);
         CREATE INDEX IF NOT EXISTS idx_episode_sources_episode_id ON episode_sources(episode_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_profiles_provider_id ON dvr_recording_profiles(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_dvr_user_limits_provider_id ON dvr_user_limits(provider_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
@@ -413,6 +437,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "dvr_remote_recordings_root", "TEXT"),
         ("movie_sources", "local_file_path", "TEXT"),
         ("episode_sources", "local_file_path", "TEXT"),
+        ("dvr_recording_profiles", "dispatcharr_user_id", "INTEGER"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -591,15 +616,18 @@ def create_recording_profile(
     description: str | None = None, description_mode: str = "contains",
     mode: str = "all", channel_id: int | None = None,
     target_movie_category_id: int | None = None, target_series_category_id: int | None = None,
+    dispatcharr_user_id: int | None = None,
 ) -> int:
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO dvr_recording_profiles
            (provider_id, label, tvg_id, title, title_mode, description, description_mode,
-            mode, channel_id, target_movie_category_id, target_series_category_id, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            mode, channel_id, target_movie_category_id, target_series_category_id,
+            dispatcharr_user_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (provider_id, label, tvg_id or None, title, title_mode, description or None, description_mode,
-         mode, channel_id, target_movie_category_id, target_series_category_id, _now()),
+         mode, channel_id, target_movie_category_id, target_series_category_id,
+         dispatcharr_user_id, _now()),
     )
     profile_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -695,6 +723,68 @@ def find_recording_profile_by_rule_key(provider_id: int, title: str, tvg_id: str
         ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+# ── DVR per-person resource limits ──────────────────────────────────────────
+# Opt-in: a person (a real Dispatcharr login user, identified by their numeric
+# id) with no row here has no DVR limit enforced at all. See
+# dvr_recording_profiles' dispatcharr_user_id column and vod_routes.py's
+# create_recording_profile for how the stream-concurrency check uses this.
+
+def create_dvr_user_limit(
+    provider_id: int, dispatcharr_user_id: int, dispatcharr_username: str,
+    stream_reserve: int = 0, disk_quota_bytes: int | None = None,
+) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO dvr_user_limits
+           (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes, _now()),
+    )
+    limit_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return limit_id
+
+
+def list_dvr_user_limits(provider_id: int | None = None) -> list[dict]:
+    conn = _connect()
+    if provider_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM dvr_user_limits WHERE provider_id=? ORDER BY dispatcharr_username", (provider_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM dvr_user_limits ORDER BY dispatcharr_username").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_dvr_user_limit(provider_id: int, dispatcharr_user_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM dvr_user_limits WHERE provider_id=? AND dispatcharr_user_id=?",
+        (provider_id, dispatcharr_user_id),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_dvr_user_limit(limit_id: int, stream_reserve: int, disk_quota_bytes: int | None) -> None:
+    conn = _connect()
+    conn.execute(
+        "UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=? WHERE id=?",
+        (stream_reserve, disk_quota_bytes, limit_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def delete_dvr_user_limit(limit_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM dvr_user_limits WHERE id=?", (limit_id,))
+    _commit_with_retry(conn)
+    conn.close()
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:
