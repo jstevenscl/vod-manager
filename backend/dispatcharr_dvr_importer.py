@@ -2,15 +2,23 @@
 Imports finished Dispatcharr DVR recordings into the VOD pool -- the DVR
 counterpart to plex_importer.py/emby_vod_importer.py.
 
-Phase 1a only: same-host ingestion via a shared/bind-mounted volume
-(providers.dvr_local_path). A recording is playable the moment it's
-imported -- movie_sources/episode_sources.local_file_path points straight
-at the file on disk, and xc_server.py serves/transcodes it from there with
-no further Dispatcharr involvement. Phase 1b (network download, for when
-dvr_local_path is None) is NOT implemented here -- it needs Dispatcharr's
-DVR file-endpoint auth verified live first (see vod_manager-f09's notes);
-a provider with no local path configured is currently just skipped, not
-queued for later download.
+Two modes, chosen per-provider by whether dvr_local_path is set:
+
+- Phase 1a, same-host: a shared/bind-mounted volume. A recording is
+  playable the moment it's imported -- movie_sources/episode_sources.
+  local_file_path points straight at the file on disk (no bytes ever
+  copied), and xc_server.py serves/transcodes it from there with no
+  further Dispatcharr involvement.
+- Phase 1b, cross-host (dvr_local_path is None): downloads each
+  recording's bytes once into VOD Manager's own storage
+  (DATA_DIR/dvr_recordings/{provider_id}/...) via
+  dispatcharr_dvr_client.download_recording_file, then serves that local
+  copy identically to Phase 1a from then on. Confirmed live (dispatch-test,
+  v0.27.2, 2026-07-26) that the file-download endpoint takes the same
+  X-API-Key auth as everything else -- the one open question blocking this
+  is resolved. A recording already present locally (by path) is never
+  re-downloaded; a failed download is retried on the next poll cycle
+  rather than failing the whole import pass.
 
 Unlike XC/Plex/Emby, a DVR recording arrives with almost no metadata --
 only whatever Dispatcharr's EPG match captured (title/sub_title/description/
@@ -38,6 +46,7 @@ import logging
 import os
 import re
 
+import config
 import dispatcharr_dvr_client
 import tmdb_sync
 import vod_db
@@ -152,11 +161,13 @@ async def import_dvr_recordings(provider_id: int) -> dict:
         raise ValueError(f"provider {provider_id}'s linked Dispatcharr connection no longer exists")
 
     local_path = provider.get("dvr_local_path")
-    if not local_path:
-        logger.info("[dispatcharr_dvr_importer] provider=%s has no dvr_local_path set -- "
-                     "network download (Phase 1b) isn't implemented yet, skipping", provider["name"])
-        return {"movies_created": 0, "movies_matched": 0, "series_created": 0, "series_matched": 0,
-                "episodes_imported": 0, "skipped_no_local_path": True}
+    download_mode = not local_path
+    if download_mode:
+        # Phase 1b: no shared bind-mount, so VOD Manager owns a local copy
+        # under its own data dir instead -- same shape dvr_local_path would
+        # point at for Phase 1a, just VOD Manager-managed rather than
+        # admin-configured.
+        local_path = str(config.DATA_DIR / "dvr_recordings" / str(provider_id))
 
     recordings = await dispatcharr_dvr_client.list_completed_recordings(connection)
     remote_root = provider.get("dvr_remote_recordings_root") or _DEFAULT_REMOTE_RECORDINGS_ROOT
@@ -165,6 +176,8 @@ async def import_dvr_recordings(provider_id: int) -> dict:
     series_items: dict[str, dict] = {}
     local_paths_by_stream_id: dict[str, str] = {}
     skipped = 0
+    downloaded = 0
+    download_errors = 0
 
     for recording in recordings:
         file_info = dispatcharr_dvr_client.recording_file_info(recording)
@@ -173,7 +186,21 @@ async def import_dvr_recordings(provider_id: int) -> dict:
             skipped += 1
             continue
         recording_id = str(recording["id"])
-        local_paths_by_stream_id[recording_id] = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
+        target_path = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
+
+        if download_mode and not os.path.isfile(target_path):
+            try:
+                await dispatcharr_dvr_client.download_recording_file(connection, recording["id"], target_path)
+                downloaded += 1
+            except Exception as exc:
+                download_errors += 1
+                logger.warning("[dispatcharr_dvr_importer] failed to download recording=%s (%r): %s",
+                                recording["id"], file_info.get("file_name"), exc)
+                # Retried on the next poll cycle rather than registering a
+                # source that points at a file that doesn't actually exist.
+                continue
+
+        local_paths_by_stream_id[recording_id] = target_path
 
         program = dispatcharr_dvr_client.recording_program_info(recording)
         title = _guess_title(recording, program, file_path)
@@ -237,12 +264,14 @@ async def import_dvr_recordings(provider_id: int) -> dict:
     if provider.get("dvr_series_category_id") and touched_series_ids:
         vod_db.bulk_place_series_in_category(touched_series_ids, provider["dvr_series_category_id"])
 
-    logger.info("[dispatcharr_dvr_importer] provider=%s movies=%s series=%s skipped=%d",
-                provider["name"], movie_result, series_result, skipped)
+    logger.info("[dispatcharr_dvr_importer] provider=%s movies=%s series=%s skipped=%d downloaded=%d download_errors=%d",
+                provider["name"], movie_result, series_result, skipped, downloaded, download_errors)
 
     return {
         "provider": provider["name"],
         **movie_result,
         **series_result,
         "skipped_no_file_path": skipped,
+        "downloaded": downloaded,
+        "download_errors": download_errors,
     }
