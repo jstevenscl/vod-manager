@@ -896,7 +896,7 @@ async def import_provider_catalog(provider_id: int):
 
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
 # Per-person/per-schedule routing on top of a DVR provider's own default
-# categories -- see vod_db.match_recording_profile and
+# categories -- see vod_db.match_recording_profiles and
 # dispatcharr_dvr_client.create_series_rule.
 
 def _require_dvr_connection(provider_id: int) -> tuple[dict, dict]:
@@ -935,7 +935,26 @@ async def create_recording_profile(body: RecordingProfileRequest):
     """Creates the real Series Rule on Dispatcharr FIRST -- only saves the
     local profile row once that succeeds, so a failed remote call never
     leaves a dangling profile pointing at a rule that doesn't actually
-    exist."""
+    exist.
+
+    Blocks an exact (title, tvg_id) collision with an existing profile --
+    Dispatcharr identifies a series rule purely by that pair (no synthetic
+    id), so a second create_series_rule call for the same pair wouldn't add
+    a second independent rule, it would silently re-save (and potentially
+    alter the mode/description/channel of) the first one. Two profiles for
+    the same title are still fine as long as they're scoped to different
+    channels (or one is channel-agnostic and the other isn't) -- see
+    vod_db.match_recording_profiles' fan-out docstring for why both are
+    allowed to route the one resulting recording into their own categories."""
+    existing = vod_db.find_recording_profile_by_rule_key(body.provider_id, body.title, body.tvg_id)
+    if existing:
+        raise HTTPException(
+            409,
+            detail=f"A profile for this exact title/channel already exists ('{existing['label']}'). Dispatcharr "
+                   "identifies recording rules by title + channel alone, so a second profile here would silently "
+                   "take over the same rule instead of creating an independent one. Delete the existing profile "
+                   "first if you want to replace it, or pick a specific channel to distinguish this one.",
+        )
     _, connection = _require_dvr_connection(body.provider_id)
     try:
         await dispatcharr_dvr_client.create_series_rule(

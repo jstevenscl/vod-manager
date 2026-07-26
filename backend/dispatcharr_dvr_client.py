@@ -144,7 +144,7 @@ async def create_series_rule(
     series recording rule or update an existing one") a recurring Series
     Rule -- Dispatcharr evaluates it immediately against the current EPG to
     find and schedule matching episodes. No id is returned or needed: see
-    vod_db.match_recording_profile's docstring for why VOD Manager's own
+    vod_db.match_recording_profiles' docstring for why VOD Manager's own
     dvr_recording_profiles keys on (title, tvg_id) instead, the same pair
     Dispatcharr's own delete_series_rule below uses."""
     client = DispatcharrClient(connection["url"], connection["token"])

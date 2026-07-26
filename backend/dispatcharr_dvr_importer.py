@@ -198,7 +198,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     movie_items = []
     series_items: dict[str, dict] = {}
     local_paths_by_stream_id: dict[str, str] = {}
-    profile_by_stream_id: dict[str, dict | None] = {}
+    profile_by_stream_id: dict[str, list[dict]] = {}
     skipped = 0
     downloaded = 0
     download_errors = 0
@@ -231,10 +231,10 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
         # _guess_title already prefers program["title"] (the real EPG title)
         # whenever present, so `title` here IS that EPG title in the common
         # case -- matching against it (rather than a separately-fetched EPG
-        # title) is correct and avoids a redundant lookup. See
-        # vod_db.match_recording_profile's docstring for the (title, tvg_id)
-        # matching rationale.
-        profile_by_stream_id[recording_id] = vod_db.match_recording_profile(provider_id, title, program.get("tvg_id"))
+        # title) is correct and avoids a redundant lookup. Can be more than
+        # one profile (e.g. two people each set up their own "Seinfeld"
+        # profile) -- see vod_db.match_recording_profiles' docstring.
+        profile_by_stream_id[recording_id] = vod_db.match_recording_profiles(provider_id, title, program.get("tvg_id"))
         season_episode = _resolve_season_episode(program, file_path)
         container_extension = os.path.splitext(file_path)[1].lstrip(".") or "mkv"
 
@@ -290,26 +290,34 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
     series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
 
-    # Phase 2: a recording matched to a profile (see profile_by_stream_id
-    # above) routes into THAT profile's own target categories instead of the
-    # provider-level default -- grouped by category first so two recordings
-    # landing in the same category (whether from the same profile or
-    # different ones) collapse into one bulk_place_*_in_category call rather
-    # than one call per recording.
+    # Phase 2: a recording matched to one or more profiles (see
+    # profile_by_stream_id above) routes into the UNION of those profiles'
+    # own target categories instead of the provider-level default -- e.g.
+    # two people who each set up their own profile for the same show both
+    # get their own copy-into-category out of the one recording. Falls back
+    # to the provider default only when nothing matched at all (or the
+    # matched profile(s) left that content-type's category blank). Grouped
+    # by category first so multiple recordings/profiles landing in the same
+    # category collapse into one bulk_place_*_in_category call rather than
+    # one call per recording.
     movie_ids_by_category: dict[int, set[int]] = {}
     for stream_id, movie_id in movie_id_by_stream_id.items():
-        profile = profile_by_stream_id.get(stream_id)
-        category_id = profile["target_movie_category_id"] if profile else provider.get("dvr_movie_category_id")
-        if category_id:
+        profiles = profile_by_stream_id.get(stream_id) or []
+        category_ids = {p["target_movie_category_id"] for p in profiles if p.get("target_movie_category_id")}
+        if not category_ids and provider.get("dvr_movie_category_id"):
+            category_ids = {provider["dvr_movie_category_id"]}
+        for category_id in category_ids:
             movie_ids_by_category.setdefault(category_id, set()).add(movie_id)
     for category_id, ids in movie_ids_by_category.items():
         vod_db.bulk_place_movies_in_category(list(ids), category_id)
 
     series_ids_by_category: dict[int, set[int]] = {}
     for stream_id, series_id in series_id_by_stream_id.items():
-        profile = profile_by_stream_id.get(stream_id)
-        category_id = profile["target_series_category_id"] if profile else provider.get("dvr_series_category_id")
-        if category_id:
+        profiles = profile_by_stream_id.get(stream_id) or []
+        category_ids = {p["target_series_category_id"] for p in profiles if p.get("target_series_category_id")}
+        if not category_ids and provider.get("dvr_series_category_id"):
+            category_ids = {provider["dvr_series_category_id"]}
+        for category_id in category_ids:
             series_ids_by_category.setdefault(category_id, set()).add(series_id)
     for category_id, ids in series_ids_by_category.items():
         vod_db.bulk_place_series_in_category(list(ids), category_id)

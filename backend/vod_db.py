@@ -633,31 +633,60 @@ def delete_recording_profile(profile_id: int) -> None:
     conn.close()
 
 
-def match_recording_profile(provider_id: int, title: str, tvg_id: str | None) -> dict | None:
-    """Matches a completed recording back to whichever profile scheduled it
-    -- Dispatcharr's own Recording data carries no rule reference at all
+def match_recording_profiles(provider_id: int, title: str, tvg_id: str | None) -> list[dict]:
+    """Matches a completed recording back to every profile that scheduled it
+    -- plural, not singular: two different people can each set up their own
+    profile for the same show (one scoped to a specific EPG channel, one
+    left blank to match any channel, or simply two blank-tvg_id profiles),
+    and a single recording can legitimately satisfy more than one of them.
+    The caller places the recording into the union of every matched
+    profile's target categories rather than picking just one winner.
+
+    Dispatcharr's own Recording data carries no rule reference at all
     (confirmed via its OpenAPI schema and real captured recordings), but its
     series-rules resource is itself identified purely by (title, tvg_id) --
     its own DELETE endpoint takes exactly those two params, no id -- so
     that's the same pair used here. A profile with no tvg_id set matches
     across any channel (mirrors Dispatcharr's own "blank tvg_id = search all
-    channels" behavior); an exact tvg_id match is preferred over a
-    channel-agnostic one when both exist for the same title."""
+    channels" behavior); a profile scoped to a specific tvg_id only matches
+    a recording that actually aired on that channel.
+
+    Note this is a purely local/VOD-Manager-side fan-out -- Dispatcharr
+    itself only ever produces ONE physical recording per (title, tvg_id)
+    rule identity (see create_recording_profile's collision guard in
+    vod_routes.py), so "multiple profiles matching" means multiple people
+    sharing that single recording's copies-into-categories fan-out, not
+    multiple independent recordings."""
     conn = _connect()
     rows = conn.execute(
         "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=?", (provider_id, title)
     ).fetchall()
     conn.close()
     candidates = [dict(r) for r in rows]
-    if not candidates:
-        return None
-    for c in candidates:
-        if tvg_id and c["tvg_id"] == tvg_id:
-            return c
-    for c in candidates:
-        if not c["tvg_id"]:
-            return c
-    return None
+    return [c for c in candidates if not c["tvg_id"] or c["tvg_id"] == tvg_id]
+
+
+def find_recording_profile_by_rule_key(provider_id: int, title: str, tvg_id: str | None) -> dict | None:
+    """Dispatcharr identifies a series rule purely by (title, tvg_id) -- no
+    synthetic id -- so two profiles sharing that exact pair wouldn't create
+    two independent Dispatcharr-side rules; the second create_series_rule
+    call would just silently re-save (and potentially alter the mode/
+    description/channel of) the first one. Used by create_recording_profile
+    to block that collision before it happens, rather than let the second
+    creator quietly steal the first one's rule."""
+    conn = _connect()
+    if tvg_id:
+        row = conn.execute(
+            "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=? AND tvg_id=?",
+            (provider_id, title, tvg_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=? AND (tvg_id IS NULL OR tvg_id='')",
+            (provider_id, title),
+        ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:
