@@ -1091,7 +1091,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
         if conflict:
             raise HTTPException(409, detail=conflict)
     try:
-        await dispatcharr_dvr_client.create_series_rule(
+        evaluate_result = await dispatcharr_dvr_client.create_series_rule(
             connection, body.title, body.tvg_id, body.title_mode,
             body.description, body.description_mode, body.mode, body.channel_id,
         )
@@ -1103,7 +1103,17 @@ async def create_recording_profile(body: RecordingProfileRequest):
         body.target_movie_category_id, body.target_series_category_id,
         body.dispatcharr_user_id,
     )
-    return vod_db.get_recording_profile(profile_id)
+    profile = vod_db.get_recording_profile(profile_id)
+    # Surface whether this rule actually scheduled anything just now, rather
+    # than reporting bare success either way -- confirmed live a channel-
+    # scoped rule can save fine and still schedule 0 (e.g. a dead/ambiguous
+    # tvg_id-to-channel mapping on Dispatcharr's own side, or a genuinely
+    # empty "new episodes only" match right now), with no error unless this
+    # is checked. scheduled_now/schedule_details aren't persisted -- purely
+    # informational for this one response.
+    profile["scheduled_now"] = evaluate_result.get("scheduled", 0)
+    profile["schedule_details"] = evaluate_result.get("details", [])
+    return profile
 
 
 @router.delete("/dvr-recording-profiles/{profile_id}/", dependencies=_GUARDS)
@@ -1135,6 +1145,48 @@ async def list_dispatcharr_users(provider_id: int):
     _, connection = _require_dvr_connection(provider_id)
     try:
         return await dispatcharr_dvr_client.list_users(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.get("/epg-search/", dependencies=_GUARDS)
+async def search_epg_programs(provider_id: int, title: str):
+    """Real upcoming airings for a title, across every channel carrying it
+    -- powers the recording-profile form's channel picker so a user selects
+    a specific real (title, tvg_id, channel_id) combination instead of
+    typing a bare title and leaving channel as an easy-to-skip afterthought.
+    See dispatcharr_dvr_client.search_epg_programs and create_series_rule's
+    docstring for why a specific channel_id (not just tvg_id) matters."""
+    if not title.strip():
+        raise HTTPException(400, detail="title is required")
+    _, connection = _require_dvr_connection(provider_id)
+    try:
+        return await dispatcharr_dvr_client.search_epg_programs(connection, title)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.get("/channel-profiles/", dependencies=_GUARDS)
+async def list_channel_profiles(provider_id: int):
+    """Real Dispatcharr Channel Profiles -- a person doesn't always have the
+    full channel lineup (confirmed live: a real profile with 2395 total
+    channel memberships but only 81 enabled). Used to mark/prioritize a
+    selected person's own visible channels in the EPG search picker."""
+    _, connection = _require_dvr_connection(provider_id)
+    try:
+        return await dispatcharr_dvr_client.list_channel_profiles(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.get("/dvr-upcoming/", dependencies=_GUARDS)
+async def list_dvr_upcoming(provider_id: int):
+    """Real scheduled-but-not-yet-run recordings, for the DVR tab's
+    upcoming-recordings agenda view -- confirmed live these have no
+    'scheduled' status string of their own, just an absent/None status."""
+    _, connection = _require_dvr_connection(provider_id)
+    try:
+        return await dispatcharr_dvr_client.list_scheduled_recordings(connection)
     except Exception as exc:
         raise HTTPException(502, detail=str(exc))
 
