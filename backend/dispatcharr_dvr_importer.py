@@ -46,6 +46,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime
 
 import config
 import dispatcharr_dvr_client
@@ -75,26 +76,55 @@ def _get_import_lock(provider_id: int) -> asyncio.Lock:
 # path -- fallback only now (see _resolve_season_episode); Dispatcharr's own
 # structured season/episode fields are preferred whenever present. Kept
 # deliberately loose (not tied to one exact folder shape) since a provider's
-# TV Path Template is itself admin-configurable. A recording with no match
-# (structured or path) is treated as a movie.
+# TV Path Template is itself admin-configurable. A recording with no S/E
+# match anywhere (structured, path, AND no sub_title to fall back on -- see
+# _resolve_season_episode's third branch) is treated as a movie.
 _SEASON_EPISODE_RE = re.compile(r"[Ss](\d{1,2})[._\- ]?[Ee](\d{1,3})")
 
 
-def _resolve_season_episode(program: dict, file_path: str | None) -> tuple[int, int] | None:
+def _resolve_season_episode(program: dict, file_path: str | None, recording_start_time: str | None) -> tuple[int, int] | None:
     """Dispatcharr's own custom_properties.season/episode (structured ints)
     win whenever both are present and valid -- confirmed live as the
     authoritative source dispatch-test actually populates, strictly more
     reliable than regex-guessing the path. Falls back to path parsing only
-    when either is missing (e.g. a recording with no EPG match at all)."""
+    when either is missing (e.g. a recording with no EPG match at all).
+
+    Third fallback -- for Dispatcharr's own "TV fallback" path template
+    (`TV_Shows/{show}/{start}.mkv`, no S/E encoded). Confirmed by reading
+    Dispatcharr's actual source (apps/channels/tasks.py, dispatch-test
+    v0.27.2, 2026-07-26): that template is only ever chosen when
+    Dispatcharr's OWN season/episode lookup (_parse_epg_tv_movie_info,
+    reading the exact same EPG ProgramData.custom_properties this function
+    already checks via program.get("season")/"episode") also came up empty
+    -- so whenever the fallback template actually fires, the structured-field
+    branch above is guaranteed to have already missed too, and the file path
+    itself carries no S/E to regex out either. There is no real episode
+    identity available from either source in that case. But Dispatcharr
+    itself decides movie-vs-TV from the EPG's own category tags (looking
+    for "movie"/"film"), a signal that never appears anywhere in the
+    Recording API VOD Manager consumes -- so this can't replicate that
+    decision directly. sub_title (an episode's own name) is the next best
+    proxy: EPG data commonly carries an episode title without a formal S/E
+    number, and a genuine movie airing essentially never has one. When
+    present, synthesize a stable (season=0 "specials", episode=<start time
+    as YYYYMMDDHHMM>) identity from the recording's own fixed start time --
+    stable across re-imports (unlike an import-order-based counter) so
+    repeat recordings of the same show still fold into one series instead
+    of each becoming its own disconnected "movie" entry."""
     season, episode = program.get("season"), program.get("episode")
     if isinstance(season, int) and isinstance(episode, int) and season > 0 and episode > 0:
         return season, episode
-    if not file_path:
-        return None
-    m = _SEASON_EPISODE_RE.search(file_path)
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
+    if file_path:
+        m = _SEASON_EPISODE_RE.search(file_path)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    if program.get("sub_title") and recording_start_time:
+        try:
+            dt = datetime.fromisoformat(str(recording_start_time).replace("Z", "+00:00"))
+            return 0, int(dt.strftime("%Y%m%d%H%M"))
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
 # Dispatcharr's recordings API reports file_path as an ABSOLUTE path from
@@ -235,7 +265,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
         # one profile (e.g. two people each set up their own "Seinfeld"
         # profile) -- see vod_db.match_recording_profiles' docstring.
         profile_by_stream_id[recording_id] = vod_db.match_recording_profiles(provider_id, title, program.get("tvg_id"))
-        season_episode = _resolve_season_episode(program, file_path)
+        season_episode = _resolve_season_episode(program, file_path, recording.get("start_time"))
         container_extension = os.path.splitext(file_path)[1].lstrip(".") or "mkv"
 
         if season_episode:
