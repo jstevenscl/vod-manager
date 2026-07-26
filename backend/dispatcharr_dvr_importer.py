@@ -13,12 +13,15 @@ a provider with no local path configured is currently just skipped, not
 queued for later download.
 
 Unlike XC/Plex/Emby, a DVR recording arrives with almost no metadata --
-only whatever Dispatcharr's EPG match captured (title/sub_title/description,
-no season/episode) plus the output file's own path (which does encode
-season/episode, but only as raw folder/filename text, not structured
-fields). Two fallbacks close that gap: path-pattern parsing for
-season/episode, and a real (but conservative -- exact-title-only) TMDB
-search for genre-adjacent detail XC/Plex/Emby get for free. Anything not
+only whatever Dispatcharr's EPG match captured (title/sub_title/description/
+season/episode/poster_url when matched) plus the output file's own path.
+season/episode ARE available as structured ints on custom_properties
+(confirmed live, dispatch-test v0.27.2, 2026-07-25 -- earlier research said
+otherwise) and are always preferred; path-pattern parsing is a fallback for
+whenever they're ever missing (an EPG-unmatched recording, or an older
+Dispatcharr version). A real (but conservative -- exact-title-only) TMDB
+search fills in genre-adjacent detail XC/Plex/Emby get for free, only for
+fields Dispatcharr's own EPG match didn't already provide. Anything not
 confidently resolved lands in the existing Missing Artwork / Needs Review
 queues for a human (or AI-assist) to finish, the same as every other
 import path already does -- no new review flow invented here.
@@ -42,21 +45,51 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 # Matches "S01E05", "s1e5", "S01.E05", etc. anywhere in a recording's file
-# path -- the one structured signal available for season/episode, since
-# Dispatcharr's API never reports them (only the output path template
-# encodes them, per vod_manager-f09's research, and that template is itself
-# admin-configurable, so this is deliberately loose rather than tied to one
-# exact folder shape). A recording with no match is treated as a movie.
+# path -- fallback only now (see _resolve_season_episode); Dispatcharr's own
+# structured season/episode fields are preferred whenever present. Kept
+# deliberately loose (not tied to one exact folder shape) since a provider's
+# TV Path Template is itself admin-configurable. A recording with no match
+# (structured or path) is treated as a movie.
 _SEASON_EPISODE_RE = re.compile(r"[Ss](\d{1,2})[._\- ]?[Ee](\d{1,3})")
 
 
-def _parse_season_episode(file_path: str | None) -> tuple[int, int] | None:
+def _resolve_season_episode(program: dict, file_path: str | None) -> tuple[int, int] | None:
+    """Dispatcharr's own custom_properties.season/episode (structured ints)
+    win whenever both are present and valid -- confirmed live as the
+    authoritative source dispatch-test actually populates, strictly more
+    reliable than regex-guessing the path. Falls back to path parsing only
+    when either is missing (e.g. a recording with no EPG match at all)."""
+    season, episode = program.get("season"), program.get("episode")
+    if isinstance(season, int) and isinstance(episode, int) and season > 0 and episode > 0:
+        return season, episode
     if not file_path:
         return None
     m = _SEASON_EPISODE_RE.search(file_path)
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+# Dispatcharr's recordings API reports file_path as an ABSOLUTE path from
+# its OWN container filesystem's perspective (confirmed live: e.g.
+# "/data/recordings/TV_Shows/Show/S01E01.mkv"), not a path relative to some
+# implicit recordings root -- an admin's dvr_local_path bind-mount already
+# corresponds to whatever Dispatcharr itself calls this root, so it must be
+# stripped before joining with dvr_local_path, or the mapped path silently
+# double-nests it (dvr_local_path + "data/recordings/..." instead of just
+# dvr_local_path + the part actually under that root).
+_DEFAULT_REMOTE_RECORDINGS_ROOT = "/data/recordings"
+
+
+def _strip_remote_root(file_path: str, remote_root: str) -> str:
+    normalized = file_path.replace("\\", "/")
+    root = remote_root.rstrip("/") + "/"
+    if normalized.startswith(root):
+        return normalized[len(root):]
+    # Root didn't match (a differently-configured Dispatcharr instance, or a
+    # future/older version with a different layout) -- best-effort fall back
+    # to the old lstrip-only behavior rather than erroring the whole import.
+    return normalized.lstrip("/")
 
 
 def _guess_title(recording: dict, program: dict, file_path: str | None) -> str:
@@ -126,6 +159,7 @@ async def import_dvr_recordings(provider_id: int) -> dict:
                 "episodes_imported": 0, "skipped_no_local_path": True}
 
     recordings = await dispatcharr_dvr_client.list_completed_recordings(connection)
+    remote_root = provider.get("dvr_remote_recordings_root") or _DEFAULT_REMOTE_RECORDINGS_ROOT
 
     movie_items = []
     series_items: dict[str, dict] = {}
@@ -139,11 +173,11 @@ async def import_dvr_recordings(provider_id: int) -> dict:
             skipped += 1
             continue
         recording_id = str(recording["id"])
-        local_paths_by_stream_id[recording_id] = os.path.join(local_path, file_path.lstrip("/\\"))
+        local_paths_by_stream_id[recording_id] = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
 
         program = dispatcharr_dvr_client.recording_program_info(recording)
         title = _guess_title(recording, program, file_path)
-        season_episode = _parse_season_episode(file_path)
+        season_episode = _resolve_season_episode(program, file_path)
         container_extension = os.path.splitext(file_path)[1].lstrip(".") or "mkv"
 
         if season_episode:
@@ -157,7 +191,7 @@ async def import_dvr_recordings(provider_id: int) -> dict:
                 series_items[title] = {
                     "name": title, "year": None, "provider_series_id": f"dvr-{provider_id}-{title}",
                     "genre": None, "description": program.get("description"), "director": None,
-                    "cast_list": None, "poster_url": None, "last_enriched_at": None, "episodes": [],
+                    "cast_list": None, "poster_url": program.get("poster_url"), "last_enriched_at": None, "episodes": [],
                 }
             series_items[title]["episodes"].append({
                 "season_number": season_number, "episode_number": episode_number,
@@ -170,21 +204,26 @@ async def import_dvr_recordings(provider_id: int) -> dict:
                 "name": title, "year": None, "provider_stream_id": recording_id,
                 "container_extension": container_extension,
                 "description": program.get("description"),
-                "genre": None, "director": None, "cast_list": None, "poster_url": None,
+                "genre": None, "director": None, "cast_list": None, "poster_url": program.get("poster_url"),
                 "last_enriched_at": None,
             })
 
     # TMDB enrichment pass -- one search per distinct title, not per
-    # recording, since multiple episodes/movies can share a title.
+    # recording, since multiple episodes/movies can share a title. Only
+    # fills gaps (item.get(k) falsy) rather than overwriting unconditionally
+    # -- Dispatcharr's own EPG match (description, poster_url) is specific
+    # to this exact episode/instance, a higher-confidence source than a
+    # conservative exact-title search against the general show/movie, so it
+    # must win when both are present.
     for item in movie_items:
         detail = await _enrich_from_tmdb(item["name"], "movie")
         for k, v in detail.items():
-            if v:
+            if v and not item.get(k):
                 item[k] = v
     for item in series_items.values():
         detail = await _enrich_from_tmdb(item["name"], "series")
         for k, v in detail.items():
-            if v and k != "year":  # a series' year comes from its earliest season, not one TMDB lookup here
+            if v and k != "year" and not item.get(k):  # a series' year comes from its earliest season, not one TMDB lookup here
                 item[k] = v
 
     movie_result = vod_db.bulk_import_plex_movies(provider_id, movie_items)

@@ -386,6 +386,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "dvr_local_path", "TEXT"),
         ("providers", "dvr_movie_category_id", "INTEGER"),
         ("providers", "dvr_series_category_id", "INTEGER"),
+        ("providers", "dvr_remote_recordings_root", "TEXT"),
         ("movie_sources", "local_file_path", "TEXT"),
         ("episode_sources", "local_file_path", "TEXT"),
     ]
@@ -448,13 +449,19 @@ def upsert_provider(
     provider_type: str = "xc",
     dispatcharr_connection_id: int | None = None, dvr_local_path: str | None = None,
     dvr_movie_category_id: int | None = None, dvr_series_category_id: int | None = None,
+    dvr_remote_recordings_root: str | None = None,
 ) -> int:
     """base_url/username/password are meaningless for provider_type='dispatcharr_dvr'
     (empty strings from the caller) -- a DVR source reuses an existing
     dispatcharr_connections row for its actual url/token instead of storing
     its own, the same way Plex leaves username blank and Emby/Jellyfin leave
     both blank. The dispatcharr_connection_id/dvr_* fields are ignored for
-    every other provider_type."""
+    every other provider_type. dvr_remote_recordings_root: the absolute path
+    prefix Dispatcharr's OWN recordings API reports (default "/data/recordings",
+    confirmed live) that dvr_local_path's bind-mount corresponds to -- see
+    dispatcharr_dvr_importer._strip_remote_root. Blank/None means use that
+    built-in default; only needs setting if a Dispatcharr instance is
+    configured with a different library root."""
     encrypted_password = encrypt_value(password)
     conn = _connect()
     row = conn.execute("SELECT id FROM providers WHERE name = ?", (name,)).fetchone()
@@ -462,19 +469,21 @@ def upsert_provider(
         conn.execute(
             """UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?,
                dispatcharr_connection_id=?, dvr_local_path=?, dvr_movie_category_id=?, dvr_series_category_id=?,
-               updated_at=? WHERE id=?""",
+               dvr_remote_recordings_root=?, updated_at=? WHERE id=?""",
             (base_url, username, encrypted_password, max_streams, priority, provider_type,
              dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-             _now(), row["id"]),
+             dvr_remote_recordings_root, _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
         cur = conn.execute(
             """INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type,
-               dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
+               dvr_remote_recordings_root, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (name, base_url, username, encrypted_password, max_streams, priority, provider_type,
-             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id, _now()),
+             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
+             dvr_remote_recordings_root, _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)

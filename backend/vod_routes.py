@@ -139,6 +139,7 @@ class ProviderRequest(BaseModel):
     dvr_local_path: Optional[str] = None
     dvr_movie_category_id: Optional[int] = None
     dvr_series_category_id: Optional[int] = None
+    dvr_remote_recordings_root: Optional[str] = None
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -683,6 +684,7 @@ async def upsert_provider(body: ProviderRequest):
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
         dispatcharr_connection_id=body.dispatcharr_connection_id, dvr_local_path=body.dvr_local_path,
         dvr_movie_category_id=body.dvr_movie_category_id, dvr_series_category_id=body.dvr_series_category_id,
+        dvr_remote_recordings_root=body.dvr_remote_recordings_root,
     )
 
     sync_error = None

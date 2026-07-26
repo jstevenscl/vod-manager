@@ -42,16 +42,32 @@ def recording_program_info(recording: dict) -> dict:
     """EPG-matched program detail, when Dispatcharr had a match at record
     time -- higher-confidence than parsing the output filename, but not
     always present (an unmatched channel/timeslot still records, just
-    without this). Season/episode are deliberately NOT read from here --
-    per the research, Dispatcharr never includes them in custom_properties,
-    only in the output file's path template, so callers must parse the
-    path for those regardless of whether a program match exists."""
-    program = (recording.get("custom_properties") or {}).get("program") or {}
+    without this).
+
+    season/episode ARE available -- confirmed live against a real instance
+    (dispatch-test, v0.27.2, 2026-07-25): Dispatcharr stamps them as plain
+    ints directly on custom_properties (not nested under "program"), e.g.
+    {"season": 3, "episode": 13, ...}. Earlier research said otherwise (no
+    structured season/episode anywhere, path-parsing required) -- that was
+    wrong, or true of an older version; either way, prefer these directly
+    over dispatcharr_dvr_importer.py's regex path-parsing whenever present,
+    falling back to the path only if they're ever missing (an unmatched
+    recording, or an older Dispatcharr version).
+
+    poster_url is also directly available and reflects Dispatcharr's own
+    EPG match for this specific episode -- higher-confidence than the
+    importer's conservative TMDB exact-title fallback search, and free (no
+    extra API call), so callers should prefer it when present."""
+    props = recording.get("custom_properties") or {}
+    program = props.get("program") or {}
     return {
         "title": program.get("title") or None,
         "sub_title": program.get("sub_title") or None,
         "description": program.get("description") or None,
         "tvg_id": program.get("tvg_id") or None,
+        "season": props.get("season"),
+        "episode": props.get("episode"),
+        "poster_url": props.get("poster_url") or None,
     }
 
 
