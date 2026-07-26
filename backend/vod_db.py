@@ -651,12 +651,20 @@ def match_recording_profiles(provider_id: int, title: str, tvg_id: str | None) -
     channels" behavior); a profile scoped to a specific tvg_id only matches
     a recording that actually aired on that channel.
 
-    Note this is a purely local/VOD-Manager-side fan-out -- Dispatcharr
-    itself only ever produces ONE physical recording per (title, tvg_id)
-    rule identity (see create_recording_profile's collision guard in
-    vod_routes.py), so "multiple profiles matching" means multiple people
-    sharing that single recording's copies-into-categories fan-out, not
-    multiple independent recordings."""
+    Note this is a purely local/VOD-Manager-side fan-out. Confirmed by
+    reading Dispatcharr's own evaluate_series_rules_impl (apps/channels/
+    tasks.py, dispatch-test v0.27.2, 2026-07-26): it builds ONE
+    existing_program_keys set -- keyed by the airing's own (tvg_id,
+    start_time, end_time), not by which rule matched it -- shared across
+    every rule in the same evaluation pass. So even when both a
+    channel-scoped rule and a channel-agnostic rule match the very same
+    airing, whichever rule the loop reaches first creates the Recording and
+    adds that key; the other rule's query hits the same key and is skipped.
+    Exactly one physical recording is ever produced for a given airing
+    regardless of how many rules (or VOD Manager profiles) matched it, so
+    "multiple profiles matching" here really does mean multiple people
+    sharing that one recording's copies-into-categories fan-out, not
+    multiple independent recordings or duplicate downloads."""
     conn = _connect()
     rows = conn.execute(
         "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=?", (provider_id, title)
