@@ -3387,6 +3387,32 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                         sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                         conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                         did_match = True
+                    elif year is None:
+                        # Same reasoning as bulk_import_plex_movies's identical
+                        # branch -- a null year (rare for Plex/Emby, which
+                        # almost always report a real one, but the norm for
+                        # DVR-sourced series, which have no year signal at all
+                        # -- see dispatcharr_dvr_importer.py) still deserves an
+                        # exactly-one-candidate check rather than silently
+                        # falling straight through to a plain insert with no
+                        # disambiguation at all, unlike every other null-year
+                        # match path in this codebase.
+                        candidates = conn.execute("SELECT id FROM series WHERE name=?", (name,)).fetchall()
+                        if len(candidates) == 1:
+                            series_id = candidates[0]["id"]
+                            sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                            conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
+                            did_match = True
+                        else:
+                            cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                            vals = [name, year, 1 if candidates else 0, provider_id, item.get("provider_series_id"), *detail.values()]
+                            if item.get("tmdb_id"):
+                                cols.append("tmdb_id")
+                                vals.append(item["tmdb_id"])
+                            placeholders = ", ".join("?" for _ in cols)
+                            cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
+                            series_id = cur.lastrowid
+                            did_create = True
                     else:
                         cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
                         vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
