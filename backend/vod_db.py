@@ -234,6 +234,29 @@ def init_db() -> None:
             UNIQUE(content_type, signature)
         );
 
+        -- Phase 2 DVR scheduling. Field names (tvg_id/title/title_mode/
+        -- description/description_mode/mode/channel_id) match Dispatcharr's
+        -- own SeriesRuleRequest API body exactly (confirmed via its OpenAPI
+        -- schema, dispatch-test v0.27.2, 2026-07-26) so create_series_rule
+        -- passes them straight through with zero translation. tvg_id blank
+        -- means match across all EPG channels, same as leaving it blank in
+        -- Dispatcharr's own "Customize rule..." UI.
+        CREATE TABLE IF NOT EXISTS dvr_recording_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            tvg_id TEXT,
+            title TEXT NOT NULL,
+            title_mode TEXT NOT NULL DEFAULT 'exact',
+            description TEXT,
+            description_mode TEXT NOT NULL DEFAULT 'contains',
+            mode TEXT NOT NULL DEFAULT 'all',
+            channel_id INTEGER,
+            target_movie_category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+            target_series_category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -248,6 +271,7 @@ def init_db() -> None:
         -- event-loop-blocking O(n*m) scan that looked like a hang.
         CREATE INDEX IF NOT EXISTS idx_movie_sources_movie_id ON movie_sources(movie_id);
         CREATE INDEX IF NOT EXISTS idx_episode_sources_episode_id ON episode_sources(episode_id);
+        CREATE INDEX IF NOT EXISTS idx_dvr_recording_profiles_provider_id ON dvr_recording_profiles(provider_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
@@ -491,20 +515,22 @@ def upsert_provider(
     return provider_id
 
 
-def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> list[int]:
+def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> dict[str, int]:
     """Applied as a separate pass after bulk_import_plex_movies (see
     dispatcharr_dvr_importer.py) -- local_file_path is DVR-specific and kept
     out of that shared Plex/Emby function on purpose. Matches movie_sources
     rows by the same (provider_id, provider_stream_id) key the import just
     wrote them under; entries with no matching row (e.g. a series episode's
     stream id, since callers pass one dict covering both movies and
-    episodes) are silently skipped. Returns the distinct movie_ids touched,
-    for direct use with bulk_place_movies_in_category -- no separate lookup
-    pass needed."""
+    episodes) are silently skipped. Returns {stream_id: movie_id} rather
+    than a bare list of touched ids -- Phase 2's per-recording-profile
+    category routing needs to trace a specific recording back to the movie
+    row it became, not just know which movies were touched in aggregate;
+    callers that only need the touched set can take set(result.values())."""
     if not path_by_stream_id:
-        return []
+        return {}
     conn = _connect()
-    movie_ids = []
+    movie_id_by_stream_id: dict[str, int] = {}
     for stream_id, local_path in path_by_stream_id.items():
         row = conn.execute(
             "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
@@ -516,21 +542,23 @@ def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, 
             "UPDATE movie_sources SET local_file_path=? WHERE provider_id=? AND provider_stream_id=?",
             (local_path, provider_id, stream_id),
         )
-        movie_ids.append(row["movie_id"])
+        movie_id_by_stream_id[stream_id] = row["movie_id"]
     _commit_with_retry(conn)
     conn.close()
-    return list(dict.fromkeys(movie_ids))
+    return movie_id_by_stream_id
 
 
-def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> list[int]:
-    """Episode counterpart to set_movie_source_local_paths. Returns the
-    distinct series_ids touched (not episode_ids) -- DVR category placement
+def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> dict[str, int]:
+    """Episode counterpart to set_movie_source_local_paths. Returns
+    {stream_id: series_id} (not episode_id) -- DVR category placement
     targets a whole series, matching bulk_place_series_in_category's shape,
-    the same as every other series import path in this codebase."""
+    the same as every other series import path in this codebase; see
+    set_movie_source_local_paths's docstring for why this is a dict now
+    rather than a bare list."""
     if not path_by_stream_id:
-        return []
+        return {}
     conn = _connect()
-    series_ids = []
+    series_id_by_stream_id: dict[str, int] = {}
     for stream_id, local_path in path_by_stream_id.items():
         row = conn.execute(
             """SELECT episodes.series_id AS series_id FROM episode_sources
@@ -544,10 +572,92 @@ def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str
             "UPDATE episode_sources SET local_file_path=? WHERE provider_id=? AND provider_stream_id=?",
             (local_path, provider_id, stream_id),
         )
-        series_ids.append(row["series_id"])
+        series_id_by_stream_id[stream_id] = row["series_id"]
     _commit_with_retry(conn)
     conn.close()
-    return list(dict.fromkeys(series_ids))
+    return series_id_by_stream_id
+
+
+# ── DVR recording profiles (Phase 2) ────────────────────────────────────────
+# Per-person/per-schedule routing on top of a DVR provider's own default
+# categories -- see dispatcharr_dvr_client.create_series_rule and
+# dispatcharr_dvr_importer's profile-matching pass. Field names deliberately
+# mirror Dispatcharr's own SeriesRuleRequest body exactly (see the schema
+# comment on the table itself).
+
+def create_recording_profile(
+    provider_id: int, label: str, title: str,
+    tvg_id: str | None = None, title_mode: str = "exact",
+    description: str | None = None, description_mode: str = "contains",
+    mode: str = "all", channel_id: int | None = None,
+    target_movie_category_id: int | None = None, target_series_category_id: int | None = None,
+) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO dvr_recording_profiles
+           (provider_id, label, tvg_id, title, title_mode, description, description_mode,
+            mode, channel_id, target_movie_category_id, target_series_category_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (provider_id, label, tvg_id or None, title, title_mode, description or None, description_mode,
+         mode, channel_id, target_movie_category_id, target_series_category_id, _now()),
+    )
+    profile_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return profile_id
+
+
+def list_recording_profiles(provider_id: int | None = None) -> list[dict]:
+    conn = _connect()
+    if provider_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM dvr_recording_profiles WHERE provider_id=? ORDER BY label", (provider_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM dvr_recording_profiles ORDER BY label").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_recording_profile(profile_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM dvr_recording_profiles WHERE id=?", (profile_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_recording_profile(profile_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM dvr_recording_profiles WHERE id=?", (profile_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def match_recording_profile(provider_id: int, title: str, tvg_id: str | None) -> dict | None:
+    """Matches a completed recording back to whichever profile scheduled it
+    -- Dispatcharr's own Recording data carries no rule reference at all
+    (confirmed via its OpenAPI schema and real captured recordings), but its
+    series-rules resource is itself identified purely by (title, tvg_id) --
+    its own DELETE endpoint takes exactly those two params, no id -- so
+    that's the same pair used here. A profile with no tvg_id set matches
+    across any channel (mirrors Dispatcharr's own "blank tvg_id = search all
+    channels" behavior); an exact tvg_id match is preferred over a
+    channel-agnostic one when both exist for the same title."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM dvr_recording_profiles WHERE provider_id=? AND title=?", (provider_id, title)
+    ).fetchall()
+    conn.close()
+    candidates = [dict(r) for r in rows]
+    if not candidates:
+        return None
+    for c in candidates:
+        if tvg_id and c["tvg_id"] == tvg_id:
+            return c
+    for c in candidates:
+        if not c["tvg_id"]:
+            return c
+    return None
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:

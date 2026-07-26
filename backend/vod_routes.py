@@ -29,6 +29,7 @@ from config import (
 from routes import require_auth
 import ai_assist
 import apply_exclusions_job
+import dispatcharr_dvr_client
 import dispatcharr_dvr_importer
 import duplicate_confirm
 import emby_vod_importer
@@ -140,6 +141,29 @@ class ProviderRequest(BaseModel):
     dvr_movie_category_id: Optional[int] = None
     dvr_series_category_id: Optional[int] = None
     dvr_remote_recordings_root: Optional[str] = None
+
+
+class RecordingProfileRequest(BaseModel):
+    provider_id: int
+    label: str
+    title: str
+    tvg_id: Optional[str] = None
+    title_mode: str = "exact"
+    description: Optional[str] = None
+    description_mode: str = "contains"
+    mode: str = "all"
+    channel_id: Optional[int] = None
+    target_movie_category_id: Optional[int] = None
+    target_series_category_id: Optional[int] = None
+
+
+class RecordingProfilePreviewRequest(BaseModel):
+    provider_id: int
+    title: str
+    tvg_id: Optional[str] = None
+    title_mode: str = "exact"
+    description: Optional[str] = None
+    description_mode: str = "contains"
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -868,6 +892,84 @@ async def import_provider_catalog(provider_id: int):
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
     await vod_importer.refresh_catchall_categories()
     return result
+
+
+# ── DVR recording profiles (Phase 2) ────────────────────────────────────────
+# Per-person/per-schedule routing on top of a DVR provider's own default
+# categories -- see vod_db.match_recording_profile and
+# dispatcharr_dvr_client.create_series_rule.
+
+def _require_dvr_connection(provider_id: int) -> tuple[dict, dict]:
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(404, detail="provider not found")
+    if not provider.get("dispatcharr_connection_id"):
+        raise HTTPException(400, detail="provider has no linked Dispatcharr connection configured")
+    connection = vod_db.get_dispatcharr_connection(provider["dispatcharr_connection_id"])
+    if not connection:
+        raise HTTPException(400, detail="provider's linked Dispatcharr connection no longer exists")
+    return provider, connection
+
+
+@router.get("/dvr-recording-profiles/", dependencies=_GUARDS)
+async def list_recording_profiles(provider_id: Optional[int] = None):
+    return vod_db.list_recording_profiles(provider_id)
+
+
+@router.post("/dvr-recording-profiles/preview/", dependencies=_GUARDS)
+async def preview_recording_profile(body: RecordingProfilePreviewRequest):
+    """What Dispatcharr's own EPG currently says this rule would match,
+    without saving anything -- same live preview Dispatcharr's own
+    "Customize rule..." UI shows, confirmed live against a real instance."""
+    _, connection = _require_dvr_connection(body.provider_id)
+    try:
+        return await dispatcharr_dvr_client.preview_series_rule(
+            connection, body.title, body.tvg_id, body.title_mode, body.description, body.description_mode,
+        )
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.post("/dvr-recording-profiles/", dependencies=_GUARDS)
+async def create_recording_profile(body: RecordingProfileRequest):
+    """Creates the real Series Rule on Dispatcharr FIRST -- only saves the
+    local profile row once that succeeds, so a failed remote call never
+    leaves a dangling profile pointing at a rule that doesn't actually
+    exist."""
+    _, connection = _require_dvr_connection(body.provider_id)
+    try:
+        await dispatcharr_dvr_client.create_series_rule(
+            connection, body.title, body.tvg_id, body.title_mode,
+            body.description, body.description_mode, body.mode, body.channel_id,
+        )
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Dispatcharr rejected the rule: {exc}")
+    profile_id = vod_db.create_recording_profile(
+        body.provider_id, body.label, body.title, body.tvg_id, body.title_mode,
+        body.description, body.description_mode, body.mode, body.channel_id,
+        body.target_movie_category_id, body.target_series_category_id,
+    )
+    return vod_db.get_recording_profile(profile_id)
+
+
+@router.delete("/dvr-recording-profiles/{profile_id}/", dependencies=_GUARDS)
+async def delete_recording_profile(profile_id: int):
+    """Removing a profile also removes the real Dispatcharr rule it created
+    -- best-effort: if the remote call fails (connection gone, rule already
+    removed on Dispatcharr's side, etc.) the local profile is still deleted,
+    since the user's clear intent here is "get rid of this," not to be
+    blocked by a remote cleanup failure."""
+    profile = vod_db.get_recording_profile(profile_id)
+    if not profile:
+        raise HTTPException(404, detail="recording profile not found")
+    try:
+        _, connection = _require_dvr_connection(profile["provider_id"])
+        await dispatcharr_dvr_client.delete_series_rule(connection, profile["title"], profile.get("tvg_id"))
+    except Exception as exc:
+        logger.warning("[vod_routes] delete_recording_profile(%s): failed to remove the Dispatcharr-side rule: %s",
+                        profile_id, exc)
+    vod_db.delete_recording_profile(profile_id)
+    return {"ok": True}
 
 
 # ── Categories ───────────────────────────────────────────────────────────────

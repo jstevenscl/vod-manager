@@ -114,3 +114,76 @@ async def download_recording_file(connection: dict, recording_id: int, dest_path
                 async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                     f.write(chunk)
     os.replace(tmp_path, dest_path)
+
+
+def _series_rule_body(
+    title: str, tvg_id: str | None, title_mode: str, description: str | None,
+    description_mode: str, mode: str, channel_id: int | None,
+) -> dict:
+    """Field names match Dispatcharr's own SeriesRuleRequest body exactly
+    (confirmed via its OpenAPI schema, GET /api/schema/, dispatch-test
+    v0.27.2, 2026-07-26) -- no translation layer needed. Blank/None tvg_id
+    genuinely means "omit the field" (matches across all EPG channels,
+    Dispatcharr's own default), not an empty string sent over the wire."""
+    body = {"title": title, "title_mode": title_mode, "description_mode": description_mode, "mode": mode}
+    if tvg_id:
+        body["tvg_id"] = tvg_id
+    if description:
+        body["description"] = description
+    if channel_id:
+        body["channel_id"] = channel_id
+    return body
+
+
+async def create_series_rule(
+    connection: dict, title: str, tvg_id: str | None = None, title_mode: str = "exact",
+    description: str | None = None, description_mode: str = "contains",
+    mode: str = "all", channel_id: int | None = None,
+) -> None:
+    """Creates (or updates, per Dispatcharr's own description: "Add a new
+    series recording rule or update an existing one") a recurring Series
+    Rule -- Dispatcharr evaluates it immediately against the current EPG to
+    find and schedule matching episodes. No id is returned or needed: see
+    vod_db.match_recording_profile's docstring for why VOD Manager's own
+    dvr_recording_profiles keys on (title, tvg_id) instead, the same pair
+    Dispatcharr's own delete_series_rule below uses."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    body = _series_rule_body(title, tvg_id, title_mode, description, description_mode, mode, channel_id)
+    await client.post("/api/channels/series-rules/", body)
+
+
+async def delete_series_rule(connection: dict, title: str, tvg_id: str | None = None) -> None:
+    """Confirmed via the OpenAPI schema: series rules are identified purely
+    by (title, tvg_id) -- there's no synthetic id for this resource at all."""
+    params = {"title": title}
+    if tvg_id:
+        params["tvg_id"] = tvg_id
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.delete(
+            f"{connection['url'].rstrip('/')}/api/channels/series-rules/",
+            headers={"X-API-Key": connection["token"]}, params=params,
+        )
+        resp.raise_for_status()
+
+
+async def preview_series_rule(
+    connection: dict, title: str, tvg_id: str | None = None, title_mode: str = "exact",
+    description: str | None = None, description_mode: str = "contains", limit: int = 25,
+) -> dict:
+    """Upcoming programs this rule would match, without persisting it --
+    powers the same live preview Dispatcharr's own "Customize rule..." UI
+    shows (confirmed live). Used by VOD Manager's own recording-profile form
+    to show the same preview before saving. Returns the full response dict
+    as-is: {"matches": [...], "total": int, "limit": int, "epg_found": bool,
+    "warn": bool} (confirmed live -- the list itself is under "matches", not
+    "results" like most of Dispatcharr's other list endpoints); epg_found in
+    particular is a real, useful signal a caller can't derive from an empty
+    "matches" list alone -- False means Dispatcharr has no EPG data at all
+    for this title, not just "nothing airing soon"."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    body = {"title": title, "title_mode": title_mode, "description_mode": description_mode, "limit": limit}
+    if tvg_id:
+        body["tvg_id"] = tvg_id
+    if description:
+        body["description"] = description
+    return await client.post("/api/channels/series-rules/preview/", body)

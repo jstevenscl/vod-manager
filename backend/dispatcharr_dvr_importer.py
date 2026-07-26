@@ -42,6 +42,7 @@ set_episode_source_local_paths), so nothing about the Plex/Emby import path
 has to change to support this.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -52,6 +53,23 @@ import tmdb_sync
 import vod_db
 
 logger = logging.getLogger(__name__)
+
+# Serializes a given provider's own import against itself -- the background
+# _dispatcharr_dvr_poller loop and a manual "Import catalog" click (or the
+# "Apply rules now" job) can otherwise overlap, and in download mode
+# (Phase 1b) two concurrent calls racing to download the SAME recording to
+# the SAME .part path is a real bug, not just a Windows-testing artifact:
+# confirmed live (WinError 32 on Windows; on Linux the second writer would
+# instead silently corrupt the first's in-progress download, arguably
+# worse). One lock per provider_id, not a single global lock, so unrelated
+# providers still import concurrently.
+_import_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_import_lock(provider_id: int) -> asyncio.Lock:
+    if provider_id not in _import_locks:
+        _import_locks[provider_id] = asyncio.Lock()
+    return _import_locks[provider_id]
 
 # Matches "S01E05", "s1e5", "S01.E05", etc. anywhere in a recording's file
 # path -- fallback only now (see _resolve_season_episode); Dispatcharr's own
@@ -151,6 +169,11 @@ async def _enrich_from_tmdb(title: str, content_type: str) -> dict:
 
 
 async def import_dvr_recordings(provider_id: int) -> dict:
+    async with _get_import_lock(provider_id):
+        return await _import_dvr_recordings_locked(provider_id)
+
+
+async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise ValueError(f"provider {provider_id} not found")
@@ -175,6 +198,7 @@ async def import_dvr_recordings(provider_id: int) -> dict:
     movie_items = []
     series_items: dict[str, dict] = {}
     local_paths_by_stream_id: dict[str, str] = {}
+    profile_by_stream_id: dict[str, dict | None] = {}
     skipped = 0
     downloaded = 0
     download_errors = 0
@@ -204,6 +228,13 @@ async def import_dvr_recordings(provider_id: int) -> dict:
 
         program = dispatcharr_dvr_client.recording_program_info(recording)
         title = _guess_title(recording, program, file_path)
+        # _guess_title already prefers program["title"] (the real EPG title)
+        # whenever present, so `title` here IS that EPG title in the common
+        # case -- matching against it (rather than a separately-fetched EPG
+        # title) is correct and avoids a redundant lookup. See
+        # vod_db.match_recording_profile's docstring for the (title, tvg_id)
+        # matching rationale.
+        profile_by_stream_id[recording_id] = vod_db.match_recording_profile(provider_id, title, program.get("tvg_id"))
         season_episode = _resolve_season_episode(program, file_path)
         container_extension = os.path.splitext(file_path)[1].lstrip(".") or "mkv"
 
@@ -254,15 +285,34 @@ async def import_dvr_recordings(provider_id: int) -> dict:
                 item[k] = v
 
     movie_result = vod_db.bulk_import_plex_movies(provider_id, movie_items)
-    touched_movie_ids = vod_db.set_movie_source_local_paths(provider_id, local_paths_by_stream_id)
+    movie_id_by_stream_id = vod_db.set_movie_source_local_paths(provider_id, local_paths_by_stream_id)
 
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
-    touched_series_ids = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
+    series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
 
-    if provider.get("dvr_movie_category_id") and touched_movie_ids:
-        vod_db.bulk_place_movies_in_category(touched_movie_ids, provider["dvr_movie_category_id"])
-    if provider.get("dvr_series_category_id") and touched_series_ids:
-        vod_db.bulk_place_series_in_category(touched_series_ids, provider["dvr_series_category_id"])
+    # Phase 2: a recording matched to a profile (see profile_by_stream_id
+    # above) routes into THAT profile's own target categories instead of the
+    # provider-level default -- grouped by category first so two recordings
+    # landing in the same category (whether from the same profile or
+    # different ones) collapse into one bulk_place_*_in_category call rather
+    # than one call per recording.
+    movie_ids_by_category: dict[int, set[int]] = {}
+    for stream_id, movie_id in movie_id_by_stream_id.items():
+        profile = profile_by_stream_id.get(stream_id)
+        category_id = profile["target_movie_category_id"] if profile else provider.get("dvr_movie_category_id")
+        if category_id:
+            movie_ids_by_category.setdefault(category_id, set()).add(movie_id)
+    for category_id, ids in movie_ids_by_category.items():
+        vod_db.bulk_place_movies_in_category(list(ids), category_id)
+
+    series_ids_by_category: dict[int, set[int]] = {}
+    for stream_id, series_id in series_id_by_stream_id.items():
+        profile = profile_by_stream_id.get(stream_id)
+        category_id = profile["target_series_category_id"] if profile else provider.get("dvr_series_category_id")
+        if category_id:
+            series_ids_by_category.setdefault(category_id, set()).add(series_id)
+    for category_id, ids in series_ids_by_category.items():
+        vod_db.bulk_place_series_in_category(list(ids), category_id)
 
     logger.info("[dispatcharr_dvr_importer] provider=%s movies=%s series=%s skipped=%d downloaded=%d download_errors=%d",
                 provider["name"], movie_result, series_result, skipped, downloaded, download_errors)
