@@ -39,7 +39,7 @@ interface NavGroup {
   items: NavItem[]
 }
 const NAV_GROUPS: NavGroup[] = [
-  { label: 'Library', items: [
+  { label: 'VOD Library', items: [
     { label: 'Movies', icon: <Film size={15} />, tab: 'movies' },
     { label: 'TV Shows', icon: <Tv size={15} />, tab: 'series' },
   ] },
