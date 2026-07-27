@@ -432,11 +432,17 @@ function MissingEpisodesPanel({ series, providerId, qc }: {
                   </button>
                 </div>
                 {result?.resolved && (
-                  <p className="text-green-600 dark:text-green-500 pl-1">Backfilled ({result.mode}) from the pool instead of recording.</p>
+                  <p className="text-green-600 dark:text-green-500 pl-1">
+                    {result.mode === 'recorded'
+                      ? "Found on this show's usual channel and recorded -- no manual pick needed."
+                      : result.mode === 'already_scheduled'
+                        ? 'Already has a real recording scheduled for this exact airing -- nothing new to do.'
+                        : `Backfilled (${result.mode}) from the pool instead of recording.`}
+                  </p>
                 )}
                 {result && !result.resolved && result.candidates.length > 0 && (
                   <div className="pl-1 space-y-0.5">
-                    <p className="text-muted-foreground">Not in the pool -- pick a channel/airing to record:</p>
+                    <p className="text-muted-foreground">{result.message || 'Not in the pool -- pick a channel/airing to record:'}</p>
                     {result.candidates.slice(0, 8).map((c, i) => (
                       <button
                         key={i}
@@ -791,6 +797,62 @@ function SectionCard({ title, icon, children }: { title: string; icon: React.Rea
         {children}
       </CardContent>
     </Card>
+  )
+}
+
+// ---- Shared redesign primitives (KPI tile / status pill / chip) ----
+// Used across the DVR, Providers, and Curation & Maintenance screens so
+// every "how much / how healthy" summary shares one visual language
+// instead of each screen inventing its own badge/number treatment.
+
+function KpiTile({ icon, label, value, note, noteTone = 'default' }: {
+  icon: React.ReactNode
+  label: string
+  value: React.ReactNode
+  note?: React.ReactNode
+  noteTone?: 'default' | 'warn'
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-3.5 shadow-sm">
+      <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+        <span className="text-primary [&_svg]:w-3.5 [&_svg]:h-3.5">{icon}</span>
+        {label}
+      </div>
+      <div className="mt-2 text-xl font-bold tracking-tight tabular-nums">{value}</div>
+      {note && <div className={`mt-0.5 text-[11px] ${noteTone === 'warn' ? 'text-warning' : 'text-muted-foreground/70'}`}>{note}</div>}
+    </div>
+  )
+}
+
+function StatusPill({ label, tone = 'success', icon }: {
+  label: React.ReactNode
+  tone?: 'success' | 'warning' | 'destructive' | 'info'
+  icon?: React.ReactNode
+}) {
+  const toneCls = {
+    success: 'text-success bg-success/10 border-success/25',
+    warning: 'text-warning bg-warning/10 border-warning/25',
+    destructive: 'text-destructive bg-destructive/10 border-destructive/25',
+    info: 'text-primary bg-primary/10 border-primary/25',
+  }[tone]
+  const dotCls = { success: 'bg-success', warning: 'bg-warning', destructive: 'bg-destructive', info: 'bg-primary' }[tone]
+  return (
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${toneCls}`}>
+      {icon ?? <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />}
+      {label}
+    </span>
+  )
+}
+
+function Chip({ children, tone = 'default' }: { children: React.ReactNode; tone?: 'default' | 'rec' }) {
+  return (
+    <span className={
+      tone === 'rec'
+        ? 'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-destructive bg-destructive/10'
+        : 'inline-flex items-center rounded border border-border bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground'
+    }>
+      {children}
+    </span>
   )
 }
 
@@ -2846,26 +2908,17 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export default function VodManager() {
+export type VodManagerTab = 'movies' | 'series' | 'curation' | 'config' | 'dvr'
+export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'metrics'
+
+export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
+  activeTab: VodManagerTab
+  setActiveTab: (t: VodManagerTab) => void
+  dvrSubTab: DvrSubTab
+  setDvrSubTabPersisted: (t: DvrSubTab) => void
+}) {
   const qc = useQueryClient()
 
-  // ── Page tabs + view modes, persisted across reloads ──
-  const [activeTab, setActiveTabState] = useState<'movies' | 'series' | 'curation' | 'config' | 'dvr'>(() => {
-    const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'curation' || saved === 'config' || saved === 'dvr' ? saved : 'movies'
-  })
-  function setActiveTab(t: typeof activeTab) {
-    localStorage.setItem('vodmanager-tab', t)
-    setActiveTabState(t)
-  }
-  const [dvrSubTab, setDvrSubTab] = useState<'scheduled' | 'users' | 'library' | 'metrics'>(() => {
-    const saved = localStorage.getItem('vodmanager-dvr-subtab')
-    return saved === 'scheduled' || saved === 'users' || saved === 'library' || saved === 'metrics' ? saved : 'scheduled'
-  })
-  function setDvrSubTabPersisted(t: typeof dvrSubTab) {
-    localStorage.setItem('vodmanager-dvr-subtab', t)
-    setDvrSubTab(t)
-  }
   const [movieViewMode, setMovieViewModeState] = useState<'list' | 'grid'>(
     () => (localStorage.getItem('vodmanager-movies-view') === 'grid' ? 'grid' : 'list')
   )
@@ -4162,28 +4215,6 @@ export default function VodManager() {
         )}
       </SectionCard>
 
-      <div className="flex items-center gap-0.5 rounded border border-border p-0.5 w-fit">
-        {([
-          { key: 'movies' as const, label: 'Movies', icon: <Film size={12} /> },
-          { key: 'series' as const, label: 'TV Shows', icon: <Tv size={12} /> },
-          { key: 'dvr' as const, label: 'DVR', icon: <CalendarClock size={12} /> },
-          { key: 'curation' as const, label: 'Curation & Maintenance', icon: <Wrench size={12} /> },
-          { key: 'config' as const, label: 'Configuration', icon: <Settings size={12} /> },
-        ]).map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setActiveTab(t.key)}
-            className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs transition-colors ${
-              activeTab === t.key
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:text-foreground hover:bg-accent'
-            }`}
-          >
-            {t.icon}{t.label}
-          </button>
-        ))}
-      </div>
-
       {activeTab === 'config' && (
       <>
       <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
@@ -5366,27 +5397,6 @@ export default function VodManager() {
                 </select>
               </div>
             )}
-
-            <div className="flex items-center gap-0.5 rounded border border-border p-0.5 w-fit">
-              {([
-                { key: 'scheduled' as const, label: 'Scheduled Recordings', icon: <CalendarDays size={12} /> },
-                { key: 'users' as const, label: 'Users', icon: <Users size={12} /> },
-                { key: 'library' as const, label: 'DVR Library', icon: <HardDriveDownload size={12} /> },
-                { key: 'metrics' as const, label: 'Metrics', icon: <LayoutGrid size={12} /> },
-              ]).map((t) => (
-                <button
-                  key={t.key}
-                  onClick={() => setDvrSubTabPersisted(t.key)}
-                  className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs transition-colors ${
-                    dvrSubTab === t.key
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:text-foreground hover:bg-accent'
-                  }`}
-                >
-                  {t.icon}{t.label}
-                </button>
-              ))}
-            </div>
 
             {dvrSubTab === 'scheduled' && (
               <>
