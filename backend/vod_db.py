@@ -810,8 +810,8 @@ def delete_dvr_user_limit(limit_id: int) -> None:
     conn.close()
 
 
-def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> int:
-    """A person's disk usage = sum of file_size_bytes for every movie/episode
+def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> dict:
+    """A person's usage = sum of file_size_bytes for every movie/episode
     currently placed in any category that any of their profiles targets --
     deliberately reuses movie_category_placements/series_category_placements
     (the same tables Manage Categories/TMDB Lists already read) instead of a
@@ -819,7 +819,20 @@ def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> int
     an admin sees sitting in this person's category is exactly what's being
     summed. Per the fan-out design (c8c6139) and the user's own explicit
     call, a recording shared with someone else's profile still counts in
-    full here -- no splitting."""
+    full here -- no splitting.
+
+    Splits into actual_bytes (local_file_path IS NOT NULL -- a real local
+    copy VOD Manager is actually storing, DVR-recorded or downloaded-for-
+    backfill) and virtual_bytes (local_file_path IS NULL -- a backfilled
+    pointer into another provider's own stream, nothing stored locally,
+    but the explicit design choice -- per the user, 2026-07-27 -- is to
+    still count it against quota/retention exactly as if it were real, so
+    a person's limit reflects how much library they're accumulating, not
+    just how many bytes VOD Manager happens to be storing on their behalf.
+    total_bytes (their sum) is what quota enforcement and retention should
+    always compare against; actual/virtual are for display, so an admin
+    can tell "how much disk is this really costing me" apart from "how
+    much library does this person have" when the two diverge."""
     conn = _connect()
     profiles = conn.execute(
         "SELECT target_movie_category_id, target_series_category_id FROM dvr_recording_profiles "
@@ -828,28 +841,36 @@ def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> int
     ).fetchall()
     movie_cat_ids = {p["target_movie_category_id"] for p in profiles if p["target_movie_category_id"]}
     series_cat_ids = {p["target_series_category_id"] for p in profiles if p["target_series_category_id"]}
-    total = 0
+    actual, virtual = 0, 0
     if movie_cat_ids:
         placeholders = ",".join("?" * len(movie_cat_ids))
         row = conn.execute(
-            f"""SELECT COALESCE(SUM(ms.file_size_bytes), 0) AS total FROM movie_category_placements mcp
+            f"""SELECT
+                    COALESCE(SUM(CASE WHEN ms.local_file_path IS NOT NULL THEN ms.file_size_bytes ELSE 0 END), 0) AS actual,
+                    COALESCE(SUM(CASE WHEN ms.local_file_path IS NULL THEN ms.file_size_bytes ELSE 0 END), 0) AS virtual
+                FROM movie_category_placements mcp
                 JOIN movie_sources ms ON ms.movie_id = mcp.movie_id
                 WHERE mcp.category_id IN ({placeholders})""",
             tuple(movie_cat_ids),
         ).fetchone()
-        total += row["total"]
+        actual += row["actual"]
+        virtual += row["virtual"]
     if series_cat_ids:
         placeholders = ",".join("?" * len(series_cat_ids))
         row = conn.execute(
-            f"""SELECT COALESCE(SUM(es.file_size_bytes), 0) AS total FROM series_category_placements scp
+            f"""SELECT
+                    COALESCE(SUM(CASE WHEN es.local_file_path IS NOT NULL THEN es.file_size_bytes ELSE 0 END), 0) AS actual,
+                    COALESCE(SUM(CASE WHEN es.local_file_path IS NULL THEN es.file_size_bytes ELSE 0 END), 0) AS virtual
+                FROM series_category_placements scp
                 JOIN episodes e ON e.series_id = scp.series_id
                 JOIN episode_sources es ON es.episode_id = e.id
                 WHERE scp.category_id IN ({placeholders})""",
             tuple(series_cat_ids),
         ).fetchone()
-        total += row["total"]
+        actual += row["actual"]
+        virtual += row["virtual"]
     conn.close()
-    return total
+    return {"actual_bytes": actual, "virtual_bytes": virtual, "total_bytes": actual + virtual}
 
 
 def find_retention_candidates(provider_id: int, dispatcharr_user_id: int) -> dict:

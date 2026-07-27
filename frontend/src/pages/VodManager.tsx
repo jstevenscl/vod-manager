@@ -3426,12 +3426,14 @@ export default function VodManager() {
       setRuleHealth((prev) => ({ ...prev, [rp.id]: { matches: -1, checking: false } }))
     }
   }
-  const dvrUserUsageQuery = useQuery<Record<number, number>>({
+  const dvrUserUsageQuery = useQuery<Record<number, { actual_bytes: number; virtual_bytes: number; total_bytes: number }>>({
     queryKey: ['vod-dvr-user-usage', recordingProfilesProviderId, dvrUserLimitsQuery.data?.map((l) => l.id).join(',')],
     queryFn: async () => {
       const entries = await Promise.all(
         (dvrUserLimitsQuery.data ?? []).map((lim) =>
-          api.get(`/vod/dvr-user-limits/${lim.id}/usage/`).then((r) => [lim.id, r.data.usage_bytes] as const)
+          api.get(`/vod/dvr-user-limits/${lim.id}/usage/`).then((r) => [lim.id, {
+            actual_bytes: r.data.actual_bytes, virtual_bytes: r.data.virtual_bytes, total_bytes: r.data.total_bytes,
+          }] as const)
         )
       )
       return Object.fromEntries(entries)
@@ -5469,8 +5471,9 @@ export default function VodManager() {
                 <div className="space-y-2">
                   {dvrUserLimitsQuery.data?.map((lim) => {
                     const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
-                    const usageBytes = dvrUserUsageQuery.data?.[lim.id]
-                    const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
+                    const usage = dvrUserUsageQuery.data?.[lim.id]
+                    const usageGB = usage != null ? (usage.total_bytes / 1024 ** 3) : null
+                    const virtualGB = usage != null ? (usage.virtual_bytes / 1024 ** 3) : null
                     const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
                     const pushUpdate = (patch: Partial<{ stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }>) =>
                       updateDvrUserLimit.mutate({
@@ -5489,6 +5492,7 @@ export default function VodManager() {
                               {' · '}
                               {usageGB != null ? usageGB.toFixed(1) : '?'}GB
                               {quotaGB != null ? ` / ${quotaGB.toFixed(0)}GB` : ' (no disk quota)'}
+                              {virtualGB != null && virtualGB > 0.01 && ` (${virtualGB.toFixed(1)}GB virtual/backfill)`}
                             </span>
                           </span>
                           <button
@@ -5761,8 +5765,9 @@ export default function VodManager() {
                   )}
                   <div className="space-y-1">
                     {dvrUserLimitsQuery.data?.map((lim) => {
-                      const usageBytes = dvrUserUsageQuery.data?.[lim.id]
-                      const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
+                      const usage = dvrUserUsageQuery.data?.[lim.id]
+                      const usageGB = usage != null ? (usage.total_bytes / 1024 ** 3) : null
+                      const virtualGB = usage != null ? (usage.virtual_bytes / 1024 ** 3) : null
                       const ruleCount = recordingProfilesQuery.data?.filter((rp) => rp.dispatcharr_user_id === lim.dispatcharr_user_id).length ?? 0
                       const sessions = (watchSessionsQuery.data ?? []).filter((w) => w.dispatcharr_user_id === lim.dispatcharr_user_id)
                       const lastSeen = sessions.length ? Math.max(...sessions.map((s) => Number(s.last_seen_at))) : null
@@ -5772,6 +5777,7 @@ export default function VodManager() {
                             <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
                             <span className="text-muted-foreground">
                               — {usageGB != null ? `${usageGB.toFixed(1)}GB used` : 'usage unknown'}
+                              {virtualGB != null && virtualGB > 0.01 && ` (${virtualGB.toFixed(1)}GB virtual)`}
                               {' · '}{ruleCount} recording rule{ruleCount === 1 ? '' : 's'}
                               {' · '}{sessions.length} watch session{sessions.length === 1 ? '' : 's'} logged
                               {lastSeen != null && <> · last watched {new Date(lastSeen * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</>}

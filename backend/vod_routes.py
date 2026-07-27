@@ -1334,13 +1334,22 @@ async def get_dvr_user_limit_usage(limit_id: int):
     """Current disk usage for this person -- sum of file_size_bytes across
     whatever's actually sitting in the categories their profiles target
     (vod_db.dvr_user_disk_usage_bytes), computed live so it always reflects
-    the current pool state rather than a cached counter that could drift."""
+    the current pool state rather than a cached counter that could drift.
+    Split into actual_bytes (real local copies) vs virtual_bytes (backfill
+    pointers into another provider's stream, nothing stored locally) --
+    total_bytes is what quota enforcement compares against; the split is
+    for display so an admin can see how much is really costing disk."""
     limits = [lim for lim in vod_db.list_dvr_user_limits() if lim["id"] == limit_id]
     if not limits:
         raise HTTPException(404, detail="DVR limit not found")
     limit_row = limits[0]
     usage = vod_db.dvr_user_disk_usage_bytes(limit_row["provider_id"], limit_row["dispatcharr_user_id"])
-    return {"usage_bytes": usage}
+    return {
+        "usage_bytes": usage["total_bytes"],
+        "actual_bytes": usage["actual_bytes"],
+        "virtual_bytes": usage["virtual_bytes"],
+        "total_bytes": usage["total_bytes"],
+    }
 
 
 # ── Categories ───────────────────────────────────────────────────────────────

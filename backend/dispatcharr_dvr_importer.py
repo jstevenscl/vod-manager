@@ -18,7 +18,12 @@ Two modes, chosen per-provider by whether dvr_local_path is set:
   X-API-Key auth as everything else -- the one open question blocking this
   is resolved. A recording already present locally (by path) is never
   re-downloaded; a failed download is retried on the next poll cycle
-  rather than failing the whole import pass.
+  rather than failing the whole import pass. Stored under a deterministic
+  hashed filename (sha256 of provider_id+recording_id), not the real
+  show/episode name Dispatcharr gave it -- this is VOD Manager's own copy
+  on disk (unlike Phase 1a's shared-volume reference), and a VPS host's
+  automated content scan looks at filenames first. The real title lives
+  only in the database.
 
 Unlike XC/Plex/Emby, a DVR recording arrives with almost no metadata --
 only whatever Dispatcharr's EPG match captured (title/sub_title/description/
@@ -43,6 +48,7 @@ has to change to support this.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -240,7 +246,22 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
             skipped += 1
             continue
         recording_id = str(recording["id"])
-        target_path = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
+        if download_mode:
+            # This is VOD Manager's own copy (Phase 1b), fully under our
+            # control, unlike Phase 1a's shared-volume reference to a file
+            # Dispatcharr itself owns and names -- so this is the one case
+            # where renaming is both safe and worth doing. A VPS host doing
+            # an automated content scan looks at filenames first; a real
+            # show/episode name sitting in DATA_DIR/dvr_recordings is a much
+            # easier target than an opaque hash with the actual title living
+            # only in our own database. Deterministic (provider_id +
+            # recording_id), not random, so a re-import after a restart
+            # still resolves to the same path instead of re-downloading.
+            ext = os.path.splitext(file_path)[1] or ".mkv"
+            hashed_name = hashlib.sha256(f"{provider_id}:{recording_id}".encode()).hexdigest() + ext
+            target_path = os.path.join(local_path, hashed_name)
+        else:
+            target_path = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
 
         if download_mode and not os.path.isfile(target_path):
             try:
@@ -333,11 +354,12 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
         if limit_row.get("disk_quota_bytes") is None:
             continue
         usage = vod_db.dvr_user_disk_usage_bytes(provider_id, limit_row["dispatcharr_user_id"])
-        if usage >= limit_row["disk_quota_bytes"]:
+        if usage["total_bytes"] >= limit_row["disk_quota_bytes"]:
             over_quota_user_ids.add(limit_row["dispatcharr_user_id"])
-            logger.info("[dispatcharr_dvr_importer] %s is over their DVR disk quota (%d >= %d bytes) -- "
-                        "withholding new category placements for them this pass",
-                        limit_row["dispatcharr_username"], usage, limit_row["disk_quota_bytes"])
+            logger.info("[dispatcharr_dvr_importer] %s is over their DVR disk quota (%d >= %d bytes, "
+                        "%d actual / %d virtual) -- withholding new category placements for them this pass",
+                        limit_row["dispatcharr_username"], usage["total_bytes"], limit_row["disk_quota_bytes"],
+                        usage["actual_bytes"], usage["virtual_bytes"])
 
     # Phase 2: a recording matched to one or more profiles (see
     # profile_by_stream_id above) routes into the UNION of those profiles'
