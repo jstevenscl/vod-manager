@@ -3018,7 +3018,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'curation' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -4968,31 +4968,34 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </>
       )}
 
-      {activeTab === 'curation' && (
+      {activeTab === 'providers' && (
       <>
       <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
-        <div className="overflow-x-auto">
+        <p className="text-sm text-muted-foreground">
+          Every source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin, and Dispatcharr DVR connections.
+        </p>
+        <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-xs min-w-[1100px]">
           <thead>
-            <tr className="text-muted-foreground text-left">
-              <th className="pb-1 font-normal">Name</th>
-              <th className="pb-1 font-normal">Base URL</th>
-              <th className="pb-1 font-normal">Movies</th>
-              <th className="pb-1 font-normal" title="Distinct series with at least one episode from this provider">Series</th>
-              <th className="pb-1 font-normal" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
-              <th className="pb-1 font-normal" title="Higher number wins when multiple providers carry the same title">Priority</th>
-              <th className="pb-1 font-normal">Max Streams</th>
-              <th className="pb-1 font-normal" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
-              <th className="pb-1 font-normal" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it">Shared Limit / Live Accounts</th>
-              <th className="pb-1 font-normal" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
-              <th className="pb-1 font-normal"></th>
+            <tr className="text-muted-foreground text-left bg-secondary/50">
+              <th className="py-2 px-2 font-semibold">Name</th>
+              <th className="py-2 px-2 font-semibold">Base URL</th>
+              <th className="py-2 px-2 font-semibold">Movies</th>
+              <th className="py-2 px-2 font-semibold" title="Distinct series with at least one episode from this provider">Series</th>
+              <th className="py-2 px-2 font-semibold" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
+              <th className="py-2 px-2 font-semibold" title="Higher number wins when multiple providers carry the same title">Priority</th>
+              <th className="py-2 px-2 font-semibold">Max Streams</th>
+              <th className="py-2 px-2 font-semibold" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
+              <th className="py-2 px-2 font-semibold" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it">Shared Limit / Live Accounts</th>
+              <th className="py-2 px-2 font-semibold" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
+              <th className="py-2 px-2 font-semibold"></th>
             </tr>
           </thead>
           <tbody>
             {providersQuery.data?.map((p) => (
-              <tr key={p.id} className={`border-t border-border/50 ${!p.is_active ? 'opacity-50' : ''}`}>
-                <td className="py-1 pr-2">
-                  <span className="flex items-center gap-1">
+              <tr key={p.id} className={`border-t border-border ${!p.is_active ? 'opacity-50' : ''}`}>
+                <td className="py-2 px-2">
+                  <span className="flex items-center gap-1.5 flex-wrap">
                     <input
                       className={inputCls('w-24')}
                       defaultValue={p.name}
@@ -5003,8 +5006,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         if (v && v !== p.name) setProviderName.mutate({ id: p.id, name: v })
                       }}
                     />
-                    {p.provider_type !== 'xc' && <span className="text-muted-foreground">({PROVIDER_TYPE_LABELS[p.provider_type]})</span>}
-                    {!p.is_active && <span className="text-muted-foreground">(inactive)</span>}
+                    {p.provider_type !== 'xc' && <Chip>{PROVIDER_TYPE_LABELS[p.provider_type]}</Chip>}
+                    <StatusPill tone={p.is_active ? 'success' : 'destructive'} label={p.is_active ? 'Active' : 'Inactive'} />
                   </span>
                 </td>
                 <td className="py-1 pr-2">
@@ -5258,7 +5261,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
         </div>
       </SectionCard>
+      </>
+      )}
 
+      {activeTab === 'curation' && (
+      <>
       <SectionCard title="Import Language Exclusion" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           Auto-archives matching movies/series the moment they're imported (or re-imported) — global across every
@@ -5494,7 +5501,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         {!dvrProviders.length ? (
           <SectionCard title="DVR" icon={<CalendarClock size={14} />}>
             <p className="text-xs text-muted-foreground">
-              No Dispatcharr DVR provider configured yet. Add one from Curation & Maintenance → Providers.
+              No Dispatcharr DVR provider configured yet. Add one from Providers.
             </p>
           </SectionCard>
         ) : (

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CalendarDays, Film, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
-  Palette, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
+  Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
 import Login from '@/pages/Login'
@@ -51,6 +51,7 @@ const NAV_GROUPS: NavGroup[] = [
     { label: 'Metrics', icon: <LayoutGrid size={15} />, tab: 'dvr', dvrSubTab: 'metrics' },
   ] },
   { label: 'Operations', items: [
+    { label: 'Providers', icon: <RefreshCw size={15} />, tab: 'providers' },
     { label: 'Curation & Maintenance', icon: <Wrench size={15} />, tab: 'curation' },
   ] },
   { label: 'System', items: [
