@@ -1636,16 +1636,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
 
   if (mode === 'grid') {
     return (
-      <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
-        <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
+      <div className="rounded-lg border border-border bg-card overflow-hidden shadow-sm hover:shadow-md hover:border-primary/40 transition-all relative">
+        <div className="absolute top-1.5 left-1.5 z-10" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" className="w-3.5 h-3.5" />
         </div>
         {!!movie.is_adult && (
-          <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
+          <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
         )}
         <button
           title={movie.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
-          className="absolute top-1 left-6 z-10 bg-background/80 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          className="absolute top-1.5 left-7 z-10 bg-background/85 rounded p-0.5 text-muted-foreground hover:text-foreground"
           onClick={(e) => { e.stopPropagation(); onToggleArchived() }}
         >
           {movie.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
@@ -1654,17 +1654,17 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           {movie.poster_url ? (
             <img src={movie.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
           ) : (
-            <div className="w-full aspect-[2/3] bg-muted flex items-center justify-center">
+            <div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center">
               <Film size={24} className="text-muted-foreground" />
             </div>
           )}
-          <div className="p-1.5 text-xs">
-            <p className="font-medium truncate">{movie.name}</p>
-            <p className="text-muted-foreground">{movie.year ?? ''}</p>
+          <div className="p-2 text-xs">
+            <p className="font-semibold truncate leading-snug">{movie.name}</p>
+            <p className="text-muted-foreground text-[11px] mt-0.5">{movie.year ?? ''}</p>
           </div>
         </button>
         {movie.sources.length > 0 && (
-          <div className="absolute bottom-8 right-1 z-10 bg-background/80 rounded" onClick={(e) => e.stopPropagation()}>
+          <div className="absolute bottom-9 right-1.5 z-10 bg-background/85 rounded" onClick={(e) => e.stopPropagation()}>
             <PlayButton
               url={buildPreviewUrl('movie', movie.id, movie.sources[0]?.container_extension || 'mp4', xcCredentials)}
               transcodedUrl={movie.sources[0] ? buildTranscodedPreviewSourceUrl('movie', movie.sources[0].id, xcCredentials) : null}
@@ -1688,17 +1688,21 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   }
 
   return (
-    <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
-      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
-      {movie.poster_url && (
-        <img src={movie.poster_url} alt="" className="w-8 h-12 object-cover rounded shrink-0" loading="lazy" />
+    <div className="rounded-lg border border-border bg-card p-2.5 text-xs flex gap-3 shadow-sm hover:border-primary/30 transition-colors">
+      <input type="checkbox" className="mt-1 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
+      {movie.poster_url ? (
+        <img src={movie.poster_url} alt="" className="w-10 h-14 object-cover rounded-md shrink-0" loading="lazy" />
+      ) : (
+        <div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center">
+          <Film size={14} className="text-muted-foreground" />
+        </div>
       )}
       <div className="flex-1 min-w-0">
       <div className="flex items-center justify-between">
-        <span className="font-medium flex items-center gap-1 cursor-pointer" onClick={() => setOpen(!open)}>
-          {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-          {movie.name}{movie.year ? ` (${movie.year})` : ''}
-          {!!movie.is_adult && <span className="text-destructive text-[10px] font-semibold">18+</span>}
+        <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
+          {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
+          {movie.name}{movie.year ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
+          {!!movie.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
           {movie.sources.length} source{movie.sources.length === 1 ? '' : 's'} · {movie.placements.length} categor{movie.placements.length === 1 ? 'y' : 'ies'}
@@ -1739,10 +1743,12 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           </button>
         </span>
       </div>
-      {movie.placements.length > 0 && (
-        <div className="text-muted-foreground mt-0.5">{movie.placements.map((p) => p.category_name).join(', ')}</div>
+      {(movie.placements.length > 0 || movie.genre) && (
+        <div className="flex flex-wrap items-center gap-1 mt-1.5">
+          {movie.placements.map((p) => <Chip key={p.id}>{p.category_name}</Chip>)}
+          {movie.genre && <Chip>{movie.genre}</Chip>}
+        </div>
       )}
-      {movie.genre && <div className="text-muted-foreground mt-0.5">genre: {movie.genre}</div>}
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
@@ -1895,16 +1901,16 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 
   if (mode === 'grid') {
     return (
-      <div className="rounded border border-border/50 overflow-hidden hover:border-primary/50 transition-colors relative">
-        <div className="absolute top-1 left-1 z-10" onClick={(e) => e.stopPropagation()}>
+      <div className="rounded-lg border border-border bg-card overflow-hidden shadow-sm hover:shadow-md hover:border-primary/40 transition-all relative">
+        <div className="absolute top-1.5 left-1.5 z-10" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" className="w-3.5 h-3.5" />
         </div>
         {!!series.is_adult && (
-          <span className="absolute top-1 right-1 z-10 text-destructive text-[10px] font-semibold bg-background/80 rounded px-1">18+</span>
+          <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
         )}
         <button
           title={series.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
-          className="absolute top-1 left-6 z-10 bg-background/80 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          className="absolute top-1.5 left-7 z-10 bg-background/85 rounded p-0.5 text-muted-foreground hover:text-foreground"
           onClick={(e) => { e.stopPropagation(); onToggleArchived() }}
         >
           {series.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
@@ -1913,13 +1919,13 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           {series.poster_url ? (
             <img src={series.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
           ) : (
-            <div className="w-full aspect-[2/3] bg-muted flex items-center justify-center">
+            <div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center">
               <Tv size={24} className="text-muted-foreground" />
             </div>
           )}
-          <div className="p-1.5 text-xs">
-            <p className="font-medium truncate">{series.name}</p>
-            <p className="text-muted-foreground">{series.year ?? ''}</p>
+          <div className="p-2 text-xs">
+            <p className="font-semibold truncate leading-snug">{series.name}</p>
+            <p className="text-muted-foreground text-[11px] mt-0.5">{series.year ?? ''}</p>
           </div>
         </button>
         {open && (
@@ -1937,17 +1943,21 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   }
 
   return (
-    <div className="rounded border border-border/50 p-2 text-xs flex gap-2">
-      <input type="checkbox" className="mt-0.5 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
-      {series.poster_url && (
-        <img src={series.poster_url} alt="" className="w-8 h-12 object-cover rounded shrink-0" loading="lazy" />
+    <div className="rounded-lg border border-border bg-card p-2.5 text-xs flex gap-3 shadow-sm hover:border-primary/30 transition-colors">
+      <input type="checkbox" className="mt-1 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
+      {series.poster_url ? (
+        <img src={series.poster_url} alt="" className="w-10 h-14 object-cover rounded-md shrink-0" loading="lazy" />
+      ) : (
+        <div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center">
+          <Tv size={14} className="text-muted-foreground" />
+        </div>
       )}
       <div className="flex-1 min-w-0">
       <div className="flex items-center justify-between">
-        <span className="font-medium flex items-center gap-1 cursor-pointer" onClick={() => setOpen(!open)}>
-          {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-          {series.name}{series.year ? ` (${series.year})` : ''}
-          {!!series.is_adult && <span className="text-destructive text-[10px] font-semibold">18+</span>}
+        <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
+          {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
+          {series.name}{series.year ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
+          {!!series.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
           {series.episodes.length} episode{series.episodes.length === 1 ? '' : 's'}
@@ -1982,8 +1992,12 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           })()}
         </span>
       </div>
-      {series.genre && <div className="text-muted-foreground mt-0.5">genre: {series.genre}</div>}
-      {series.import_provider_name && <div className="text-muted-foreground mt-0.5">matched from: {series.import_provider_name}</div>}
+      {(series.genre || series.import_provider_name) && (
+        <div className="flex flex-wrap items-center gap-1 mt-1.5">
+          {series.genre && <Chip>{series.genre}</Chip>}
+          {series.import_provider_name && <Chip>matched: {series.import_provider_name}</Chip>}
+        </div>
+      )}
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
