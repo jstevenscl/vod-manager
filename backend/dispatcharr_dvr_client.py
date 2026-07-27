@@ -232,6 +232,25 @@ def _overlaps_any(start: str | None, end: str | None, intervals: list[tuple[str,
     return False
 
 
+async def is_already_scheduled(connection: dict, channel_id: int, program: dict) -> bool:
+    """Same dedup schedule_channel_recordings applies internally (identity
+    key OR real-world time-overlap against every existing Recording on this
+    channel), exposed standalone for callers that create a single one-off
+    Recording outside that function's own loop -- e.g. vod_routes.
+    resolve_missing_episode's scoped-channel auto-record path, which found
+    a real live gap while testing 2026-07-27: a Recording already existed
+    for the exact episode being "found," and without this check the
+    auto-record path would have silently created a duplicate."""
+    existing = await _list_all_recordings(connection)
+    on_channel = [r for r in existing if r.get("channel") == channel_id]
+    key = _episode_identity_key(program)
+    existing_keys = {_episode_identity_key((r.get("custom_properties") or {}).get("program") or {}) for r in on_channel}
+    if key in existing_keys:
+        return True
+    existing_intervals = [(r["start_time"], r["end_time"]) for r in on_channel]
+    return _overlaps_any(program.get("start_time"), program.get("end_time"), existing_intervals)
+
+
 async def create_recording(connection: dict, channel_id: int, program: dict, scheduled_by: dict | None = None) -> dict:
     """Creates a single one-off Recording directly against Dispatcharr's
     plain Recording model (POST /api/channels/recordings/) -- channel id +

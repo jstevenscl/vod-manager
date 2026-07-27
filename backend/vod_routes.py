@@ -1308,20 +1308,40 @@ async def list_missing_episodes(series_id: int):
     ]
 
 
+def _matches_episode(m: dict, season_number: int, episode_number: int) -> bool:
+    props = m.get("custom_properties") or {}
+    season, episode = props.get("season"), props.get("episode")
+    if season is not None and episode is not None:
+        return season == season_number and episode == episode_number
+    return True  # no structured season/episode on this listing -- surface it, let the admin eyeball it
+
+
 @router.post("/series/{series_id}/missing-episodes/resolve/", dependencies=_GUARDS)
 async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveRequest):
-    """The cascade the user asked for, 2026-07-27: (1) already in the pool
-    from a regular (non-DVR) provider? Backfill it (pointer or download,
-    per whatever an existing Recording Rule for this show says, defaulting
-    to pointer when no rule exists) and place it straight into a category
-    -- done, no EPG search needed. (2) not in the pool -- search the EPG
-    (unscoped, across every channel, same shape as the Scheduled Recordings
-    picker's own search) for candidate airings and return them for the
-    admin to pick from; nothing is scheduled yet, since an unscoped search
-    can't safely auto-pick a channel (the exact per-affiliate duplication
-    problem create_recording's docstring documents). (3) neither the pool
-    nor the EPG has it -- flag it in dvr_unresolved_missing_episodes for
-    admin visibility and say so, rather than the attempt silently vanishing."""
+    """The cascade the user asked for, 2026-07-27, refined per their own
+    follow-up the same day: (1) already in the pool from a regular
+    (non-DVR) provider? Backfill it (pointer or download, per whatever an
+    existing Recording Rule for this show says, defaulting to pointer when
+    no rule exists) and place it straight into a category -- done, no EPG
+    search needed. (2) not in the pool, but an existing Recording Rule for
+    this show already names a specific channel -- that's a real, existing
+    admin decision about where this show is normally watched/recorded from,
+    so check THAT channel's own EPG (scoped, same call
+    schedule_channel_recordings itself makes) for a season+episode match
+    within the 7-day guide horizon. A hit there is high-confidence enough
+    to auto-schedule directly, no picker needed -- the user's own insight,
+    2026-07-27: "we know...the channel they want to record the series
+    from...wouldnt we be able to use smart logic to find the scheduled
+    recording in the schedule to confirm it is going to air at that time on
+    that channel." (3) neither the pool nor the rule's own channel has it
+    (or there's no rule at all, so there's no "usual channel" signal) --
+    fall back to an unscoped search across every channel and return
+    candidates for the admin to pick from; nothing auto-schedules from an
+    unscoped result, since guessing a channel there is the exact per-
+    affiliate duplication problem create_recording's own docstring
+    documents. (4) nothing anywhere -- flag it in
+    dvr_unresolved_missing_episodes for admin visibility and say so, rather
+    than the attempt silently vanishing."""
     series = vod_db.get_series(series_id)
     if not series:
         raise HTTPException(404, detail="series not found")
@@ -1346,21 +1366,53 @@ async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveReq
         return {"resolved": True, "mode": mode, "candidates": [], "message": None}
 
     _, connection = _require_dvr_connection(body.provider_id)
+    rule = vod_db.find_recording_profile_for_title(body.provider_id, series["name"])
+    if rule and rule.get("channel_id"):
+        try:
+            scoped_matches = await dispatcharr_dvr_client.search_epg_programs(
+                connection, series["name"], channel_id=rule["channel_id"],
+            )
+        except Exception as exc:
+            raise HTTPException(502, detail=f"EPG search failed: {exc}")
+        scoped_candidates = [m for m in scoped_matches if _matches_episode(m, body.season_number, body.episode_number)]
+        if scoped_candidates:
+            if await dispatcharr_dvr_client.is_already_scheduled(connection, rule["channel_id"], scoped_candidates[0]):
+                # Already a real Recording for this exact airing (e.g. an
+                # earlier rescan already caught it) -- nothing new to do,
+                # but it's genuinely resolved, not missing.
+                vod_db.clear_unresolved_missing_episode(series_id, body.season_number, body.episode_number)
+                return {"resolved": True, "mode": "already_scheduled", "candidates": [], "message": None}
+            scheduled_by = None
+            if rule.get("dispatcharr_user_id"):
+                try:
+                    users = await dispatcharr_dvr_client.list_users(connection)
+                    user = next((u for u in users if u.get("id") == rule["dispatcharr_user_id"]), None)
+                    scheduled_by = {
+                        "dispatcharr_user_id": rule["dispatcharr_user_id"],
+                        "dispatcharr_username": user["username"] if user else None,
+                        "profile_label": rule["label"],
+                    }
+                except Exception as exc:
+                    logger.warning("[vod_routes] resolve_missing_episode: couldn't resolve username for scheduled_by: %s", exc)
+            try:
+                await dispatcharr_dvr_client.create_recording(connection, rule["channel_id"], scoped_candidates[0], scheduled_by)
+            except Exception as exc:
+                raise HTTPException(502, detail=f"Found on this show's usual channel but Dispatcharr rejected the recording: {exc}")
+            vod_db.clear_unresolved_missing_episode(series_id, body.season_number, body.episode_number)
+            return {"resolved": True, "mode": "recorded", "candidates": [], "message": None}
+
     try:
         matches = await dispatcharr_dvr_client.search_epg_programs(connection, series["name"], limit=50)
     except Exception as exc:
         raise HTTPException(502, detail=f"EPG search failed: {exc}")
 
-    def _matches_episode(m: dict) -> bool:
-        props = m.get("custom_properties") or {}
-        season, episode = props.get("season"), props.get("episode")
-        if season is not None and episode is not None:
-            return season == body.season_number and episode == body.episode_number
-        return True  # no structured season/episode on this listing -- surface it, let the admin eyeball it
-
-    candidates = [m for m in matches if _matches_episode(m)]
+    candidates = [m for m in matches if _matches_episode(m, body.season_number, body.episode_number)]
     if candidates:
-        return {"resolved": False, "mode": None, "candidates": candidates, "message": None}
+        message = (
+            "Not airing on this show's usual channel within the 7-day guide -- these are matches on other channels; "
+            "pick one to record it there instead." if rule and rule.get("channel_id") else None
+        )
+        return {"resolved": False, "mode": None, "candidates": candidates, "message": message}
 
     vod_db.record_unresolved_missing_episode(series_id, body.season_number, body.episode_number, body.episode_name)
     return {
