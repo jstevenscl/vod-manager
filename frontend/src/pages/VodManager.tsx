@@ -3359,7 +3359,7 @@ export default function VodManager() {
   })
   const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
   const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
-  const [recordingProfileResult, setRecordingProfileResult] = useState<{ scheduled_now: number; total_matches: number } | null>(null)
+  const [recordingProfileResult, setRecordingProfileResult] = useState<{ scheduled_now: number; total_matches: number; skipped_conflicts: number } | null>(null)
   const [epgSearchTitle, setEpgSearchTitle] = useState('')
   const epgSearch = useMutation({
     mutationFn: () => api.get<EpgSearchProgram[]>('/vod/epg-search/', {
@@ -3386,7 +3386,7 @@ export default function VodManager() {
       setEpgSearchTitle('')
       epgSearch.reset()
       setRecordingProfileError(null)
-      setRecordingProfileResult({ scheduled_now: data.scheduled_now ?? 0, total_matches: data.total_matches ?? 0 })
+      setRecordingProfileResult({ scheduled_now: data.scheduled_now ?? 0, total_matches: data.total_matches ?? 0, skipped_conflicts: data.skipped_conflicts ?? 0 })
     },
     onError: (e: any) => { setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'); setRecordingProfileResult(null) },
   })
@@ -4762,7 +4762,7 @@ export default function VodManager() {
                   {p.provider_type === 'dispatcharr_dvr' && (
                     <Button
                       size="sm" variant="outline"
-                      title="Manage this provider's recording profiles, upcoming recordings, and DVR limits"
+                      title="Manage this provider's recording rules, upcoming recordings, users, and library"
                       onClick={() => {
                         setRecordingProfilesProviderId(p.id)
                         setRecordingProfileForm(blankRecordingProfileForm)
@@ -5159,9 +5159,9 @@ export default function VodManager() {
 
             {dvrSubTab === 'scheduled' && (
               <>
-                <SectionCard title="Recording Profiles" icon={<CalendarClock size={14} />}>
+                <SectionCard title="Recording Rules" icon={<CalendarClock size={14} />}>
                   <p className="text-sm text-muted-foreground">
-                    Each profile schedules real Dispatcharr recordings for a specific show on a specific channel, and
+                    Each rule schedules real Dispatcharr recordings for a specific show on a specific channel, and
                     re-checks for new episodes automatically. When one finishes, it's routed into the categories
                     below instead of this provider's own default.
                   </p>
@@ -5169,7 +5169,7 @@ export default function VodManager() {
                   <div className="space-y-1.5">
                     {recordingProfilesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
                     {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
-                      <p className="text-xs text-muted-foreground">No recording profiles yet.</p>
+                      <p className="text-xs text-muted-foreground">No recording rules yet.</p>
                     )}
                     {recordingProfilesQuery.data?.map((rp) => (
                       <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
@@ -5189,9 +5189,9 @@ export default function VodManager() {
                           </span>
                         </span>
                         <button
-                          title="Delete this recording profile (also cancels its future recordings on Dispatcharr)"
+                          title="Delete this recording rule (also cancels its future recordings on Dispatcharr)"
                           className="text-muted-foreground hover:text-destructive p-1"
-                          onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
+                          onClick={() => { if (confirm(`Delete recording rule "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
                         >
                           <Trash2 size={12} />
                         </button>
@@ -5200,7 +5200,7 @@ export default function VodManager() {
                   </div>
 
                   <div className="border-t border-border pt-3 space-y-1.5">
-                    <p className="text-xs font-medium">Add a profile</p>
+                    <p className="text-xs font-medium">Add a rule</p>
                     <p className="text-[11px] text-muted-foreground">
                       Search the real guide and pick the exact channel to record — matching a title with no channel
                       picked records every affiliate carrying it as a separate duplicate, so a channel is required.
@@ -5217,7 +5217,7 @@ export default function VodManager() {
                         className={inputCls()}
                         value={recordingProfileForm.dispatcharr_user_id}
                         onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
-                        title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured under Users, this profile counts against their stream budget, and their own Channel Profile is used to flag channels outside their lineup below"
+                        title="Attributes this rule to a real Dispatcharr person -- if they have DVR limits configured under Users, this rule counts against their stream budget, and their own Channel Profile is used to flag channels outside their lineup below"
                       >
                         <option value="">Person (optional)…</option>
                         {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
@@ -5318,6 +5318,10 @@ export default function VodManager() {
                         Scheduled {recordingProfileResult.scheduled_now} of {recordingProfileResult.total_matches} upcoming episode
                         {recordingProfileResult.total_matches === 1 ? '' : 's'}
                         {recordingProfileResult.total_matches > 0 && recordingProfileResult.scheduled_now === 0 && ' (all already scheduled)'}.
+                        {recordingProfileResult.skipped_conflicts > 0 && (
+                          <> {recordingProfileResult.skipped_conflicts} skipped -- the guide listed more than one episode for the
+                          same time slot on this channel (conflicting upstream EPG data), so only the first was kept.</>
+                        )}
                       </p>
                     )}
                     {recordingProfileError && <p className="text-xs text-destructive">{recordingProfileError}</p>}
@@ -5327,7 +5331,7 @@ export default function VodManager() {
                         disabled={!recordingProfileForm.title.trim() || !recordingProfileForm.channel_id || addRecordingProfile.isPending}
                         onClick={() => addRecordingProfile.mutate()}
                       >
-                        {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
+                        {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add rule</>}
                       </Button>
                     </div>
                   </div>
@@ -5373,7 +5377,7 @@ export default function VodManager() {
               <SectionCard title="Users" icon={<Users size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Opt-in per person -- only enforced for someone listed here. Stream reserve predicts whether a new
-                  profile could require more simultaneous recordings than their Dispatcharr account allows.
+                  recording rule could require more simultaneous recordings than their Dispatcharr account allows.
                   Disk quota withholds new category placements once they're over (nothing existing is ever deleted
                   automatically). Retention lets you reclaim space explicitly -- review candidates and confirm before
                   anything is actually removed.
@@ -5407,7 +5411,7 @@ export default function VodManager() {
                             </span>
                           </span>
                           <button
-                            title="Remove this person's DVR limits (their existing profiles are unaffected, just unconstrained again)"
+                            title="Remove this person's DVR limits (their existing recording rules are unaffected, just unconstrained again)"
                             className="text-muted-foreground hover:text-destructive p-1"
                             onClick={() => { if (confirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`)) deleteDvrUserLimit.mutate(lim.id) }}
                           >
