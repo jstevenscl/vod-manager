@@ -175,11 +175,20 @@ class DvrUserLimitRequest(BaseModel):
     dispatcharr_username: str
     stream_reserve: int = 0
     disk_quota_bytes: Optional[int] = None
+    retention_max_age_days: Optional[int] = None
+    retention_max_episodes_per_show: Optional[int] = None
 
 
 class DvrUserLimitUpdateRequest(BaseModel):
     stream_reserve: int = 0
     disk_quota_bytes: Optional[int] = None
+    retention_max_age_days: Optional[int] = None
+    retention_max_episodes_per_show: Optional[int] = None
+
+
+class ApplyRetentionRequest(BaseModel):
+    movies: list[dict] = []
+    episodes: list[dict] = []
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -1109,9 +1118,21 @@ async def create_recording_profile(body: RecordingProfileRequest):
         )
         if conflict:
             raise HTTPException(409, detail=conflict)
+    scheduled_by = None
+    if body.dispatcharr_user_id:
+        try:
+            users = await dispatcharr_dvr_client.list_users(connection)
+            user = next((u for u in users if u.get("id") == body.dispatcharr_user_id), None)
+            scheduled_by = {
+                "dispatcharr_user_id": body.dispatcharr_user_id,
+                "dispatcharr_username": user["username"] if user else None,
+                "profile_label": body.label,
+            }
+        except Exception as exc:
+            logger.warning("[vod_routes] create_recording_profile: couldn't resolve username for scheduled_by: %s", exc)
     try:
         schedule_result = await dispatcharr_dvr_client.schedule_channel_recordings(
-            connection, body.channel_id, body.title, body.mode,
+            connection, body.channel_id, body.title, body.mode, scheduled_by=scheduled_by,
         )
     except Exception as exc:
         raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
@@ -1261,13 +1282,17 @@ async def create_dvr_user_limit(body: DvrUserLimitRequest):
     limit_id = vod_db.create_dvr_user_limit(
         body.provider_id, body.dispatcharr_user_id, body.dispatcharr_username,
         body.stream_reserve, body.disk_quota_bytes,
+        body.retention_max_age_days, body.retention_max_episodes_per_show,
     )
     return vod_db.get_dvr_user_limit(body.provider_id, body.dispatcharr_user_id) or {"id": limit_id}
 
 
 @router.post("/dvr-user-limits/{limit_id}/", dependencies=_GUARDS)
 async def update_dvr_user_limit(limit_id: int, body: DvrUserLimitUpdateRequest):
-    vod_db.update_dvr_user_limit(limit_id, body.stream_reserve, body.disk_quota_bytes)
+    vod_db.update_dvr_user_limit(
+        limit_id, body.stream_reserve, body.disk_quota_bytes,
+        body.retention_max_age_days, body.retention_max_episodes_per_show,
+    )
     return {"ok": True}
 
 
@@ -1275,6 +1300,28 @@ async def update_dvr_user_limit(limit_id: int, body: DvrUserLimitUpdateRequest):
 async def delete_dvr_user_limit(limit_id: int):
     vod_db.delete_dvr_user_limit(limit_id)
     return {"ok": True}
+
+
+@router.get("/dvr-user-limits/{limit_id}/retention-candidates/", dependencies=_GUARDS)
+async def get_retention_candidates(limit_id: int):
+    """Dry-run only -- see vod_db.find_retention_candidates for why nothing
+    is deleted by this call, just listed for review."""
+    limits = [lim for lim in vod_db.list_dvr_user_limits() if lim["id"] == limit_id]
+    if not limits:
+        raise HTTPException(404, detail="DVR limit not found")
+    lim = limits[0]
+    return vod_db.find_retention_candidates(lim["provider_id"], lim["dispatcharr_user_id"])
+
+
+@router.post("/dvr-user-limits/{limit_id}/apply-retention/", dependencies=_GUARDS)
+async def apply_retention(limit_id: int, body: ApplyRetentionRequest):
+    """The confirm step after get_retention_candidates -- deletes exactly
+    the movie/episode sources the admin reviewed and submitted back, no
+    re-scanning or re-deciding here. See vod_db.apply_retention_deletions."""
+    limits = [lim for lim in vod_db.list_dvr_user_limits() if lim["id"] == limit_id]
+    if not limits:
+        raise HTTPException(404, detail="DVR limit not found")
+    return vod_db.apply_retention_deletions(body.movies, body.episodes)
 
 
 @router.get("/dvr-user-limits/{limit_id}/usage/", dependencies=_GUARDS)

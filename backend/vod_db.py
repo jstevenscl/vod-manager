@@ -278,6 +278,8 @@ def init_db() -> None:
             dispatcharr_username TEXT NOT NULL,
             stream_reserve INTEGER NOT NULL DEFAULT 0,
             disk_quota_bytes INTEGER,
+            retention_max_age_days INTEGER,
+            retention_max_episodes_per_show INTEGER,
             created_at TEXT NOT NULL,
             UNIQUE(provider_id, dispatcharr_user_id)
         );
@@ -475,6 +477,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("dvr_recording_profiles", "dispatcharr_user_id", "INTEGER"),
         ("movie_sources", "file_size_bytes", "INTEGER"),
         ("episode_sources", "file_size_bytes", "INTEGER"),
+        ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
+        ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -746,13 +750,16 @@ def match_recording_profiles(provider_id: int, title: str, tvg_id: str | None) -
 def create_dvr_user_limit(
     provider_id: int, dispatcharr_user_id: int, dispatcharr_username: str,
     stream_reserve: int = 0, disk_quota_bytes: int | None = None,
+    retention_max_age_days: int | None = None, retention_max_episodes_per_show: int | None = None,
 ) -> int:
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO dvr_user_limits
-           (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes, created_at)
-           VALUES (?,?,?,?,?,?)""",
-        (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes, _now()),
+           (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes,
+            retention_max_age_days, retention_max_episodes_per_show, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes,
+         retention_max_age_days, retention_max_episodes_per_show, _now()),
     )
     limit_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -782,11 +789,15 @@ def get_dvr_user_limit(provider_id: int, dispatcharr_user_id: int) -> dict | Non
     return dict(row) if row else None
 
 
-def update_dvr_user_limit(limit_id: int, stream_reserve: int, disk_quota_bytes: int | None) -> None:
+def update_dvr_user_limit(
+    limit_id: int, stream_reserve: int, disk_quota_bytes: int | None,
+    retention_max_age_days: int | None = None, retention_max_episodes_per_show: int | None = None,
+) -> None:
     conn = _connect()
     conn.execute(
-        "UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=? WHERE id=?",
-        (stream_reserve, disk_quota_bytes, limit_id),
+        """UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=?,
+           retention_max_age_days=?, retention_max_episodes_per_show=? WHERE id=?""",
+        (stream_reserve, disk_quota_bytes, retention_max_age_days, retention_max_episodes_per_show, limit_id),
     )
     _commit_with_retry(conn)
     conn.close()
@@ -839,6 +850,119 @@ def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> int
         total += row["total"]
     conn.close()
     return total
+
+
+def find_retention_candidates(provider_id: int, dispatcharr_user_id: int) -> dict:
+    """Dry-run scan for a person's retention policy (dvr_user_limits.
+    retention_max_age_days / retention_max_episodes_per_show, opt-in, both
+    nullable) -- returns candidates, deletes nothing. See
+    apply_retention_deletions for the actual delete step, a deliberately
+    separate explicit action (matches the Orphan Checker's scan-then-delete
+    pattern already established in this app) so an admin reviews exactly
+    what would go before anything does.
+
+    Only ever proposes a movie/episode whose ONLY source is this DVR
+    provider -- one that's also available from another provider is left
+    alone, since deleting it here would silently orphan this provider's
+    placement while a different provider's copy became the sole survivor,
+    not something a single person's retention policy should be able to
+    trigger on content another provider still actively serves.
+
+    Same category-resolution as dvr_user_disk_usage_bytes above -- a
+    person's DVR-managed content is whatever's placed in the categories
+    their own recording profiles target, not a separate tracked set."""
+    limit_row = get_dvr_user_limit(provider_id, dispatcharr_user_id)
+    if not limit_row:
+        return {"movies": [], "episodes": []}
+    max_age_days = limit_row.get("retention_max_age_days")
+    max_episodes_per_show = limit_row.get("retention_max_episodes_per_show")
+    if not max_age_days and not max_episodes_per_show:
+        return {"movies": [], "episodes": []}
+
+    conn = _connect()
+    profiles = conn.execute(
+        "SELECT target_movie_category_id, target_series_category_id FROM dvr_recording_profiles "
+        "WHERE provider_id=? AND dispatcharr_user_id=?",
+        (provider_id, dispatcharr_user_id),
+    ).fetchall()
+    movie_cat_ids = {p["target_movie_category_id"] for p in profiles if p["target_movie_category_id"]}
+    series_cat_ids = {p["target_series_category_id"] for p in profiles if p["target_series_category_id"]}
+
+    movie_candidates = []
+    if max_age_days and movie_cat_ids:
+        placeholders = ",".join("?" * len(movie_cat_ids))
+        cutoff = str(time.time() - max_age_days * 86400)
+        rows = conn.execute(
+            f"""SELECT DISTINCT m.id, m.name, m.year, m.created_at,
+                       (SELECT COUNT(*) FROM movie_sources WHERE movie_id=m.id) AS source_count,
+                       (SELECT ms.id FROM movie_sources ms WHERE ms.movie_id=m.id LIMIT 1) AS source_id,
+                       (SELECT ms.provider_id FROM movie_sources ms WHERE ms.movie_id=m.id LIMIT 1) AS source_provider_id
+                FROM movies m
+                JOIN movie_category_placements mcp ON mcp.movie_id = m.id
+                WHERE mcp.category_id IN ({placeholders}) AND m.created_at < ?""",
+            (*movie_cat_ids, cutoff),
+        ).fetchall()
+        for r in rows:
+            if r["source_count"] == 1 and r["source_provider_id"] == provider_id:
+                movie_candidates.append({
+                    "movie_id": r["id"], "source_id": r["source_id"], "name": r["name"], "year": r["year"],
+                    "created_at": r["created_at"], "reason": "age",
+                })
+
+    episode_candidates = []
+    if series_cat_ids:
+        placeholders = ",".join("?" * len(series_cat_ids))
+        series_rows = conn.execute(
+            f"SELECT DISTINCT series_id, name FROM series_category_placements scp "
+            f"JOIN series s ON s.id = scp.series_id WHERE category_id IN ({placeholders})",
+            tuple(series_cat_ids),
+        ).fetchall()
+        cutoff = str(time.time() - max_age_days * 86400) if max_age_days else None
+        for sr in series_rows:
+            series_id = sr["series_id"]
+            eps = conn.execute(
+                """SELECT e.id, e.name, e.season_number, e.episode_number, e.created_at,
+                          (SELECT COUNT(*) FROM episode_sources WHERE episode_id=e.id) AS source_count,
+                          (SELECT es.id FROM episode_sources es WHERE es.episode_id=e.id LIMIT 1) AS source_id,
+                          (SELECT es.provider_id FROM episode_sources es WHERE es.episode_id=e.id LIMIT 1) AS source_provider_id
+                   FROM episodes e WHERE e.series_id=? ORDER BY e.created_at DESC""",
+                (series_id,),
+            ).fetchall()
+            eligible = [e for e in eps if e["source_count"] == 1 and e["source_provider_id"] == provider_id]
+            to_delete_ids = set()
+            if max_episodes_per_show and len(eligible) > max_episodes_per_show:
+                to_delete_ids.update(e["id"] for e in eligible[max_episodes_per_show:])
+            if cutoff:
+                to_delete_ids.update(e["id"] for e in eligible if e["created_at"] < cutoff)
+            for e in eligible:
+                if e["id"] in to_delete_ids:
+                    episode_candidates.append({
+                        "episode_id": e["id"], "source_id": e["source_id"], "series_name": sr["name"],
+                        "season_number": e["season_number"], "episode_number": e["episode_number"],
+                        "name": e["name"], "created_at": e["created_at"],
+                    })
+    conn.close()
+    return {"movies": movie_candidates, "episodes": episode_candidates}
+
+
+def apply_retention_deletions(movies: list[dict], episodes: list[dict]) -> dict:
+    """The confirm step after find_retention_candidates -- takes exactly the
+    {movie_id, source_id} / {episode_id, source_id} pairs an admin reviewed
+    and approved (never re-scans/re-decides here, so what gets deleted is
+    exactly what was shown), and removes each one's DVR source via the same
+    delete_movie_source/delete_episode_source already used elsewhere --
+    both already purge the parent row once it's sourceless (see
+    _purge_if_sourceless_movie/_purge_if_sourceless_episode), so there's no
+    separate delete-the-row step needed here.
+
+    Does NOT touch the underlying recording file on disk -- only removes
+    it from VOD Manager's own catalog. Real filesystem cleanup is a
+    separate, not-yet-built concern."""
+    for m in movies:
+        delete_movie_source(m["movie_id"], m["source_id"])
+    for e in episodes:
+        delete_episode_source(e["episode_id"], e["source_id"])
+    return {"deleted_movies": len(movies), "deleted_episodes": len(episodes)}
 
 
 def set_provider_priority(provider_id: int, priority: int) -> None:

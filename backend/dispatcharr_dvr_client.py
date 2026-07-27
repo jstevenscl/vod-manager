@@ -201,7 +201,7 @@ def _episode_identity_key(program: dict) -> str:
     return f"{base}|{program.get('start_time')}|{program.get('end_time')}"
 
 
-async def create_recording(connection: dict, channel_id: int, program: dict) -> dict:
+async def create_recording(connection: dict, channel_id: int, program: dict, scheduled_by: dict | None = None) -> dict:
     """Creates a single one-off Recording directly against Dispatcharr's
     plain Recording model (POST /api/channels/recordings/) -- channel id +
     start/end time only, with NO tvg_id-based matching anywhere in the path.
@@ -231,27 +231,37 @@ async def create_recording(connection: dict, channel_id: int, program: dict) -> 
     global pre/post-roll offsets when custom_properties.program is present
     as a dict), nested the same way search_epg_programs' own results are, so
     _episode_identity_key produces the same key whether it's reading a fresh
-    search result or an already-created Recording."""
+    search result or an already-created Recording.
+
+    scheduled_by, when given, is stored as a sibling of "program" (not
+    nested inside it, so it never affects _episode_identity_key) --
+    {"dispatcharr_user_id", "dispatcharr_username", "profile_label"} --
+    Dispatcharr's own Recording model has no concept of who scheduled it,
+    so this is VOD Manager's own record for the Scheduled Recordings
+    subpage's "who" column."""
     props = program.get("custom_properties") or {}
     client = DispatcharrClient(connection["url"], connection["token"])
+    custom_properties = {
+        "program": {
+            "tvg_id": program.get("tvg_id"),
+            "title": program.get("title"),
+            "sub_title": program.get("sub_title"),
+            "start_time": program["start_time"],
+            "end_time": program["end_time"],
+            "custom_properties": {
+                "season": props.get("season"),
+                "episode": props.get("episode"),
+                "onscreen_episode": props.get("onscreen_episode"),
+            },
+        },
+    }
+    if scheduled_by:
+        custom_properties["scheduled_by"] = scheduled_by
     body = {
         "channel": channel_id,
         "start_time": program["start_time"],
         "end_time": program["end_time"],
-        "custom_properties": {
-            "program": {
-                "tvg_id": program.get("tvg_id"),
-                "title": program.get("title"),
-                "sub_title": program.get("sub_title"),
-                "start_time": program["start_time"],
-                "end_time": program["end_time"],
-                "custom_properties": {
-                    "season": props.get("season"),
-                    "episode": props.get("episode"),
-                    "onscreen_episode": props.get("onscreen_episode"),
-                },
-            },
-        },
+        "custom_properties": custom_properties,
     }
     return await client.post("/api/channels/recordings/", body)
 
@@ -263,6 +273,7 @@ async def delete_recording(connection: dict, recording_id: int) -> None:
 
 async def schedule_channel_recordings(
     connection: dict, channel_id: int, title: str, mode: str = "all", limit: int = 50,
+    scheduled_by: dict | None = None,
 ) -> dict:
     """Replaces Dispatcharr's own Series Rules feature entirely -- searches
     this one channel's own real EPG (search_epg_programs, channel-scoped,
@@ -279,7 +290,10 @@ async def schedule_channel_recordings(
     mode="new" mirrors Dispatcharr's own series-rules "new episodes only"
     semantics -- only programs whose own EPG data marks custom_properties.
     new truthy are considered, the same field _evaluate_series_rules_locked
-    checks (apps/channels/tasks.py, dispatch-test v0.28.2)."""
+    checks (apps/channels/tasks.py, dispatch-test v0.28.2).
+
+    scheduled_by is passed straight through to create_recording -- see its
+    docstring."""
     matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id)
     if mode == "new":
         matches = [m for m in matches if (m.get("custom_properties") or {}).get("new")]
@@ -298,7 +312,7 @@ async def schedule_channel_recordings(
             skipped += 1
             continue
         try:
-            recording = await create_recording(connection, channel_id, program)
+            recording = await create_recording(connection, channel_id, program, scheduled_by)
         except Exception as exc:
             logger.warning(
                 "[dispatcharr_dvr_client] schedule_channel_recordings: failed to create recording for %r at %s: %s",

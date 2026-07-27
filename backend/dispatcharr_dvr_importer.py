@@ -420,12 +420,28 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
         raise ValueError(f"provider {provider_id}'s linked Dispatcharr connection no longer exists")
 
     profiles = [p for p in vod_db.list_recording_profiles(provider_id) if p.get("channel_id")]
+    username_by_id = {}
+    if any(p.get("dispatcharr_user_id") for p in profiles):
+        try:
+            users = await dispatcharr_dvr_client.list_users(connection)
+            username_by_id = {u["id"]: u["username"] for u in users}
+        except Exception as exc:
+            logger.warning("[dispatcharr_dvr_importer] rescan_recording_profiles: couldn't resolve usernames: %s", exc)
+
     scheduled_total = 0
     results = []
     for profile in profiles:
+        scheduled_by = None
+        if profile.get("dispatcharr_user_id"):
+            scheduled_by = {
+                "dispatcharr_user_id": profile["dispatcharr_user_id"],
+                "dispatcharr_username": username_by_id.get(profile["dispatcharr_user_id"]),
+                "profile_label": profile["label"],
+            }
         try:
             result = await dispatcharr_dvr_client.schedule_channel_recordings(
                 connection, profile["channel_id"], profile["title"], profile.get("mode", "all"),
+                scheduled_by=scheduled_by,
             )
         except Exception as exc:
             logger.warning("[dispatcharr_dvr_importer] rescan_recording_profiles: profile=%r failed: %s",
