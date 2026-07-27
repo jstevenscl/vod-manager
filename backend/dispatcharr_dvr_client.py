@@ -13,6 +13,7 @@ no separate JWT or other auth scheme needed, resolving Phase 1b's one open
 question.
 """
 
+from datetime import datetime
 import logging
 import os
 
@@ -201,6 +202,36 @@ def _episode_identity_key(program: dict) -> str:
     return f"{base}|{program.get('start_time')}|{program.get('end_time')}"
 
 
+def _parse_iso(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _overlaps_any(start: str | None, end: str | None, intervals: list[tuple[str, str]]) -> bool:
+    """True if [start, end) overlaps any of the given (start, end) interval
+    strings -- used by schedule_channel_recordings to catch two EPG
+    programs claiming the same real-world timeslot on one channel even
+    when they look like different episodes by identity alone (see its
+    docstring for why this happens with real, conflicting upstream guide
+    data). Malformed/unparseable timestamps are treated as non-overlapping
+    rather than raising -- a channel-scoping bug shouldn't take down
+    scheduling entirely."""
+    a_start, a_end = _parse_iso(start), _parse_iso(end)
+    if a_start is None or a_end is None:
+        return False
+    for b_start_raw, b_end_raw in intervals:
+        b_start, b_end = _parse_iso(b_start_raw), _parse_iso(b_end_raw)
+        if b_start is None or b_end is None:
+            continue
+        if a_start < b_end and b_start < a_end:
+            return True
+    return False
+
+
 async def create_recording(connection: dict, channel_id: int, program: dict, scheduled_by: dict | None = None) -> dict:
     """Creates a single one-off Recording directly against Dispatcharr's
     plain Recording model (POST /api/channels/recordings/) -- channel id +
@@ -292,6 +323,21 @@ async def schedule_channel_recordings(
     new truthy are considered, the same field _evaluate_series_rules_locked
     checks (apps/channels/tasks.py, dispatch-test v0.28.2).
 
+    Also collapses by real-world TIME OVERLAP on this channel, not just
+    episode identity -- confirmed live (dispatch-test v0.28.2, 2026-07-27)
+    that a channel's own EPG search can legitimately return two DIFFERENT
+    episode numbers claiming the exact same time slot (bad/conflicting
+    upstream guide data spanning multiple EPG sources, not something this
+    function invents) -- e.g. "Access Daily" search returned onscreen
+    S16E187 and S16E179 both at 2026-07-28T08:00:00Z on the same channel,
+    on 4 of 5 days checked. _episode_identity_key alone would schedule
+    both, since by season/episode metadata they genuinely look like
+    different episodes -- but a channel can only physically produce one
+    recording per timeslot, so this needs its own check. Keeps whichever
+    candidate is encountered first (search results are already
+    chronologically ordered) and skips/logs the rest as a real,
+    upstream-caused conflict worth being able to see, not a silent drop.
+
     scheduled_by is passed straight through to create_recording -- see its
     docstring."""
     matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id)
@@ -304,12 +350,23 @@ async def schedule_channel_recordings(
         for r in existing
         if r.get("channel") == channel_id
     }
+    existing_intervals = [
+        (r["start_time"], r["end_time"]) for r in existing if r.get("channel") == channel_id
+    ]
 
-    created, skipped = [], 0
+    created, skipped, conflicts = [], 0, 0
     for program in matches:
         key = _episode_identity_key(program)
         if key in existing_keys:
             skipped += 1
+            continue
+        if _overlaps_any(program.get("start_time"), program.get("end_time"), existing_intervals):
+            conflicts += 1
+            logger.warning(
+                "[dispatcharr_dvr_client] schedule_channel_recordings: skipping %r at %s -- time-slot conflict "
+                "with an already-claimed recording on channel %s (likely conflicting upstream EPG data)",
+                title, program.get("start_time"), channel_id,
+            )
             continue
         try:
             recording = await create_recording(connection, channel_id, program, scheduled_by)
@@ -320,9 +377,13 @@ async def schedule_channel_recordings(
             )
             continue
         existing_keys.add(key)
+        existing_intervals.append((program.get("start_time"), program.get("end_time")))
         created.append(recording)
 
-    return {"total_matches": len(matches), "scheduled": len(created), "skipped_existing": skipped, "created": created}
+    return {
+        "total_matches": len(matches), "scheduled": len(created), "skipped_existing": skipped,
+        "skipped_conflicts": conflicts, "created": created,
+    }
 
 
 async def list_channel_profiles(connection: dict) -> list[dict]:

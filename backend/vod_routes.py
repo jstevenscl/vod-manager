@@ -1151,6 +1151,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
     # either way. Not persisted -- purely informational for this response.
     profile["scheduled_now"] = schedule_result.get("scheduled", 0)
     profile["total_matches"] = schedule_result.get("total_matches", 0)
+    profile["skipped_conflicts"] = schedule_result.get("skipped_conflicts", 0)
     return profile
 
 
