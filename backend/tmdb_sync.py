@@ -124,6 +124,47 @@ async def search_title(query: str, content_type: str) -> list[dict]:
         return list(await asyncio.gather(*[_build(item) for item in candidates]))
 
 
+async def get_series_episode_list(tmdb_id: str) -> list[dict]:
+    """Every canonical episode TMDB knows about for a series -- the DVR
+    Library's Sonarr/Radarr-style missing-episode view diffs this against
+    what's actually in the pool (vod_db.list_episodes_for_series_ids) to
+    find gaps, then offers a one-click way to fill them (backfill from the
+    pool, or an EPG search/schedule) rather than requiring an admin to
+    notice and go look for a specific episode themselves.
+
+    One /tv/{id} call for the season list, then one /tv/{id}/season/{n}
+    call per real season (TMDB's season 0 is "Specials", excluded --
+    Dispatcharr recordings/EPG data essentially never carry a specials
+    numbering VOD Manager could match against), fetched concurrently."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        raise ValueError("TMDB API key not configured")
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        r = await client.get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key})
+        r.raise_for_status()
+        seasons = [s["season_number"] for s in r.json().get("seasons", []) if s.get("season_number")]
+
+        async def _season(season_number: int) -> list[dict]:
+            try:
+                sr = await client.get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
+                sr.raise_for_status()
+                return [
+                    {
+                        "season_number": season_number,
+                        "episode_number": ep["episode_number"],
+                        "name": ep.get("name"),
+                        "air_date": ep.get("air_date"),
+                    }
+                    for ep in sr.json().get("episodes", [])
+                ]
+            except Exception as exc:
+                logger.warning("[tmdb_sync] failed to fetch season %d for tmdb_id=%s: %s", season_number, tmdb_id, exc)
+                return []
+
+        results = await asyncio.gather(*[_season(n) for n in seasons])
+    return [ep for season_eps in results for ep in season_eps]
+
+
 async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:
     """TMDB's own canonical title and release year per id. Two Duplicate
     Finder candidates sharing a tmdb_id confirms they're the same real

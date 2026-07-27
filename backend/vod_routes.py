@@ -170,6 +170,19 @@ class RecordingProfilePreviewRequest(BaseModel):
     description_mode: str = "contains"
 
 
+class MissingEpisodeResolveRequest(BaseModel):
+    provider_id: int
+    season_number: int
+    episode_number: int
+    episode_name: Optional[str] = None
+
+
+class MissingEpisodeScheduleRequest(BaseModel):
+    provider_id: int
+    channel_id: int
+    program: dict
+
+
 class DvrUserLimitRequest(BaseModel):
     provider_id: int
     dispatcharr_user_id: int
@@ -1260,6 +1273,128 @@ async def list_channel_profiles(provider_id: int):
         return await dispatcharr_dvr_client.list_channel_profiles(connection)
     except Exception as exc:
         raise HTTPException(502, detail=str(exc))
+
+
+# ── DVR Library missing-episode view (Sonarr/Radarr-style gap browsing) ─────
+
+@router.get("/series/{series_id}/missing-episodes/", dependencies=_GUARDS)
+async def list_missing_episodes(series_id: int):
+    """Sonarr/Radarr-style gap view: every canonical (TMDB) episode for
+    this series, each flagged in_pool True/False against what VOD Manager
+    already has. Requires the series to already carry a tmdb_id (set during
+    normal enrichment) -- a series with none has nothing canonical to diff
+    against, so this 400s rather than guessing at episode counts."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    if not series.get("tmdb_id"):
+        raise HTTPException(400, detail="this series has no TMDB id yet -- nothing canonical to diff against")
+    try:
+        canonical = await tmdb_sync.get_series_episode_list(series["tmdb_id"])
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB lookup failed: {exc}")
+    have = {
+        (e["season_number"], e["episode_number"])
+        for e in vod_db.list_episodes_for_series_ids([series_id]).get(series_id, [])
+    }
+    unresolved = {(u["season_number"], u["episode_number"]) for u in vod_db.list_unresolved_missing_episodes(series_id)}
+    return [
+        {
+            **ep,
+            "in_pool": (ep["season_number"], ep["episode_number"]) in have,
+            "flagged_unresolved": (ep["season_number"], ep["episode_number"]) in unresolved,
+        }
+        for ep in canonical
+    ]
+
+
+@router.post("/series/{series_id}/missing-episodes/resolve/", dependencies=_GUARDS)
+async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveRequest):
+    """The cascade the user asked for, 2026-07-27: (1) already in the pool
+    from a regular (non-DVR) provider? Backfill it (pointer or download,
+    per whatever an existing Recording Rule for this show says, defaulting
+    to pointer when no rule exists) and place it straight into a category
+    -- done, no EPG search needed. (2) not in the pool -- search the EPG
+    (unscoped, across every channel, same shape as the Scheduled Recordings
+    picker's own search) for candidate airings and return them for the
+    admin to pick from; nothing is scheduled yet, since an unscoped search
+    can't safely auto-pick a channel (the exact per-affiliate duplication
+    problem create_recording's docstring documents). (3) neither the pool
+    nor the EPG has it -- flag it in dvr_unresolved_missing_episodes for
+    admin visibility and say so, rather than the attempt silently vanishing."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    program = {"title": series["name"], "custom_properties": {"season": body.season_number, "episode": body.episode_number}}
+
+    match = vod_db.find_pool_backfill_match(series["name"], program)
+    if match:
+        rule = vod_db.find_recording_profile_for_title(body.provider_id, series["name"])
+        mode = (rule or {}).get("backfill_mode") or "pointer"
+        provider = vod_db.get_provider(body.provider_id)
+        target_category_id = (rule or {}).get("target_series_category_id") or (provider or {}).get("dvr_series_category_id")
+        try:
+            if mode == "download":
+                await dispatcharr_dvr_importer._apply_download_backfill(match, body.provider_id)
+            else:
+                await dispatcharr_dvr_importer._apply_pointer_backfill(match)
+            if target_category_id:
+                vod_db.place_series_in_category(match["series_id"], target_category_id)
+        except Exception as exc:
+            raise HTTPException(502, detail=f"Found in the pool but backfill failed: {exc}")
+        vod_db.clear_unresolved_missing_episode(series_id, body.season_number, body.episode_number)
+        return {"resolved": True, "mode": mode, "candidates": [], "message": None}
+
+    _, connection = _require_dvr_connection(body.provider_id)
+    try:
+        matches = await dispatcharr_dvr_client.search_epg_programs(connection, series["name"], limit=50)
+    except Exception as exc:
+        raise HTTPException(502, detail=f"EPG search failed: {exc}")
+
+    def _matches_episode(m: dict) -> bool:
+        props = m.get("custom_properties") or {}
+        season, episode = props.get("season"), props.get("episode")
+        if season is not None and episode is not None:
+            return season == body.season_number and episode == body.episode_number
+        return True  # no structured season/episode on this listing -- surface it, let the admin eyeball it
+
+    candidates = [m for m in matches if _matches_episode(m)]
+    if candidates:
+        return {"resolved": False, "mode": None, "candidates": candidates, "message": None}
+
+    vod_db.record_unresolved_missing_episode(series_id, body.season_number, body.episode_number, body.episode_name)
+    return {
+        "resolved": False, "mode": None, "candidates": [],
+        "message": "Not found in the pool or the EPG -- flagged for review. Worth checking manually against "
+                    "Plex/Emby/Jellyfin if one of those is also configured for this instance.",
+    }
+
+
+@router.post("/series/{series_id}/missing-episodes/schedule/", dependencies=_GUARDS)
+async def schedule_missing_episode(series_id: int, body: MissingEpisodeScheduleRequest):
+    """Schedules exactly one specific EPG candidate the admin picked from
+    resolve_missing_episode's results -- a genuine one-off Recording (see
+    dispatcharr_dvr_client.create_recording), not a full recurring rule."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    _, connection = _require_dvr_connection(body.provider_id)
+    try:
+        recording = await dispatcharr_dvr_client.create_recording(connection, body.channel_id, body.program)
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
+    props = body.program.get("custom_properties") or {}
+    season, episode = props.get("season"), props.get("episode")
+    if season is not None and episode is not None:
+        vod_db.clear_unresolved_missing_episode(series_id, season, episode)
+    return recording
+
+
+@router.get("/dvr-unresolved-missing-episodes/", dependencies=_GUARDS)
+async def list_dvr_unresolved_missing_episodes(series_id: Optional[int] = None):
+    """Admin-visible flag list -- everything resolve_missing_episode
+    couldn't find anywhere (see its own docstring)."""
+    return vod_db.list_unresolved_missing_episodes(series_id)
 
 
 @router.get("/dvr-upcoming/", dependencies=_GUARDS)

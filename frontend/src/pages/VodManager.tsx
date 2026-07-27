@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -342,6 +342,126 @@ function PlayButton({ url, transcodedUrl, hlsUrl, title }: { url: string | null;
   )
 }
 
+// Sonarr/Radarr-style gap view for one series -- every canonical (TMDB)
+// episode not yet in the pool, with a "Find" action that runs the backend
+// cascade the user specced 2026-07-27: pool backfill first (silent,
+// instant), else EPG candidates to pick from (nothing auto-scheduled --
+// picking a channel is a real decision, same reasoning as the Scheduled
+// Recordings picker), else a flagged-for-review message.
+function MissingEpisodesPanel({ series, providerId, qc }: {
+  series: Series
+  providerId: number
+  qc: ReturnType<typeof useQueryClient>
+}) {
+  const missingQuery = useQuery<MissingEpisode[]>({
+    queryKey: ['vod-missing-episodes', series.id],
+    queryFn: () => api.get(`/vod/series/${series.id}/missing-episodes/`).then((r) => r.data),
+  })
+  const [resolving, setResolving] = useState<string | null>(null)
+  const [resolveResult, setResolveResult] = useState<Record<string, { resolved: boolean; mode: string | null; candidates: EpgSearchProgram[]; message: string | null }>>({})
+
+  async function findEpisode(ep: MissingEpisode) {
+    const key = `${ep.season_number}-${ep.episode_number}`
+    setResolving(key)
+    try {
+      const res = await api.post(`/vod/series/${series.id}/missing-episodes/resolve/`, {
+        provider_id: providerId, season_number: ep.season_number, episode_number: ep.episode_number, episode_name: ep.name,
+      })
+      setResolveResult((prev) => ({ ...prev, [key]: res.data }))
+      if (res.data.resolved) {
+        qc.invalidateQueries({ queryKey: ['vod-missing-episodes', series.id] })
+        qc.invalidateQueries({ queryKey: ['vod-dvr-library-series', providerId] })
+        qc.invalidateQueries({ queryKey: ['vod-series'] })
+      }
+    } catch (e: any) {
+      setResolveResult((prev) => ({ ...prev, [key]: { resolved: false, mode: null, candidates: [], message: e?.response?.data?.detail ?? e.message ?? 'Failed.' } }))
+    } finally {
+      setResolving(null)
+    }
+  }
+
+  async function scheduleCandidate(ep: MissingEpisode, program: EpgSearchProgram, channelId: number | undefined) {
+    if (!channelId) return
+    const key = `${ep.season_number}-${ep.episode_number}`
+    setResolving(key)
+    try {
+      await api.post(`/vod/series/${series.id}/missing-episodes/schedule/`, { provider_id: providerId, channel_id: channelId, program })
+      setResolveResult((prev) => { const next = { ...prev }; delete next[key]; return next })
+      qc.invalidateQueries({ queryKey: ['vod-missing-episodes', series.id] })
+      qc.invalidateQueries({ queryKey: ['vod-dvr-upcoming', providerId] })
+    } catch (e: any) {
+      alert(e?.response?.data?.detail ?? e.message ?? 'Failed to schedule.')
+    } finally {
+      setResolving(null)
+    }
+  }
+
+  if (missingQuery.isLoading) return <p className="text-[11px] text-muted-foreground px-1">Loading canonical episode list…</p>
+  if (missingQuery.isError) return <p className="text-[11px] text-destructive px-1">{(missingQuery.error as any)?.response?.data?.detail ?? 'Failed to load TMDB episode list.'}</p>
+  const missing = (missingQuery.data ?? []).filter((e) => !e.in_pool)
+  if (!missing.length) return <p className="text-[11px] text-muted-foreground px-1">No gaps — every canonical episode is already in the pool.</p>
+
+  const bySeason = new Map<number, MissingEpisode[]>()
+  for (const ep of missing) {
+    if (!bySeason.has(ep.season_number)) bySeason.set(ep.season_number, [])
+    bySeason.get(ep.season_number)!.push(ep)
+  }
+
+  return (
+    <div className="ml-4 pl-2 border-l border-border space-y-1.5 py-1">
+      {[...bySeason.entries()].sort((a, b) => a[0] - b[0]).map(([season, eps]) => (
+        <div key={season} className="space-y-1">
+          <p className="text-[10px] font-medium text-muted-foreground">Season {season}</p>
+          {eps.sort((a, b) => a.episode_number - b.episode_number).map((ep) => {
+            const key = `${ep.season_number}-${ep.episode_number}`
+            const result = resolveResult[key]
+            const busy = resolving === key
+            return (
+              <div key={key} className="text-[11px]">
+                <div className="flex items-center gap-1.5">
+                  <span className="flex-1 truncate">
+                    E{ep.episode_number} — {ep.name || 'Untitled'}{ep.air_date && <span className="text-muted-foreground"> ({ep.air_date})</span>}
+                    {ep.flagged_unresolved && <span className="text-[10px] text-amber-600 dark:text-amber-500 ml-1">flagged</span>}
+                  </span>
+                  <button
+                    className="text-muted-foreground hover:text-foreground flex items-center gap-1 shrink-0 disabled:opacity-50"
+                    disabled={busy}
+                    onClick={() => findEpisode(ep)}
+                  >
+                    {busy ? <Loader2 size={11} className="animate-spin" /> : <Search size={11} />} Find
+                  </button>
+                </div>
+                {result?.resolved && (
+                  <p className="text-green-600 dark:text-green-500 pl-1">Backfilled ({result.mode}) from the pool instead of recording.</p>
+                )}
+                {result && !result.resolved && result.candidates.length > 0 && (
+                  <div className="pl-1 space-y-0.5">
+                    <p className="text-muted-foreground">Not in the pool -- pick a channel/airing to record:</p>
+                    {result.candidates.slice(0, 8).map((c, i) => (
+                      <button
+                        key={i}
+                        className="flex items-center gap-1.5 w-full text-left hover:bg-accent rounded px-1 py-0.5 disabled:opacity-50"
+                        disabled={busy || !c.channels?.[0]?.id}
+                        onClick={() => scheduleCandidate(ep, c, c.channels?.[0]?.id)}
+                      >
+                        <span className="flex-1 truncate">{c.channels?.[0]?.name ?? c.tvg_id} — {c.title}{c.sub_title ? `: ${c.sub_title}` : ''}</span>
+                        <span className="text-muted-foreground shrink-0">{c.start_time ? new Date(c.start_time).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : ''}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {result && !result.resolved && result.candidates.length === 0 && result.message && (
+                  <p className="text-muted-foreground pl-1">{result.message}</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // Merges/overwrites a ?start=<secs> query param — used to restart the
 // transcoded stream partway into the file (see buildTranscodedPreviewSourceUrl).
 function withStartParam(url: string, startSecs: number): string {
@@ -630,8 +750,28 @@ interface Series {
   is_adult: number
   review_excluded: number
   import_provider_name: string | null
+  tmdb_id: string | null
   episodes: Episode[]
   placements: SeriesPlacement[]
+}
+
+interface MissingEpisode {
+  season_number: number
+  episode_number: number
+  name: string | null
+  air_date: string | null
+  in_pool: boolean
+  flagged_unresolved: boolean
+}
+
+interface UnresolvedMissingEpisode {
+  id: number
+  series_id: number
+  series_name: string
+  season_number: number
+  episode_number: number
+  episode_name: string | null
+  checked_at: string
 }
 
 interface EnrichProgress {
@@ -3371,6 +3511,7 @@ export default function VodManager() {
   // retention's apply step already uses), not a blanket row delete -- a
   // movie/episode also sourced elsewhere stays, just no longer via DVR.
   const [dvrLibraryTab, setDvrLibraryTab] = useState<'movies' | 'series'>('movies')
+  const [expandedMissingSeriesId, setExpandedMissingSeriesId] = useState<number | null>(null)
   function formatFileSize(n: number): string {
     if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
     if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(0)} MB`
@@ -3414,6 +3555,11 @@ export default function VodManager() {
   const watchSessionsQuery = useQuery<WatchSession[]>({
     queryKey: ['vod-watch-sessions'],
     queryFn: () => api.get('/vod/watch-sessions/').then((r) => r.data),
+    enabled: dvrSubTab === 'metrics',
+  })
+  const unresolvedMissingEpisodesQuery = useQuery<UnresolvedMissingEpisode[]>({
+    queryKey: ['vod-dvr-unresolved-missing-episodes'],
+    queryFn: () => api.get('/vod/dvr-unresolved-missing-episodes/').then((r) => r.data),
     enabled: dvrSubTab === 'metrics',
   })
   const [ruleHealth, setRuleHealth] = useState<Record<number, { matches: number; checking: boolean }>>({})
@@ -5721,47 +5867,65 @@ export default function VodManager() {
                     })}
                   </div>
                 ) : (
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                     {dvrLibrarySeriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
                     {(() => {
-                      const rows = (dvrLibrarySeriesQuery.data?.items ?? []).flatMap((s) =>
-                        s.episodes
-                          .flatMap((e) => e.sources.filter((src) => src.provider_id === recordingProfilesProviderId).map((src) => ({ series: s, episode: e, source: src })))
-                      )
-                      if (dvrLibrarySeriesQuery.data && !rows.length) {
+                      const groups = (dvrLibrarySeriesQuery.data?.items ?? [])
+                        .map((s) => ({
+                          series: s,
+                          rows: s.episodes.flatMap((e) => e.sources.filter((src) => src.provider_id === recordingProfilesProviderId).map((src) => ({ episode: e, source: src }))),
+                        }))
+                        .filter((g) => g.rows.length > 0)
+                      if (dvrLibrarySeriesQuery.data && !groups.length) {
                         return <p className="text-xs text-muted-foreground">No episodes from this provider yet.</p>
                       }
-                      return rows.map(({ series, episode, source }) => {
-                        const ext = source.container_extension || 'mp4'
-                        return (
-                          <div key={`${episode.id}-${source.id}`} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
-                            <PlayButton
-                              url={buildPreviewSourceUrl('series', source.id, ext, xcCredentialsQuery.data)}
-                              transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
-                              hlsUrl={buildHlsPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
-                              title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
-                            />
-                            <span className="flex-1 truncate">
-                              <span className="font-medium">{series.name}</span>{' '}
-                              <span className="text-muted-foreground">
-                                S{episode.season_number}E{episode.episode_number} — {episode.name}
-                              </span>
-                            </span>
-                            <span className="text-muted-foreground shrink-0 uppercase">
-                              {ext}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}
-                            </span>
-                            {episode.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</span>}
+                      return groups.map(({ series, rows }) => (
+                        <div key={series.id} className="space-y-1">
+                          {rows.map(({ episode, source }) => {
+                            const ext = source.container_extension || 'mp4'
+                            return (
+                              <div key={`${episode.id}-${source.id}`} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                                <PlayButton
+                                  url={buildPreviewSourceUrl('series', source.id, ext, xcCredentialsQuery.data)}
+                                  transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
+                                  hlsUrl={buildHlsPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
+                                  title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
+                                />
+                                <span className="flex-1 truncate">
+                                  <span className="font-medium">{series.name}</span>{' '}
+                                  <span className="text-muted-foreground">
+                                    S{episode.season_number}E{episode.episode_number} — {episode.name}
+                                  </span>
+                                </span>
+                                <span className="text-muted-foreground shrink-0 uppercase">
+                                  {ext}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}
+                                </span>
+                                {episode.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</span>}
+                                <button
+                                  title="Remove this provider's copy from the pool"
+                                  className="text-muted-foreground hover:text-destructive p-1"
+                                  disabled={deleteDvrEpisodeSource.isPending}
+                                  onClick={() => { if (confirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`)) deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id }) }}
+                                >
+                                  <Trash2 size={12} />
+                                </button>
+                              </div>
+                            )
+                          })}
+                          {series.tmdb_id && (
                             <button
-                              title="Remove this provider's copy from the pool"
-                              className="text-muted-foreground hover:text-destructive p-1"
-                              disabled={deleteDvrEpisodeSource.isPending}
-                              onClick={() => { if (confirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`)) deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id }) }}
+                              className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1 pl-1"
+                              onClick={() => setExpandedMissingSeriesId(expandedMissingSeriesId === series.id ? null : series.id)}
                             >
-                              <Trash2 size={12} />
+                              {expandedMissingSeriesId === series.id ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                              Missing episodes
                             </button>
-                          </div>
-                        )
-                      })
+                          )}
+                          {expandedMissingSeriesId === series.id && recordingProfilesProviderId != null && (
+                            <MissingEpisodesPanel series={series} providerId={recordingProfilesProviderId} qc={qc} />
+                          )}
+                        </div>
+                      ))
                     })()}
                   </div>
                 )}
@@ -5857,6 +6021,31 @@ export default function VodManager() {
                         </div>
                       )
                     })}
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="Unresolved Missing Episodes" icon={<Search size={14} />}>
+                  <p className="text-sm text-muted-foreground">
+                    Episodes the DVR Library's "Find" action couldn't locate anywhere -- not already in the pool, and
+                    no EPG airing found either. Worth checking manually against Plex/Emby/Jellyfin if configured.
+                  </p>
+                  {unresolvedMissingEpisodesQuery.data && !unresolvedMissingEpisodesQuery.data.length && (
+                    <p className="text-xs text-muted-foreground">Nothing flagged.</p>
+                  )}
+                  <div className="space-y-1">
+                    {unresolvedMissingEpisodesQuery.data?.map((u) => (
+                      <div key={u.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                        <span className="flex-1 truncate">
+                          <span className="font-medium">{u.series_name}</span>{' '}
+                          <span className="text-muted-foreground">
+                            S{u.season_number}E{u.episode_number}{u.episode_name ? ` — ${u.episode_name}` : ''}
+                          </span>
+                        </span>
+                        <span className="text-muted-foreground shrink-0">
+                          flagged {new Date(Number(u.checked_at) * 1000).toLocaleDateString()}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 </SectionCard>
               </>

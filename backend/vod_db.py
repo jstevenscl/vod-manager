@@ -315,6 +315,26 @@ def init_db() -> None:
             UNIQUE(dispatcharr_connection_id, client_id)
         );
 
+        -- The DVR Library's missing-episode view's "not found anywhere"
+        -- outcome: a canonical (TMDB) episode that's neither already in the
+        -- pool (find_pool_backfill_match) nor findable via an unscoped EPG
+        -- title search. Per the user's own explicit request, 2026-07-27:
+        -- "post it somewhere an admin can see on the backend" instead of
+        -- the attempt silently vanishing -- an admin can then go look for
+        -- it manually (Plex/Emby/Jellyfin, a different EPG source, etc.).
+        -- One row per (series, season, episode); re-checking an already-
+        -- flagged episode just refreshes checked_at rather than
+        -- duplicating the row.
+        CREATE TABLE IF NOT EXISTS dvr_unresolved_missing_episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+            season_number INTEGER NOT NULL,
+            episode_number INTEGER NOT NULL,
+            episode_name TEXT,
+            checked_at TEXT NOT NULL,
+            UNIQUE(series_id, season_number, episode_number)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -817,6 +837,64 @@ def find_pool_backfill_match(title: str, program: dict) -> dict | None:
     """, (movie_id,)).fetchone()
     conn.close()
     return {"type": "movie", "movie_id": movie_id, "source": dict(source)} if source else None
+
+
+def find_recording_profile_for_title(provider_id: int, title: str) -> dict | None:
+    """Missing-episode resolve's own backfill_mode/target-category source
+    when there's no per-episode rule to ask -- an existing Recording Rule
+    for this same show (any channel) is the closest signal for "how would
+    the admin normally want this handled," so its own backfill_mode and
+    target categories are reused rather than defaulting blind. None when no
+    rule exists at all -- the caller falls back to the provider's own
+    default dvr_movie_category_id/dvr_series_category_id in that case, same
+    fallback the main import pass already uses."""
+    normalized = _normalize_title_for_dedup(title)
+    conn = _connect()
+    rows = conn.execute("SELECT * FROM dvr_recording_profiles WHERE provider_id=?", (provider_id,)).fetchall()
+    conn.close()
+    return next((dict(r) for r in rows if _normalize_title_for_dedup(r["title"]) == normalized), None)
+
+
+def record_unresolved_missing_episode(series_id: int, season_number: int, episode_number: int, episode_name: str | None) -> None:
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO dvr_unresolved_missing_episodes (series_id, season_number, episode_number, episode_name, checked_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(series_id, season_number, episode_number) DO UPDATE SET
+               episode_name=excluded.episode_name, checked_at=excluded.checked_at""",
+        (series_id, season_number, episode_number, episode_name, _now()),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def clear_unresolved_missing_episode(series_id: int, season_number: int, episode_number: int) -> None:
+    conn = _connect()
+    conn.execute(
+        "DELETE FROM dvr_unresolved_missing_episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+        (series_id, season_number, episode_number),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_unresolved_missing_episodes(series_id: int | None = None) -> list[dict]:
+    conn = _connect()
+    if series_id is not None:
+        rows = conn.execute(
+            """SELECT u.*, s.name AS series_name FROM dvr_unresolved_missing_episodes u
+               JOIN series s ON s.id = u.series_id WHERE u.series_id=?
+               ORDER BY u.season_number, u.episode_number""",
+            (series_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT u.*, s.name AS series_name FROM dvr_unresolved_missing_episodes u
+               JOIN series s ON s.id = u.series_id
+               ORDER BY u.checked_at DESC""",
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ── DVR per-person resource limits ──────────────────────────────────────────
