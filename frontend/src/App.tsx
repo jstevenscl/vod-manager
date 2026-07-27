@@ -47,6 +47,7 @@ const NAV_GROUPS: NavGroup[] = [
     { label: 'Scheduled', icon: <CalendarDays size={15} />, tab: 'dvr', dvrSubTab: 'scheduled' },
     { label: 'Users', icon: <Users size={15} />, tab: 'dvr', dvrSubTab: 'users' },
     { label: 'Library', icon: <HardDriveDownload size={15} />, tab: 'dvr', dvrSubTab: 'library' },
+    { label: 'Missing', icon: <Search size={15} />, tab: 'dvr', dvrSubTab: 'missing' },
     { label: 'Metrics', icon: <LayoutGrid size={15} />, tab: 'dvr', dvrSubTab: 'metrics' },
   ] },
   { label: 'Operations', items: [

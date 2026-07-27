@@ -408,62 +408,122 @@ function MissingEpisodesPanel({ series, providerId, qc }: {
   }
 
   return (
-    <div className="ml-4 pl-2 border-l border-border space-y-1.5 py-1">
+    <div className="space-y-3">
       {[...bySeason.entries()].sort((a, b) => a[0] - b[0]).map(([season, eps]) => (
-        <div key={season} className="space-y-1">
-          <p className="text-[10px] font-medium text-muted-foreground">Season {season}</p>
-          {eps.sort((a, b) => a.episode_number - b.episode_number).map((ep) => {
-            const key = `${ep.season_number}-${ep.episode_number}`
-            const result = resolveResult[key]
-            const busy = resolving === key
-            return (
-              <div key={key} className="text-[11px]">
-                <div className="flex items-center gap-1.5">
-                  <span className="flex-1 truncate">
-                    E{ep.episode_number} — {ep.name || 'Untitled'}{ep.air_date && <span className="text-muted-foreground"> ({ep.air_date})</span>}
-                    {ep.flagged_unresolved && <span className="text-[10px] text-amber-600 dark:text-amber-500 ml-1">flagged</span>}
-                  </span>
-                  <button
-                    className="text-muted-foreground hover:text-foreground flex items-center gap-1 shrink-0 disabled:opacity-50"
-                    disabled={busy}
-                    onClick={() => findEpisode(ep)}
-                  >
-                    {busy ? <Loader2 size={11} className="animate-spin" /> : <Search size={11} />} Find
-                  </button>
-                </div>
-                {result?.resolved && (
-                  <p className="text-green-600 dark:text-green-500 pl-1">
-                    {result.mode === 'recorded'
-                      ? "Found on this show's usual channel and recorded -- no manual pick needed."
-                      : result.mode === 'already_scheduled'
-                        ? 'Already has a real recording scheduled for this exact airing -- nothing new to do.'
-                        : `Backfilled (${result.mode}) from the pool instead of recording.`}
-                  </p>
-                )}
-                {result && !result.resolved && result.candidates.length > 0 && (
-                  <div className="pl-1 space-y-0.5">
-                    <p className="text-muted-foreground">{result.message || 'Not in the pool -- pick a channel/airing to record:'}</p>
-                    {result.candidates.slice(0, 8).map((c, i) => (
-                      <button
-                        key={i}
-                        className="flex items-center gap-1.5 w-full text-left hover:bg-accent rounded px-1 py-0.5 disabled:opacity-50"
-                        disabled={busy || !c.channels?.[0]?.id}
-                        onClick={() => scheduleCandidate(ep, c, c.channels?.[0]?.id)}
-                      >
-                        <span className="flex-1 truncate">{c.channels?.[0]?.name ?? c.tvg_id} — {c.title}{c.sub_title ? `: ${c.sub_title}` : ''}</span>
-                        <span className="text-muted-foreground shrink-0">{c.start_time ? new Date(c.start_time).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : ''}</span>
-                      </button>
-                    ))}
+        <div key={season}>
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Season {season}</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+          <div className="space-y-1.5">
+            {eps.sort((a, b) => a.episode_number - b.episode_number).map((ep) => {
+              const key = `${ep.season_number}-${ep.episode_number}`
+              const result = resolveResult[key]
+              const busy = resolving === key
+              return (
+                <div key={key} className="rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-muted-foreground shrink-0 w-9 tabular-nums">E{ep.episode_number}</span>
+                    <span className="flex-1 truncate">
+                      <span className="font-semibold">{ep.name || 'Untitled'}</span>
+                      {ep.air_date && <span className="text-muted-foreground"> ({ep.air_date})</span>}
+                    </span>
+                    {ep.flagged_unresolved && <StatusPill tone="warning" label="flagged" />}
+                    <button
+                      className="rounded-md border border-border bg-background px-2 py-1 text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:border-primary/40 flex items-center gap-1 shrink-0 disabled:opacity-50"
+                      disabled={busy}
+                      onClick={() => findEpisode(ep)}
+                    >
+                      {busy ? <Loader2 size={11} className="animate-spin" /> : <Search size={11} />} Find
+                    </button>
                   </div>
-                )}
-                {result && !result.resolved && result.candidates.length === 0 && result.message && (
-                  <p className="text-muted-foreground pl-1">{result.message}</p>
-                )}
-              </div>
-            )
-          })}
+                  {result?.resolved && (
+                    <div className="mt-2 pt-2 border-t border-border">
+                      <StatusPill
+                        tone="success"
+                        label={
+                          result.mode === 'recorded'
+                            ? "Found on this show's usual channel and recorded -- no manual pick needed."
+                            : result.mode === 'already_scheduled'
+                              ? 'Already has a real recording scheduled for this exact airing.'
+                              : `Backfilled (${result.mode}) from the pool instead of recording.`
+                        }
+                      />
+                    </div>
+                  )}
+                  {result && !result.resolved && result.candidates.length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-border space-y-1">
+                      <p className="text-muted-foreground text-[11px]">{result.message || 'Not in the pool -- pick a channel/airing to record:'}</p>
+                      {result.candidates.slice(0, 8).map((c, i) => (
+                        <button
+                          key={i}
+                          className="flex items-center gap-1.5 w-full text-left rounded-md border border-border bg-background hover:border-primary/40 hover:bg-accent px-2 py-1 disabled:opacity-50"
+                          disabled={busy || !c.channels?.[0]?.id}
+                          onClick={() => scheduleCandidate(ep, c, c.channels?.[0]?.id)}
+                        >
+                          <span className="flex-1 truncate">{c.channels?.[0]?.name ?? c.tvg_id} — {c.title}{c.sub_title ? `: ${c.sub_title}` : ''}</span>
+                          <span className="text-muted-foreground shrink-0">{c.start_time ? new Date(c.start_time).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : ''}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {result && !result.resolved && result.candidates.length === 0 && result.message && (
+                    <div className="mt-2 pt-2 border-t border-border">
+                      <StatusPill tone="warning" label={result.message} />
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+// Dedicated cross-rule Missing Episodes page -- covers every show with an
+// active Recording Rule, not just ones this specific provider has already
+// recorded an episode for (the old per-series toggle buried inside DVR
+// Library only ever showed up for already-partially-recorded shows, real
+// gap found live-testing 2026-07-27). Resolves each rule's own title to a
+// pool series via the existing search endpoint (no new backend route
+// needed), then reuses MissingEpisodesPanel unchanged -- same Find
+// cascade, just surfaced somewhere any show with a rule can be found,
+// recorded or not.
+function RuleMissingBlock({ rule, providerId, qc }: {
+  rule: RecordingProfile
+  providerId: number
+  qc: ReturnType<typeof useQueryClient>
+}) {
+  const seriesQuery = useQuery<{ items: Series[]; total: number }>({
+    queryKey: ['vod-series-search-for-rule', rule.title],
+    queryFn: () => api.get('/vod/series/', { params: { search: rule.title, limit: 5 } }).then((r) => r.data),
+  })
+  if (seriesQuery.isLoading) {
+    return <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm text-xs text-muted-foreground">Looking up "{rule.title}"…</div>
+  }
+  const matched = seriesQuery.data?.items.find((s) => s.name.trim().toLowerCase() === rule.title.trim().toLowerCase())
+  if (!matched) {
+    return (
+      <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm">
+        <div className="text-[13px] font-semibold">{rule.title}</div>
+        <div className="text-[11px] text-muted-foreground mt-0.5">Not in the pool yet -- nothing to diff against until at least one episode has been recorded or backfilled.</div>
+      </div>
+    )
+  }
+  if (!matched.tmdb_id) {
+    return (
+      <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm">
+        <div className="text-[13px] font-semibold">{matched.name}</div>
+        <div className="text-[11px] text-muted-foreground mt-0.5">No TMDB match yet -- nothing canonical to diff against.</div>
+      </div>
+    )
+  }
+  return (
+    <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm">
+      <div className="text-[13px] font-semibold mb-1.5">{matched.name}</div>
+      <MissingEpisodesPanel series={matched} providerId={providerId} qc={qc} />
     </div>
   )
 }
@@ -2923,7 +2983,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
 }
 
 export type VodManagerTab = 'movies' | 'series' | 'curation' | 'config' | 'dvr'
-export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'metrics'
+export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
   activeTab: VodManagerTab
@@ -5427,9 +5487,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       <p className="text-xs text-muted-foreground">No recording rules yet.</p>
                     )}
                     {recordingProfilesQuery.data?.map((rp) => (
-                      <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                      <div key={rp.id} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                         <span className="flex-1">
-                          <span className="font-medium">{rp.label}</span>{' '}
+                          <span className="font-semibold">{rp.label}</span>{' '}
                           <span className="text-muted-foreground">
                             — "{rp.title}", {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
                             {rp.channel_id ? `, channel ${rp.channel_id}` : ' (no channel -- won\'t schedule)'}
@@ -5620,16 +5680,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                             const who = r.custom_properties?.scheduled_by
                             const time = new Date(r.start_time).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
                             return (
-                              <div key={r.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
-                                <span className="font-mono text-muted-foreground w-16 shrink-0">{time}</span>
+                              <div key={r.id} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
+                                <span className="font-mono text-muted-foreground w-16 shrink-0 tabular-nums">{time}</span>
                                 <span className="flex-1 truncate">
-                                  <span className="font-medium">{prog?.title ?? 'Unknown'}</span>
+                                  <span className="font-semibold">{prog?.title ?? 'Unknown'}</span>
                                   {prog?.sub_title && <span className="text-muted-foreground"> — {prog.sub_title}</span>}
                                 </span>
-                                {who?.dispatcharr_username && (
-                                  <span className="text-muted-foreground shrink-0">{who.dispatcharr_username}</span>
-                                )}
-                                <span className="text-muted-foreground shrink-0">channel {r.channel}</span>
+                                {who?.dispatcharr_username && <Chip>{who.dispatcharr_username}</Chip>}
+                                <Chip>channel {r.channel}</Chip>
                               </div>
                             )
                           })}
@@ -5667,19 +5725,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         retention_max_age_days: lim.retention_max_age_days, retention_max_episodes_per_show: lim.retention_max_episodes_per_show,
                         ...patch,
                       })
+                    const actualGB = usage != null ? (usage.actual_bytes / 1024 ** 3) : null
+                    const quotaDenomGB = quotaGB ?? Math.max(1, usageGB ?? 1)
                     return (
-                      <div key={lim.id} className="border border-border rounded px-2 py-1.5 space-y-1">
-                        <div className="flex items-center gap-1.5 text-xs">
-                          <span className="flex-1">
-                            <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
-                            <span className="text-muted-foreground">
-                              — stream limit {liveUser?.stream_limit ?? '?'} (budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
-                              {' · '}
-                              {usageGB != null ? usageGB.toFixed(1) : '?'}GB
-                              {quotaGB != null ? ` / ${quotaGB.toFixed(0)}GB` : ' (no disk quota)'}
-                              {virtualGB != null && virtualGB > 0.01 && ` (${virtualGB.toFixed(1)}GB virtual/backfill)`}
-                            </span>
-                          </span>
+                      <div key={lim.id} className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm space-y-2">
+                        <div className="flex items-center gap-3">
+                          <div className="w-7 h-7 rounded-full bg-gradient-to-br from-primary to-primary/70 flex items-center justify-center text-[11px] font-bold text-primary-foreground shrink-0">
+                            {lim.dispatcharr_username.slice(0, 1).toUpperCase()}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-[13px] font-semibold">{lim.dispatcharr_username}</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              stream limit {liveUser?.stream_limit ?? '?'} (budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
+                            </div>
+                          </div>
                           <button
                             title="Remove this person's DVR limits (their existing recording rules are unaffected, just unconstrained again)"
                             className="text-muted-foreground hover:text-destructive p-1"
@@ -5687,6 +5746,29 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           >
                             <Trash2 size={12} />
                           </button>
+                        </div>
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground mb-1">
+                            <span>Disk quota</span>
+                            <span className="tabular-nums">{usageGB != null ? usageGB.toFixed(1) : '0.0'}{quotaGB != null ? ` / ${quotaGB.toFixed(0)} GB` : ' GB (no quota set)'}</span>
+                          </div>
+                          <div className="h-1.5 rounded-full bg-secondary overflow-hidden flex">
+                            {actualGB != null && actualGB > 0 && (
+                              <div className="h-full bg-primary" style={{ width: `${Math.min(100, (actualGB / quotaDenomGB) * 100)}%` }} />
+                            )}
+                            {virtualGB != null && virtualGB > 0 && (
+                              <div
+                                className="h-full bg-primary/35"
+                                style={{
+                                  width: `${Math.min(100 - Math.min(100, ((actualGB ?? 0) / quotaDenomGB) * 100), (virtualGB / quotaDenomGB) * 100)}%`,
+                                  backgroundImage: 'repeating-linear-gradient(135deg, hsl(var(--primary)/0.5) 0 3px, transparent 3px 6px)',
+                                }}
+                              />
+                            )}
+                          </div>
+                          {virtualGB != null && virtualGB > 0.01 && (
+                            <div className="text-[10.5px] text-muted-foreground mt-1">{virtualGB.toFixed(1)}GB virtual/backfill (hatched)</div>
+                          )}
                         </div>
                         <div className="flex flex-wrap items-center gap-1.5">
                           <label className="text-[10px] text-muted-foreground flex items-center gap-1">
@@ -5859,7 +5941,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       const src = m.sources.find((s) => s.provider_id === recordingProfilesProviderId)
                       const ext = src?.container_extension || 'mp4'
                       return (
-                        <div key={m.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                        <div key={m.id} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                           {src && (
                             <PlayButton
                               url={buildPreviewSourceUrl('movie', src.id, ext, xcCredentialsQuery.data)}
@@ -5869,15 +5951,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                             />
                           )}
                           <span className="flex-1 truncate">
-                            <span className="font-medium">{m.name}</span>{' '}
+                            <span className="font-semibold">{m.name}</span>{' '}
                             <span className="text-muted-foreground">{m.year ? `(${m.year})` : ''}</span>
                           </span>
-                          {src && (
-                            <span className="text-muted-foreground shrink-0 uppercase">
-                              {ext}{src.file_size_bytes != null && ` · ${formatFileSize(src.file_size_bytes)}`}
-                            </span>
-                          )}
-                          {m.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {m.sources.length - 1} other source{m.sources.length > 2 ? 's' : ''}</span>}
+                          {src && <Chip>{ext.toUpperCase()}{src.file_size_bytes != null && ` · ${formatFileSize(src.file_size_bytes)}`}</Chip>}
+                          {m.sources.length > 1 && <Chip>+{m.sources.length - 1} other source{m.sources.length > 2 ? 's' : ''}</Chip>}
                           <button
                             title="Remove this provider's copy from the pool"
                             className="text-muted-foreground hover:text-destructive p-1"
@@ -5908,7 +5986,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           {rows.map(({ episode, source }) => {
                             const ext = source.container_extension || 'mp4'
                             return (
-                              <div key={`${episode.id}-${source.id}`} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                              <div key={`${episode.id}-${source.id}`} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                                 <PlayButton
                                   url={buildPreviewSourceUrl('series', source.id, ext, xcCredentialsQuery.data)}
                                   transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
@@ -5916,15 +5994,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                                   title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
                                 />
                                 <span className="flex-1 truncate">
-                                  <span className="font-medium">{series.name}</span>{' '}
+                                  <span className="font-semibold">{series.name}</span>{' '}
                                   <span className="text-muted-foreground">
                                     S{episode.season_number}E{episode.episode_number} — {episode.name}
                                   </span>
                                 </span>
-                                <span className="text-muted-foreground shrink-0 uppercase">
-                                  {ext}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}
-                                </span>
-                                {episode.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</span>}
+                                <Chip>{ext.toUpperCase()}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}</Chip>
+                                {episode.sources.length > 1 && <Chip>+{episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</Chip>}
                                 <button
                                   title="Remove this provider's copy from the pool"
                                   className="text-muted-foreground hover:text-destructive p-1"
@@ -5956,6 +6032,26 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               </SectionCard>
             )}
 
+            {dvrSubTab === 'missing' && (
+              <SectionCard title="Missing Episodes" icon={<Search size={14} />}>
+                <p className="text-sm text-muted-foreground">
+                  Every gap across every show with an active recording rule -- not just ones this provider has
+                  already recorded an episode for. Find runs the same cascade everywhere: pool backfill first, then
+                  this show's own known channel, then a cross-channel search, then flags it for review.
+                </p>
+                {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
+                  <p className="text-xs text-muted-foreground">No recording rules yet -- add one under Scheduled first.</p>
+                )}
+                <div className="space-y-2">
+                  {recordingProfilesQuery.data?.map((rp) => (
+                    recordingProfilesProviderId != null && (
+                      <RuleMissingBlock key={rp.id} rule={rp} providerId={recordingProfilesProviderId} qc={qc} />
+                    )
+                  ))}
+                </div>
+              </SectionCard>
+            )}
+
             {dvrSubTab === 'metrics' && (
               <>
                 <SectionCard title="People" icon={<Users size={14} />}>
@@ -5975,9 +6071,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       const sessions = (watchSessionsQuery.data ?? []).filter((w) => w.dispatcharr_user_id === lim.dispatcharr_user_id)
                       const lastSeen = sessions.length ? Math.max(...sessions.map((s) => Number(s.last_seen_at))) : null
                       return (
-                        <div key={lim.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                        <div key={lim.id} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                           <span className="flex-1">
-                            <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
+                            <span className="font-semibold">{lim.dispatcharr_username}</span>{' '}
                             <span className="text-muted-foreground">
                               — {usageGB != null ? `${usageGB.toFixed(1)}GB used` : 'usage unknown'}
                               {virtualGB != null && virtualGB > 0.01 && ` (${virtualGB.toFixed(1)}GB virtual)`}
@@ -6005,9 +6101,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     return (
                       <div className="space-y-1">
                         {rows.map(([channelId, count]) => (
-                          <div key={channelId} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                          <div key={channelId} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                             <span className="flex-1">channel {channelId}</span>
-                            <span className="text-muted-foreground">{count} rule{count === 1 ? '' : 's'}</span>
+                            <Chip>{count} rule{count === 1 ? '' : 's'}</Chip>
                           </div>
                         ))}
                       </div>
@@ -6027,17 +6123,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     {recordingProfilesQuery.data?.map((rp) => {
                       const health = ruleHealth[rp.id]
                       return (
-                        <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                        <div key={rp.id} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                           <span className="flex-1 truncate">
-                            <span className="font-medium">{rp.label}</span>{' '}
+                            <span className="font-semibold">{rp.label}</span>{' '}
                             <span className="text-muted-foreground">— "{rp.title}"</span>
                           </span>
                           {health && !health.checking && (
                             health.matches < 0
-                              ? <span className="text-destructive shrink-0">check failed</span>
-                              : <span className={`shrink-0 ${health.matches === 0 ? 'text-destructive' : 'text-muted-foreground'}`}>
-                                  {health.matches === 0 ? 'no upcoming matches' : `${health.matches} upcoming match${health.matches === 1 ? '' : 'es'}`}
-                                </span>
+                              ? <StatusPill tone="destructive" label="check failed" />
+                              : health.matches === 0
+                                ? <StatusPill tone="warning" label="no upcoming matches" />
+                                : <StatusPill tone="success" label={`${health.matches} upcoming match${health.matches === 1 ? '' : 'es'}`} />
                           )}
                           <Button size="sm" variant="outline" disabled={!rp.channel_id || health?.checking} onClick={() => checkRuleHealth(rp)}>
                             {health?.checking ? <Loader2 size={12} className="animate-spin" /> : 'Check'}
@@ -6058,16 +6154,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   )}
                   <div className="space-y-1">
                     {unresolvedMissingEpisodesQuery.data?.map((u) => (
-                      <div key={u.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                      <div key={u.id} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
                         <span className="flex-1 truncate">
-                          <span className="font-medium">{u.series_name}</span>{' '}
+                          <span className="font-semibold">{u.series_name}</span>{' '}
                           <span className="text-muted-foreground">
                             S{u.season_number}E{u.episode_number}{u.episode_name ? ` — ${u.episode_name}` : ''}
                           </span>
                         </span>
-                        <span className="text-muted-foreground shrink-0">
-                          flagged {new Date(Number(u.checked_at) * 1000).toLocaleDateString()}
-                        </span>
+                        <Chip>flagged {new Date(Number(u.checked_at) * 1000).toLocaleDateString()}</Chip>
                       </div>
                     ))}
                   </div>
