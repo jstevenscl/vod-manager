@@ -66,7 +66,10 @@ interface DvrUpcomingRecording {
   channel: number
   start_time: string
   end_time: string
-  custom_properties?: { program?: { title?: string; sub_title?: string | null } }
+  custom_properties?: {
+    program?: { title?: string; sub_title?: string | null }
+    scheduled_by?: { dispatcharr_user_id?: number; dispatcharr_username?: string | null; profile_label?: string } | null
+  }
 }
 
 interface EpgSearchProgram {
@@ -86,6 +89,27 @@ interface DvrUserLimit {
   dispatcharr_username: string
   stream_reserve: number
   disk_quota_bytes: number | null
+  retention_max_age_days: number | null
+  retention_max_episodes_per_show: number | null
+  created_at: string
+}
+
+interface RetentionCandidateMovie {
+  movie_id: number
+  source_id: number
+  name: string
+  year: number | null
+  created_at: string
+  reason: string
+}
+
+interface RetentionCandidateEpisode {
+  episode_id: number
+  source_id: number
+  series_name: string
+  season_number: number
+  episode_number: number
+  name: string
   created_at: string
 }
 
@@ -2677,6 +2701,14 @@ export default function VodManager() {
     localStorage.setItem('vodmanager-tab', t)
     setActiveTabState(t)
   }
+  const [dvrSubTab, setDvrSubTab] = useState<'scheduled' | 'users' | 'library' | 'metrics'>(() => {
+    const saved = localStorage.getItem('vodmanager-dvr-subtab')
+    return saved === 'scheduled' || saved === 'users' || saved === 'library' || saved === 'metrics' ? saved : 'scheduled'
+  })
+  function setDvrSubTabPersisted(t: typeof dvrSubTab) {
+    localStorage.setItem('vodmanager-dvr-subtab', t)
+    setDvrSubTab(t)
+  }
   const [movieViewMode, setMovieViewModeState] = useState<'list' | 'grid'>(
     () => (localStorage.getItem('vodmanager-movies-view') === 'grid' ? 'grid' : 'list')
   )
@@ -3254,7 +3286,10 @@ export default function VodManager() {
     queryFn:  () => api.get('/vod/dvr-user-limits/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
     enabled:  recordingProfilesProviderId != null,
   })
-  const [dvrLimitForm, setDvrLimitForm] = useState({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '' })
+  const [dvrLimitForm, setDvrLimitForm] = useState({
+    dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '',
+    retention_max_age_days: '', retention_max_episodes_per_show: '',
+  })
   const [dvrLimitError, setDvrLimitError] = useState<string | null>(null)
   const addDvrUserLimit = useMutation({
     mutationFn: () => {
@@ -3265,11 +3300,13 @@ export default function VodManager() {
         dispatcharr_username: user?.username ?? `user ${dvrLimitForm.dispatcharr_user_id}`,
         stream_reserve: Number(dvrLimitForm.stream_reserve) || 0,
         disk_quota_bytes: dvrLimitForm.disk_quota_gb ? Math.round(Number(dvrLimitForm.disk_quota_gb) * 1024 ** 3) : null,
+        retention_max_age_days: dvrLimitForm.retention_max_age_days ? Number(dvrLimitForm.retention_max_age_days) : null,
+        retention_max_episodes_per_show: dvrLimitForm.retention_max_episodes_per_show ? Number(dvrLimitForm.retention_max_episodes_per_show) : null,
       })
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] })
-      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '' })
+      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '', retention_max_age_days: '', retention_max_episodes_per_show: '' })
       setDvrLimitError(null)
     },
     onError: (e: any) => setDvrLimitError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
@@ -3277,6 +3314,36 @@ export default function VodManager() {
   const deleteDvrUserLimit = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/dvr-user-limits/${id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
+  })
+  const updateDvrUserLimit = useMutation({
+    mutationFn: (v: { id: number; stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }) =>
+      api.post(`/vod/dvr-user-limits/${v.id}/`, {
+        stream_reserve: v.stream_reserve, disk_quota_bytes: v.disk_quota_bytes,
+        retention_max_age_days: v.retention_max_age_days, retention_max_episodes_per_show: v.retention_max_episodes_per_show,
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
+  })
+  // Retention: dry-run scan, then an explicit separate confirm step -- see
+  // vod_db.find_retention_candidates/apply_retention_deletions' docstrings
+  // for why this is two calls, not one (matches the Orphan Checker's own
+  // scan-then-delete pattern already established in this app).
+  const [retentionReviewLimitId, setRetentionReviewLimitId] = useState<number | null>(null)
+  const retentionCandidatesQuery = useQuery<{ movies: RetentionCandidateMovie[]; episodes: RetentionCandidateEpisode[] }>({
+    queryKey: ['vod-dvr-retention-candidates', retentionReviewLimitId],
+    queryFn: () => api.get(`/vod/dvr-user-limits/${retentionReviewLimitId}/retention-candidates/`).then((r) => r.data),
+    enabled: retentionReviewLimitId != null,
+  })
+  const applyRetention = useMutation({
+    mutationFn: () => api.post(`/vod/dvr-user-limits/${retentionReviewLimitId}/apply-retention/`, {
+      movies: retentionCandidatesQuery.data?.movies ?? [],
+      episodes: retentionCandidatesQuery.data?.episodes ?? [],
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dvr-user-usage'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      setRetentionReviewLimitId(null)
+    },
   })
   const dvrUserUsageQuery = useQuery<Record<number, number>>({
     queryKey: ['vod-dvr-user-usage', recordingProfilesProviderId, dvrUserLimitsQuery.data?.map((l) => l.id).join(',')],
@@ -5069,218 +5136,369 @@ export default function VodManager() {
               </div>
             )}
 
-            <SectionCard title="Recording Profiles & People" icon={<Users size={14} />}>
-              <p className="text-sm text-muted-foreground">
-                Each profile schedules real Dispatcharr recordings for a specific show on a specific channel, and
-                re-checks for new episodes automatically. When one finishes, it's routed into the categories below
-                instead of this provider's own default.
-              </p>
+            <div className="flex items-center gap-0.5 rounded border border-border p-0.5 w-fit">
+              {([
+                { key: 'scheduled' as const, label: 'Scheduled Recordings', icon: <CalendarDays size={12} /> },
+                { key: 'users' as const, label: 'Users', icon: <Users size={12} /> },
+                { key: 'library' as const, label: 'DVR Library', icon: <HardDriveDownload size={12} /> },
+                { key: 'metrics' as const, label: 'Metrics', icon: <LayoutGrid size={12} /> },
+              ]).map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => setDvrSubTabPersisted(t.key)}
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs transition-colors ${
+                    dvrSubTab === t.key
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                  }`}
+                >
+                  {t.icon}{t.label}
+                </button>
+              ))}
+            </div>
 
-              <div className="space-y-1.5">
-                {recordingProfilesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
-                {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
-                  <p className="text-xs text-muted-foreground">No recording profiles yet.</p>
-                )}
-                {recordingProfilesQuery.data?.map((rp) => (
-                  <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
-                    <span className="flex-1">
-                      <span className="font-medium">{rp.label}</span>{' '}
-                      <span className="text-muted-foreground">
-                        — "{rp.title}", {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
-                        {rp.channel_id ? `, channel ${rp.channel_id}` : ' (no channel -- won\'t schedule)'}
-                        {' → '}
-                        {[
-                          movieCategories.find((c) => c.id === rp.target_movie_category_id)?.name,
-                          seriesCategories.find((c) => c.id === rp.target_series_category_id)?.name,
-                        ].filter(Boolean).join(' / ') || 'no category set'}
-                        {rp.dispatcharr_user_id != null && (
-                          <> · {dispatcharrUsersQuery.data?.find((u) => u.id === rp.dispatcharr_user_id)?.username ?? `user ${rp.dispatcharr_user_id}`}</>
-                        )}
-                      </span>
-                    </span>
-                    <button
-                      title="Delete this recording profile (also cancels its future recordings on Dispatcharr)"
-                      className="text-muted-foreground hover:text-destructive p-1"
-                      onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                ))}
-              </div>
+            {dvrSubTab === 'scheduled' && (
+              <>
+                <SectionCard title="Recording Profiles" icon={<CalendarClock size={14} />}>
+                  <p className="text-sm text-muted-foreground">
+                    Each profile schedules real Dispatcharr recordings for a specific show on a specific channel, and
+                    re-checks for new episodes automatically. When one finishes, it's routed into the categories
+                    below instead of this provider's own default.
+                  </p>
 
-              <div className="border-t border-border pt-3 space-y-1.5">
-                <p className="text-xs font-medium">Add a profile</p>
-                <p className="text-[11px] text-muted-foreground">
-                  Search the real guide and pick the exact channel to record — matching a title with no channel picked
-                  records every affiliate carrying it as a separate duplicate, so a channel is required.
-                </p>
-
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <input
-                    className={inputCls('flex-1 min-w-[8rem]')}
-                    placeholder="Label (e.g. Bob's Seinfeld)"
-                    value={recordingProfileForm.label}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, label: e.target.value })}
-                  />
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.dispatcharr_user_id}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
-                    title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured below, this profile counts against their stream budget, and their own Channel Profile is used to flag channels outside their lineup below"
-                  >
-                    <option value="">Person (optional)…</option>
-                    {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
-                  </select>
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.mode}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, mode: e.target.value as 'all' | 'new' })}
-                    title="All episodes vs. new episodes only"
-                  >
-                    <option value="all">All episodes</option>
-                    <option value="new">New episodes only</option>
-                  </select>
-                </div>
-
-                {recordingProfileForm.channel_id ? (
-                  <div className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1.5 bg-muted/30">
-                    <span className="flex-1">
-                      <span className="font-medium">{recordingProfileForm.channel_label}</span>
-                      <span className="text-muted-foreground"> — "{recordingProfileForm.title}"</span>
-                    </span>
-                    <button
-                      className="text-muted-foreground hover:text-foreground underline decoration-dotted text-[11px] shrink-0"
-                      onClick={() => setRecordingProfileForm({ ...recordingProfileForm, channel_id: '', tvg_id: '', channel_label: '' })}
-                    >
-                      change
-                    </button>
-                  </div>
-                ) : (
                   <div className="space-y-1.5">
-                    <div className="flex items-center gap-1.5">
-                      <input
-                        className={inputCls('flex-1')}
-                        placeholder="Search the guide (e.g. Seinfeld)"
-                        value={epgSearchTitle}
-                        onChange={(e) => setEpgSearchTitle(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && epgSearchTitle.trim()) epgSearch.mutate() }}
-                      />
-                      <Button
-                        size="sm" variant="outline"
-                        disabled={!epgSearchTitle.trim() || epgSearch.isPending}
-                        onClick={() => epgSearch.mutate()}
-                      >
-                        {epgSearch.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Search'}
-                      </Button>
-                    </div>
-                    {epgSearch.data && !epgChannelGroups.length && (
-                      <p className="text-xs text-muted-foreground">No upcoming airings found for that title in the next 7 days.</p>
+                    {recordingProfilesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+                    {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
+                      <p className="text-xs text-muted-foreground">No recording profiles yet.</p>
                     )}
-                    {!!epgChannelGroups.length && (
-                      <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-1.5">
-                        {epgChannelGroups.map(({ channel, programs }) => {
-                          const inLineup = visibleChannelIds == null || visibleChannelIds.has(channel.id)
-                          const next = programs[0]
-                          return (
-                            <button
-                              key={channel.id}
-                              className={`w-full text-left text-xs px-2 py-1 rounded hover:bg-accent flex items-center gap-2 ${inLineup ? '' : 'opacity-50'}`}
-                              title={inLineup ? undefined : `Outside ${selectedDispatcharrUser?.username}'s Channel Profile -- they wouldn't normally see this channel`}
-                              onClick={() => pickEpgChannel(channel, programs)}
-                            >
-                              <span className="font-mono text-muted-foreground w-8 shrink-0">{channel.channel_number ?? '—'}</span>
-                              <span className="flex-1 truncate">{channel.name}</span>
-                              {next?.sub_title && <span className="text-muted-foreground truncate max-w-[10rem]">{next.sub_title}</span>}
-                              <span className="text-muted-foreground shrink-0">{programs.length} upcoming</span>
-                              {!inLineup && <span className="text-[10px] text-muted-foreground shrink-0">not in lineup</span>}
-                            </button>
-                          )
-                        })}
+                    {recordingProfilesQuery.data?.map((rp) => (
+                      <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                        <span className="flex-1">
+                          <span className="font-medium">{rp.label}</span>{' '}
+                          <span className="text-muted-foreground">
+                            — "{rp.title}", {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
+                            {rp.channel_id ? `, channel ${rp.channel_id}` : ' (no channel -- won\'t schedule)'}
+                            {' → '}
+                            {[
+                              movieCategories.find((c) => c.id === rp.target_movie_category_id)?.name,
+                              seriesCategories.find((c) => c.id === rp.target_series_category_id)?.name,
+                            ].filter(Boolean).join(' / ') || 'no category set'}
+                            {rp.dispatcharr_user_id != null && (
+                              <> · {dispatcharrUsersQuery.data?.find((u) => u.id === rp.dispatcharr_user_id)?.username ?? `user ${rp.dispatcharr_user_id}`}</>
+                            )}
+                          </span>
+                        </span>
+                        <button
+                          title="Delete this recording profile (also cancels its future recordings on Dispatcharr)"
+                          className="text-muted-foreground hover:text-destructive p-1"
+                          onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="border-t border-border pt-3 space-y-1.5">
+                    <p className="text-xs font-medium">Add a profile</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Search the real guide and pick the exact channel to record — matching a title with no channel
+                      picked records every affiliate carrying it as a separate duplicate, so a channel is required.
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <input
+                        className={inputCls('flex-1 min-w-[8rem]')}
+                        placeholder="Label (e.g. Bob's Seinfeld)"
+                        value={recordingProfileForm.label}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, label: e.target.value })}
+                      />
+                      <select
+                        className={inputCls()}
+                        value={recordingProfileForm.dispatcharr_user_id}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
+                        title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured under Users, this profile counts against their stream budget, and their own Channel Profile is used to flag channels outside their lineup below"
+                      >
+                        <option value="">Person (optional)…</option>
+                        {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
+                      </select>
+                      <select
+                        className={inputCls()}
+                        value={recordingProfileForm.mode}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, mode: e.target.value as 'all' | 'new' })}
+                        title="All episodes vs. new episodes only"
+                      >
+                        <option value="all">All episodes</option>
+                        <option value="new">New episodes only</option>
+                      </select>
+                    </div>
+
+                    {recordingProfileForm.channel_id ? (
+                      <div className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1.5 bg-muted/30">
+                        <span className="flex-1">
+                          <span className="font-medium">{recordingProfileForm.channel_label}</span>
+                          <span className="text-muted-foreground"> — "{recordingProfileForm.title}"</span>
+                        </span>
+                        <button
+                          className="text-muted-foreground hover:text-foreground underline decoration-dotted text-[11px] shrink-0"
+                          onClick={() => setRecordingProfileForm({ ...recordingProfileForm, channel_id: '', tvg_id: '', channel_label: '' })}
+                        >
+                          change
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            className={inputCls('flex-1')}
+                            placeholder="Search the guide (e.g. Seinfeld)"
+                            value={epgSearchTitle}
+                            onChange={(e) => setEpgSearchTitle(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && epgSearchTitle.trim()) epgSearch.mutate() }}
+                          />
+                          <Button
+                            size="sm" variant="outline"
+                            disabled={!epgSearchTitle.trim() || epgSearch.isPending}
+                            onClick={() => epgSearch.mutate()}
+                          >
+                            {epgSearch.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Search'}
+                          </Button>
+                        </div>
+                        {epgSearch.data && !epgChannelGroups.length && (
+                          <p className="text-xs text-muted-foreground">No upcoming airings found for that title in the next 7 days.</p>
+                        )}
+                        {!!epgChannelGroups.length && (
+                          <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-1.5">
+                            {epgChannelGroups.map(({ channel, programs }) => {
+                              const inLineup = visibleChannelIds == null || visibleChannelIds.has(channel.id)
+                              const next = programs[0]
+                              return (
+                                <button
+                                  key={channel.id}
+                                  className={`w-full text-left text-xs px-2 py-1 rounded hover:bg-accent flex items-center gap-2 ${inLineup ? '' : 'opacity-50'}`}
+                                  title={inLineup ? undefined : `Outside ${selectedDispatcharrUser?.username}'s Channel Profile -- they wouldn't normally see this channel`}
+                                  onClick={() => pickEpgChannel(channel, programs)}
+                                >
+                                  <span className="font-mono text-muted-foreground w-8 shrink-0">{channel.channel_number ?? '—'}</span>
+                                  <span className="flex-1 truncate">{channel.name}</span>
+                                  {next?.sub_title && <span className="text-muted-foreground truncate max-w-[10rem]">{next.sub_title}</span>}
+                                  <span className="text-muted-foreground shrink-0">{programs.length} upcoming</span>
+                                  {!inLineup && <span className="text-[10px] text-muted-foreground shrink-0">not in lineup</span>}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
                       </div>
                     )}
+
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <select
+                        className={inputCls()}
+                        value={recordingProfileForm.target_movie_category_id}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_movie_category_id: e.target.value })}
+                        title="If a matching recording is classified as a movie, place it here"
+                      >
+                        <option value="">Movie category (optional)…</option>
+                        {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
+                      <select
+                        className={inputCls()}
+                        value={recordingProfileForm.target_series_category_id}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_series_category_id: e.target.value })}
+                        title="If a matching recording is classified as a TV series, place its series here"
+                      >
+                        <option value="">TV category (optional)…</option>
+                        {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
+                    </div>
+
+                    {recordingProfileResult && (
+                      <p className="text-xs text-muted-foreground">
+                        Scheduled {recordingProfileResult.scheduled_now} of {recordingProfileResult.total_matches} upcoming episode
+                        {recordingProfileResult.total_matches === 1 ? '' : 's'}
+                        {recordingProfileResult.total_matches > 0 && recordingProfileResult.scheduled_now === 0 && ' (all already scheduled)'}.
+                      </p>
+                    )}
+                    {recordingProfileError && <p className="text-xs text-destructive">{recordingProfileError}</p>}
+                    <div className="flex justify-end gap-2 pt-1">
+                      <Button
+                        size="sm"
+                        disabled={!recordingProfileForm.title.trim() || !recordingProfileForm.channel_id || addRecordingProfile.isPending}
+                        onClick={() => addRecordingProfile.mutate()}
+                      >
+                        {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
+                      </Button>
+                    </div>
                   </div>
-                )}
+                </SectionCard>
 
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.target_movie_category_id}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_movie_category_id: e.target.value })}
-                    title="If a matching recording is classified as a movie, place it here"
-                  >
-                    <option value="">Movie category (optional)…</option>
-                    {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.target_series_category_id}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, target_series_category_id: e.target.value })}
-                    title="If a matching recording is classified as a TV series, place its series here"
-                  >
-                    <option value="">TV category (optional)…</option>
-                    {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                </div>
+                <SectionCard title="Upcoming Recordings" icon={<CalendarDays size={14} />}>
+                  {dvrUpcomingQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+                  {dvrUpcomingQuery.data && !dvrUpcomingQuery.data.length && (
+                    <p className="text-xs text-muted-foreground">Nothing scheduled right now.</p>
+                  )}
+                  <div className="space-y-3">
+                    {upcomingByDay.map(([day, items]) => (
+                      <div key={day}>
+                        <p className="text-xs font-medium text-muted-foreground mb-1">{day}</p>
+                        <div className="space-y-1">
+                          {items.map((r) => {
+                            const prog = r.custom_properties?.program
+                            const who = r.custom_properties?.scheduled_by
+                            const time = new Date(r.start_time).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+                            return (
+                              <div key={r.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                                <span className="font-mono text-muted-foreground w-16 shrink-0">{time}</span>
+                                <span className="flex-1 truncate">
+                                  <span className="font-medium">{prog?.title ?? 'Unknown'}</span>
+                                  {prog?.sub_title && <span className="text-muted-foreground"> — {prog.sub_title}</span>}
+                                </span>
+                                {who?.dispatcharr_username && (
+                                  <span className="text-muted-foreground shrink-0">{who.dispatcharr_username}</span>
+                                )}
+                                <span className="text-muted-foreground shrink-0">channel {r.channel}</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </SectionCard>
+              </>
+            )}
 
-                {recordingProfileResult && (
-                  <p className="text-xs text-muted-foreground">
-                    Scheduled {recordingProfileResult.scheduled_now} of {recordingProfileResult.total_matches} upcoming episode
-                    {recordingProfileResult.total_matches === 1 ? '' : 's'}
-                    {recordingProfileResult.total_matches > 0 && recordingProfileResult.scheduled_now === 0 && ' (all already scheduled)'}.
-                  </p>
-                )}
-                {recordingProfileError && <p className="text-xs text-destructive">{recordingProfileError}</p>}
-                <div className="flex justify-end gap-2 pt-1">
-                  <Button
-                    size="sm"
-                    disabled={!recordingProfileForm.title.trim() || !recordingProfileForm.channel_id || addRecordingProfile.isPending}
-                    onClick={() => addRecordingProfile.mutate()}
-                  >
-                    {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
-                  </Button>
-                </div>
-              </div>
-
-              <div className="border-t border-border pt-3 space-y-1.5">
-                <p className="text-xs font-medium">DVR limits</p>
-                <p className="text-xs text-muted-foreground">
-                  Opt-in per person -- only enforced for someone listed here. Predicts whether a new profile could
-                  require more simultaneous recordings than their Dispatcharr account allows (stream limit minus
-                  the reserve below, kept free for their own live TV watching). Dispatcharr itself never checks this
-                  for recordings, so this is a best-effort warning at the moment a profile is added, not a guarantee.
+            {dvrSubTab === 'users' && (
+              <SectionCard title="Users" icon={<Users size={14} />}>
+                <p className="text-sm text-muted-foreground">
+                  Opt-in per person -- only enforced for someone listed here. Stream reserve predicts whether a new
+                  profile could require more simultaneous recordings than their Dispatcharr account allows.
+                  Disk quota withholds new category placements once they're over (nothing existing is ever deleted
+                  automatically). Retention lets you reclaim space explicitly -- review candidates and confirm before
+                  anything is actually removed.
                 </p>
                 {dvrUserLimitsQuery.data && !dvrUserLimitsQuery.data.length && (
                   <p className="text-xs text-muted-foreground">No one has DVR limits configured yet.</p>
                 )}
-                {dvrUserLimitsQuery.data?.map((lim) => {
-                  const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
-                  const usageBytes = dvrUserUsageQuery.data?.[lim.id]
-                  const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
-                  const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
-                  return (
-                    <div key={lim.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
-                      <span className="flex-1">
-                        <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
-                        <span className="text-muted-foreground">
-                          — stream limit {liveUser?.stream_limit ?? '?'}, reserve {lim.stream_reserve}
-                          {' '}(budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
-                          {' · '}
-                          {usageGB != null ? usageGB.toFixed(1) : '?'}GB
-                          {quotaGB != null ? ` / ${quotaGB.toFixed(0)}GB` : ' (no disk quota)'}
-                        </span>
-                      </span>
-                      <button
-                        title="Remove this person's DVR limits (their existing profiles are unaffected, just unconstrained again)"
-                        className="text-muted-foreground hover:text-destructive p-1"
-                        onClick={() => { if (confirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`)) deleteDvrUserLimit.mutate(lim.id) }}
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  )
-                })}
-                <div className="flex flex-wrap items-center gap-1.5">
+                <div className="space-y-2">
+                  {dvrUserLimitsQuery.data?.map((lim) => {
+                    const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
+                    const usageBytes = dvrUserUsageQuery.data?.[lim.id]
+                    const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
+                    const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
+                    const pushUpdate = (patch: Partial<{ stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }>) =>
+                      updateDvrUserLimit.mutate({
+                        id: lim.id,
+                        stream_reserve: lim.stream_reserve, disk_quota_bytes: lim.disk_quota_bytes,
+                        retention_max_age_days: lim.retention_max_age_days, retention_max_episodes_per_show: lim.retention_max_episodes_per_show,
+                        ...patch,
+                      })
+                    return (
+                      <div key={lim.id} className="border border-border rounded px-2 py-1.5 space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs">
+                          <span className="flex-1">
+                            <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
+                            <span className="text-muted-foreground">
+                              — stream limit {liveUser?.stream_limit ?? '?'} (budget {liveUser ? Math.max(0, liveUser.stream_limit - lim.stream_reserve) : '?'})
+                              {' · '}
+                              {usageGB != null ? usageGB.toFixed(1) : '?'}GB
+                              {quotaGB != null ? ` / ${quotaGB.toFixed(0)}GB` : ' (no disk quota)'}
+                            </span>
+                          </span>
+                          <button
+                            title="Remove this person's DVR limits (their existing profiles are unaffected, just unconstrained again)"
+                            className="text-muted-foreground hover:text-destructive p-1"
+                            onClick={() => { if (confirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`)) deleteDvrUserLimit.mutate(lim.id) }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Reserve
+                            <input
+                              className={inputCls('w-16')} type="number" defaultValue={lim.stream_reserve} key={`res-${lim.id}-${lim.stream_reserve}`}
+                              onBlur={(e) => { const v = Number(e.target.value) || 0; if (v !== lim.stream_reserve) pushUpdate({ stream_reserve: v }) }}
+                            />
+                          </label>
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Quota GB
+                            <input
+                              className={inputCls('w-16')} type="number" defaultValue={quotaGB ?? ''} key={`quota-${lim.id}-${lim.disk_quota_bytes}`}
+                              placeholder="none"
+                              onBlur={(e) => {
+                                const v = e.target.value ? Math.round(Number(e.target.value) * 1024 ** 3) : null
+                                if (v !== lim.disk_quota_bytes) pushUpdate({ disk_quota_bytes: v })
+                              }}
+                            />
+                          </label>
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Max age (days)
+                            <input
+                              className={inputCls('w-16')} type="number" defaultValue={lim.retention_max_age_days ?? ''} key={`age-${lim.id}-${lim.retention_max_age_days}`}
+                              placeholder="none"
+                              onBlur={(e) => {
+                                const v = e.target.value ? Number(e.target.value) : null
+                                if (v !== lim.retention_max_age_days) pushUpdate({ retention_max_age_days: v })
+                              }}
+                            />
+                          </label>
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Max episodes/show
+                            <input
+                              className={inputCls('w-16')} type="number" defaultValue={lim.retention_max_episodes_per_show ?? ''} key={`eps-${lim.id}-${lim.retention_max_episodes_per_show}`}
+                              placeholder="none"
+                              onBlur={(e) => {
+                                const v = e.target.value ? Number(e.target.value) : null
+                                if (v !== lim.retention_max_episodes_per_show) pushUpdate({ retention_max_episodes_per_show: v })
+                              }}
+                            />
+                          </label>
+                          {(lim.retention_max_age_days || lim.retention_max_episodes_per_show) && (
+                            <Button size="sm" variant="outline" onClick={() => setRetentionReviewLimitId(lim.id)}>
+                              Review retention
+                            </Button>
+                          )}
+                        </div>
+                        {retentionReviewLimitId === lim.id && (
+                          <div className="border-t border-border pt-1.5 mt-1.5 space-y-1.5">
+                            {retentionCandidatesQuery.isLoading && <p className="text-[11px] text-muted-foreground">Scanning…</p>}
+                            {retentionCandidatesQuery.data && !retentionCandidatesQuery.data.movies.length && !retentionCandidatesQuery.data.episodes.length && (
+                              <p className="text-[11px] text-muted-foreground">Nothing eligible for removal right now.</p>
+                            )}
+                            {retentionCandidatesQuery.data && (retentionCandidatesQuery.data.movies.length > 0 || retentionCandidatesQuery.data.episodes.length > 0) && (
+                              <>
+                                <p className="text-[11px] text-muted-foreground">
+                                  {retentionCandidatesQuery.data.movies.length} movie(s), {retentionCandidatesQuery.data.episodes.length} episode(s) eligible -- only items whose sole source is this DVR provider:
+                                </p>
+                                <ul className="text-[11px] text-muted-foreground list-disc pl-4 max-h-32 overflow-y-auto">
+                                  {retentionCandidatesQuery.data.movies.map((m) => (
+                                    <li key={`m-${m.movie_id}`}>{m.name} {m.year ? `(${m.year})` : ''}</li>
+                                  ))}
+                                  {retentionCandidatesQuery.data.episodes.map((e) => (
+                                    <li key={`e-${e.episode_id}`}>{e.series_name} S{e.season_number}E{e.episode_number} — {e.name}</li>
+                                  ))}
+                                </ul>
+                              </>
+                            )}
+                            <div className="flex justify-end gap-2">
+                              <Button size="sm" variant="outline" onClick={() => setRetentionReviewLimitId(null)}>Cancel</Button>
+                              <Button
+                                size="sm" className="text-destructive"
+                                disabled={applyRetention.isPending || !retentionCandidatesQuery.data || (!retentionCandidatesQuery.data.movies.length && !retentionCandidatesQuery.data.episodes.length)}
+                                onClick={() => { if (confirm('Delete these items from the VOD Manager pool? This cannot be undone.')) applyRetention.mutate() }}
+                              >
+                                {applyRetention.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Trash2 size={12} className="mr-1" /> Delete listed items</>}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                <div className="border-t border-border pt-2 flex flex-wrap items-center gap-1.5">
                   <select
                     className={inputCls()}
                     value={dvrLimitForm.dispatcharr_user_id}
@@ -5305,6 +5523,22 @@ export default function VodManager() {
                     onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, disk_quota_gb: e.target.value })}
                     title="Optional -- leave blank for no disk quota. Once their recordings' categories hold this much, new category placements for them are withheld (nothing existing is ever deleted)."
                   />
+                  <input
+                    className={inputCls('w-28')}
+                    type="number"
+                    placeholder="Max age (days)"
+                    value={dvrLimitForm.retention_max_age_days}
+                    onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, retention_max_age_days: e.target.value })}
+                    title="Optional -- flag their recordings older than this many days as eligible for removal via Review retention. Nothing is ever deleted automatically."
+                  />
+                  <input
+                    className={inputCls('w-32')}
+                    type="number"
+                    placeholder="Max episodes/show"
+                    value={dvrLimitForm.retention_max_episodes_per_show}
+                    onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, retention_max_episodes_per_show: e.target.value })}
+                    title="Optional -- keep only this many most-recent episodes per show, flagging the rest as eligible for removal via Review retention."
+                  />
                   <Button
                     size="sm"
                     disabled={!dvrLimitForm.dispatcharr_user_id || addDvrUserLimit.isPending}
@@ -5314,53 +5548,35 @@ export default function VodManager() {
                   </Button>
                 </div>
                 {dvrLimitError && <p className="text-xs text-destructive">{dvrLimitError}</p>}
-              </div>
-            </SectionCard>
+              </SectionCard>
+            )}
 
-            <SectionCard title="Upcoming Recordings" icon={<CalendarDays size={14} />}>
-              {dvrUpcomingQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
-              {dvrUpcomingQuery.data && !dvrUpcomingQuery.data.length && (
-                <p className="text-xs text-muted-foreground">Nothing scheduled right now.</p>
-              )}
-              <div className="space-y-3">
-                {upcomingByDay.map(([day, items]) => (
-                  <div key={day}>
-                    <p className="text-xs font-medium text-muted-foreground mb-1">{day}</p>
-                    <div className="space-y-1">
-                      {items.map((r) => {
-                        const prog = r.custom_properties?.program
-                        const time = new Date(r.start_time).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-                        return (
-                          <div key={r.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
-                            <span className="font-mono text-muted-foreground w-16 shrink-0">{time}</span>
-                            <span className="flex-1 truncate">
-                              <span className="font-medium">{prog?.title ?? 'Unknown'}</span>
-                              {prog?.sub_title && <span className="text-muted-foreground"> — {prog.sub_title}</span>}
-                            </span>
-                            <span className="text-muted-foreground shrink-0">channel {r.channel}</span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </SectionCard>
+            {dvrSubTab === 'library' && (
+              <SectionCard title="DVR Library" icon={<HardDriveDownload size={14} />}>
+                {(() => {
+                  const provider = providersQuery.data?.find((p) => p.id === recordingProfilesProviderId)
+                  return (
+                    <p className="text-sm text-muted-foreground">
+                      {provider ? (
+                        <>
+                          <span className="font-medium text-foreground">{provider.movie_count}</span> movies ·{' '}
+                          <span className="font-medium text-foreground">{provider.series_count}</span> series ·{' '}
+                          <span className="font-medium text-foreground">{provider.episode_count}</span> episodes
+                          sourced from this provider — browse them in the Movies / TV Shows tabs for now.
+                        </>
+                      ) : '—'}
+                      {' '}A dedicated browse-and-delete view scoped to this provider is coming next.
+                    </p>
+                  )
+                })()}
+              </SectionCard>
+            )}
 
-            <SectionCard title="DVR Media" icon={<HardDriveDownload size={14} />}>
-              {(() => {
-                const provider = providersQuery.data?.find((p) => p.id === recordingProfilesProviderId)
-                if (!provider) return <p className="text-xs text-muted-foreground">—</p>
-                return (
-                  <p className="text-sm">
-                    <span className="font-medium">{provider.movie_count}</span> movies ·{' '}
-                    <span className="font-medium">{provider.series_count}</span> series ·{' '}
-                    <span className="font-medium">{provider.episode_count}</span> episodes sourced from this provider
-                    — browse them in the Movies / TV Shows tabs.
-                  </p>
-                )
-              })()}
-            </SectionCard>
+            {dvrSubTab === 'metrics' && (
+              <SectionCard title="Metrics" icon={<LayoutGrid size={14} />}>
+                <p className="text-sm text-muted-foreground">Coming next.</p>
+              </SectionCard>
+            )}
           </>
         )}
       </>
