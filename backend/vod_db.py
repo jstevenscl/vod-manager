@@ -282,6 +282,37 @@ def init_db() -> None:
             UNIQUE(provider_id, dispatcharr_user_id)
         );
 
+        -- Turns Dispatcharr's real-time-only VOD connection stats (GET
+        -- /proxy/stats/, confirmed live 2026-07-27 it carries a real
+        -- per-person user_id on every active VOD connection, but
+        -- Dispatcharr itself never persists it once the connection ends)
+        -- into VOD Manager's own history -- see dispatcharr_dvr_importer.
+        -- poll_watch_sessions, which upserts/closes these rows every poll.
+        -- client_id is Dispatcharr's own per-connection identifier
+        -- (confirmed live it's timestamp-prefixed, e.g.
+        -- "vod_1785120140964_6853"), reused as the session key here rather
+        -- than inventing a new one. Not DVR-specific -- covers any VOD
+        -- content served through a connection's relay, DVR-recorded or
+        -- not. dispatcharr_user_id is intentionally not a local FK, same
+        -- reasoning as dvr_user_limits above.
+        CREATE TABLE IF NOT EXISTS watch_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatcharr_connection_id INTEGER NOT NULL REFERENCES dispatcharr_connections(id) ON DELETE CASCADE,
+            client_id TEXT NOT NULL,
+            dispatcharr_user_id INTEGER,
+            dispatcharr_username TEXT,
+            content_type TEXT,
+            content_name TEXT,
+            content_uuid TEXT,
+            client_ip TEXT,
+            bytes_sent INTEGER NOT NULL DEFAULT 0,
+            position_seconds REAL,
+            started_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            ended_at TEXT,
+            UNIQUE(dispatcharr_connection_id, client_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -298,6 +329,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_episode_sources_episode_id ON episode_sources(episode_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_profiles_provider_id ON dvr_recording_profiles(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_user_limits_provider_id ON dvr_user_limits(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_watch_sessions_connection_open ON watch_sessions(dispatcharr_connection_id, ended_at);
+        CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(dispatcharr_user_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
@@ -4726,3 +4759,91 @@ def get_ai_candidate_rows(content_type: str, prefilter_rule_json: str | None, li
         rows = [r for r in rows if _rule_matches(r, rule)]
 
     return rows[:limit], len(rows)
+
+
+# ── Watch session history (per-person VOD viewing, from Dispatcharr's live
+# connection stats) ──────────────────────────────────────────────────────
+# See the watch_sessions table comment for why this exists and what
+# client_id means here; dispatcharr_dvr_importer.poll_watch_sessions is the
+# only caller.
+
+def upsert_watch_session(
+    dispatcharr_connection_id: int, client_id: str,
+    dispatcharr_user_id: int | None, dispatcharr_username: str | None,
+    content_type: str | None, content_name: str | None, content_uuid: str | None,
+    client_ip: str | None, bytes_sent: int, position_seconds: float | None,
+) -> None:
+    """One poll's worth of a live VOD watch session. Reopens (clears
+    ended_at on) a session that was previously marked ended if Dispatcharr's
+    own client_id somehow reappears -- in practice this shouldn't happen
+    given its embedded timestamp, but a reconnect reusing the same id
+    should still be treated as the same session rather than silently
+    dropped or duplicated."""
+    conn = _connect()
+    now = _now()
+    existing = conn.execute(
+        "SELECT id FROM watch_sessions WHERE dispatcharr_connection_id=? AND client_id=?",
+        (dispatcharr_connection_id, client_id),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE watch_sessions SET last_seen_at=?, bytes_sent=?, position_seconds=?,
+               dispatcharr_user_id=?, dispatcharr_username=?, ended_at=NULL WHERE id=?""",
+            (now, bytes_sent, position_seconds, dispatcharr_user_id, dispatcharr_username, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO watch_sessions
+               (dispatcharr_connection_id, client_id, dispatcharr_user_id, dispatcharr_username,
+                content_type, content_name, content_uuid, client_ip, bytes_sent, position_seconds,
+                started_at, last_seen_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (dispatcharr_connection_id, client_id, dispatcharr_user_id, dispatcharr_username,
+             content_type, content_name, content_uuid, client_ip, bytes_sent, position_seconds,
+             now, now),
+        )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def close_stale_watch_sessions(dispatcharr_connection_id: int, active_client_ids: list[str]) -> int:
+    """Marks ended_at on any still-open session for this connection whose
+    client_id wasn't in Dispatcharr's most recent /proxy/stats/ response --
+    Dispatcharr only ever reports current state, so a session dropping out
+    of that list is the only signal we get that it ended (no explicit
+    'stopped' event to listen for)."""
+    conn = _connect()
+    now = _now()
+    if active_client_ids:
+        placeholders = ",".join("?" for _ in active_client_ids)
+        cur = conn.execute(
+            f"""UPDATE watch_sessions SET ended_at=? WHERE dispatcharr_connection_id=? AND ended_at IS NULL
+                AND client_id NOT IN ({placeholders})""",
+            (now, dispatcharr_connection_id, *active_client_ids),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE watch_sessions SET ended_at=? WHERE dispatcharr_connection_id=? AND ended_at IS NULL",
+            (now, dispatcharr_connection_id),
+        )
+    _commit_with_retry(conn)
+    conn.close()
+    return cur.rowcount
+
+
+def list_watch_sessions(
+    dispatcharr_user_id: int | None = None, active_only: bool = False, limit: int = 500,
+) -> list[dict]:
+    conn = _connect()
+    query = "SELECT * FROM watch_sessions WHERE 1=1"
+    params: list = []
+    if dispatcharr_user_id is not None:
+        query += " AND dispatcharr_user_id=?"
+        params.append(dispatcharr_user_id)
+    if active_only:
+        query += " AND ended_at IS NULL"
+    query += " ORDER BY started_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

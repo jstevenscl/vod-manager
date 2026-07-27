@@ -1231,6 +1231,16 @@ async def list_dvr_upcoming(provider_id: int):
         raise HTTPException(502, detail=str(exc))
 
 
+@router.get("/watch-sessions/", dependencies=_GUARDS)
+async def list_watch_sessions(dispatcharr_user_id: Optional[int] = None, active_only: bool = False):
+    """VOD Manager's own persisted watch-session history -- see
+    main.py's _watch_session_poller and vod_db.watch_sessions' table
+    comment for why this exists (Dispatcharr's own connection stats are
+    real-time only). Powers the DVR Metrics subpage's per-person
+    recorded-vs-watched view."""
+    return vod_db.list_watch_sessions(dispatcharr_user_id, active_only)
+
+
 @router.get("/dvr-user-limits/", dependencies=_GUARDS)
 async def list_dvr_user_limits(provider_id: Optional[int] = None):
     return vod_db.list_dvr_user_limits(provider_id)

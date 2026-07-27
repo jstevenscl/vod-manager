@@ -205,6 +205,40 @@ async def _dispatcharr_dvr_poller() -> None:
         await asyncio.sleep(_DVR_POLL_SECONDS)
 
 
+_WATCH_SESSION_POLL_SECONDS = 45  # frequent enough to catch short viewing
+# sessions and keep bytes_sent/position_seconds reasonably fresh, without
+# hammering Dispatcharr with more than one request per connection every
+# ~45s. Deliberately shorter than _DVR_POLL_SECONDS -- Dispatcharr only
+# exposes this as current state (no persisted history on its side), so a
+# session shorter than the poll interval would be missed entirely rather
+# than just seen a little late.
+
+
+async def _watch_session_poller() -> None:
+    """Background task: turns Dispatcharr's real-time-only VOD connection
+    stats into VOD Manager's own persisted watch-session history --
+    Dispatcharr never keeps this once a connection ends (confirmed live,
+    see dispatcharr_dvr_importer.poll_watch_sessions), so something has to
+    poll while a session is still active. Runs per Dispatcharr connection,
+    not per provider or per DVR provider specifically -- any VOD content
+    served through a connection's relay can be watched, not just
+    DVR-recorded content."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            connections = await asyncio.to_thread(vod_db.list_dispatcharr_connections)
+            for c in connections:
+                try:
+                    result = await dispatcharr_dvr_importer.poll_watch_sessions(c)
+                    if result["active"] or result["closed"]:
+                        logger.info("[watch_session_poller] connection=%s: %s", c["label"], result)
+                except Exception as exc:
+                    logger.warning("[watch_session_poller] connection=%s failed: %s", c["label"], exc)
+        except Exception as exc:
+            logger.warning("[watch_session_poller] cycle failed: %s", exc)
+        await asyncio.sleep(_WATCH_SESSION_POLL_SECONDS)
+
+
 async def _vod_enrichment_scheduler() -> None:
     """Background task: periodically runs bulk_enrich_all so newly-imported or
     stale (past ENRICHMENT_TTL_SECONDS) items get enriched without a manual
@@ -285,6 +319,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_dispatcharr_dvr_poller()),
+        asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(_category_schedule_loop()),

@@ -439,3 +439,45 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
         logger.info("[dispatcharr_dvr_importer] provider=%s rescanned %d profile(s), %d new recording(s) scheduled: %s",
                      provider["name"], len(profiles), scheduled_total, results)
     return {"profiles_scanned": len(profiles), "scheduled": scheduled_total, "details": results}
+
+
+async def poll_watch_sessions(connection: dict) -> dict:
+    """One polling cycle against a single Dispatcharr connection's live
+    /proxy/stats/ -- turns Dispatcharr's real-time-only VOD connection state
+    (confirmed live, dispatch-test v0.28.2, 2026-07-27: a real per-person
+    user_id is present on every active VOD connection, but Dispatcharr
+    itself never persists it once the connection ends -- see
+    dispatcharr_dvr_client.get_proxy_stats) into VOD Manager's own history
+    by upserting/closing watch_sessions rows every time this runs.
+
+    Not DVR-specific -- covers any VOD content served through this
+    connection's relay, DVR-recorded or not; lives here anyway rather than
+    a new module, matching rescan_recording_profiles' precedent that
+    connection/provider-level Dispatcharr polling orchestration belongs in
+    the importer, next to vod_db."""
+    users = await dispatcharr_dvr_client.list_users(connection)
+    username_by_id = {u["id"]: u["username"] for u in users}
+
+    stats = await dispatcharr_dvr_client.get_proxy_stats(connection)
+    active_client_ids = []
+    for group in (stats.get("vod") or {}).get("vod_connections", []):
+        for c in group.get("connections", []):
+            client_id = c.get("client_id")
+            if not client_id:
+                continue
+            active_client_ids.append(client_id)
+            try:
+                user_id = int(c["user_id"]) if c.get("user_id") not in (None, "") else None
+            except (TypeError, ValueError):
+                user_id = None
+            try:
+                position_seconds = float(c["position_seconds"]) if c.get("position_seconds") not in (None, "") else None
+            except (TypeError, ValueError):
+                position_seconds = None
+            vod_db.upsert_watch_session(
+                connection["id"], client_id, user_id, username_by_id.get(user_id),
+                c.get("content_type"), c.get("content_name"), c.get("content_uuid"),
+                c.get("client_ip"), int(c.get("bytes_sent") or 0), position_seconds,
+            )
+    closed = vod_db.close_stale_watch_sessions(connection["id"], active_client_ids)
+    return {"active": len(active_client_ids), "closed": closed}

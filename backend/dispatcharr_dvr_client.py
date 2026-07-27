@@ -340,3 +340,24 @@ async def list_users(connection: dict) -> list[dict]:
     client = DispatcharrClient(connection["url"], connection["token"])
     data = await client.get("/api/accounts/users/")
     return data if isinstance(data, list) else data.get("results", [])
+
+
+async def get_proxy_stats(connection: dict) -> dict:
+    """Dispatcharr's own real-time connection stats -- GET /proxy/stats/
+    (root-mounted, NOT under /api/ -- confirmed live, dispatch-test v0.28.2,
+    2026-07-27), same X-API-Key auth as everything else despite Dispatcharr's
+    own view requiring IsAdmin. Returns {"live": {...}, "vod":
+    {"vod_connections": [...], "total_connections": int}, "catchup": {...},
+    "timestamp": float}.
+
+    Each entry in vod.vod_connections[].connections carries a real
+    Dispatcharr user_id for who's actually watching -- confirmed live by
+    logging into dispatch-test as a dedicated test account, playing a real
+    VOD movie sourced from VOD Manager's own relay, and checking this exact
+    response while it played. This is Dispatcharr's CURRENT STATE only
+    (Redis-TTL backed on Dispatcharr's own side, no persisted history) -- a
+    caller has to poll repeatedly and build its own history from the deltas,
+    see dispatcharr_dvr_importer.poll_watch_sessions and main.py's
+    _watch_session_poller."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    return await client.get("/proxy/stats/")
