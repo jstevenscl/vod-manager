@@ -54,10 +54,13 @@ import os
 import re
 from datetime import datetime
 
+import httpx
+
 import config
 import dispatcharr_dvr_client
 import tmdb_sync
 import vod_db
+import xc_server
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +417,136 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     }
 
 
+async def _probe_content_length(url: str) -> int | None:
+    """Pointer-mode backfill's virtual byte accounting -- a plain HEAD isn't
+    reliable against real XC/Plex/Emby upstreams (some 404 a HEAD while GET
+    works fine), so this opens a real streamed GET, reads Content-Length,
+    then closes without ever consuming the body -- same header source
+    xc_server._proxy_vod_stream already trusts for these same upstreams."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0), follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    return None
+                length = resp.headers.get("content-length")
+                return int(length) if length else None
+    except Exception as exc:
+        logger.warning("[dispatcharr_dvr_importer] backfill content-length probe failed for %s: %s",
+                        xc_server._redact_upstream_url(url), exc)
+        return None
+
+
+async def _download_url_to_file(url: str, dest_path: str) -> None:
+    """Same shape as dispatcharr_dvr_client.download_recording_file
+    (stream to a .part file, atomic os.replace on success) -- generalized
+    to any provider's own resolved stream URL rather than Dispatcharr's
+    recording-file endpoint specifically, for download-mode backfill."""
+    tmp_path = dest_path + ".part"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
+    os.replace(tmp_path, dest_path)
+
+
+async def _apply_pointer_backfill(match: dict) -> None:
+    """No new disk cost -- just makes sure the matched source's
+    file_size_bytes is populated (a regular provider's source never gets
+    this at import time, only DVR-recorded sources do) so it counts toward
+    the target person's quota as virtual usage once placed. local_file_path
+    is deliberately left untouched -- this stays a pointer into the source
+    provider's own stream."""
+    source = match["source"]
+    if source.get("file_size_bytes") is not None:
+        return
+    provider = vod_db.get_provider(source["provider_id"])
+    if not provider:
+        return
+    url = xc_server._build_upstream_url("movie" if match["type"] == "movie" else "series", provider, source)
+    size = await _probe_content_length(url)
+    if size is None:
+        return
+    if match["type"] == "movie":
+        vod_db.set_movie_source_file_size_bytes(source["id"], size)
+    else:
+        vod_db.set_episode_source_file_size_bytes(source["id"], size)
+
+
+async def _apply_download_backfill(match: dict, dvr_provider_id: int) -> None:
+    """Downloads the matched source's bytes into a genuinely new local copy
+    (same hashed-filename-under-DATA_DIR/dvr_recordings convention as
+    completed DVR recordings, see this module's own docstring) and
+    registers it as an additional source on the SAME movie/episode, owned
+    by the recording rule's own DVR provider_id -- reusing the
+    dispatcharr_dvr playback branch (_build_upstream_url,
+    _proxy_vod_stream) that already knows how to serve a local_file_path
+    untouched, rather than teaching regular-provider sources a second
+    "maybe local" code path. Deterministic filename (movie/episode id, not
+    the source's provider_stream_id) so re-running backfill for the same
+    item is idempotent even if which source provider originally supplied it
+    later changes."""
+    source = match["source"]
+    provider = vod_db.get_provider(source["provider_id"])
+    if not provider:
+        raise ValueError(f"source provider {source['provider_id']} not found")
+    kind = "movie" if match["type"] == "movie" else "series"
+    url = xc_server._build_upstream_url(kind, provider, source)
+    ext = source.get("container_extension") or "mp4"
+    item_id = match.get("movie_id") or match["episode_id"]
+    key = f"{match['type']}-{item_id}"
+    hashed_name = hashlib.sha256(key.encode()).hexdigest() + "." + ext
+    dest_dir = str(config.DATA_DIR / "dvr_recordings" / "_backfill")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, hashed_name)
+    if not os.path.isfile(dest_path):
+        await _download_url_to_file(url, dest_path)
+    file_size = os.path.getsize(dest_path)
+    stream_id = f"backfill-{key}"
+    if match["type"] == "movie":
+        vod_db.add_movie_source(match["movie_id"], dvr_provider_id, stream_id, ext,
+                                 file_size_bytes=file_size, local_file_path=dest_path)
+    else:
+        vod_db.add_episode_source(match["episode_id"], dvr_provider_id, stream_id, ext,
+                                   file_size_bytes=file_size, local_file_path=dest_path)
+
+
+async def _try_backfill(program: dict, profile: dict) -> bool:
+    """The backfill_check callback passed into schedule_channel_recordings
+    for any profile with backfill_mode set -- returns True (handled, don't
+    record) when this airing's title/episode already exists in the pool
+    from a regular provider and the backfill itself (pointer's Content-
+    Length probe, or download's real byte transfer) succeeds; False in
+    every other case, including a failed backfill attempt, which falls
+    through to schedule_channel_recordings' normal create_recording path
+    so a transient provider hiccup never silently loses the recording."""
+    mode = profile.get("backfill_mode")
+    if not mode:
+        return False
+    match = vod_db.find_pool_backfill_match(profile["title"], program)
+    if not match:
+        return False
+    try:
+        if mode == "download":
+            await _apply_download_backfill(match, profile["provider_id"])
+        elif mode == "pointer":
+            await _apply_pointer_backfill(match)
+        else:
+            return False
+        if match["type"] == "movie" and profile.get("target_movie_category_id"):
+            vod_db.place_movie_in_category(match["movie_id"], profile["target_movie_category_id"])
+        elif match["type"] == "series" and profile.get("target_series_category_id"):
+            vod_db.place_series_in_category(match["series_id"], profile["target_series_category_id"])
+    except Exception as exc:
+        logger.warning("[dispatcharr_dvr_importer] backfill (%s) failed for %r, falling back to a normal "
+                        "DVR recording for this one: %s", mode, profile["title"], exc)
+        return False
+    logger.info("[dispatcharr_dvr_importer] backfilled (%s) %r from the pool instead of recording it -- profile=%r",
+                mode, program.get("title"), profile["label"])
+    return True
+
+
 async def rescan_recording_profiles(provider_id: int) -> dict:
     """Re-runs every channel-scoped recording profile's own EPG search and
     schedules any newly-visible episode as a real Recording -- see
@@ -451,6 +584,7 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
             logger.warning("[dispatcharr_dvr_importer] rescan_recording_profiles: couldn't resolve usernames: %s", exc)
 
     scheduled_total = 0
+    backfilled_total = 0
     results = []
     for profile in profiles:
         scheduled_by = None
@@ -460,23 +594,26 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
                 "dispatcharr_username": username_by_id.get(profile["dispatcharr_user_id"]),
                 "profile_label": profile["label"],
             }
+        backfill_check = (lambda program, profile=profile: _try_backfill(program, profile)) if profile.get("backfill_mode") else None
         try:
             result = await dispatcharr_dvr_client.schedule_channel_recordings(
                 connection, profile["channel_id"], profile["title"], profile.get("mode", "all"),
-                scheduled_by=scheduled_by,
+                scheduled_by=scheduled_by, backfill_check=backfill_check,
             )
         except Exception as exc:
             logger.warning("[dispatcharr_dvr_importer] rescan_recording_profiles: profile=%r failed: %s",
                             profile["label"], exc)
             continue
         scheduled_total += result["scheduled"]
-        if result["scheduled"]:
+        backfilled_total += result.get("backfilled", 0)
+        if result["scheduled"] or result.get("backfilled"):
             results.append({"profile": profile["label"], **result})
 
     if results:
-        logger.info("[dispatcharr_dvr_importer] provider=%s rescanned %d profile(s), %d new recording(s) scheduled: %s",
-                     provider["name"], len(profiles), scheduled_total, results)
-    return {"profiles_scanned": len(profiles), "scheduled": scheduled_total, "details": results}
+        logger.info("[dispatcharr_dvr_importer] provider=%s rescanned %d profile(s), %d new recording(s) scheduled, "
+                     "%d backfilled from the pool instead: %s",
+                     provider["name"], len(profiles), scheduled_total, backfilled_total, results)
+    return {"profiles_scanned": len(profiles), "scheduled": scheduled_total, "backfilled": backfilled_total, "details": results}
 
 
 async def poll_watch_sessions(connection: dict) -> dict:

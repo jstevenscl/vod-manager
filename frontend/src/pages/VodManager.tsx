@@ -3287,6 +3287,7 @@ export default function VodManager() {
     label: '', title: '', tvg_id: '', channel_id: '', channel_label: '',
     mode: 'all' as 'all' | 'new',
     target_movie_category_id: '', target_series_category_id: '', dispatcharr_user_id: '',
+    backfill_mode: '' as '' | 'pointer' | 'download',
   }
   const dispatcharrUsersQuery = useQuery<DispatcharrUser[]>({
     queryKey: ['vod-dispatcharr-users', recordingProfilesProviderId],
@@ -3442,7 +3443,7 @@ export default function VodManager() {
   })
   const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
   const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
-  const [recordingProfileResult, setRecordingProfileResult] = useState<{ scheduled_now: number; total_matches: number; skipped_conflicts: number } | null>(null)
+  const [recordingProfileResult, setRecordingProfileResult] = useState<{ scheduled_now: number; total_matches: number; skipped_conflicts: number; backfilled_now: number } | null>(null)
   const [epgSearchTitle, setEpgSearchTitle] = useState('')
   const epgSearch = useMutation({
     mutationFn: () => api.get<EpgSearchProgram[]>('/vod/epg-search/', {
@@ -3461,6 +3462,7 @@ export default function VodManager() {
       target_movie_category_id: recordingProfileForm.target_movie_category_id ? Number(recordingProfileForm.target_movie_category_id) : null,
       target_series_category_id: recordingProfileForm.target_series_category_id ? Number(recordingProfileForm.target_series_category_id) : null,
       dispatcharr_user_id: recordingProfileForm.dispatcharr_user_id ? Number(recordingProfileForm.dispatcharr_user_id) : null,
+      backfill_mode: recordingProfileForm.backfill_mode || null,
     }).then((r) => r.data),
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] })
@@ -3469,7 +3471,7 @@ export default function VodManager() {
       setEpgSearchTitle('')
       epgSearch.reset()
       setRecordingProfileError(null)
-      setRecordingProfileResult({ scheduled_now: data.scheduled_now ?? 0, total_matches: data.total_matches ?? 0, skipped_conflicts: data.skipped_conflicts ?? 0 })
+      setRecordingProfileResult({ scheduled_now: data.scheduled_now ?? 0, total_matches: data.total_matches ?? 0, skipped_conflicts: data.skipped_conflicts ?? 0, backfilled_now: data.backfilled_now ?? 0 })
     },
     onError: (e: any) => { setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'); setRecordingProfileResult(null) },
   })
@@ -5394,6 +5396,16 @@ export default function VodManager() {
                         <option value="">TV category (optional)…</option>
                         {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                       </select>
+                      <select
+                        className={inputCls()}
+                        value={recordingProfileForm.backfill_mode}
+                        onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, backfill_mode: e.target.value as '' | 'pointer' | 'download' })}
+                        title="If a matching episode/movie already exists in the pool from a regular provider, use it instead of recording a new copy via DVR"
+                      >
+                        <option value="">Backfill: off (always DVR-record)</option>
+                        <option value="pointer">Backfill: pointer (use existing source, no new disk cost)</option>
+                        <option value="download">Backfill: download &amp; store (durable local copy, survives that provider going down)</option>
+                      </select>
                     </div>
 
                     {recordingProfileResult && (
@@ -5404,6 +5416,9 @@ export default function VodManager() {
                         {recordingProfileResult.skipped_conflicts > 0 && (
                           <> {recordingProfileResult.skipped_conflicts} skipped -- the guide listed more than one episode for the
                           same time slot on this channel (conflicting upstream EPG data), so only the first was kept.</>
+                        )}
+                        {recordingProfileResult.backfilled_now > 0 && (
+                          <> {recordingProfileResult.backfilled_now} already in the pool from another provider -- placed directly instead of recording.</>
                         )}
                       </p>
                     )}

@@ -304,7 +304,7 @@ async def delete_recording(connection: dict, recording_id: int) -> None:
 
 async def schedule_channel_recordings(
     connection: dict, channel_id: int, title: str, mode: str = "all", limit: int = 50,
-    scheduled_by: dict | None = None,
+    scheduled_by: dict | None = None, backfill_check=None,
 ) -> dict:
     """Replaces Dispatcharr's own Series Rules feature entirely -- searches
     this one channel's own real EPG (search_epg_programs, channel-scoped,
@@ -339,7 +339,18 @@ async def schedule_channel_recordings(
     upstream-caused conflict worth being able to see, not a silent drop.
 
     scheduled_by is passed straight through to create_recording -- see its
-    docstring."""
+    docstring.
+
+    backfill_check, when given, is awaited with each surviving (not already
+    scheduled, not time-conflicted) program BEFORE a Recording is created
+    for it -- if it returns truthy, that program is treated as handled
+    (counted, dedup keys/intervals updated so a later match in this same
+    call doesn't re-trigger it) WITHOUT ever calling create_recording. This
+    is how DVR-owned rules avoid re-recording something the pool already
+    has from a regular provider -- see dispatcharr_dvr_importer._try_backfill
+    for what the callback actually does; this function stays a pure
+    Dispatcharr-API client with no vod_db dependency of its own, so the
+    vod_db-aware decision lives in the caller instead of here."""
     matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id)
     if mode == "new":
         matches = [m for m in matches if (m.get("custom_properties") or {}).get("new")]
@@ -354,7 +365,7 @@ async def schedule_channel_recordings(
         (r["start_time"], r["end_time"]) for r in existing if r.get("channel") == channel_id
     ]
 
-    created, skipped, conflicts = [], 0, 0
+    created, skipped, conflicts, backfilled = [], 0, 0, 0
     for program in matches:
         key = _episode_identity_key(program)
         if key in existing_keys:
@@ -368,6 +379,21 @@ async def schedule_channel_recordings(
                 title, program.get("start_time"), channel_id,
             )
             continue
+        if backfill_check is not None:
+            try:
+                handled = await backfill_check(program)
+            except Exception as exc:
+                logger.warning(
+                    "[dispatcharr_dvr_client] schedule_channel_recordings: backfill_check failed for %r at %s: %s "
+                    "-- falling back to a normal DVR recording for this one",
+                    title, program.get("start_time"), exc,
+                )
+                handled = False
+            if handled:
+                existing_keys.add(key)
+                existing_intervals.append((program.get("start_time"), program.get("end_time")))
+                backfilled += 1
+                continue
         try:
             recording = await create_recording(connection, channel_id, program, scheduled_by)
         except Exception as exc:
@@ -382,7 +408,7 @@ async def schedule_channel_recordings(
 
     return {
         "total_matches": len(matches), "scheduled": len(created), "skipped_existing": skipped,
-        "skipped_conflicts": conflicts, "created": created,
+        "skipped_conflicts": conflicts, "backfilled": backfilled, "created": created,
     }
 
 

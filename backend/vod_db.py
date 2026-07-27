@@ -479,6 +479,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("episode_sources", "file_size_bytes", "INTEGER"),
         ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
+        ("dvr_recording_profiles", "backfill_mode", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -655,18 +656,27 @@ def create_recording_profile(
     description: str | None = None, description_mode: str = "contains",
     mode: str = "all", channel_id: int | None = None,
     target_movie_category_id: int | None = None, target_series_category_id: int | None = None,
-    dispatcharr_user_id: int | None = None,
+    dispatcharr_user_id: int | None = None, backfill_mode: str | None = None,
 ) -> int:
+    """backfill_mode is None/'off' (default -- always record via DVR even if
+    the title already exists in the pool from another provider), 'pointer'
+    (place the existing item into this rule's target category instead of
+    recording, no new disk cost -- see vod_db.find_pool_backfill_match /
+    dispatcharr_dvr_importer._try_backfill), or 'download' (same match, but
+    also pulls a durable local copy from the source provider first, so the
+    item survives that provider going down -- per the user's explicit
+    reasoning, 2026-07-27, that a pointer-only "recording" a person believes
+    is safe could otherwise vanish out from under them)."""
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO dvr_recording_profiles
            (provider_id, label, tvg_id, title, title_mode, description, description_mode,
             mode, channel_id, target_movie_category_id, target_series_category_id,
-            dispatcharr_user_id, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            dispatcharr_user_id, backfill_mode, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (provider_id, label, tvg_id or None, title, title_mode, description or None, description_mode,
          mode, channel_id, target_movie_category_id, target_series_category_id,
-         dispatcharr_user_id, _now()),
+         dispatcharr_user_id, backfill_mode or None, _now()),
     )
     profile_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -739,6 +749,74 @@ def match_recording_profiles(provider_id: int, title: str, tvg_id: str | None) -
     conn.close()
     candidates = [dict(r) for r in rows]
     return [c for c in candidates if not c["tvg_id"] or c["tvg_id"] == tvg_id]
+
+
+def find_pool_backfill_match(title: str, program: dict) -> dict | None:
+    """Backfill support (opt-in per rule via dvr_recording_profiles.
+    backfill_mode): before scheduling a fresh DVR recording, checks whether
+    this exact episode/movie already sits in the pool from a regular
+    (non-DVR) provider -- if so, the rule can place the existing item into
+    its target category instead of re-recording it (see
+    dispatcharr_dvr_importer._try_backfill).
+
+    Matches on _normalize_title_for_dedup'd title, the same forgiving-but-
+    bounded comparison the duplicate-detection pass already trusts
+    elsewhere in this file -- exact string equality would miss "Show" vs
+    "Show:", the same real-world mismatch that motivated
+    _normalize_title_for_dedup in the first place.
+
+    program carrying season/episode (custom_properties, same shape
+    dispatcharr_dvr_client._episode_identity_key reads) means it's a series
+    airing: matches a series by normalized name, then a specific episode by
+    season+episode number within it. No season/episode means a movie:
+    matches by normalized name alone -- EPG program data essentially never
+    carries a reliable year, so year isn't part of this comparison.
+
+    Only ever returns a source whose own provider is itself NOT a
+    dispatcharr_dvr provider -- backfilling from another rule's own DVR
+    recording isn't "already in the pool from elsewhere," it's just a
+    different rule's output, so it's excluded to avoid one rule silently
+    eating another's recording instead of doing its own job. Full-table
+    scan + Python-side normalization, same tradeoff find_duplicate_groups
+    already makes -- pool sizes here are in the thousands, not millions."""
+    props = program.get("custom_properties") or {}
+    season, episode = props.get("season"), props.get("episode")
+    normalized = _normalize_title_for_dedup(title)
+    conn = _connect()
+    if season is not None and episode is not None:
+        series_rows = conn.execute("SELECT id, name FROM series").fetchall()
+        series_id = next((r["id"] for r in series_rows if _normalize_title_for_dedup(r["name"]) == normalized), None)
+        if series_id is None:
+            conn.close()
+            return None
+        ep_row = conn.execute(
+            "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+            (series_id, season, episode),
+        ).fetchone()
+        if not ep_row:
+            conn.close()
+            return None
+        source = conn.execute("""
+            SELECT es.id, es.provider_id, es.provider_stream_id, es.container_extension, es.file_size_bytes, es.local_file_path
+            FROM episode_sources es JOIN providers p ON p.id = es.provider_id
+            WHERE es.episode_id=? AND p.provider_type != 'dispatcharr_dvr' AND p.is_active=1
+            ORDER BY p.priority DESC, es.last_seen_at DESC LIMIT 1
+        """, (ep_row["id"],)).fetchone()
+        conn.close()
+        return {"type": "series", "series_id": series_id, "episode_id": ep_row["id"], "source": dict(source)} if source else None
+    movie_rows = conn.execute("SELECT id, name FROM movies").fetchall()
+    movie_id = next((r["id"] for r in movie_rows if _normalize_title_for_dedup(r["name"]) == normalized), None)
+    if movie_id is None:
+        conn.close()
+        return None
+    source = conn.execute("""
+        SELECT ms.id, ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.file_size_bytes, ms.local_file_path
+        FROM movie_sources ms JOIN providers p ON p.id = ms.provider_id
+        WHERE ms.movie_id=? AND p.provider_type != 'dispatcharr_dvr' AND p.is_active=1
+        ORDER BY p.priority DESC, ms.last_seen_at DESC LIMIT 1
+    """, (movie_id,)).fetchone()
+    conn.close()
+    return {"type": "movie", "movie_id": movie_id, "source": dict(source)} if source else None
 
 
 # ── DVR per-person resource limits ──────────────────────────────────────────
@@ -2365,15 +2443,43 @@ def list_movie_placements(movie_id: int) -> list[dict]:
 def add_movie_source(
     movie_id: int, provider_id: int, provider_stream_id: str,
     container_extension: str = "mp4", provider_category_name: str | None = None,
+    file_size_bytes: int | None = None, local_file_path: str | None = None,
 ) -> None:
+    """file_size_bytes/local_file_path are optional and only ever passed by
+    download-backfill (see dispatcharr_dvr_importer._apply_download_backfill)
+    -- every other caller registers a plain provider-streamed source and
+    leaves both null, unchanged from this function's original behavior."""
     conn = _connect()
     conn.execute(
-        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, added_at, last_seen_at)
-           VALUES (?,?,?,?,?,?,?)
+        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, file_size_bytes, local_file_path, added_at, last_seen_at)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name""",
-        (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, _now(), _now()),
+               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
+               file_size_bytes=COALESCE(excluded.file_size_bytes, movie_sources.file_size_bytes),
+               local_file_path=COALESCE(excluded.local_file_path, movie_sources.local_file_path)""",
+        (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name,
+         file_size_bytes, local_file_path, _now(), _now()),
     )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_movie_source_file_size_bytes(source_id: int, file_size_bytes: int) -> None:
+    """Pointer-mode backfill's virtual byte accounting -- a regular
+    provider's movie_sources row never gets file_size_bytes populated at
+    import time (only DVR-recorded sources do), so this fills it in from a
+    one-time Content-Length probe once the pool item is backfilled into
+    someone's category, without touching local_file_path -- it stays a
+    pointer (virtual), not a local copy (actual)."""
+    conn = _connect()
+    conn.execute("UPDATE movie_sources SET file_size_bytes=? WHERE id=?", (file_size_bytes, source_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_episode_source_file_size_bytes(source_id: int, file_size_bytes: int) -> None:
+    conn = _connect()
+    conn.execute("UPDATE episode_sources SET file_size_bytes=? WHERE id=?", (file_size_bytes, source_id))
     _commit_with_retry(conn)
     conn.close()
 
@@ -2886,14 +2992,21 @@ def list_episode_sources_for_episode_ids(episode_ids: list[int]) -> dict[int, li
     return grouped
 
 
-def add_episode_source(episode_id: int, provider_id: int, provider_stream_id: str, container_extension: str = "mp4") -> None:
+def add_episode_source(
+    episode_id: int, provider_id: int, provider_stream_id: str, container_extension: str = "mp4",
+    file_size_bytes: int | None = None, local_file_path: str | None = None,
+) -> None:
+    """See add_movie_source's docstring -- file_size_bytes/local_file_path
+    are download-backfill-only, null for every other caller."""
     conn = _connect()
     conn.execute(
-        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, added_at, last_seen_at)
-           VALUES (?,?,?,?,?,?)
+        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, added_at, last_seen_at)
+           VALUES (?,?,?,?,?,?,?,?)
            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-               episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at""",
-        (episode_id, provider_id, provider_stream_id, container_extension, _now(), _now()),
+               episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at,
+               file_size_bytes=COALESCE(excluded.file_size_bytes, episode_sources.file_size_bytes),
+               local_file_path=COALESCE(excluded.local_file_path, episode_sources.local_file_path)""",
+        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, _now(), _now()),
     )
     _commit_with_retry(conn)
     conn.close()

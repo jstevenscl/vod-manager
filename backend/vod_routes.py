@@ -157,6 +157,7 @@ class RecordingProfileRequest(BaseModel):
     target_movie_category_id: Optional[int] = None
     target_series_category_id: Optional[int] = None
     dispatcharr_user_id: Optional[int] = None
+    backfill_mode: Optional[str] = None
 
 
 class RecordingProfilePreviewRequest(BaseModel):
@@ -1130,9 +1131,24 @@ async def create_recording_profile(body: RecordingProfileRequest):
             }
         except Exception as exc:
             logger.warning("[vod_routes] create_recording_profile: couldn't resolve username for scheduled_by: %s", exc)
+    backfill_check = None
+    if body.backfill_mode:
+        # profile row doesn't exist yet at this point -- _try_backfill only
+        # needs these specific fields (see its docstring), so a lightweight
+        # dict standing in for the not-yet-persisted profile is enough;
+        # avoids creating the DB row before we even know Dispatcharr will
+        # accept the schedule call below.
+        pseudo_profile = {
+            "title": body.title, "provider_id": body.provider_id, "label": body.label,
+            "backfill_mode": body.backfill_mode,
+            "target_movie_category_id": body.target_movie_category_id,
+            "target_series_category_id": body.target_series_category_id,
+        }
+        backfill_check = lambda program: dispatcharr_dvr_importer._try_backfill(program, pseudo_profile)
     try:
         schedule_result = await dispatcharr_dvr_client.schedule_channel_recordings(
             connection, body.channel_id, body.title, body.mode, scheduled_by=scheduled_by,
+            backfill_check=backfill_check,
         )
     except Exception as exc:
         raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
@@ -1140,7 +1156,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
         body.provider_id, body.label, body.title, body.tvg_id, body.title_mode,
         body.description, body.description_mode, body.mode, body.channel_id,
         body.target_movie_category_id, body.target_series_category_id,
-        body.dispatcharr_user_id,
+        body.dispatcharr_user_id, body.backfill_mode,
     )
     profile = vod_db.get_recording_profile(profile_id)
     # Surface whether this actually scheduled anything just now, rather than
@@ -1152,6 +1168,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
     profile["scheduled_now"] = schedule_result.get("scheduled", 0)
     profile["total_matches"] = schedule_result.get("total_matches", 0)
     profile["skipped_conflicts"] = schedule_result.get("skipped_conflicts", 0)
+    profile["backfilled_now"] = schedule_result.get("backfilled", 0)
     return profile
 
 
