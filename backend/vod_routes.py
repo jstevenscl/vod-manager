@@ -1212,18 +1212,22 @@ async def list_dispatcharr_users(provider_id: int):
 
 
 @router.get("/epg-search/", dependencies=_GUARDS)
-async def search_epg_programs(provider_id: int, title: str):
+async def search_epg_programs(provider_id: int, title: str, channel_id: Optional[int] = None):
     """Real upcoming airings for a title, across every channel carrying it
-    -- powers the recording-profile form's channel picker so a user selects
-    a specific real (title, tvg_id, channel_id) combination instead of
-    typing a bare title and leaving channel as an easy-to-skip afterthought.
-    See dispatcharr_dvr_client.create_recording's docstring for why a
-    specific channel_id (not just tvg_id) matters."""
+    (or scoped to one, when channel_id is given -- e.g. the Metrics
+    subpage's on-demand rule-health check, which needs to know whether a
+    specific rule's own channel still has real upcoming matches, not
+    whether the title exists anywhere) -- powers the recording-profile
+    form's channel picker so a user selects a specific real (title, tvg_id,
+    channel_id) combination instead of typing a bare title and leaving
+    channel as an easy-to-skip afterthought. See dispatcharr_dvr_client.
+    create_recording's docstring for why a specific channel_id (not just
+    tvg_id) matters."""
     if not title.strip():
         raise HTTPException(400, detail="title is required")
     _, connection = _require_dvr_connection(provider_id)
     try:
-        return await dispatcharr_dvr_client.search_epg_programs(connection, title)
+        return await dispatcharr_dvr_client.search_epg_programs(connection, title, channel_id=channel_id)
     except Exception as exc:
         raise HTTPException(502, detail=str(exc))
 
