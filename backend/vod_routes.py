@@ -28,6 +28,7 @@ from config import (
     set_default_categories_prompt_dismissed,
 )
 from routes import require_auth
+from secrets_util import hash_password
 import ai_assist
 import apply_exclusions_job
 import dispatcharr_dvr_client
@@ -203,6 +204,17 @@ class DvrUserLimitUpdateRequest(BaseModel):
 class ApplyRetentionRequest(BaseModel):
     movies: list[dict] = []
     episodes: list[dict] = []
+
+
+class PortalAccountRequest(BaseModel):
+    provider_id: int
+    dispatcharr_user_id: int
+    username: str
+    password: str
+
+
+class PortalAccountPasswordRequest(BaseModel):
+    password: str
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -1461,6 +1473,16 @@ async def list_dvr_unresolved_missing_episodes(series_id: Optional[int] = None):
     return vod_db.list_unresolved_missing_episodes(series_id)
 
 
+@router.get("/dvr-recording-failures/", dependencies=_GUARDS)
+async def list_dvr_recording_failures(provider_id: Optional[int] = None):
+    """Admin-visible log of every recording dispatcharr_dvr_importer.
+    reschedule_failed_recordings has ever detected as genuinely failed --
+    both outcomes ('rescheduled' onto a replacement channel, or still
+    'unresolved' and retried on the next poll cycle), see that function's
+    own docstring."""
+    return vod_db.list_recording_failures(provider_id)
+
+
 @router.get("/dvr-upcoming/", dependencies=_GUARDS)
 async def list_dvr_upcoming(provider_id: int):
     """Real scheduled-but-not-yet-run recordings, for the DVR tab's
@@ -1566,6 +1588,66 @@ async def get_dvr_user_limit_usage(limit_id: int):
         "virtual_bytes": usage["virtual_bytes"],
         "total_bytes": usage["total_bytes"],
     }
+
+
+# ── Portal accounts (admin-side provisioning) ───────────────────────────────
+# Creates/manages the end-user DVR portal's own login accounts -- see
+# backend/portal_routes.py and backend/portal_auth.py for the portal's own
+# (deliberately separate) auth system these rows drive. Admin-only, same
+# _GUARDS as everything else in this file -- a portal account itself can
+# never reach these, only /api/portal/* (require_portal_auth).
+
+def _redact_portal_account(account: dict) -> dict:
+    return {k: v for k, v in account.items() if k not in ("password_salt", "password_hash", "totp_secret")}
+
+
+@router.get("/portal-accounts/", dependencies=_GUARDS)
+async def list_portal_accounts(provider_id: Optional[int] = None):
+    return [_redact_portal_account(a) for a in vod_db.list_portal_accounts(provider_id)]
+
+
+@router.post("/portal-accounts/", dependencies=_GUARDS)
+async def create_portal_account(body: PortalAccountRequest):
+    if vod_db.get_portal_account_by_username(body.username):
+        raise HTTPException(409, detail=f"'{body.username}' is already taken")
+    existing = [
+        a for a in vod_db.list_portal_accounts(body.provider_id)
+        if a["dispatcharr_user_id"] == body.dispatcharr_user_id
+    ]
+    if existing:
+        raise HTTPException(409, detail="This person already has a portal account for this provider")
+    salt, hashed = hash_password(body.password)
+    account_id = vod_db.create_portal_account(body.provider_id, body.dispatcharr_user_id, body.username, salt, hashed)
+    return _redact_portal_account(vod_db.get_portal_account(account_id))
+
+
+@router.post("/portal-accounts/{account_id}/reset-password/", dependencies=_GUARDS)
+async def reset_portal_account_password(account_id: int, body: PortalAccountPasswordRequest):
+    if not vod_db.get_portal_account(account_id):
+        raise HTTPException(404, detail="portal account not found")
+    salt, hashed = hash_password(body.password)
+    vod_db.set_portal_account_password(account_id, salt, hashed)
+    return {"ok": True}
+
+
+@router.post("/portal-accounts/{account_id}/reset-mfa/", dependencies=_GUARDS)
+async def reset_portal_account_mfa(account_id: int):
+    """Revokes MFA enrollment -- e.g. the person lost their authenticator
+    device. Their next login is forced back through enrollment (see
+    portal_routes.portal_login's enrollment_required flag) before they can
+    do anything else, same as a brand-new account."""
+    if not vod_db.get_portal_account(account_id):
+        raise HTTPException(404, detail="portal account not found")
+    vod_db.set_portal_account_totp(account_id, None, totp_enabled=False)
+    return {"ok": True}
+
+
+@router.delete("/portal-accounts/{account_id}/", dependencies=_GUARDS)
+async def delete_portal_account(account_id: int):
+    if not vod_db.get_portal_account(account_id):
+        raise HTTPException(404, detail="portal account not found")
+    vod_db.delete_portal_account(account_id)
+    return {"ok": True}
 
 
 # ── Categories ───────────────────────────────────────────────────────────────

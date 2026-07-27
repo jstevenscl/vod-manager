@@ -53,11 +53,17 @@ async def list_scheduled_recordings(connection: dict) -> list[dict]:
     is None/absent (not some 'scheduled' string), so 'not completed and not
     currently recording' is the correct upcoming test, matching the same
     custom_properties.status field list_completed_recordings/_is_completed
-    already reads. Powers the DVR tab's upcoming-recordings agenda view."""
+    already reads. Also excludes 'interrupted' -- confirmed live that's
+    Dispatcharr's own status for a recording that already ran and either
+    failed or was cut short (see list_failed_recordings/_is_failed's
+    docstring), which is neither still-upcoming nor a fresh success; without
+    this exclusion a failed recording showed up here as if it were still
+    going to happen, in both the admin DVR tab and the end-user portal's own
+    Upcoming view. Powers the DVR tab's upcoming-recordings agenda view."""
     recordings = await _list_all_recordings(connection)
     return [
         r for r in recordings
-        if (r.get("custom_properties") or {}).get("status") not in ("completed", "recording")
+        if (r.get("custom_properties") or {}).get("status") not in ("completed", "recording", "interrupted")
     ]
 
 
@@ -460,6 +466,75 @@ async def list_users(connection: dict) -> list[dict]:
     client = DispatcharrClient(connection["url"], connection["token"])
     data = await client.get("/api/accounts/users/")
     return data if isinstance(data, list) else data.get("results", [])
+
+
+async def visible_channel_ids(connection: dict, dispatcharr_user_id: int) -> set[int] | None:
+    """The set of channel ids this person's own Dispatcharr Channel Profile
+    membership actually grants them, or None if it couldn't be determined
+    (a transient Dispatcharr API failure) -- callers should treat None as
+    'unknown, don't block' rather than 'zero access'. Confirmed live
+    (2026-07-27, real dispatch-test instance) that a real account can have
+    an entirely EMPTY channel_profiles membership -- originally built for
+    the end-user portal (portal_routes.py), where it's used to confine
+    search/scheduling to the caller's own lineup, and reused by
+    dispatcharr_dvr_importer.reschedule_failed_recordings for the same
+    reason: an automated replacement recording shouldn't land on a channel
+    the recording's own owner can't actually watch."""
+    try:
+        users = await list_users(connection)
+        user = next((u for u in users if u.get("id") == dispatcharr_user_id), None)
+        if user is None:
+            return None
+        profile_ids = set(user.get("channel_profiles") or [])
+        profiles = await list_channel_profiles(connection)
+        visible: set[int] = set()
+        for p in profiles:
+            if p["id"] in profile_ids:
+                visible.update(p.get("channels") or [])
+        return visible
+    except Exception as exc:
+        logger.warning("[dispatcharr_dvr_client] couldn't resolve visible channel lineup for dispatcharr_user_id=%s: %s",
+                        dispatcharr_user_id, exc)
+        return None
+
+
+def _is_failed(recording: dict) -> bool:
+    """Real-recording-failure signature, confirmed live against dispatch-test
+    v0.28.2's own apps/channels/tasks.py: Dispatcharr has no dedicated
+    'failed' status -- 'interrupted' conflates a genuine failure (stream
+    never came up, or a mid-recording outage outlasted the ~80s retry
+    window run_recording gives it) with benign server-restart interruptions
+    it recovers from itself on next worker start (recover_recordings_on_
+    startup). bytes_written 0/None or a failed remux is the real signal
+    something never actually got recorded; interrupted_reason's prefix
+    disambiguates a genuine failure ('no_stream_data', 'ffmpeg_outage_
+    window_exhausted') from the benign, self-recovering ones
+    ('server_shutdown', 'server_restarted*') that shouldn't be raced with
+    our own rescheduling attempt."""
+    props = recording.get("custom_properties") or {}
+    if props.get("status") != "interrupted":
+        return False
+    if props.get("bytes_written") not in (0, None) and props.get("remux_success"):
+        return False
+    reason = props.get("interrupted_reason") or ""
+    return reason.startswith("no_stream_data") or reason.startswith("ffmpeg_outage_window_exhausted")
+
+
+async def list_failed_recordings(connection: dict) -> list[dict]:
+    """Every recording that was scheduled, actually attempted, and genuinely
+    failed -- see _is_failed's docstring for the exact signature and why
+    Dispatcharr's own 'interrupted' status alone isn't enough. Powers
+    dispatcharr_dvr_importer.reschedule_failed_recordings' detection step;
+    Dispatcharr itself never retries these (confirmed live, no Celery
+    retry/autoretry anywhere in run_recording, and scheduling is a one-shot
+    ClockedSchedule/PeriodicTask discarded once fired) -- VOD Manager is the
+    only thing that ever looks at this list."""
+    recordings = await _list_all_recordings(connection)
+    failed = [r for r in recordings if _is_failed(r)]
+    if failed:
+        logger.info("[dispatcharr_dvr_client] connection=%s: %d recording(s), %d genuinely failed",
+                     connection["label"], len(recordings), len(failed))
+    return failed
 
 
 async def get_proxy_stats(connection: dict) -> dict:

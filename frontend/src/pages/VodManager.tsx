@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
 import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
+import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
 
 interface Provider {
@@ -93,6 +93,16 @@ interface DvrUserLimit {
   disk_quota_bytes: number | null
   retention_max_age_days: number | null
   retention_max_episodes_per_show: number | null
+  created_at: string
+}
+
+interface PortalAccount {
+  id: number
+  provider_id: number
+  dispatcharr_user_id: number
+  username: string
+  totp_enabled: number
+  totp_last_counter: number | null
   created_at: string
 }
 
@@ -876,6 +886,20 @@ interface UnresolvedMissingEpisode {
   checked_at: string
 }
 
+interface DvrRecordingFailure {
+  id: number
+  provider_id: number
+  dispatcharr_recording_id: number
+  title: string
+  season_number: number | null
+  episode_number: number | null
+  original_channel_id: number | null
+  interrupted_reason: string | null
+  outcome: 'rescheduled' | 'unresolved'
+  replacement_channel_id: number | null
+  detected_at: string
+}
+
 interface EnrichProgress {
   running: boolean
   movies_total: number; movies_done: number; movies_errors: number
@@ -885,76 +909,9 @@ interface EnrichProgress {
 
 interface Page<T> { items: T[]; total: number; limit: number; offset: number }
 
-function SectionCard({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
-  return (
-    <Card>
-      <CardContent className="space-y-3">
-        <h2 className="text-sm font-semibold flex items-center gap-1.5">{icon}{title}</h2>
-        {children}
-      </CardContent>
-    </Card>
-  )
-}
-
-// ---- Shared redesign primitives (KPI tile / status pill / chip) ----
-// Used across the DVR, Providers, and Curation & Maintenance screens so
-// every "how much / how healthy" summary shares one visual language
-// instead of each screen inventing its own badge/number treatment.
-
-function KpiTile({ icon, label, value, note, noteTone = 'default' }: {
-  icon: React.ReactNode
-  label: string
-  value: React.ReactNode
-  note?: React.ReactNode
-  noteTone?: 'default' | 'warn'
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-card p-3.5 shadow-sm">
-      <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="text-primary [&_svg]:w-3.5 [&_svg]:h-3.5">{icon}</span>
-        {label}
-      </div>
-      <div className="mt-2 text-xl font-bold tracking-tight tabular-nums">{value}</div>
-      {note && <div className={`mt-0.5 text-[11px] ${noteTone === 'warn' ? 'text-warning' : 'text-muted-foreground/70'}`}>{note}</div>}
-    </div>
-  )
-}
-
-function StatusPill({ label, tone = 'success', icon }: {
-  label: React.ReactNode
-  tone?: 'success' | 'warning' | 'destructive' | 'info'
-  icon?: React.ReactNode
-}) {
-  const toneCls = {
-    success: 'text-success bg-success/10 border-success/25',
-    warning: 'text-warning bg-warning/10 border-warning/25',
-    destructive: 'text-destructive bg-destructive/10 border-destructive/25',
-    info: 'text-primary bg-primary/10 border-primary/25',
-  }[tone]
-  const dotCls = { success: 'bg-success', warning: 'bg-warning', destructive: 'bg-destructive', info: 'bg-primary' }[tone]
-  return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${toneCls}`}>
-      {icon ?? <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />}
-      {label}
-    </span>
-  )
-}
-
-function Chip({ children, tone = 'default' }: { children: React.ReactNode; tone?: 'default' | 'rec' }) {
-  return (
-    <span className={
-      tone === 'rec'
-        ? 'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-destructive bg-destructive/10'
-        : 'inline-flex items-center rounded border border-border bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground'
-    }>
-      {children}
-    </span>
-  )
-}
-
-function inputCls(extra = '') {
-  return `h-7 px-2 rounded border border-border bg-background text-xs outline-none focus:ring-1 focus:ring-primary ${extra}`
-}
+// SectionCard/KpiTile/StatusPill/Chip/QuotaBar/inputCls moved to
+// @/components/dvr-shared so the end-user portal (src/pages/Portal.tsx) can
+// share them without importing this whole file.
 
 function Pager({ total, limit, offset, onOffset }: { total: number; limit: number; offset: number; onOffset: (o: number) => void }) {
   if (total <= limit) return null
@@ -3644,6 +3601,42 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
   })
+  // Portal Access -- provisioning for the separate end-user DVR portal login
+  // (backend/portal_routes.py, backend/portal_auth.py). Deliberately not the
+  // same account/credentials as Dispatcharr or the admin login -- see
+  // backend/vod_db.py's portal_accounts table comment.
+  const portalAccountsQuery = useQuery<PortalAccount[]>({
+    queryKey: ['vod-portal-accounts', recordingProfilesProviderId],
+    queryFn:  () => api.get('/vod/portal-accounts/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled:  recordingProfilesProviderId != null,
+  })
+  const [portalAccountForm, setPortalAccountForm] = useState({ dispatcharr_user_id: '', username: '', password: '' })
+  const [portalAccountError, setPortalAccountError] = useState<string | null>(null)
+  const createPortalAccount = useMutation({
+    mutationFn: () => api.post('/vod/portal-accounts/', {
+      provider_id: recordingProfilesProviderId,
+      dispatcharr_user_id: Number(portalAccountForm.dispatcharr_user_id),
+      username: portalAccountForm.username,
+      password: portalAccountForm.password,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] })
+      setPortalAccountForm({ dispatcharr_user_id: '', username: '', password: '' })
+      setPortalAccountError(null)
+    },
+    onError: (e: any) => setPortalAccountError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
+  })
+  const resetPortalAccountPassword = useMutation({
+    mutationFn: (v: { id: number; password: string }) => api.post(`/vod/portal-accounts/${v.id}/reset-password/`, { password: v.password }),
+  })
+  const resetPortalAccountMfa = useMutation({
+    mutationFn: (id: number) => api.post(`/vod/portal-accounts/${id}/reset-mfa/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] }),
+  })
+  const deletePortalAccount = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/portal-accounts/${id}/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] }),
+  })
   // Retention: dry-run scan, then an explicit separate confirm step -- see
   // vod_db.find_retention_candidates/apply_retention_deletions' docstrings
   // for why this is two calls, not one (matches the Orphan Checker's own
@@ -3724,6 +3717,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-dvr-unresolved-missing-episodes'],
     queryFn: () => api.get('/vod/dvr-unresolved-missing-episodes/').then((r) => r.data),
     enabled: dvrSubTab === 'metrics',
+  })
+  const dvrRecordingFailuresQuery = useQuery<DvrRecordingFailure[]>({
+    queryKey: ['vod-dvr-recording-failures', recordingProfilesProviderId],
+    queryFn: () => api.get('/vod/dvr-recording-failures/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled: dvrSubTab === 'metrics' && recordingProfilesProviderId != null,
   })
   const [ruleHealth, setRuleHealth] = useState<Record<number, { matches: number; checking: boolean }>>({})
   const checkRuleHealth = async (rp: RecordingProfile) => {
@@ -5772,6 +5770,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             )}
 
             {dvrSubTab === 'users' && (
+              <>
               <SectionCard title="Users" icon={<Users size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Opt-in per person -- only enforced for someone listed here. Stream reserve predicts whether a new
@@ -5787,7 +5786,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   {dvrUserLimitsQuery.data?.map((lim) => {
                     const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === lim.dispatcharr_user_id)
                     const usage = dvrUserUsageQuery.data?.[lim.id]
-                    const usageGB = usage != null ? (usage.total_bytes / 1024 ** 3) : null
                     const virtualGB = usage != null ? (usage.virtual_bytes / 1024 ** 3) : null
                     const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
                     const pushUpdate = (patch: Partial<{ stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }>) =>
@@ -5798,7 +5796,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         ...patch,
                       })
                     const actualGB = usage != null ? (usage.actual_bytes / 1024 ** 3) : null
-                    const quotaDenomGB = quotaGB ?? Math.max(1, usageGB ?? 1)
                     return (
                       <div key={lim.id} className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm space-y-2">
                         <div className="flex items-center gap-3">
@@ -5819,29 +5816,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                             <Trash2 size={12} />
                           </button>
                         </div>
-                        <div>
-                          <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground mb-1">
-                            <span>Disk quota</span>
-                            <span className="tabular-nums">{usageGB != null ? usageGB.toFixed(1) : '0.0'}{quotaGB != null ? ` / ${quotaGB.toFixed(0)} GB` : ' GB (no quota set)'}</span>
-                          </div>
-                          <div className="h-1.5 rounded-full bg-secondary overflow-hidden flex">
-                            {actualGB != null && actualGB > 0 && (
-                              <div className="h-full bg-primary" style={{ width: `${Math.min(100, (actualGB / quotaDenomGB) * 100)}%` }} />
-                            )}
-                            {virtualGB != null && virtualGB > 0 && (
-                              <div
-                                className="h-full bg-primary/35"
-                                style={{
-                                  width: `${Math.min(100 - Math.min(100, ((actualGB ?? 0) / quotaDenomGB) * 100), (virtualGB / quotaDenomGB) * 100)}%`,
-                                  backgroundImage: 'repeating-linear-gradient(135deg, hsl(var(--primary)/0.5) 0 3px, transparent 3px 6px)',
-                                }}
-                              />
-                            )}
-                          </div>
-                          {virtualGB != null && virtualGB > 0.01 && (
-                            <div className="text-[10.5px] text-muted-foreground mt-1">{virtualGB.toFixed(1)}GB virtual/backfill (hatched)</div>
-                          )}
-                        </div>
+                        <QuotaBar actualGB={actualGB} virtualGB={virtualGB} quotaGB={quotaGB} />
                         <div className="flex flex-wrap items-center gap-1.5">
                           <label className="text-[10px] text-muted-foreground flex items-center gap-1">
                             Reserve
@@ -5977,6 +5952,91 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 </div>
                 {dvrLimitError && <p className="text-xs text-destructive">{dvrLimitError}</p>}
               </SectionCard>
+
+              <SectionCard title="Portal Access" icon={<ShieldCheck size={14} />}>
+                <p className="text-sm text-muted-foreground">
+                  Lets a person log into their own DVR portal -- schedule recordings, see their upcoming recordings and
+                  usage, browse what they've recorded -- through a login that's separate from both this admin panel and
+                  Dispatcharr itself, with mandatory authenticator-app MFA. Create one per person below; they'll pick up
+                  from there with the username/password you set (and enroll MFA themselves on first login).
+                </p>
+                {portalAccountsQuery.data && !portalAccountsQuery.data.length && (
+                  <p className="text-xs text-muted-foreground">No portal accounts yet.</p>
+                )}
+                <div className="space-y-1.5">
+                  {portalAccountsQuery.data?.map((acct) => {
+                    const liveUser = dispatcharrUsersQuery.data?.find((u) => u.id === acct.dispatcharr_user_id)
+                    return (
+                      <div key={acct.id} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
+                        <div className="flex-1 min-w-0 truncate">
+                          <span className="font-semibold">{acct.username}</span>{' '}
+                          <span className="text-muted-foreground">— {liveUser?.username ?? `user ${acct.dispatcharr_user_id}`}</span>
+                        </div>
+                        <StatusPill
+                          label={acct.totp_enabled ? 'MFA enrolled' : 'MFA not set up'}
+                          tone={acct.totp_enabled ? 'success' : 'warning'}
+                        />
+                        <Button
+                          size="sm" variant="outline"
+                          onClick={() => {
+                            const pw = prompt(`New password for "${acct.username}":`)
+                            if (pw) resetPortalAccountPassword.mutate({ id: acct.id, password: pw })
+                          }}
+                        >
+                          Reset password
+                        </Button>
+                        {!!acct.totp_enabled && (
+                          <Button
+                            size="sm" variant="outline"
+                            onClick={() => { if (confirm(`Reset MFA for "${acct.username}"? They'll need to re-enroll on their next login.`)) resetPortalAccountMfa.mutate(acct.id) }}
+                          >
+                            Reset MFA
+                          </Button>
+                        )}
+                        <button
+                          title="Delete this portal account"
+                          className="text-muted-foreground hover:text-destructive p-1"
+                          onClick={() => { if (confirm(`Delete portal account "${acct.username}"?`)) deletePortalAccount.mutate(acct.id) }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+                <div className="border-t border-border pt-2 flex flex-wrap items-center gap-1.5">
+                  <select
+                    className={inputCls()}
+                    value={portalAccountForm.dispatcharr_user_id}
+                    onChange={(e) => setPortalAccountForm({ ...portalAccountForm, dispatcharr_user_id: e.target.value })}
+                  >
+                    <option value="">Person…</option>
+                    {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
+                  </select>
+                  <input
+                    className={inputCls('w-32')}
+                    placeholder="Portal username"
+                    value={portalAccountForm.username}
+                    onChange={(e) => setPortalAccountForm({ ...portalAccountForm, username: e.target.value })}
+                  />
+                  <input
+                    className={inputCls('w-32')}
+                    type="password"
+                    placeholder="Initial password"
+                    value={portalAccountForm.password}
+                    onChange={(e) => setPortalAccountForm({ ...portalAccountForm, password: e.target.value })}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={!portalAccountForm.dispatcharr_user_id || !portalAccountForm.username || !portalAccountForm.password || createPortalAccount.isPending}
+                    onClick={() => createPortalAccount.mutate()}
+                  >
+                    {createPortalAccount.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add</>}
+                  </Button>
+                </div>
+                {portalAccountError && <p className="text-xs text-destructive">{portalAccountError}</p>}
+              </SectionCard>
+              </>
             )}
 
             {dvrSubTab === 'library' && (
@@ -6244,6 +6304,37 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           </span>
                         </span>
                         <Chip>flagged {new Date(Number(u.checked_at) * 1000).toLocaleDateString()}</Chip>
+                      </div>
+                    ))}
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="Failed Recording Replacements" icon={<CalendarClock size={14} />}>
+                  <p className="text-sm text-muted-foreground">
+                    Recordings Dispatcharr scheduled and attempted but that genuinely failed -- Dispatcharr never
+                    retries these on its own. VOD Manager looks for the same episode's next airing on any channel in
+                    that person's own lineup and reschedules it there automatically; "unresolved" is retried every
+                    poll cycle rather than given up on.
+                  </p>
+                  {dvrRecordingFailuresQuery.data && !dvrRecordingFailuresQuery.data.length && (
+                    <p className="text-xs text-muted-foreground">None detected.</p>
+                  )}
+                  <div className="space-y-1">
+                    {dvrRecordingFailuresQuery.data?.map((f) => (
+                      <div key={f.id} className="flex items-center gap-1.5 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
+                        <span className="flex-1 truncate">
+                          <span className="font-semibold">{f.title}</span>{' '}
+                          {f.season_number != null && f.episode_number != null && (
+                            <span className="text-muted-foreground">S{f.season_number}E{f.episode_number}</span>
+                          )}{' '}
+                          <span className="text-muted-foreground">— was channel {f.original_channel_id ?? '?'}</span>
+                        </span>
+                        {f.outcome === 'rescheduled' ? (
+                          <StatusPill label={`rescheduled -> channel ${f.replacement_channel_id}`} tone="success" />
+                        ) : (
+                          <StatusPill label="unresolved" tone="warning" />
+                        )}
+                        <Chip>detected {new Date(Number(f.detected_at) * 1000).toLocaleDateString()}</Chip>
                       </div>
                     ))}
                   </div>

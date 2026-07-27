@@ -17,6 +17,7 @@ from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
 import plex_importer
+from portal_routes import router as portal_router
 from routes import router
 import tmdb_sync
 import vod_db
@@ -169,18 +170,24 @@ _DVR_POLL_SECONDS = 300  # kept separate from the configurable XC/Plex/Emby
 
 async def _dispatcharr_dvr_poller() -> None:
     """Background task: pulls newly-finished Dispatcharr DVR recordings into
-    the VOD pool, then rescans every channel-scoped recording profile for
+    the VOD pool, rescans every channel-scoped recording profile for
     newly-visible upcoming episodes to schedule (dispatcharr_dvr_importer.
-    rescan_recording_profiles) -- both are "did anything change on
-    Dispatcharr's side" checks for the same provider, so they share this
-    loop and cadence rather than each getting their own. The rescan exists
-    because VOD Manager's own direct-Recording scheduling (see
-    dispatcharr_dvr_client.schedule_channel_recordings) bypasses Dispatcharr's
-    own recurring series-rules re-evaluation entirely -- see that function's
-    docstring for why. Kept as its own loop rather than folded into
-    _vod_catalog_refresher -- that refresher's due-time tracking is keyed off
-    provider_type-specific Settings intervals (XC/Plex/Emby/Jellyfin only),
-    and DVR's Phase 1a scope doesn't need that configurability yet."""
+    rescan_recording_profiles), then checks for recordings that genuinely
+    failed and reschedules the same episode's next airing elsewhere
+    (dispatcharr_dvr_importer.reschedule_failed_recordings) -- all three are
+    "did anything change on Dispatcharr's side" checks for the same
+    provider, so they share this loop and cadence rather than each getting
+    their own. The rescan exists because VOD Manager's own direct-Recording
+    scheduling (see dispatcharr_dvr_client.schedule_channel_recordings)
+    bypasses Dispatcharr's own recurring series-rules re-evaluation entirely
+    -- see that function's docstring for why. The failed-recording rescue
+    exists because Dispatcharr never retries a recording that never
+    started, or whose mid-recording outage-retry window ran out -- see
+    reschedule_failed_recordings' own docstring. Kept as its own loop rather
+    than folded into _vod_catalog_refresher -- that refresher's due-time
+    tracking is keyed off provider_type-specific Settings intervals (XC/
+    Plex/Emby/Jellyfin only), and DVR's Phase 1a scope doesn't need that
+    configurability yet."""
     await asyncio.sleep(20)
     while True:
         try:
@@ -200,6 +207,12 @@ async def _dispatcharr_dvr_poller() -> None:
                         logger.info("[dispatcharr_dvr_poller] %s: rescan %s", p["name"], rescan)
                 except Exception as exc:
                     logger.warning("[dispatcharr_dvr_poller] provider=%s rescan failed: %s", p["name"], exc)
+                try:
+                    rescue = await dispatcharr_dvr_importer.reschedule_failed_recordings(p["id"])
+                    if rescue["rescheduled"] or rescue["unresolved"]:
+                        logger.info("[dispatcharr_dvr_poller] %s: failed-recording rescue %s", p["name"], rescue)
+                except Exception as exc:
+                    logger.warning("[dispatcharr_dvr_poller] provider=%s failed-recording rescue failed: %s", p["name"], exc)
         except Exception as exc:
             logger.warning("[dispatcharr_dvr_poller] cycle failed: %s", exc)
         await asyncio.sleep(_DVR_POLL_SECONDS)
@@ -338,6 +351,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="VOD Manager", version=APP_VERSION, lifespan=lifespan)
 app.include_router(router)
 app.include_router(vod_router)
+app.include_router(portal_router)
 app.include_router(xc_router)
 app.include_router(backup_router)
 app.include_router(diagnostics_router)

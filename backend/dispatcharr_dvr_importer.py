@@ -52,12 +52,13 @@ import hashlib
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
 import config
 import dispatcharr_dvr_client
+from dispatcharr_dvr_client import _parse_iso
 import tmdb_sync
 import vod_db
 import xc_server
@@ -345,6 +346,21 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
     series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
 
+    # Attribute each recording to (one of) the profile(s) that scheduled it
+    # -- powers the end-user portal's "my completed recordings" library
+    # (vod_db.list_portal_library_movies/episodes), which has no other way
+    # to know which person a given recording belongs to. See
+    # set_movie_source_recording_profile's docstring for the single-owner
+    # caveat when more than one profile matched.
+    for stream_id, profiles in profile_by_stream_id.items():
+        if not profiles:
+            continue
+        owner_profile_id = profiles[0]["id"]
+        if stream_id in movie_id_by_stream_id:
+            vod_db.set_movie_source_recording_profile(provider_id, stream_id, owner_profile_id)
+        elif stream_id in series_id_by_stream_id:
+            vod_db.set_episode_source_recording_profile(provider_id, stream_id, owner_profile_id)
+
     # Disk quota (opt-in, same dvr_user_limits row Part 1's stream check
     # uses): a person at/over their disk_quota_bytes has NEW category
     # placements withheld from this point forward -- existing placements and
@@ -614,6 +630,173 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
                      "%d backfilled from the pool instead: %s",
                      provider["name"], len(profiles), scheduled_total, backfilled_total, results)
     return {"profiles_scanned": len(profiles), "scheduled": scheduled_total, "backfilled": backfilled_total, "details": results}
+
+
+def _same_episode(candidate: dict, season_number: int | None, episode_number: int | None, sub_title: str | None) -> bool:
+    """Cross-channel "is this the same episode" check for
+    reschedule_failed_recordings below -- deliberately NOT
+    dispatcharr_dvr_client._episode_identity_key, which folds tvg_id into
+    its key specifically to dedup two listings of the SAME channel (see
+    is_already_scheduled) -- a replacement on a different channel
+    legitimately has a different tvg_id, so that key would never match
+    across channels. search_epg_programs is already title-scoped, so this
+    only needs season+episode (preferred) or an exact sub_title match as a
+    fallback for titles with no structured season/episode.
+
+    Deliberately more conservative than vod_routes._matches_episode (the
+    admin's manual-pick Missing Episodes flow), which falls back to "any
+    airing of this title counts" when neither signal is available -- that's
+    fine when a human picks from a list, but this path auto-schedules with
+    no review, and silently grabbing the wrong episode of a long-running
+    show is worse than leaving it unresolved for another poll cycle."""
+    props = candidate.get("custom_properties") or {}
+    c_season, c_episode = props.get("season"), props.get("episode")
+    if season_number is not None and episode_number is not None:
+        return c_season == season_number and c_episode == episode_number
+    if sub_title:
+        return (candidate.get("sub_title") or "").strip().lower() == sub_title.strip().lower()
+    return False
+
+
+async def reschedule_failed_recordings(provider_id: int) -> dict:
+    """Dispatcharr never retries a recording that never started, or whose
+    ~80s mid-recording outage-retry window ran out (confirmed live,
+    dispatch-test v0.28.2 -- see dispatcharr_dvr_client.list_failed_
+    recordings' docstring) -- this is VOD Manager's own replacement, same
+    reasoning as rescan_recording_profiles above being the replacement for
+    Dispatcharr's own broken series-rules re-evaluation. For each genuine
+    failure: finds the owning dvr_recording_profiles row (for its
+    dispatcharr_user_id, to scope candidates to that person's own channel
+    lineup and to tag scheduled_by the same way every other auto-scheduling
+    path here does), searches the EPG for the same title, keeps only
+    candidates that are the SAME episode (_same_episode) and still in the
+    future, and schedules the single earliest one that isn't already
+    scheduled -- "the next airing, on any channel" is literally the
+    earliest surviving candidate after that filtering, which is exactly
+    what catches a delayed West Coast feed or a same-channel rerun later
+    the same night.
+
+    A profile-less title (no dvr_recording_profiles row matches, e.g. an
+    ad-hoc Recording created outside VOD Manager entirely) has no "how
+    would this normally be scheduled" to go on, so it's searched unscoped
+    -- same as resolve_missing_episode's own admin-side cross-channel
+    fallback when there's no rule/channel to check first.
+
+    Outcomes are persisted via vod_db.upsert_recording_failure:
+    'rescheduled' rows are never revisited; 'unresolved' ones are retried
+    every call, since a new EPG entry can enter the 7-day search horizon as
+    time passes."""
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise ValueError(f"provider {provider_id} not found")
+    if not provider.get("dispatcharr_connection_id"):
+        raise ValueError(f"provider {provider_id} has no linked Dispatcharr connection configured")
+    connection = vod_db.get_dispatcharr_connection(provider["dispatcharr_connection_id"])
+    if not connection:
+        raise ValueError(f"provider {provider_id}'s linked Dispatcharr connection no longer exists")
+
+    try:
+        failed = await dispatcharr_dvr_client.list_failed_recordings(connection)
+    except Exception as exc:
+        logger.warning("[dispatcharr_dvr_importer] reschedule_failed_recordings: couldn't list failed recordings: %s", exc)
+        return {"checked": 0, "rescheduled": 0, "unresolved": 0, "details": []}
+    if not failed:
+        return {"checked": 0, "rescheduled": 0, "unresolved": 0, "details": []}
+
+    username_by_id = {}
+    try:
+        users = await dispatcharr_dvr_client.list_users(connection)
+        username_by_id = {u["id"]: u["username"] for u in users}
+    except Exception as exc:
+        logger.warning("[dispatcharr_dvr_importer] reschedule_failed_recordings: couldn't resolve usernames: %s", exc)
+
+    now = datetime.now(timezone.utc)
+    rescheduled_total = 0
+    unresolved_total = 0
+    details = []
+
+    for recording in failed:
+        recording_id = recording.get("id")
+        if recording_id is None:
+            continue
+        existing = vod_db.get_recording_failure(provider_id, recording_id)
+        if existing and existing["outcome"] == "rescheduled":
+            continue  # already handled, never revisit
+
+        program = (recording.get("custom_properties") or {}).get("program") or {}
+        title = program.get("title")
+        if not title:
+            continue
+        props = program.get("custom_properties") or {}
+        season_number, episode_number = props.get("season"), props.get("episode")
+        sub_title = program.get("sub_title")
+        original_channel_id = recording.get("channel")
+        interrupted_reason = (recording.get("custom_properties") or {}).get("interrupted_reason")
+
+        try:
+            rule = vod_db.find_recording_profile_for_title(provider_id, title)
+            dispatcharr_user_id = rule.get("dispatcharr_user_id") if rule else None
+            visible = None
+            if dispatcharr_user_id:
+                visible = await dispatcharr_dvr_client.visible_channel_ids(connection, dispatcharr_user_id)
+
+            matches = await dispatcharr_dvr_client.search_epg_programs(connection, title)
+            candidates = []
+            for m in matches:
+                if not _same_episode(m, season_number, episode_number, sub_title):
+                    continue
+                start = _parse_iso(m.get("start_time"))
+                if not start or start <= now:
+                    continue
+                for ch in m.get("channels") or []:
+                    ch_id = ch.get("id")
+                    if ch_id is None or (visible is not None and ch_id not in visible):
+                        continue
+                    candidates.append((start, ch_id, m))
+            candidates.sort(key=lambda c: c[0])
+
+            chosen = None
+            for start, ch_id, m in candidates:
+                if await dispatcharr_dvr_client.is_already_scheduled(connection, ch_id, m):
+                    continue
+                chosen = (ch_id, m)
+                break
+
+            if chosen:
+                ch_id, m = chosen
+                scheduled_by = None
+                if dispatcharr_user_id:
+                    scheduled_by = {
+                        "dispatcharr_user_id": dispatcharr_user_id,
+                        "dispatcharr_username": username_by_id.get(dispatcharr_user_id),
+                        "profile_label": rule["label"] if rule else None,
+                    }
+                await dispatcharr_dvr_client.create_recording(connection, ch_id, m, scheduled_by)
+                vod_db.upsert_recording_failure(
+                    provider_id, recording_id, title, season_number, episode_number,
+                    original_channel_id, interrupted_reason, "rescheduled", ch_id,
+                )
+                rescheduled_total += 1
+                details.append({"title": title, "season": season_number, "episode": episode_number,
+                                 "outcome": "rescheduled", "channel": ch_id})
+                logger.info("[dispatcharr_dvr_importer] reschedule_failed_recordings: %r S%sE%s rescheduled on "
+                            "channel %s (was channel %s, %s)",
+                            title, season_number, episode_number, ch_id, original_channel_id, interrupted_reason)
+            else:
+                vod_db.upsert_recording_failure(
+                    provider_id, recording_id, title, season_number, episode_number,
+                    original_channel_id, interrupted_reason, "unresolved", None,
+                )
+                unresolved_total += 1
+        except Exception as exc:
+            logger.warning("[dispatcharr_dvr_importer] reschedule_failed_recordings: recording=%s (%r) failed: %s",
+                            recording_id, title, exc)
+            continue
+
+    if rescheduled_total or unresolved_total:
+        logger.info("[dispatcharr_dvr_importer] provider=%s: %d failed recording(s) checked, %d rescheduled, %d unresolved",
+                     provider["name"], len(failed), rescheduled_total, unresolved_total)
+    return {"checked": len(failed), "rescheduled": rescheduled_total, "unresolved": unresolved_total, "details": details}
 
 
 async def poll_watch_sessions(connection: dict) -> dict:

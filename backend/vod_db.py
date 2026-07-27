@@ -335,6 +335,60 @@ def init_db() -> None:
             UNIQUE(series_id, season_number, episode_number)
         );
 
+        -- A DVR recording Dispatcharr scheduled, actually attempted, and
+        -- genuinely failed (see dispatcharr_dvr_client.list_failed_recordings'
+        -- docstring for the exact failure signature) -- Dispatcharr itself
+        -- never retries these, so dispatcharr_dvr_importer.
+        -- reschedule_failed_recordings is what looks for the same episode's
+        -- next airing on any channel and schedules that instead. One row per
+        -- (provider, Dispatcharr recording id): outcome 'unresolved' is
+        -- re-attempted every poll cycle (a new EPG entry can enter the 7-day
+        -- search horizon as time passes, same reason rescan_recording_profiles
+        -- itself re-runs every cycle); outcome 'rescheduled' is done and never
+        -- touched again. dispatcharr_recording_id is intentionally not a
+        -- local FK -- the Recording lives in Dispatcharr, not here.
+        CREATE TABLE IF NOT EXISTS dvr_recording_failures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_recording_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            season_number INTEGER,
+            episode_number INTEGER,
+            original_channel_id INTEGER,
+            interrupted_reason TEXT,
+            outcome TEXT NOT NULL,
+            replacement_channel_id INTEGER,
+            detected_at TEXT NOT NULL,
+            UNIQUE(provider_id, dispatcharr_recording_id)
+        );
+
+        -- End-user self-service DVR portal login (backend/portal_auth.py,
+        -- backend/portal_routes.py) -- deliberately a separate credential
+        -- system from both the admin login (config.py's auth_username/
+        -- auth_hash) and Dispatcharr's own login, so a portal account being
+        -- compromised never exposes admin access or a real Dispatcharr
+        -- password. One row per (DVR provider, real Dispatcharr login
+        -- user); admin-provisioned only, no self-registration.
+        -- dispatcharr_user_id is intentionally not a local FK, same
+        -- reasoning as dvr_user_limits below -- the person lives in
+        -- Dispatcharr. TOTP MFA is mandatory: totp_secret stays NULL
+        -- (totp_enabled 0) until the account's first login completes
+        -- enrollment; totp_secret is Fernet-encrypted at rest via
+        -- secrets_util, same as every other stored secret in this app.
+        CREATE TABLE IF NOT EXISTS portal_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_user_id INTEGER NOT NULL,
+            username TEXT NOT NULL UNIQUE,
+            password_salt TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            totp_secret TEXT,
+            totp_enabled INTEGER NOT NULL DEFAULT 0,
+            totp_last_counter INTEGER,
+            created_at TEXT NOT NULL,
+            UNIQUE(provider_id, dispatcharr_user_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -353,6 +407,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_dvr_user_limits_provider_id ON dvr_user_limits(provider_id);
         CREATE INDEX IF NOT EXISTS idx_watch_sessions_connection_open ON watch_sessions(dispatcharr_connection_id, ended_at);
         CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(dispatcharr_user_id);
+        CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
@@ -501,6 +557,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
         ("dvr_recording_profiles", "backfill_mode", "TEXT"),
         ("dvr_recording_profiles", "monitored", "INTEGER NOT NULL DEFAULT 1"),
+        ("movie_sources", "recording_profile_id", "INTEGER"),
+        ("episode_sources", "recording_profile_id", "INTEGER"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -664,6 +722,40 @@ def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str
     _commit_with_retry(conn)
     conn.close()
     return series_id_by_stream_id
+
+
+def set_movie_source_recording_profile(provider_id: int, stream_id: str, recording_profile_id: int) -> None:
+    """Attributes a just-imported DVR-recorded movie source to the profile
+    (and therefore the person, via dvr_recording_profiles.dispatcharr_user_id)
+    that scheduled it -- see dispatcharr_dvr_importer.import_dvr_recordings'
+    Phase 2, where this is called once per (provider_id, stream_id) after
+    set_movie_source_local_paths. A recording can match more than one
+    profile (vod_db.match_recording_profiles' fan-out -- e.g. two different
+    people each set up their own profile for the same show); this column
+    only holds a single owner, so the caller picks one (currently: the
+    first match) rather than this being a many-to-many attribution. Good
+    enough for "whose portal library does this show up in" without a join
+    table, at the cost of a shared recording only ever being attributed to
+    one of its matching people."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE movie_sources SET recording_profile_id=? WHERE provider_id=? AND provider_stream_id=?",
+        (recording_profile_id, provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_episode_source_recording_profile(provider_id: int, stream_id: str, recording_profile_id: int) -> None:
+    """Episode counterpart to set_movie_source_recording_profile -- same
+    single-owner caveat applies."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE episode_sources SET recording_profile_id=? WHERE provider_id=? AND provider_stream_id=?",
+        (recording_profile_id, provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
 
 
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
@@ -910,6 +1002,59 @@ def list_unresolved_missing_episodes(series_id: int | None = None) -> list[dict]
     return [dict(r) for r in rows]
 
 
+# ── Failed DVR recording replacements ───────────────────────────────────────
+# See dvr_recording_failures' CREATE TABLE comment above and
+# dispatcharr_dvr_importer.reschedule_failed_recordings for the full cascade.
+
+def upsert_recording_failure(
+    provider_id: int, dispatcharr_recording_id: int, title: str,
+    season_number: int | None, episode_number: int | None, original_channel_id: int | None,
+    interrupted_reason: str | None, outcome: str, replacement_channel_id: int | None,
+) -> None:
+    """outcome='unresolved' rows are meant to be called again on a later
+    poll cycle (see reschedule_failed_recordings) -- the ON CONFLICT branch
+    lets a retry's fresh outcome/replacement_channel_id/detected_at
+    overwrite the previous attempt's, so a row that goes unresolved ->
+    rescheduled across cycles just updates in place rather than needing a
+    separate transition path."""
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO dvr_recording_failures
+           (provider_id, dispatcharr_recording_id, title, season_number, episode_number,
+            original_channel_id, interrupted_reason, outcome, replacement_channel_id, detected_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(provider_id, dispatcharr_recording_id) DO UPDATE SET
+               outcome=excluded.outcome, replacement_channel_id=excluded.replacement_channel_id,
+               detected_at=excluded.detected_at""",
+        (provider_id, dispatcharr_recording_id, title, season_number, episode_number,
+         original_channel_id, interrupted_reason, outcome, replacement_channel_id, _now()),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_recording_failures(provider_id: int | None = None) -> list[dict]:
+    conn = _connect()
+    if provider_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM dvr_recording_failures WHERE provider_id=? ORDER BY detected_at DESC", (provider_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM dvr_recording_failures ORDER BY detected_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_recording_failure(provider_id: int, dispatcharr_recording_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM dvr_recording_failures WHERE provider_id=? AND dispatcharr_recording_id=?",
+        (provider_id, dispatcharr_recording_id),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 # ── DVR per-person resource limits ──────────────────────────────────────────
 # Opt-in: a person (a real Dispatcharr login user, identified by their numeric
 # id) with no row here has no DVR limit enforced at all. See
@@ -977,6 +1122,171 @@ def delete_dvr_user_limit(limit_id: int) -> None:
     conn.execute("DELETE FROM dvr_user_limits WHERE id=?", (limit_id,))
     _commit_with_retry(conn)
     conn.close()
+
+
+# ── Portal accounts (end-user self-service DVR login) ──────────────────────
+# See the portal_accounts CREATE TABLE comment above for the design
+# rationale. Admin-provisioned only -- backend/vod_routes.py's admin-guarded
+# CRUD routes call these; backend/portal_routes.py's login flow calls
+# get_portal_account_by_username/set_portal_account_totp.
+
+def create_portal_account(
+    provider_id: int, dispatcharr_user_id: int, username: str,
+    password_salt: str, password_hash: str,
+) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO portal_accounts
+           (provider_id, dispatcharr_user_id, username, password_salt, password_hash, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (provider_id, dispatcharr_user_id, username, password_salt, password_hash, _now()),
+    )
+    account_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return account_id
+
+
+def list_portal_accounts(provider_id: int | None = None) -> list[dict]:
+    conn = _connect()
+    if provider_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM portal_accounts WHERE provider_id=? ORDER BY username", (provider_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM portal_accounts ORDER BY username").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_portal_account(account_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM portal_accounts WHERE id=?", (account_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_portal_account_by_username(username: str) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM portal_accounts WHERE username=?", (username,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_portal_account_password(account_id: int, password_salt: str, password_hash: str) -> None:
+    conn = _connect()
+    conn.execute(
+        "UPDATE portal_accounts SET password_salt=?, password_hash=? WHERE id=?",
+        (password_salt, password_hash, account_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_portal_account_totp(account_id: int, totp_secret: str | None, totp_enabled: bool) -> None:
+    """Pass totp_secret=None, totp_enabled=False to revoke enrollment (e.g.
+    admin-triggered MFA reset) -- the next login forces re-enrollment.
+    Resets totp_last_counter -- a fresh/rotated secret invalidates whatever
+    counter was tracked against the old one. Use enable_confirmed_totp
+    instead when flipping totp_enabled on for the secret that was just
+    verified (portal_routes.portal_confirm_mfa) -- that path must NOT wipe
+    the counter that same verification just recorded, or the code that
+    confirmed enrollment becomes replayable again immediately after."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE portal_accounts SET totp_secret=?, totp_enabled=?, totp_last_counter=NULL WHERE id=?",
+        (encrypt_value(totp_secret) if totp_secret else None, int(totp_enabled), account_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def enable_confirmed_portal_totp(account_id: int) -> None:
+    """Flips totp_enabled=1 for a secret that's already stored (set via
+    set_portal_account_totp during enrollment) and already passed
+    verification -- deliberately leaves totp_secret and totp_last_counter
+    untouched, unlike set_portal_account_totp."""
+    conn = _connect()
+    conn.execute("UPDATE portal_accounts SET totp_enabled=1 WHERE id=?", (account_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_portal_account_totp_counter(account_id: int, counter: int) -> None:
+    """Anti-replay: records the 30s time-step counter of the most recently
+    accepted TOTP code so portal_routes._verify_totp_code can reject that
+    exact code (or an earlier one) being submitted a second time within its
+    own still-valid window -- otherwise a shoulder-surfed/intercepted code
+    is usable twice, not just once, for up to ~30s."""
+    conn = _connect()
+    conn.execute("UPDATE portal_accounts SET totp_last_counter=? WHERE id=?", (counter, account_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def delete_portal_account(account_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM portal_accounts WHERE id=?", (account_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+# ── Portal library (completed recordings, scoped to one person) ────────────
+# See set_movie_source_recording_profile's docstring for how
+# movie_sources.recording_profile_id / episode_sources.recording_profile_id
+# get populated (dispatcharr_dvr_importer's Phase 2) and its single-owner
+# caveat when a recording matched more than one profile.
+
+def list_portal_library_movies(dispatcharr_user_id: int) -> list[dict]:
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT DISTINCT m.id, m.name, m.year, m.poster_url, m.duration_secs
+        FROM movies m
+        JOIN movie_sources ms ON ms.movie_id = m.id
+        JOIN dvr_recording_profiles p ON p.id = ms.recording_profile_id
+        WHERE p.dispatcharr_user_id = ?
+        ORDER BY m.name
+    """, (dispatcharr_user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_portal_library_episodes(dispatcharr_user_id: int) -> list[dict]:
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT DISTINCT e.id, e.name, e.season_number, e.episode_number, e.duration_secs,
+               s.id AS series_id, s.name AS series_name, s.poster_url AS series_poster_url
+        FROM episodes e
+        JOIN series s ON s.id = e.series_id
+        JOIN episode_sources es ON es.episode_id = e.id
+        JOIN dvr_recording_profiles p ON p.id = es.recording_profile_id
+        WHERE p.dispatcharr_user_id = ?
+        ORDER BY s.name, e.season_number, e.episode_number
+    """, (dispatcharr_user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def movie_owned_by_portal_user(movie_id: int, dispatcharr_user_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute("""
+        SELECT 1 FROM movie_sources ms
+        JOIN dvr_recording_profiles p ON p.id = ms.recording_profile_id
+        WHERE ms.movie_id = ? AND p.dispatcharr_user_id = ? LIMIT 1
+    """, (movie_id, dispatcharr_user_id)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def episode_owned_by_portal_user(episode_id: int, dispatcharr_user_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute("""
+        SELECT 1 FROM episode_sources es
+        JOIN dvr_recording_profiles p ON p.id = es.recording_profile_id
+        WHERE es.episode_id = ? AND p.dispatcharr_user_id = ? LIMIT 1
+    """, (episode_id, dispatcharr_user_id)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> dict:
