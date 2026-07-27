@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import api from '@/lib/api'
@@ -45,6 +45,8 @@ interface RecordingProfile {
   target_movie_category_id: number | null
   target_series_category_id: number | null
   dispatcharr_user_id: number | null
+  backfill_mode: 'pointer' | 'download' | null
+  monitored: number
   created_at: string
 }
 
@@ -496,14 +498,31 @@ function RuleMissingBlock({ rule, providerId, qc }: {
   providerId: number
   qc: ReturnType<typeof useQueryClient>
 }) {
+  const [expanded, setExpanded] = useState(false)
   const seriesQuery = useQuery<{ items: Series[]; total: number }>({
     queryKey: ['vod-series-search-for-rule', rule.title],
-    queryFn: () => api.get('/vod/series/', { params: { search: rule.title, limit: 5 } }).then((r) => r.data),
+    // limit=50, not a small number -- a common title (e.g. "This Is Us")
+    // can have several regional/localized prefixed variants ("AR| This Is
+    // Us") sorted ahead of the real exact-name match, confirmed live
+    // 2026-07-27 that limit=5 missed it entirely even though the pool had
+    // it. Cheap either way -- this is a handful of rules, not the whole
+    // library.
+    queryFn: () => api.get('/vod/series/', { params: { search: rule.title, limit: 50 } }).then((r) => r.data),
   })
+  const matched = seriesQuery.data?.items.find((s) => s.name.trim().toLowerCase() === rule.title.trim().toLowerCase())
+  // Same query key MissingEpisodesPanel itself uses -- react-query dedupes
+  // this into one request and shares the cache, so expanding is instant
+  // and the collapsed header's count never costs a second fetch.
+  const missingQuery = useQuery<MissingEpisode[]>({
+    queryKey: ['vod-missing-episodes', matched?.id],
+    queryFn: () => api.get(`/vod/series/${matched!.id}/missing-episodes/`).then((r) => r.data),
+    enabled: !!matched?.tmdb_id,
+  })
+  const gapCount = missingQuery.data?.filter((e) => !e.in_pool).length
+
   if (seriesQuery.isLoading) {
     return <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm text-xs text-muted-foreground">Looking up "{rule.title}"…</div>
   }
-  const matched = seriesQuery.data?.items.find((s) => s.name.trim().toLowerCase() === rule.title.trim().toLowerCase())
   if (!matched) {
     return (
       <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm">
@@ -521,9 +540,26 @@ function RuleMissingBlock({ rule, providerId, qc }: {
     )
   }
   return (
-    <div className="rounded-lg border border-border bg-card px-3 py-2.5 shadow-sm">
-      <div className="text-[13px] font-semibold mb-1.5">{matched.name}</div>
-      <MissingEpisodesPanel series={matched} providerId={providerId} qc={qc} />
+    <div className="rounded-lg border border-border bg-card shadow-sm overflow-hidden">
+      <button
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-accent/50"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        {expanded ? <ChevronUp size={14} className="text-muted-foreground shrink-0" /> : <ChevronDown size={14} className="text-muted-foreground shrink-0" />}
+        <span className="text-[13px] font-semibold flex-1 truncate">{matched.name}</span>
+        {missingQuery.isLoading ? (
+          <span className="text-[11px] text-muted-foreground">checking…</span>
+        ) : gapCount === 0 ? (
+          <StatusPill tone="success" label="no gaps" />
+        ) : gapCount != null ? (
+          <StatusPill tone="warning" label={`${gapCount} missing`} />
+        ) : null}
+      </button>
+      {expanded && (
+        <div className="px-3 pb-3 pt-1 border-t border-border">
+          <MissingEpisodesPanel series={matched} providerId={providerId} qc={qc} />
+        </div>
+      )}
     </div>
   )
 }
@@ -3805,6 +3841,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-dvr-upcoming', recordingProfilesProviderId] })
     },
   })
+  const setRecordingProfileMonitored = useMutation({
+    mutationFn: (v: { id: number; monitored: boolean }) => api.post(`/vod/dvr-recording-profiles/${v.id}/monitored/`, null, { params: { monitored: v.monitored } }),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] }),
+  })
   const [expandedLiveAccountsProviderId, setExpandedLiveAccountsProviderId] = useState<number | null>(null)
   const providerLiveAccountsQuery = useQuery<ProviderLiveAccount[]>({
     queryKey: ['vod-provider-live-accounts', expandedLiveAccountsProviderId],
@@ -5504,6 +5544,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           </span>
                         </span>
                         <button
+                          title={rp.monitored ? 'Monitored -- shows up on the Missing Episodes page. Click to unmonitor.' : 'Unmonitored -- hidden from the Missing Episodes page. Click to monitor.'}
+                          className={rp.monitored ? 'text-primary hover:text-primary/70 p-1' : 'text-muted-foreground/50 hover:text-foreground p-1'}
+                          disabled={setRecordingProfileMonitored.isPending}
+                          onClick={() => setRecordingProfileMonitored.mutate({ id: rp.id, monitored: !rp.monitored })}
+                        >
+                          {rp.monitored ? <Eye size={12} /> : <EyeOff size={12} />}
+                        </button>
+                        <button
                           title="Delete this recording rule (also cancels its future recordings on Dispatcharr)"
                           className="text-muted-foreground hover:text-destructive p-1"
                           onClick={() => { if (confirm(`Delete recording rule "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
@@ -6035,20 +6083,30 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {dvrSubTab === 'missing' && (
               <SectionCard title="Missing Episodes" icon={<Search size={14} />}>
                 <p className="text-sm text-muted-foreground">
-                  Every gap across every show with an active recording rule -- not just ones this provider has
-                  already recorded an episode for. Find runs the same cascade everywhere: pool backfill first, then
-                  this show's own known channel, then a cross-channel search, then flags it for review.
+                  Every gap across every monitored show with an active recording rule -- not just ones this provider
+                  has already recorded an episode for. Unmonitor a rule (the eye icon under Scheduled) to keep a show
+                  off this list without cancelling its recordings. Find runs the same cascade everywhere: pool
+                  backfill first, then this show's own known channel, then a cross-channel search, then flags it for
+                  review.
                 </p>
-                {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
-                  <p className="text-xs text-muted-foreground">No recording rules yet -- add one under Scheduled first.</p>
-                )}
-                <div className="space-y-2">
-                  {recordingProfilesQuery.data?.map((rp) => (
-                    recordingProfilesProviderId != null && (
-                      <RuleMissingBlock key={rp.id} rule={rp} providerId={recordingProfilesProviderId} qc={qc} />
-                    )
-                  ))}
-                </div>
+                {(() => {
+                  const monitoredRules = (recordingProfilesQuery.data ?? []).filter((rp) => rp.monitored)
+                  if (recordingProfilesQuery.data && !recordingProfilesQuery.data.length) {
+                    return <p className="text-xs text-muted-foreground">No recording rules yet -- add one under Scheduled first.</p>
+                  }
+                  if (recordingProfilesQuery.data && !monitoredRules.length) {
+                    return <p className="text-xs text-muted-foreground">Every rule is unmonitored -- toggle one back on under Scheduled to see its gaps here.</p>
+                  }
+                  return (
+                    <div className="space-y-2">
+                      {monitoredRules.map((rp) => (
+                        recordingProfilesProviderId != null && (
+                          <RuleMissingBlock key={rp.id} rule={rp} providerId={recordingProfilesProviderId} qc={qc} />
+                        )
+                      ))}
+                    </div>
+                  )
+                })()}
               </SectionCard>
             )}
 

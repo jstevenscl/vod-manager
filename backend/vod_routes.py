@@ -1228,6 +1228,18 @@ async def delete_recording_profile(profile_id: int):
     return {"ok": True}
 
 
+@router.post("/dvr-recording-profiles/{profile_id}/monitored/", dependencies=_GUARDS)
+async def set_recording_profile_monitored(profile_id: int, monitored: bool):
+    """Toggle-only -- doesn't touch scheduling. See vod_db.
+    set_recording_profile_monitored's docstring for why this is separate
+    from delete."""
+    profile = vod_db.get_recording_profile(profile_id)
+    if not profile:
+        raise HTTPException(404, detail="recording profile not found")
+    vod_db.set_recording_profile_monitored(profile_id, monitored)
+    return {"ok": True}
+
+
 @router.get("/dispatcharr-users/", dependencies=_GUARDS)
 async def list_dispatcharr_users(provider_id: int):
     """Real Dispatcharr login accounts for this DVR provider's connection --

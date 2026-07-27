@@ -500,6 +500,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
         ("dvr_recording_profiles", "backfill_mode", "TEXT"),
+        ("dvr_recording_profiles", "monitored", "INTEGER NOT NULL DEFAULT 1"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -726,6 +727,18 @@ def get_recording_profile(profile_id: int) -> dict | None:
 def delete_recording_profile(profile_id: int) -> None:
     conn = _connect()
     conn.execute("DELETE FROM dvr_recording_profiles WHERE id=?", (profile_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_recording_profile_monitored(profile_id: int, monitored: bool) -> None:
+    """Independent of whether the rule still actively schedules recordings
+    -- monitored only controls whether this show's gaps surface on the
+    dedicated Missing Episodes page. Unmonitoring a rule is how an admin
+    opts a show out of that page's clutter without deleting (and thereby
+    cancelling) the rule's own real Dispatcharr recordings."""
+    conn = _connect()
+    conn.execute("UPDATE dvr_recording_profiles SET monitored=? WHERE id=?", (1 if monitored else 0, profile_id))
     _commit_with_retry(conn)
     conn.close()
 
