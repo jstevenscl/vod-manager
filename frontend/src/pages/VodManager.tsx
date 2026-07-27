@@ -52,6 +52,23 @@ interface DispatcharrUser {
   id: number
   username: string
   stream_limit: number
+  channel_profiles?: number[]
+}
+
+interface DispatcharrChannelProfile {
+  id: number
+  name: string
+  channels: number[]
+}
+
+interface EpgSearchProgram {
+  id: number
+  title: string
+  sub_title: string | null
+  start_time: string
+  end_time: string
+  tvg_id: string
+  channels: { id: number; name: string; channel_number: number | null; channel_group: string | null; tvg_id: string }[]
 }
 
 interface DvrUserLimit {
@@ -3194,14 +3211,18 @@ export default function VodManager() {
     enabled:  recordingProfilesProviderId != null,
   })
   const blankRecordingProfileForm = {
-    label: '', title: '', mode: 'all' as 'all' | 'new',
+    label: '', title: '', tvg_id: '', channel_id: '', channel_label: '',
+    mode: 'all' as 'all' | 'new',
     target_movie_category_id: '', target_series_category_id: '', dispatcharr_user_id: '',
-    advancedOpen: false, tvg_id: '', title_mode: 'exact' as 'exact' | 'contains' | 'search' | 'regex',
-    description: '', description_mode: 'contains' as 'contains' | 'search' | 'regex', channel_id: '',
   }
   const dispatcharrUsersQuery = useQuery<DispatcharrUser[]>({
     queryKey: ['vod-dispatcharr-users', recordingProfilesProviderId],
     queryFn:  () => api.get('/vod/dispatcharr-users/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
+    enabled:  recordingProfilesProviderId != null,
+  })
+  const channelProfilesQuery = useQuery<DispatcharrChannelProfile[]>({
+    queryKey: ['vod-dvr-channel-profiles', recordingProfilesProviderId],
+    queryFn:  () => api.get('/vod/channel-profiles/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
     enabled:  recordingProfilesProviderId != null,
   })
   const dvrUserLimitsQuery = useQuery<DvrUserLimit[]>({
@@ -3247,42 +3268,72 @@ export default function VodManager() {
   })
   const [recordingProfileForm, setRecordingProfileForm] = useState(blankRecordingProfileForm)
   const [recordingProfileError, setRecordingProfileError] = useState<string | null>(null)
-  const [recordingProfilePreview, setRecordingProfilePreview] = useState<{ matches: any[]; total: number; epg_found: boolean; warn: boolean } | null>(null)
-  const previewRecordingProfile = useMutation({
-    mutationFn: () => api.post('/vod/dvr-recording-profiles/preview/', {
-      provider_id: recordingProfilesProviderId,
-      title: recordingProfileForm.title,
-      tvg_id: recordingProfileForm.tvg_id.trim() || null,
-      title_mode: recordingProfileForm.title_mode,
-      description: recordingProfileForm.description.trim() || null,
-      description_mode: recordingProfileForm.description_mode,
+  const [recordingProfileResult, setRecordingProfileResult] = useState<{ scheduled_now: number; total_matches: number } | null>(null)
+  const [epgSearchTitle, setEpgSearchTitle] = useState('')
+  const epgSearch = useMutation({
+    mutationFn: () => api.get<EpgSearchProgram[]>('/vod/epg-search/', {
+      params: { provider_id: recordingProfilesProviderId, title: epgSearchTitle.trim() },
     }).then((r) => r.data),
-    onSuccess: (data) => { setRecordingProfilePreview(data); setRecordingProfileError(null) },
-    onError:   (e: any) => setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Preview failed.'),
+    onError: (e: any) => setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Search failed.'),
   })
   const addRecordingProfile = useMutation({
     mutationFn: () => api.post('/vod/dvr-recording-profiles/', {
       provider_id: recordingProfilesProviderId,
       label: recordingProfileForm.label.trim() || recordingProfileForm.title,
       title: recordingProfileForm.title,
-      tvg_id: recordingProfileForm.tvg_id.trim() || null,
-      title_mode: recordingProfileForm.title_mode,
-      description: recordingProfileForm.description.trim() || null,
-      description_mode: recordingProfileForm.description_mode,
+      tvg_id: recordingProfileForm.tvg_id || null,
       mode: recordingProfileForm.mode,
       channel_id: recordingProfileForm.channel_id ? Number(recordingProfileForm.channel_id) : null,
       target_movie_category_id: recordingProfileForm.target_movie_category_id ? Number(recordingProfileForm.target_movie_category_id) : null,
       target_series_category_id: recordingProfileForm.target_series_category_id ? Number(recordingProfileForm.target_series_category_id) : null,
       dispatcharr_user_id: recordingProfileForm.dispatcharr_user_id ? Number(recordingProfileForm.dispatcharr_user_id) : null,
-    }),
-    onSuccess: () => {
+    }).then((r) => r.data),
+    onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] })
       setRecordingProfileForm(blankRecordingProfileForm)
-      setRecordingProfilePreview(null)
+      setEpgSearchTitle('')
+      epgSearch.reset()
       setRecordingProfileError(null)
+      setRecordingProfileResult({ scheduled_now: data.scheduled_now ?? 0, total_matches: data.total_matches ?? 0 })
     },
-    onError: (e: any) => setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
+    onError: (e: any) => { setRecordingProfileError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'); setRecordingProfileResult(null) },
   })
+  // Real Dispatcharr Channel Profiles, cross-referenced against the selected
+  // person's own membership -- a person doesn't always have the full channel
+  // lineup (confirmed live: a real profile with 2395 total memberships but
+  // only 81 enabled), so the EPG picker below marks channels outside their
+  // lineup rather than hiding them (an admin may deliberately want to record
+  // something outside a person's normal channels).
+  const selectedDispatcharrUser = dispatcharrUsersQuery.data?.find((u) => String(u.id) === recordingProfileForm.dispatcharr_user_id)
+  const visibleChannelIds = selectedDispatcharrUser
+    ? new Set(
+        (channelProfilesQuery.data ?? [])
+          .filter((cp) => selectedDispatcharrUser.channel_profiles?.includes(cp.id))
+          .flatMap((cp) => cp.channels),
+      )
+    : null
+  const epgChannelGroups = (() => {
+    const byChannel = new Map<number, { channel: EpgSearchProgram['channels'][number]; programs: EpgSearchProgram[] }>()
+    for (const program of epgSearch.data ?? []) {
+      for (const ch of program.channels ?? []) {
+        if (!byChannel.has(ch.id)) byChannel.set(ch.id, { channel: ch, programs: [] })
+        byChannel.get(ch.id)!.programs.push(program)
+      }
+    }
+    return [...byChannel.values()].sort((a, b) => (a.channel.channel_number ?? 0) - (b.channel.channel_number ?? 0))
+  })()
+  const pickEpgChannel = (channel: EpgSearchProgram['channels'][number], programs: EpgSearchProgram[]) => {
+    const first = programs[0]
+    setRecordingProfileForm({
+      ...recordingProfileForm,
+      title: first.title,
+      tvg_id: first.tvg_id,
+      channel_id: String(channel.id),
+      channel_label: `${channel.channel_number ?? '?'} · ${channel.name}`,
+    })
+    setEpgSearchTitle('')
+    epgSearch.reset()
+  }
   const deleteRecordingProfile = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/dvr-recording-profiles/${id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-recording-profiles', recordingProfilesProviderId] }),
@@ -4605,7 +4656,9 @@ export default function VodManager() {
                       onClick={() => {
                         setRecordingProfilesProviderId(p.id)
                         setRecordingProfileForm(blankRecordingProfileForm)
-                        setRecordingProfilePreview(null)
+                        setEpgSearchTitle('')
+                        epgSearch.reset()
+                        setRecordingProfileResult(null)
                         setRecordingProfileError(null)
                       }}
                     >
@@ -4954,8 +5007,9 @@ export default function VodManager() {
               Recording Profiles — {providersQuery.data?.find((p) => p.id === recordingProfilesProviderId)?.name}
             </h2>
             <p className="text-sm text-muted-foreground">
-              Each profile creates a real recurring rule on Dispatcharr for a specific show. When one of its
-              recordings finishes, it's routed into the categories below instead of this provider's own default.
+              Each profile schedules real Dispatcharr recordings for a specific show on a specific channel, and
+              re-checks for new episodes automatically. When one finishes, it's routed into the categories below
+              instead of this provider's own default.
             </p>
 
             <div className="space-y-1.5">
@@ -4968,8 +5022,8 @@ export default function VodManager() {
                   <span className="flex-1">
                     <span className="font-medium">{rp.label}</span>{' '}
                     <span className="text-muted-foreground">
-                      — "{rp.title}" ({rp.title_mode}), {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
-                      {rp.tvg_id ? `, channel ${rp.tvg_id}` : ''}
+                      — "{rp.title}", {rp.mode === 'all' ? 'all episodes' : 'new episodes only'}
+                      {rp.channel_id ? `, channel ${rp.channel_id}` : ' (no channel -- won\'t schedule)'}
                       {' → '}
                       {[
                         movieCategories.find((c) => c.id === rp.target_movie_category_id)?.name,
@@ -4981,9 +5035,9 @@ export default function VodManager() {
                     </span>
                   </span>
                   <button
-                    title="Delete this recording profile (also removes the rule from Dispatcharr)"
+                    title="Delete this recording profile (also cancels its future recordings on Dispatcharr)"
                     className="text-muted-foreground hover:text-destructive p-1"
-                    onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also removes the rule from Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
+                    onClick={() => { if (confirm(`Delete recording profile "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -4993,6 +5047,11 @@ export default function VodManager() {
 
             <div className="border-t border-border pt-3 space-y-1.5">
               <p className="text-xs font-medium">Add a profile</p>
+              <p className="text-[11px] text-muted-foreground">
+                Search the real guide and pick the exact channel to record — matching a title with no channel picked
+                records every affiliate carrying it as a separate duplicate, so a channel is required.
+              </p>
+
               <div className="flex flex-wrap items-center gap-1.5">
                 <input
                   className={inputCls('flex-1 min-w-[8rem]')}
@@ -5000,12 +5059,15 @@ export default function VodManager() {
                   value={recordingProfileForm.label}
                   onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, label: e.target.value })}
                 />
-                <input
-                  className={inputCls('flex-1 min-w-[8rem]')}
-                  placeholder="Show title (exact match, as it appears in the guide)"
-                  value={recordingProfileForm.title}
-                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, title: e.target.value })}
-                />
+                <select
+                  className={inputCls()}
+                  value={recordingProfileForm.dispatcharr_user_id}
+                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
+                  title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured below, this profile counts against their stream budget, and their own Channel Profile is used to flag channels outside their lineup below"
+                >
+                  <option value="">Person (optional)…</option>
+                  {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
+                </select>
                 <select
                   className={inputCls()}
                   value={recordingProfileForm.mode}
@@ -5016,6 +5078,66 @@ export default function VodManager() {
                   <option value="new">New episodes only</option>
                 </select>
               </div>
+
+              {recordingProfileForm.channel_id ? (
+                <div className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1.5 bg-muted/30">
+                  <span className="flex-1">
+                    <span className="font-medium">{recordingProfileForm.channel_label}</span>
+                    <span className="text-muted-foreground"> — "{recordingProfileForm.title}"</span>
+                  </span>
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted text-[11px] shrink-0"
+                    onClick={() => setRecordingProfileForm({ ...recordingProfileForm, channel_id: '', tvg_id: '', channel_label: '' })}
+                  >
+                    change
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      className={inputCls('flex-1')}
+                      placeholder="Search the guide (e.g. Seinfeld)"
+                      value={epgSearchTitle}
+                      onChange={(e) => setEpgSearchTitle(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' && epgSearchTitle.trim()) epgSearch.mutate() }}
+                    />
+                    <Button
+                      size="sm" variant="outline"
+                      disabled={!epgSearchTitle.trim() || epgSearch.isPending}
+                      onClick={() => epgSearch.mutate()}
+                    >
+                      {epgSearch.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Search'}
+                    </Button>
+                  </div>
+                  {epgSearch.data && !epgChannelGroups.length && (
+                    <p className="text-xs text-muted-foreground">No upcoming airings found for that title in the next 7 days.</p>
+                  )}
+                  {!!epgChannelGroups.length && (
+                    <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-1.5">
+                      {epgChannelGroups.map(({ channel, programs }) => {
+                        const inLineup = visibleChannelIds == null || visibleChannelIds.has(channel.id)
+                        const next = programs[0]
+                        return (
+                          <button
+                            key={channel.id}
+                            className={`w-full text-left text-xs px-2 py-1 rounded hover:bg-accent flex items-center gap-2 ${inLineup ? '' : 'opacity-50'}`}
+                            title={inLineup ? undefined : `Outside ${selectedDispatcharrUser?.username}'s Channel Profile -- they wouldn't normally see this channel`}
+                            onClick={() => pickEpgChannel(channel, programs)}
+                          >
+                            <span className="font-mono text-muted-foreground w-8 shrink-0">{channel.channel_number ?? '—'}</span>
+                            <span className="flex-1 truncate">{channel.name}</span>
+                            {next?.sub_title && <span className="text-muted-foreground truncate max-w-[10rem]">{next.sub_title}</span>}
+                            <span className="text-muted-foreground shrink-0">{programs.length} upcoming</span>
+                            {!inLineup && <span className="text-[10px] text-muted-foreground shrink-0">not in lineup</span>}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center gap-1.5">
                 <select
                   className={inputCls()}
@@ -5035,98 +5157,20 @@ export default function VodManager() {
                   <option value="">TV category (optional)…</option>
                   {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
-                <select
-                  className={inputCls()}
-                  value={recordingProfileForm.dispatcharr_user_id}
-                  onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, dispatcharr_user_id: e.target.value })}
-                  title="Attributes this profile to a real Dispatcharr person -- if they have DVR limits configured below, this profile counts against their stream budget"
-                >
-                  <option value="">Person (optional)…</option>
-                  {dispatcharrUsersQuery.data?.map((u) => <option key={u.id} value={u.id}>{u.username}</option>)}
-                </select>
               </div>
 
-              <button
-                className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
-                onClick={() => setRecordingProfileForm({ ...recordingProfileForm, advancedOpen: !recordingProfileForm.advancedOpen })}
-              >
-                {recordingProfileForm.advancedOpen ? '▾' : '▸'} Advanced options
-              </button>
-              {recordingProfileForm.advancedOpen && (
-                <div className="flex flex-wrap items-center gap-1.5 pl-3 border-l-2 border-border">
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.title_mode}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, title_mode: e.target.value as any })}
-                    title="How the title above is matched against the guide"
-                  >
-                    <option value="exact">Title: exact</option>
-                    <option value="contains">Title: contains</option>
-                    <option value="search">Title: search</option>
-                    <option value="regex">Title: regex</option>
-                  </select>
-                  <input
-                    className={inputCls('w-32')}
-                    placeholder="EPG channel id (tvg_id, optional)"
-                    value={recordingProfileForm.tvg_id}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, tvg_id: e.target.value })}
-                    title="Restrict matches to this EPG channel only -- blank matches across every channel"
-                  />
-                  <input
-                    className={inputCls('w-16')}
-                    type="number"
-                    placeholder="channel id"
-                    value={recordingProfileForm.channel_id}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, channel_id: e.target.value })}
-                    title="Pin the recording to this Dispatcharr channel -- otherwise Dispatcharr picks its own default"
-                  />
-                  <input
-                    className={inputCls('flex-1 min-w-[8rem]')}
-                    placeholder="Description filter (optional)"
-                    value={recordingProfileForm.description}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, description: e.target.value })}
-                  />
-                  <select
-                    className={inputCls()}
-                    value={recordingProfileForm.description_mode}
-                    onChange={(e) => setRecordingProfileForm({ ...recordingProfileForm, description_mode: e.target.value as any })}
-                  >
-                    <option value="contains">Description: contains</option>
-                    <option value="search">Description: search</option>
-                    <option value="regex">Description: regex</option>
-                  </select>
-                </div>
+              {recordingProfileResult && (
+                <p className="text-xs text-muted-foreground">
+                  Scheduled {recordingProfileResult.scheduled_now} of {recordingProfileResult.total_matches} upcoming episode
+                  {recordingProfileResult.total_matches === 1 ? '' : 's'}
+                  {recordingProfileResult.total_matches > 0 && recordingProfileResult.scheduled_now === 0 && ' (all already scheduled)'}.
+                </p>
               )}
-
-              <div className="flex items-center gap-1.5 pt-1">
-                <Button
-                  size="sm" variant="outline"
-                  disabled={!recordingProfileForm.title.trim() || previewRecordingProfile.isPending}
-                  onClick={() => previewRecordingProfile.mutate()}
-                >
-                  {previewRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Preview matches'}
-                </Button>
-                {recordingProfilePreview && (
-                  <span className="text-[10px] text-muted-foreground">
-                    {recordingProfilePreview.epg_found
-                      ? `${recordingProfilePreview.total} upcoming match${recordingProfilePreview.total === 1 ? '' : 'es'}`
-                      : 'No EPG data found for this title'}
-                  </span>
-                )}
-              </div>
-              {recordingProfilePreview && !!recordingProfilePreview.matches?.length && (
-                <ul className="text-[10px] text-muted-foreground list-disc pl-4 max-h-24 overflow-y-auto">
-                  {recordingProfilePreview.matches.slice(0, 8).map((m, i) => (
-                    <li key={i}>{m.title ?? m.sub_title ?? m.name ?? JSON.stringify(m)}</li>
-                  ))}
-                </ul>
-              )}
-
               {recordingProfileError && <p className="text-xs text-destructive">{recordingProfileError}</p>}
               <div className="flex justify-end gap-2 pt-1">
                 <Button
                   size="sm"
-                  disabled={!recordingProfileForm.title.trim() || addRecordingProfile.isPending}
+                  disabled={!recordingProfileForm.title.trim() || !recordingProfileForm.channel_id || addRecordingProfile.isPending}
                   onClick={() => addRecordingProfile.mutate()}
                 >
                   {addRecordingProfile.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" /> Add profile</>}
