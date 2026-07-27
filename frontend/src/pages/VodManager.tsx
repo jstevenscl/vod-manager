@@ -103,6 +103,23 @@ interface RetentionCandidateMovie {
   reason: string
 }
 
+interface WatchSession {
+  id: number
+  dispatcharr_connection_id: number
+  client_id: string
+  dispatcharr_user_id: number | null
+  dispatcharr_username: string | null
+  content_type: string | null
+  content_name: string | null
+  content_uuid: string | null
+  client_ip: string | null
+  bytes_sent: number
+  position_seconds: number | null
+  started_at: string
+  last_seen_at: string
+  ended_at: string | null
+}
+
 interface RetentionCandidateEpisode {
   episode_id: number
   source_id: number
@@ -575,7 +592,7 @@ const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult'
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
 
-interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string }
+interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null }
 interface MoviePlacement { id: number; category_id: number; export_stream_id: number; name_suffix: string; category_name: string }
 interface Movie {
   id: number
@@ -600,7 +617,7 @@ interface MetadataRule {
   sort_order: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; file_size_bytes?: number | null }
 interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[] }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
@@ -3345,6 +3362,70 @@ export default function VodManager() {
       setRetentionReviewLimitId(null)
     },
   })
+  // DVR Library -- browse/delete this provider's own recorded media.
+  // /vod/movies/ and /vod/series/ already support provider_id filtering
+  // server-side (confirmed while scoping this), so no new backend was
+  // needed -- just consuming what's already there. "Delete" removes this
+  // provider's own source (DELETE .../sources/{id}/, the same operation
+  // retention's apply step already uses), not a blanket row delete -- a
+  // movie/episode also sourced elsewhere stays, just no longer via DVR.
+  const [dvrLibraryTab, setDvrLibraryTab] = useState<'movies' | 'series'>('movies')
+  function formatFileSize(n: number): string {
+    if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
+    if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(0)} MB`
+    return `${(n / 1024 ** 3).toFixed(2)} GB`
+  }
+  const dvrLibraryMoviesQuery = useQuery<{ items: Movie[]; total: number }>({
+    queryKey: ['vod-dvr-library-movies', recordingProfilesProviderId],
+    queryFn: () => api.get('/vod/movies/', { params: { provider_id: recordingProfilesProviderId, limit: 200, archived: false } }).then((r) => r.data),
+    enabled: recordingProfilesProviderId != null && dvrSubTab === 'library',
+  })
+  const dvrLibrarySeriesQuery = useQuery<{ items: Series[]; total: number }>({
+    queryKey: ['vod-dvr-library-series', recordingProfilesProviderId],
+    queryFn: () => api.get('/vod/series/', { params: { provider_id: recordingProfilesProviderId, limit: 200, archived: false } }).then((r) => r.data),
+    enabled: recordingProfilesProviderId != null && dvrSubTab === 'library',
+  })
+  const deleteDvrMovieSource = useMutation({
+    mutationFn: (v: { movieId: number; sourceId: number }) => api.delete(`/vod/movies/${v.movieId}/sources/${v.sourceId}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dvr-library-movies', recordingProfilesProviderId] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
+  })
+  const deleteDvrEpisodeSource = useMutation({
+    mutationFn: (v: { episodeId: number; sourceId: number }) => api.delete(`/vod/episodes/${v.episodeId}/sources/${v.sourceId}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-dvr-library-series', recordingProfilesProviderId] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
+  })
+  // Metrics -- real numbers only, nothing simulated. Watch activity comes
+  // from the watch_sessions history built by main.py's background poller
+  // (see dispatcharr_dvr_importer.poll_watch_sessions) -- genuinely
+  // per-person now, not the unattributed fallback originally planned,
+  // since Dispatcharr's own /proxy/stats/ turned out to carry a real
+  // user_id after all. Rule health is deliberately on-demand (a "Check"
+  // button), not automatic -- reuses the same channel-scoped EPG search
+  // the picker already uses, so it costs nothing new server-side and never
+  // runs without being asked for.
+  const watchSessionsQuery = useQuery<WatchSession[]>({
+    queryKey: ['vod-watch-sessions'],
+    queryFn: () => api.get('/vod/watch-sessions/').then((r) => r.data),
+    enabled: dvrSubTab === 'metrics',
+  })
+  const [ruleHealth, setRuleHealth] = useState<Record<number, { matches: number; checking: boolean }>>({})
+  const checkRuleHealth = async (rp: RecordingProfile) => {
+    if (!rp.channel_id) return
+    setRuleHealth((prev) => ({ ...prev, [rp.id]: { matches: prev[rp.id]?.matches ?? 0, checking: true } }))
+    try {
+      const res = await api.get<EpgSearchProgram[]>('/vod/epg-search/', { params: { provider_id: recordingProfilesProviderId, title: rp.title, channel_id: rp.channel_id } })
+      setRuleHealth((prev) => ({ ...prev, [rp.id]: { matches: res.data.length, checking: false } }))
+    } catch {
+      setRuleHealth((prev) => ({ ...prev, [rp.id]: { matches: -1, checking: false } }))
+    }
+  }
   const dvrUserUsageQuery = useQuery<Record<number, number>>({
     queryKey: ['vod-dvr-user-usage', recordingProfilesProviderId, dvrUserLimitsQuery.data?.map((l) => l.id).join(',')],
     queryFn: async () => {
@@ -5557,29 +5638,207 @@ export default function VodManager() {
 
             {dvrSubTab === 'library' && (
               <SectionCard title="DVR Library" icon={<HardDriveDownload size={14} />}>
-                {(() => {
-                  const provider = providersQuery.data?.find((p) => p.id === recordingProfilesProviderId)
-                  return (
-                    <p className="text-sm text-muted-foreground">
-                      {provider ? (
-                        <>
-                          <span className="font-medium text-foreground">{provider.movie_count}</span> movies ·{' '}
-                          <span className="font-medium text-foreground">{provider.series_count}</span> series ·{' '}
-                          <span className="font-medium text-foreground">{provider.episode_count}</span> episodes
-                          sourced from this provider — browse them in the Movies / TV Shows tabs for now.
-                        </>
-                      ) : '—'}
-                      {' '}A dedicated browse-and-delete view scoped to this provider is coming next.
-                    </p>
-                  )
-                })()}
+                <p className="text-sm text-muted-foreground">
+                  Everything this provider has recorded and imported into the pool. Deleting here only removes this
+                  provider's own copy -- if the same title is also sourced from somewhere else, that copy is
+                  untouched.
+                </p>
+                <div className="flex items-center gap-0.5 rounded border border-border p-0.5 w-fit">
+                  {(['movies', 'series'] as const).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setDvrLibraryTab(t)}
+                      className={`px-2.5 py-1 rounded text-xs transition-colors capitalize ${
+                        dvrLibraryTab === t ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+
+                {dvrLibraryTab === 'movies' ? (
+                  <div className="space-y-1">
+                    {dvrLibraryMoviesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+                    {dvrLibraryMoviesQuery.data && !dvrLibraryMoviesQuery.data.items.length && (
+                      <p className="text-xs text-muted-foreground">No movies from this provider yet.</p>
+                    )}
+                    {dvrLibraryMoviesQuery.data?.total != null && dvrLibraryMoviesQuery.data.total > dvrLibraryMoviesQuery.data.items.length && (
+                      <p className="text-[11px] text-muted-foreground">Showing {dvrLibraryMoviesQuery.data.items.length} of {dvrLibraryMoviesQuery.data.total}.</p>
+                    )}
+                    {dvrLibraryMoviesQuery.data?.items.map((m) => {
+                      const src = m.sources.find((s) => s.provider_id === recordingProfilesProviderId)
+                      const ext = src?.container_extension || 'mp4'
+                      return (
+                        <div key={m.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                          {src && (
+                            <PlayButton
+                              url={buildPreviewSourceUrl('movie', src.id, ext, xcCredentialsQuery.data)}
+                              transcodedUrl={buildTranscodedPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
+                              hlsUrl={buildHlsPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
+                              title={m.name}
+                            />
+                          )}
+                          <span className="flex-1 truncate">
+                            <span className="font-medium">{m.name}</span>{' '}
+                            <span className="text-muted-foreground">{m.year ? `(${m.year})` : ''}</span>
+                          </span>
+                          {src && (
+                            <span className="text-muted-foreground shrink-0 uppercase">
+                              {ext}{src.file_size_bytes != null && ` · ${formatFileSize(src.file_size_bytes)}`}
+                            </span>
+                          )}
+                          {m.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {m.sources.length - 1} other source{m.sources.length > 2 ? 's' : ''}</span>}
+                          <button
+                            title="Remove this provider's copy from the pool"
+                            className="text-muted-foreground hover:text-destructive p-1"
+                            disabled={!src || deleteDvrMovieSource.isPending}
+                            onClick={() => { if (src && confirm(`Remove "${m.name}" from the DVR pool? This can't be undone.`)) deleteDvrMovieSource.mutate({ movieId: m.id, sourceId: src.id }) }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {dvrLibrarySeriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
+                    {(() => {
+                      const rows = (dvrLibrarySeriesQuery.data?.items ?? []).flatMap((s) =>
+                        s.episodes
+                          .flatMap((e) => e.sources.filter((src) => src.provider_id === recordingProfilesProviderId).map((src) => ({ series: s, episode: e, source: src })))
+                      )
+                      if (dvrLibrarySeriesQuery.data && !rows.length) {
+                        return <p className="text-xs text-muted-foreground">No episodes from this provider yet.</p>
+                      }
+                      return rows.map(({ series, episode, source }) => {
+                        const ext = source.container_extension || 'mp4'
+                        return (
+                          <div key={`${episode.id}-${source.id}`} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                            <PlayButton
+                              url={buildPreviewSourceUrl('series', source.id, ext, xcCredentialsQuery.data)}
+                              transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
+                              hlsUrl={buildHlsPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
+                              title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
+                            />
+                            <span className="flex-1 truncate">
+                              <span className="font-medium">{series.name}</span>{' '}
+                              <span className="text-muted-foreground">
+                                S{episode.season_number}E{episode.episode_number} — {episode.name}
+                              </span>
+                            </span>
+                            <span className="text-muted-foreground shrink-0 uppercase">
+                              {ext}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}
+                            </span>
+                            {episode.sources.length > 1 && <span className="text-[10px] text-muted-foreground shrink-0">also from {episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</span>}
+                            <button
+                              title="Remove this provider's copy from the pool"
+                              className="text-muted-foreground hover:text-destructive p-1"
+                              disabled={deleteDvrEpisodeSource.isPending}
+                              onClick={() => { if (confirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`)) deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id }) }}
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        )
+                      })
+                    })()}
+                  </div>
+                )}
               </SectionCard>
             )}
 
             {dvrSubTab === 'metrics' && (
-              <SectionCard title="Metrics" icon={<LayoutGrid size={14} />}>
-                <p className="text-sm text-muted-foreground">Coming next.</p>
-              </SectionCard>
+              <>
+                <SectionCard title="People" icon={<Users size={14} />}>
+                  <p className="text-sm text-muted-foreground">
+                    Storage and real watch activity per person, from Dispatcharr's own live connection stats
+                    (confirmed live it carries a real per-person identity, polled into history in the background).
+                  </p>
+                  {dvrUserLimitsQuery.data && !dvrUserLimitsQuery.data.length && (
+                    <p className="text-xs text-muted-foreground">No one has DVR limits configured under Users yet -- nothing to show metrics for.</p>
+                  )}
+                  <div className="space-y-1">
+                    {dvrUserLimitsQuery.data?.map((lim) => {
+                      const usageBytes = dvrUserUsageQuery.data?.[lim.id]
+                      const usageGB = usageBytes != null ? (usageBytes / 1024 ** 3) : null
+                      const ruleCount = recordingProfilesQuery.data?.filter((rp) => rp.dispatcharr_user_id === lim.dispatcharr_user_id).length ?? 0
+                      const sessions = (watchSessionsQuery.data ?? []).filter((w) => w.dispatcharr_user_id === lim.dispatcharr_user_id)
+                      const lastSeen = sessions.length ? Math.max(...sessions.map((s) => Number(s.last_seen_at))) : null
+                      return (
+                        <div key={lim.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                          <span className="flex-1">
+                            <span className="font-medium">{lim.dispatcharr_username}</span>{' '}
+                            <span className="text-muted-foreground">
+                              — {usageGB != null ? `${usageGB.toFixed(1)}GB used` : 'usage unknown'}
+                              {' · '}{ruleCount} recording rule{ruleCount === 1 ? '' : 's'}
+                              {' · '}{sessions.length} watch session{sessions.length === 1 ? '' : 's'} logged
+                              {lastSeen != null && <> · last watched {new Date(lastSeen * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</>}
+                            </span>
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="Recording Load by Channel" icon={<CalendarClock size={14} />}>
+                  <p className="text-sm text-muted-foreground">How many active recording rules target each channel -- useful for spotting one channel carrying most of the load, or a rule pointed at the wrong channel.</p>
+                  {(() => {
+                    const byChannel = new Map<number, number>()
+                    for (const rp of recordingProfilesQuery.data ?? []) {
+                      if (!rp.channel_id) continue
+                      byChannel.set(rp.channel_id, (byChannel.get(rp.channel_id) ?? 0) + 1)
+                    }
+                    const rows = [...byChannel.entries()].sort((a, b) => b[1] - a[1])
+                    if (!rows.length) return <p className="text-xs text-muted-foreground">No channel-scoped recording rules yet.</p>
+                    return (
+                      <div className="space-y-1">
+                        {rows.map(([channelId, count]) => (
+                          <div key={channelId} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                            <span className="flex-1">channel {channelId}</span>
+                            <span className="text-muted-foreground">{count} rule{count === 1 ? '' : 's'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  })()}
+                </SectionCard>
+
+                <SectionCard title="Rule Health" icon={<CalendarDays size={14} />}>
+                  <p className="text-sm text-muted-foreground">
+                    On-demand check only -- re-searches each rule's own channel right now. 0 matches means either a
+                    genuine hiatus/break or something worth a closer look, not necessarily broken.
+                  </p>
+                  {recordingProfilesQuery.data && !recordingProfilesQuery.data.length && (
+                    <p className="text-xs text-muted-foreground">No recording rules yet.</p>
+                  )}
+                  <div className="space-y-1">
+                    {recordingProfilesQuery.data?.map((rp) => {
+                      const health = ruleHealth[rp.id]
+                      return (
+                        <div key={rp.id} className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1">
+                          <span className="flex-1 truncate">
+                            <span className="font-medium">{rp.label}</span>{' '}
+                            <span className="text-muted-foreground">— "{rp.title}"</span>
+                          </span>
+                          {health && !health.checking && (
+                            health.matches < 0
+                              ? <span className="text-destructive shrink-0">check failed</span>
+                              : <span className={`shrink-0 ${health.matches === 0 ? 'text-destructive' : 'text-muted-foreground'}`}>
+                                  {health.matches === 0 ? 'no upcoming matches' : `${health.matches} upcoming match${health.matches === 1 ? '' : 'es'}`}
+                                </span>
+                          )}
+                          <Button size="sm" variant="outline" disabled={!rp.channel_id || health?.checking} onClick={() => checkRuleHealth(rp)}>
+                            {health?.checking ? <Loader2 size={12} className="animate-spin" /> : 'Check'}
+                          </Button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </SectionCard>
+              </>
             )}
           </>
         )}
