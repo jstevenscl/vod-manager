@@ -4898,19 +4898,36 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {enrichProgress?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
             {enrichProgress?.running ? 'Enriching…' : 'Bulk Enrich All'}
           </Button>
-          {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
-            <span className="text-xs text-muted-foreground">
-              movies {enrichProgress.movies_done}/{enrichProgress.movies_total}
-              {enrichProgress.movies_errors > 0 ? ` (${enrichProgress.movies_errors} errors)` : ''}
-              {' · '}
-              series {enrichProgress.series_done}/{enrichProgress.series_total}
-              {enrichProgress.series_errors > 0 ? ` (${enrichProgress.series_errors} errors)` : ''}
-              {!enrichProgress.running && enrichProgress.started_at && enrichProgress.finished_at
-                ? ` · took ${Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s`
-                : ''}
-            </span>
+          {enrichProgress && !enrichProgress.running && enrichProgress.started_at && enrichProgress.finished_at && (
+            <span className="text-xs text-muted-foreground">took {Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s</span>
           )}
         </div>
+        {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
+          <div className="space-y-1.5">
+            {(() => {
+              const mPct = enrichProgress.movies_total ? Math.round((enrichProgress.movies_done / enrichProgress.movies_total) * 100) : 100
+              const sPct = enrichProgress.series_total ? Math.round((enrichProgress.series_done / enrichProgress.series_total) * 100) : 100
+              return (
+                <>
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-0.5">
+                      <span>Movies</span>
+                      <span className="tabular-nums">{enrichProgress.movies_done.toLocaleString()} / {enrichProgress.movies_total.toLocaleString()}{enrichProgress.movies_errors > 0 && ` (${enrichProgress.movies_errors} errors)`}</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-primary" style={{ width: `${mPct}%` }} /></div>
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-0.5">
+                      <span>Series</span>
+                      <span className="tabular-nums">{enrichProgress.series_done.toLocaleString()} / {enrichProgress.series_total.toLocaleString()}{enrichProgress.series_errors > 0 && ` (${enrichProgress.series_errors} errors)`}</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-primary" style={{ width: `${sPct}%` }} /></div>
+                  </div>
+                </>
+              )
+            })()}
+          </div>
+        )}
       </SectionCard>
       </>
       )}
@@ -6271,14 +6288,25 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           )}
         </div>
         {!!orphansQuery.data && (
-          <div className="text-xs text-muted-foreground space-y-1">
-            <p>Orphaned series (dead provider reference): {orphansQuery.data.orphaned_series.count}
-              {!!orphansQuery.data.orphaned_series.sample.length && ` — e.g. ${orphansQuery.data.orphaned_series.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
-            </p>
-            <p>Sourceless movies: {orphansQuery.data.sourceless_movies.count}
-              {!!orphansQuery.data.sourceless_movies.sample.length && ` — e.g. ${orphansQuery.data.sourceless_movies.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
-            </p>
-            <p>Sourceless episodes (in otherwise-healthy series): {orphansQuery.data.sourceless_episodes.count}</p>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={orphansQuery.data.orphaned_series.count ? 'warning' : 'success'} label="Orphaned series" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {orphansQuery.data.orphaned_series.count} -- dead provider reference
+                {!!orphansQuery.data.orphaned_series.sample.length && ` · e.g. ${orphansQuery.data.orphaned_series.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={orphansQuery.data.sourceless_movies.count ? 'warning' : 'success'} label="Sourceless movies" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {orphansQuery.data.sourceless_movies.count}
+                {!!orphansQuery.data.sourceless_movies.sample.length && ` -- e.g. ${orphansQuery.data.sourceless_movies.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={orphansQuery.data.sourceless_episodes.count ? 'warning' : 'success'} label="Sourceless episodes" />
+              <span className="flex-1 text-muted-foreground truncate">{orphansQuery.data.sourceless_episodes.count} -- in otherwise-healthy series</span>
+            </div>
           </div>
         )}
       </SectionCard>
