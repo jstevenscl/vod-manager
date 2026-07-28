@@ -5215,11 +5215,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 {dispatcharrConnectionsQuery.data?.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
               </select>
               <input
-                className={inputCls('w-56')}
-                placeholder="Local path (e.g. /mnt/dispatcharr-recordings)"
+                className={inputCls('w-64')}
+                placeholder="Local/NFS path (optional -- e.g. /mnt/dispatcharr-recordings)"
                 value={providerForm.dvr_local_path}
                 onChange={(e) => setProviderForm({ ...providerForm, dvr_local_path: e.target.value })}
-                title="Where Dispatcharr's recordings folder is mounted inside this container -- same-host/shared-volume setups only (Phase 1a)"
+                title="Where Dispatcharr's recordings folder is mounted inside this container -- a same-host shared volume or an NFS mount both work the same way here, since either just looks like a local path once mounted in. Leave blank for a Dispatcharr instance on a separate host with no shared mount: recordings are downloaded over its API instead, one copy per recording, a little slower but needs no shared filesystem at all."
               />
               <select
                 className={inputCls()}
@@ -5267,7 +5267,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             disabled={
               !providerForm.name || addProvider.isPending ||
               (providerForm.provider_type === 'dispatcharr_dvr'
-                ? !providerForm.dispatcharr_connection_id || !providerForm.dvr_local_path.trim()
+                ? !providerForm.dispatcharr_connection_id
                 : !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username))
             }
             onClick={() => addProvider.mutate()}
