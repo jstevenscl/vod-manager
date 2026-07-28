@@ -412,6 +412,16 @@ def init_db() -> None:
     """)
     _commit_with_retry(conn)
     _migrate(conn)
+    # dispatcharr_connection_id only exists on `providers` from here on (it's
+    # an ALTER TABLE in _migrate, not a base column -- providers predates
+    # DVR support) -- this index has to wait until after that call on a
+    # genuinely fresh database, not live in the executescript above with the
+    # rest of the schema.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_one_dvr_per_connection
+            ON providers(dispatcharr_connection_id) WHERE provider_type='dispatcharr_dvr'
+    """)
+    _commit_with_retry(conn)
     _migrate_primary_dispatcharr_connection(conn)
     _migrate_encrypt_plaintext_credentials(conn)
     _seed_default_categories(conn)
@@ -617,48 +627,109 @@ def _item_savepoint(conn: sqlite3.Connection):
 def upsert_provider(
     name: str, base_url: str, username: str, password: str, max_streams: int = 0, priority: int = 0,
     provider_type: str = "xc",
-    dispatcharr_connection_id: int | None = None, dvr_local_path: str | None = None,
-    dvr_movie_category_id: int | None = None, dvr_series_category_id: int | None = None,
-    dvr_remote_recordings_root: str | None = None,
 ) -> int:
-    """base_url/username/password are meaningless for provider_type='dispatcharr_dvr'
-    (empty strings from the caller) -- a DVR source reuses an existing
-    dispatcharr_connections row for its actual url/token instead of storing
-    its own, the same way Plex leaves username blank and Emby/Jellyfin leave
-    both blank. The dispatcharr_connection_id/dvr_* fields are ignored for
-    every other provider_type. dvr_remote_recordings_root: the absolute path
-    prefix Dispatcharr's OWN recordings API reports (default "/data/recordings",
-    confirmed live) that dvr_local_path's bind-mount corresponds to -- see
-    dispatcharr_dvr_importer._strip_remote_root. Blank/None means use that
-    built-in default; only needs setting if a Dispatcharr instance is
-    configured with a different library root."""
+    """For real catalog sources (xc/plex/emby/jellyfin) only -- a DVR
+    "provider" row is never created through this path, see
+    enable_dvr_for_connection instead. base_url/username are meaningless for
+    provider_type='plex' (blank username) and 'emby'/'jellyfin' (both
+    blank), same convention every one of those importers already expects."""
     encrypted_password = encrypt_value(password)
     conn = _connect()
     row = conn.execute("SELECT id FROM providers WHERE name = ?", (name,)).fetchone()
     if row:
         conn.execute(
             """UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?,
-               dispatcharr_connection_id=?, dvr_local_path=?, dvr_movie_category_id=?, dvr_series_category_id=?,
-               dvr_remote_recordings_root=?, updated_at=? WHERE id=?""",
-            (base_url, username, encrypted_password, max_streams, priority, provider_type,
-             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-             dvr_remote_recordings_root, _now(), row["id"]),
+               updated_at=? WHERE id=?""",
+            (base_url, username, encrypted_password, max_streams, priority, provider_type, _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
         cur = conn.execute(
             """INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type,
-               dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-               dvr_remote_recordings_root, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (name, base_url, username, encrypted_password, max_streams, priority, provider_type,
-             dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-             dvr_remote_recordings_root, _now()),
+               created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (name, base_url, username, encrypted_password, max_streams, priority, provider_type, _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)
     conn.close()
     return provider_id
+
+
+# ── DVR as a connection capability, not a provider type an admin picks ──────
+# A dispatcharr_dvr providers row still has to exist underneath (the pool's
+# multi-source failover/export queries -- list_movie_sources_for_streaming
+# and friends -- JOIN providers for priority/is_active on every source type,
+# DVR included, so that part of the schema stays), but nothing above this
+# layer should ever require an admin to think in terms of "add a provider"
+# for DVR. These three functions are the only way that row gets created,
+# named after the connection itself so it reads naturally everywhere it
+# already surfaces (DVR tab, Portal Access, Metrics).
+
+def enable_dvr_for_connection(
+    connection_id: int, dvr_local_path: str | None, dvr_movie_category_id: int | None,
+    dvr_series_category_id: int | None, dvr_remote_recordings_root: str | None = None,
+    priority: int = 0,
+) -> int:
+    """Upserts the one providers row for this connection's DVR -- a second
+    call with different settings edits the existing row rather than
+    erroring, so the admin UI's enable form and edit form are the same
+    submit action. The partial unique index on (dispatcharr_connection_id)
+    WHERE provider_type='dispatcharr_dvr' is what actually enforces "one per
+    connection" at the DB layer; this function's own SELECT-then-INSERT/
+    UPDATE is just how it finds the existing row to update, not the
+    enforcement itself."""
+    connection = get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise ValueError(f"Dispatcharr connection {connection_id} not found")
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id FROM providers WHERE dispatcharr_connection_id=? AND provider_type='dispatcharr_dvr'",
+        (connection_id,),
+    ).fetchone()
+    if row:
+        conn.execute(
+            """UPDATE providers SET name=?, dvr_local_path=?, dvr_movie_category_id=?, dvr_series_category_id=?,
+               dvr_remote_recordings_root=?, priority=?, is_active=1, updated_at=? WHERE id=?""",
+            (connection["label"], dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
+             dvr_remote_recordings_root, priority, _now(), row["id"]),
+        )
+        provider_id = row["id"]
+    else:
+        cur = conn.execute(
+            """INSERT INTO providers
+               (name, base_url, username, password, max_streams, priority, provider_type, is_active,
+                dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
+                dvr_remote_recordings_root, created_at)
+               VALUES (?,'','','',0,?,'dispatcharr_dvr',1,?,?,?,?,?,?)""",
+            (connection["label"], priority, connection_id, dvr_local_path, dvr_movie_category_id,
+             dvr_series_category_id, dvr_remote_recordings_root, _now()),
+        )
+        provider_id = cur.lastrowid
+    _commit_with_retry(conn)
+    conn.close()
+    return provider_id
+
+
+def disable_dvr_for_connection(connection_id: int) -> None:
+    """Deletes the DVR providers row for this connection -- the existing
+    ON DELETE CASCADE on movie_sources/episode_sources/dvr_recording_profiles/
+    dvr_user_limits/portal_accounts/dvr_recording_failures already tears
+    everything else down, identically to today's admin "Delete provider"."""
+    provider = get_dvr_provider_for_connection(connection_id)
+    if not provider:
+        return
+    delete_provider(provider["id"])
+
+
+def get_dvr_provider_for_connection(connection_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM providers WHERE dispatcharr_connection_id=? AND provider_type='dispatcharr_dvr'",
+        (connection_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> dict[str, int]:

@@ -3081,8 +3081,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const deleteDispatcharrConnection = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/dispatcharr-connections/${id}/`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] }),
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const [revealedConnId, setRevealedConnId] = useState<number | null>(null)
+
+  // DVR is a capability of a connection, not a separate "provider" the
+  // admin adds elsewhere -- see backend/vod_db.py's enable_dvr_for_connection
+  // docstring for why a providers row still exists underneath (the pool's
+  // multi-source failover/export queries need it), even though nothing here
+  // ever calls it that. dvrModalConnectionId drives the DVR settings Modal
+  // below the Dispatcharr Connections table.
+  const [dvrModalConnectionId, setDvrModalConnectionId] = useState<number | null>(null)
+  const [dvrModalForm, setDvrModalForm] = useState({
+    dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '', priority: '0',
+  })
+  const enableDvrForConnection = useMutation({
+    mutationFn: (connectionId: number) => api.post(`/vod/dispatcharr-connections/${connectionId}/dvr/`, {
+      dvr_local_path: dvrModalForm.dvr_local_path.trim() || null,
+      dvr_movie_category_id: dvrModalForm.dvr_movie_category_id ? Number(dvrModalForm.dvr_movie_category_id) : null,
+      dvr_series_category_id: dvrModalForm.dvr_series_category_id ? Number(dvrModalForm.dvr_series_category_id) : null,
+      priority: Number(dvrModalForm.priority) || 0,
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setDvrModalConnectionId(null)
+    },
+  })
+  const disableDvrForConnection = useMutation({
+    mutationFn: (connectionId: number) => api.delete(`/vod/dispatcharr-connections/${connectionId}/dvr/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setDvrModalConnectionId(null)
+    },
+  })
 
   // Automated one-shot: creates the XC client + Dispatcharr-side M3U
   // account + saved connection in one step instead of doing all three by
@@ -3432,34 +3463,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [providerForm, setProviderForm] = useState({
     name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0',
-    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr',
-    dispatcharr_connection_id: '', dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '',
+    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin',
   })
   const addProvider = useMutation({
     mutationFn: () => api.post('/vod/providers/', {
       name: providerForm.name,
-      // base_url/username/password are meaningless for a DVR provider --
-      // it reuses an existing Dispatcharr Connection's own url/token
-      // instead (see vod_db.upsert_provider's docstring).
-      base_url: providerForm.provider_type === 'dispatcharr_dvr' ? '' : providerForm.base_url,
+      base_url: providerForm.base_url,
       username: providerForm.provider_type === 'xc' ? providerForm.username : '',
-      password: providerForm.provider_type === 'dispatcharr_dvr' ? '' : providerForm.password,
+      password: providerForm.password,
       max_streams: Number(providerForm.max_streams) || 0,
       priority: Number(providerForm.priority) || 0, provider_type: providerForm.provider_type,
-      dispatcharr_connection_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dispatcharr_connection_id
-        ? Number(providerForm.dispatcharr_connection_id) : null,
-      dvr_local_path: providerForm.provider_type === 'dispatcharr_dvr' ? providerForm.dvr_local_path.trim() || null : null,
-      dvr_movie_category_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dvr_movie_category_id
-        ? Number(providerForm.dvr_movie_category_id) : null,
-      dvr_series_category_id: providerForm.provider_type === 'dispatcharr_dvr' && providerForm.dvr_series_category_id
-        ? Number(providerForm.dvr_series_category_id) : null,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
-      setProviderForm({
-        name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc',
-        dispatcharr_connection_id: '', dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '',
-      })
+      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc' })
     },
   })
   const syncProvider = useMutation({
@@ -4742,11 +4759,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <th className="pb-1 font-normal">URL</th>
               <th className="pb-1 font-normal">Token</th>
               <th className="pb-1 font-normal">VOD-relay account ID</th>
+              <th className="pb-1 font-normal">DVR</th>
               <th className="pb-1 font-normal"></th>
             </tr>
           </thead>
           <tbody>
-            {dispatcharrConnectionsQuery.data?.map((c) => (
+            {dispatcharrConnectionsQuery.data?.map((c) => {
+              const dvrProvider = providersQuery.data?.find((p) => p.provider_type === 'dispatcharr_dvr' && p.dispatcharr_connection_id === c.id)
+              return (
               <tr key={c.id} className="border-t border-border/50">
                 <td className="py-1 pr-2">
                   <input
@@ -4794,6 +4814,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     )}
                   </div>
                 </td>
+                <td className="py-1 pr-2">
+                  <Button
+                    size="sm" variant="outline"
+                    onClick={() => {
+                      setDvrModalForm({
+                        dvr_local_path: dvrProvider?.dvr_local_path ?? '',
+                        dvr_movie_category_id: dvrProvider?.dvr_movie_category_id ? String(dvrProvider.dvr_movie_category_id) : '',
+                        dvr_series_category_id: dvrProvider?.dvr_series_category_id ? String(dvrProvider.dvr_series_category_id) : '',
+                        priority: dvrProvider ? String(dvrProvider.priority) : '0',
+                      })
+                      setDvrModalConnectionId(c.id)
+                    }}
+                  >
+                    <CalendarClock size={12} className="mr-1" /> {dvrProvider ? 'DVR ✓' : 'Enable DVR'}
+                  </Button>
+                </td>
                 <td className="py-1">
                   <button
                     title="Delete connection"
@@ -4804,7 +4840,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </button>
                 </td>
               </tr>
-            ))}
+              )
+            })}
           </tbody>
         </table>
         <div className="flex items-center gap-1.5 pt-2">
@@ -4816,6 +4853,98 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
         </div>
       </SectionCard>
+
+      {dvrModalConnectionId != null && (() => {
+        const connection = dispatcharrConnectionsQuery.data?.find((c) => c.id === dvrModalConnectionId)
+        const dvrProvider = providersQuery.data?.find((p) => p.provider_type === 'dispatcharr_dvr' && p.dispatcharr_connection_id === dvrModalConnectionId)
+        return (
+        <Modal onClose={() => setDvrModalConnectionId(null)} maxWidth="max-w-lg">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">DVR — {connection?.label}</h2>
+            <p className="text-sm text-muted-foreground">
+              Pulls finished recordings from this Dispatcharr connection into the pool, and lets people schedule new
+              ones (Scheduled tab, or their own self-service portal).
+            </p>
+            <div className="space-y-2">
+              <input
+                className={inputCls('w-full')}
+                placeholder="Local/NFS path (optional -- e.g. /mnt/dispatcharr-recordings)"
+                value={dvrModalForm.dvr_local_path}
+                onChange={(e) => setDvrModalForm({ ...dvrModalForm, dvr_local_path: e.target.value })}
+                title="Where this Dispatcharr instance's recordings folder is mounted inside this container -- a same-host shared volume or an NFS mount both work the same way here, since either just looks like a local path once mounted in. Leave blank for a Dispatcharr instance on a separate host with no shared mount: recordings are downloaded over its API instead, one copy per recording, a little slower but needs no shared filesystem at all."
+              />
+              <div className="flex items-center gap-1.5">
+                <select
+                  className={inputCls('flex-1')}
+                  value={dvrModalForm.dvr_movie_category_id}
+                  onChange={(e) => setDvrModalForm({ ...dvrModalForm, dvr_movie_category_id: e.target.value })}
+                  title="Recorded movies are placed here automatically on import"
+                >
+                  <option value="">Movie category (optional)…</option>
+                  {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <select
+                  className={inputCls('flex-1')}
+                  value={dvrModalForm.dvr_series_category_id}
+                  onChange={(e) => setDvrModalForm({ ...dvrModalForm, dvr_series_category_id: e.target.value })}
+                  title="Recorded TV episodes' series are placed here automatically on import"
+                >
+                  <option value="">TV category (optional)…</option>
+                  {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <input
+                  className={inputCls('w-20')}
+                  type="number"
+                  placeholder="Priority"
+                  value={dvrModalForm.priority}
+                  onChange={(e) => setDvrModalForm({ ...dvrModalForm, priority: e.target.value })}
+                  title="Only matters if the same movie/episode also comes from another provider -- higher priority streams first"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between pt-1">
+              {dvrProvider ? (
+                <button
+                  className="text-xs text-destructive hover:underline flex items-center gap-1"
+                  onClick={() => {
+                    if (confirm(`Disable DVR for "${connection?.label}"? Its recording rules, upcoming recordings, per-person limits, and portal accounts will all be removed.`)) {
+                      disableDvrForConnection.mutate(dvrModalConnectionId)
+                    }
+                  }}
+                >
+                  <Trash2 size={12} /> Disable DVR
+                </button>
+              ) : <span />}
+              <div className="flex items-center gap-1.5">
+                {dvrProvider && (
+                  <Button
+                    size="sm" variant="outline"
+                    onClick={() => {
+                      setRecordingProfilesProviderId(dvrProvider.id)
+                      setRecordingProfileForm(blankRecordingProfileForm)
+                      setEpgSearchTitle('')
+                      epgSearch.reset()
+                      setRecordingProfileResult(null)
+                      setRecordingProfileError(null)
+                      setActiveTab('dvr')
+                      setDvrModalConnectionId(null)
+                    }}
+                  >
+                    Manage Recordings
+                  </Button>
+                )}
+                <Button
+                  size="sm" disabled={enableDvrForConnection.isPending}
+                  onClick={() => enableDvrForConnection.mutate(dvrModalConnectionId)}
+                >
+                  {enableDvrForConnection.isPending ? <Loader2 size={12} className="animate-spin" /> : (dvrProvider ? 'Save' : 'Enable DVR')}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </Modal>
+        )
+      })()}
 
       <SectionCard title="Backup & Restore" icon={<HardDriveDownload size={14} />}>
         <p className="text-xs text-muted-foreground">
@@ -4987,7 +5116,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
         <p className="text-sm text-muted-foreground">
-          Every source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin, and Dispatcharr DVR connections.
+          Every catalog source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin. (DVR is enabled per Dispatcharr
+          connection in Configuration, not added here.)
         </p>
         <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-xs min-w-[1100px]">
@@ -5007,7 +5137,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </tr>
           </thead>
           <tbody>
-            {providersQuery.data?.map((p) => (
+            {providersQuery.data?.filter((p) => p.provider_type !== 'dispatcharr_dvr').map((p) => (
               <tr key={p.id} className={`border-t border-border ${!p.is_active ? 'opacity-50' : ''}`}>
                 <td className="py-2 px-2">
                   <span className="flex items-center gap-1.5 flex-wrap">
@@ -5153,23 +5283,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   >
                     Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
                   </Button>
-                  {p.provider_type === 'dispatcharr_dvr' && (
-                    <Button
-                      size="sm" variant="outline"
-                      title="Manage this provider's recording rules, upcoming recordings, users, and library"
-                      onClick={() => {
-                        setRecordingProfilesProviderId(p.id)
-                        setRecordingProfileForm(blankRecordingProfileForm)
-                        setEpgSearchTitle('')
-                        epgSearch.reset()
-                        setRecordingProfileResult(null)
-                        setRecordingProfileError(null)
-                        setActiveTab('dvr')
-                      }}
-                    >
-                      <CalendarClock size={12} className="mr-1" /> DVR
-                    </Button>
-                  )}
                   <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
@@ -5194,81 +5307,37 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <select
             className={inputCls()}
             value={providerForm.provider_type}
-            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr' })}
+            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' })}
           >
             <option value="xc">Xtream-Codes</option>
             <option value="plex">Plex</option>
             <option value="emby">Emby</option>
             <option value="jellyfin">Jellyfin</option>
-            <option value="dispatcharr_dvr">Dispatcharr DVR</option>
           </select>
           <input className={inputCls()} placeholder="Name" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} />
-          {providerForm.provider_type === 'dispatcharr_dvr' ? (
-            <>
-              <select
-                className={inputCls()}
-                value={providerForm.dispatcharr_connection_id}
-                onChange={(e) => setProviderForm({ ...providerForm, dispatcharr_connection_id: e.target.value })}
-                title="The Dispatcharr instance whose finished DVR recordings this pulls from"
-              >
-                <option value="">Dispatcharr connection…</option>
-                {dispatcharrConnectionsQuery.data?.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </select>
-              <input
-                className={inputCls('w-64')}
-                placeholder="Local/NFS path (optional -- e.g. /mnt/dispatcharr-recordings)"
-                value={providerForm.dvr_local_path}
-                onChange={(e) => setProviderForm({ ...providerForm, dvr_local_path: e.target.value })}
-                title="Where Dispatcharr's recordings folder is mounted inside this container -- a same-host shared volume or an NFS mount both work the same way here, since either just looks like a local path once mounted in. Leave blank for a Dispatcharr instance on a separate host with no shared mount: recordings are downloaded over its API instead, one copy per recording, a little slower but needs no shared filesystem at all."
-              />
-              <select
-                className={inputCls()}
-                value={providerForm.dvr_movie_category_id}
-                onChange={(e) => setProviderForm({ ...providerForm, dvr_movie_category_id: e.target.value })}
-                title="Recorded movies are placed here automatically on import"
-              >
-                <option value="">Movie category (optional)…</option>
-                {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <select
-                className={inputCls()}
-                value={providerForm.dvr_series_category_id}
-                onChange={(e) => setProviderForm({ ...providerForm, dvr_series_category_id: e.target.value })}
-                title="Recorded TV episodes' series are placed here automatically on import"
-              >
-                <option value="">TV category (optional)…</option>
-                {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-            </>
-          ) : (
-            <>
-              <input
-                className={inputCls()}
-                placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : 'Base URL (e.g. http://host:8096)'}
-                value={providerForm.base_url}
-                onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
-              />
-              {providerForm.provider_type === 'xc' && (
-                <input className={inputCls()} placeholder="Username" value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
-              )}
-              <input
-                className={inputCls()}
-                type="password"
-                placeholder={providerForm.provider_type === 'plex' ? 'Plex token (X-Plex-Token)' : providerForm.provider_type === 'xc' ? 'Password' : 'API key'}
-                value={providerForm.password}
-                onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
-              />
-            </>
+          <input
+            className={inputCls()}
+            placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : 'Base URL (e.g. http://host:8096)'}
+            value={providerForm.base_url}
+            onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
+          />
+          {providerForm.provider_type === 'xc' && (
+            <input className={inputCls()} placeholder="Username" value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
           )}
+          <input
+            className={inputCls()}
+            type="password"
+            placeholder={providerForm.provider_type === 'plex' ? 'Plex token (X-Plex-Token)' : providerForm.provider_type === 'xc' ? 'Password' : 'API key'}
+            value={providerForm.password}
+            onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
+          />
           <input className={inputCls('w-24')} type="number" placeholder="Max streams" value={providerForm.max_streams} onChange={(e) => setProviderForm({ ...providerForm, max_streams: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Priority" value={providerForm.priority} onChange={(e) => setProviderForm({ ...providerForm, priority: e.target.value })} />
           <Button
             size="sm"
             disabled={
               !providerForm.name || addProvider.isPending ||
-              (providerForm.provider_type === 'dispatcharr_dvr'
-                ? !providerForm.dispatcharr_connection_id
-                : !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username))
+              !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username)
             }
             onClick={() => addProvider.mutate()}
           >
@@ -5516,7 +5585,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         {!dvrProviders.length ? (
           <SectionCard title="DVR" icon={<CalendarClock size={14} />}>
             <p className="text-xs text-muted-foreground">
-              No Dispatcharr DVR provider configured yet. Add one from Providers.
+              DVR isn't enabled on any Dispatcharr connection yet. Go to Configuration → Dispatcharr Connections and click "Enable DVR" on the one you want to use.
             </p>
           </SectionCard>
         ) : (

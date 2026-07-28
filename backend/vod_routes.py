@@ -135,14 +135,14 @@ class ProviderRequest(BaseModel):
     max_streams: int = 0
     priority: int = 0
     provider_type: str = "xc"
-    # Only meaningful for provider_type='dispatcharr_dvr' -- base_url/
-    # username/password are left blank by the frontend for a DVR provider,
-    # same convention as Plex (blank username) and Emby/Jellyfin (both blank).
-    dispatcharr_connection_id: Optional[int] = None
+
+
+class EnableDvrRequest(BaseModel):
     dvr_local_path: Optional[str] = None
     dvr_movie_category_id: Optional[int] = None
     dvr_series_category_id: Optional[int] = None
     dvr_remote_recordings_root: Optional[str] = None
+    priority: int = 0
 
 
 class RecordingProfileRequest(BaseModel):
@@ -510,7 +510,31 @@ async def update_dispatcharr_connection(connection_id: int, body: DispatcharrCon
 async def delete_dispatcharr_connection(connection_id: int):
     if not vod_db.get_dispatcharr_connection(connection_id):
         raise HTTPException(404, detail="connection not found")
+    if vod_db.get_dvr_provider_for_connection(connection_id):
+        raise HTTPException(409, detail="DVR is still enabled for this connection -- disable it first")
     vod_db.delete_dispatcharr_connection(connection_id)
+    return {"ok": True}
+
+
+@router.post("/dispatcharr-connections/{connection_id}/dvr/", dependencies=_GUARDS)
+async def enable_dvr_for_connection(connection_id: int, body: EnableDvrRequest):
+    """The only way a dispatcharr_dvr providers row ever gets created --
+    see vod_db.enable_dvr_for_connection's docstring. Safe to call again
+    with different settings; it edits the existing row rather than erroring,
+    so the admin UI's enable form and edit form are the same submit action."""
+    try:
+        provider_id = vod_db.enable_dvr_for_connection(
+            connection_id, body.dvr_local_path, body.dvr_movie_category_id, body.dvr_series_category_id,
+            body.dvr_remote_recordings_root, body.priority,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+    return vod_db.get_provider(provider_id)
+
+
+@router.delete("/dispatcharr-connections/{connection_id}/dvr/", dependencies=_GUARDS)
+async def disable_dvr_for_connection(connection_id: int):
+    vod_db.disable_dvr_for_connection(connection_id)
     return {"ok": True}
 
 
@@ -751,15 +775,16 @@ async def list_providers():
 
 @router.post("/providers/", dependencies=_GUARDS)
 async def upsert_provider(body: ProviderRequest):
+    if body.provider_type == "dispatcharr_dvr":
+        raise HTTPException(
+            400, detail="DVR isn't a provider you add here -- enable it on a Dispatcharr Connection in Configuration instead.",
+        )
     password = body.password.strip()
     if not password:
         existing = next((p for p in vod_db.list_providers() if p["name"] == body.name), None)
         password = existing["password"] if existing else ""
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
-        dispatcharr_connection_id=body.dispatcharr_connection_id, dvr_local_path=body.dvr_local_path,
-        dvr_movie_category_id=body.dvr_movie_category_id, dvr_series_category_id=body.dvr_series_category_id,
-        dvr_remote_recordings_root=body.dvr_remote_recordings_root,
     )
 
     sync_error = None
