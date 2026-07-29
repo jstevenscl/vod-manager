@@ -16,6 +16,7 @@ from config import (
     get_lockout_settings,
     get_openai_api_key,
     get_refresh_settings,
+    get_smtp_settings,
     get_tmdb_api_key,
     save_ai_provider,
     save_anthropic_api_key,
@@ -24,6 +25,7 @@ from config import (
     save_lockout_settings,
     save_openai_api_key,
     save_refresh_settings,
+    save_smtp_settings,
     save_tmdb_api_key,
     set_default_categories_prompt_dismissed,
 )
@@ -54,6 +56,16 @@ vod_db.init_db()
 
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
+
+
+class SmtpSettingsRequest(BaseModel):
+    host: Optional[str] = None
+    port: int = 587
+    username: Optional[str] = None
+    password: Optional[str] = None
+    from_address: Optional[str] = None
+    use_tls: bool = True
+    admin_recipients: list[str] = []
 
 
 class AiProviderRequest(BaseModel):
@@ -192,6 +204,9 @@ class DvrUserLimitRequest(BaseModel):
     disk_quota_bytes: Optional[int] = None
     retention_max_age_days: Optional[int] = None
     retention_max_episodes_per_show: Optional[int] = None
+    default_movie_category_id: Optional[int] = None
+    default_series_category_id: Optional[int] = None
+    quota_policy: str = "hard_fail"
 
 
 class DvrUserLimitUpdateRequest(BaseModel):
@@ -199,6 +214,9 @@ class DvrUserLimitUpdateRequest(BaseModel):
     disk_quota_bytes: Optional[int] = None
     retention_max_age_days: Optional[int] = None
     retention_max_episodes_per_show: Optional[int] = None
+    default_movie_category_id: Optional[int] = None
+    default_series_category_id: Optional[int] = None
+    quota_policy: Optional[str] = None
 
 
 class ApplyRetentionRequest(BaseModel):
@@ -211,10 +229,15 @@ class PortalAccountRequest(BaseModel):
     dispatcharr_user_id: int
     username: str
     password: str
+    email: Optional[str] = None
 
 
 class PortalAccountPasswordRequest(BaseModel):
     password: str
+
+
+class PortalAccountEmailRequest(BaseModel):
+    email: Optional[str] = None
 
 
 class DispatcharrConnectionRequest(BaseModel):
@@ -565,6 +588,31 @@ async def get_tmdb_settings():
 @router.post("/tmdb-settings/", dependencies=_GUARDS)
 async def save_tmdb_settings(body: TmdbApiKeyRequest):
     save_tmdb_api_key(body.api_key)
+    return {"ok": True}
+
+
+@router.get("/smtp-settings/", dependencies=_GUARDS)
+async def get_smtp_settings_route():
+    """The real password is never sent back to the browser (same pattern
+    as tmdb-settings above) -- has_password tells the settings form
+    whether one's already configured, so it can show a "leave blank to
+    keep the current password" placeholder instead of an empty required
+    field. Powers notifications.notify_quota_threshold's admin recipient
+    list, see the user's 'Both' call, 2026-07-28."""
+    settings = get_smtp_settings()
+    return {
+        "host": settings["host"], "port": settings["port"], "username": settings["username"],
+        "has_password": bool(settings["password"]), "from_address": settings["from_address"],
+        "use_tls": settings["use_tls"], "admin_recipients": settings["admin_recipients"],
+    }
+
+
+@router.post("/smtp-settings/", dependencies=_GUARDS)
+async def save_smtp_settings_route(body: SmtpSettingsRequest):
+    save_smtp_settings(
+        body.host, body.port, body.username, body.password,
+        body.from_address, body.use_tls, body.admin_recipients,
+    )
     return {"ok": True}
 
 
@@ -1144,7 +1192,7 @@ async def create_recording_profile(body: RecordingProfileRequest):
 
     No collision guard against a duplicate (title, channel_id) profile
     anymore -- schedule_channel_recordings is naturally idempotent (it skips
-    any airing already scheduled, see _episode_identity_key), so a second
+    any airing already scheduled, see episode_identity_key), so a second
     profile for the same show+channel just means a second person wants it,
     which vod_db.match_recording_profiles' fan-out already handles by
     design, not a collision to block.
@@ -1401,7 +1449,20 @@ async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveReq
         rule = vod_db.find_recording_profile_for_title(body.provider_id, series["name"])
         mode = (rule or {}).get("backfill_mode") or "pointer"
         provider = vod_db.get_provider(body.provider_id)
-        target_category_id = (rule or {}).get("target_series_category_id") or (provider or {}).get("dvr_series_category_id")
+        # Same three-tier fallback as the main import pass (rule's own
+        # category -> rule owner's personal default -> provider default) --
+        # see dispatcharr_dvr_importer.py's Phase 2 comment for why the
+        # personal-default tier matters (portal users have no way to set a
+        # category on their own rules at all).
+        user_default_series_category_id = None
+        if rule and rule.get("dispatcharr_user_id"):
+            owner_limit = vod_db.get_dvr_user_limit(body.provider_id, rule["dispatcharr_user_id"])
+            user_default_series_category_id = (owner_limit or {}).get("default_series_category_id")
+        target_category_id = (
+            (rule or {}).get("target_series_category_id")
+            or user_default_series_category_id
+            or (provider or {}).get("dvr_series_category_id")
+        )
         try:
             if mode == "download":
                 await dispatcharr_dvr_importer._apply_download_backfill(match, body.provider_id)
@@ -1547,19 +1608,27 @@ async def create_dvr_user_limit(body: DvrUserLimitRequest):
         raise HTTPException(
             409, detail=f"{body.dispatcharr_username} already has DVR limits configured for this provider.",
         )
+    if body.quota_policy not in ("hard_fail", "delete_oldest"):
+        raise HTTPException(422, detail="quota_policy must be 'hard_fail' or 'delete_oldest'")
     limit_id = vod_db.create_dvr_user_limit(
         body.provider_id, body.dispatcharr_user_id, body.dispatcharr_username,
         body.stream_reserve, body.disk_quota_bytes,
         body.retention_max_age_days, body.retention_max_episodes_per_show,
+        body.default_movie_category_id, body.default_series_category_id,
+        body.quota_policy,
     )
     return vod_db.get_dvr_user_limit(body.provider_id, body.dispatcharr_user_id) or {"id": limit_id}
 
 
 @router.post("/dvr-user-limits/{limit_id}/", dependencies=_GUARDS)
 async def update_dvr_user_limit(limit_id: int, body: DvrUserLimitUpdateRequest):
+    if body.quota_policy is not None and body.quota_policy not in ("hard_fail", "delete_oldest"):
+        raise HTTPException(422, detail="quota_policy must be 'hard_fail' or 'delete_oldest'")
     vod_db.update_dvr_user_limit(
         limit_id, body.stream_reserve, body.disk_quota_bytes,
         body.retention_max_age_days, body.retention_max_episodes_per_show,
+        body.default_movie_category_id, body.default_series_category_id,
+        body.quota_policy,
     )
     return {"ok": True}
 
@@ -1642,7 +1711,21 @@ async def create_portal_account(body: PortalAccountRequest):
     if existing:
         raise HTTPException(409, detail="This person already has a portal account for this provider")
     salt, hashed = hash_password(body.password)
-    account_id = vod_db.create_portal_account(body.provider_id, body.dispatcharr_user_id, body.username, salt, hashed)
+    account_id = vod_db.create_portal_account(
+        body.provider_id, body.dispatcharr_user_id, body.username, salt, hashed, body.email,
+    )
+    return _redact_portal_account(vod_db.get_portal_account(account_id))
+
+
+@router.post("/portal-accounts/{account_id}/email/", dependencies=_GUARDS)
+async def update_portal_account_email(account_id: int, body: PortalAccountEmailRequest):
+    """Admin edit of the same field portal_routes.portal_update_email lets
+    the person set for themselves -- e.g. onboarding them with an email up
+    front at creation, or fixing/adding one later without waiting for them
+    to log in and do it themselves."""
+    if not vod_db.get_portal_account(account_id):
+        raise HTTPException(404, detail="portal account not found")
+    vod_db.set_portal_account_email(account_id, (body.email or "").strip() or None)
     return _redact_portal_account(vod_db.get_portal_account(account_id))
 
 

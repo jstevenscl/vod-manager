@@ -52,6 +52,7 @@ import hashlib
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 import httpx
@@ -59,6 +60,7 @@ import httpx
 import config
 import dispatcharr_dvr_client
 from dispatcharr_dvr_client import _parse_iso
+import notifications
 import tmdb_sync
 import vod_db
 import xc_server
@@ -178,17 +180,31 @@ def _guess_title(recording: dict, program: dict, file_path: str | None) -> str:
     return f"Recording {recording.get('id')}"
 
 
+def _normalize_title_for_match(s: str) -> str:
+    """Strips accents/diacritics before the exact-match comparison in
+    _enrich_from_tmdb -- confirmed live 2026-07-29: Dispatcharr's own EPG
+    called a real show "Crime Exposé With Nancy O'Dell" while TMDB's own
+    title for the exact same show is "Crime Expose with Nancy O'Dell" (no
+    accent) -- a byte-for-byte exact match would reject this as "no
+    confident match" even though it plainly is one. NFKD-normalizing and
+    dropping combining marks (the accent itself) before comparing makes
+    "é"/"e" equivalent without loosening the match to a fuzzy/substring
+    one -- still exact on every letter, just accent-insensitive."""
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)).strip().lower()
+
+
 async def _enrich_from_tmdb(title: str, content_type: str) -> dict:
     """Conservative: only auto-applies when a candidate's title matches
-    exactly (case-insensitive) -- search_title() already sorts exact
-    matches first, so the top candidate is checked directly rather than
-    picking whichever TMDB ranks highest by popularity. No match found (or
-    TMDB not configured) just means less detail, never an error -- a DVR
-    recording without a confident TMDB match still imports, same as any
-    provider item that fails enrichment. Note: search_title doesn't resolve
-    genre names (TMDB's search endpoint only returns numeric genre ids),
-    so genre is deliberately not set here -- left for a human/AI-assist
-    pass later, same as any other import with no genre available."""
+    exactly (case/accent-insensitive, see _normalize_title_for_match) --
+    search_title() already sorts exact matches first, so the top candidate
+    is checked directly rather than picking whichever TMDB ranks highest by
+    popularity. No match found (or TMDB not configured) just means less
+    detail, never an error -- a DVR recording without a confident TMDB
+    match still imports, same as any provider item that fails enrichment.
+    Note: search_title doesn't resolve genre names (TMDB's search endpoint
+    only returns numeric genre ids), so genre is deliberately not set here
+    -- left for a human/AI-assist pass later, same as any other import with
+    no genre available."""
     try:
         candidates = await tmdb_sync.search_title(title, content_type)
     except Exception as exc:
@@ -197,7 +213,7 @@ async def _enrich_from_tmdb(title: str, content_type: str) -> dict:
     if not candidates:
         return {}
     top = candidates[0]
-    if (top.get("name") or "").strip().lower() != title.strip().lower():
+    if _normalize_title_for_match(top.get("name") or "") != _normalize_title_for_match(title):
         return {}
     return {
         "tmdb_id": top.get("tmdb_id"),
@@ -234,11 +250,36 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
 
     recordings = await dispatcharr_dvr_client.list_completed_recordings(connection)
     remote_root = provider.get("dvr_remote_recordings_root") or _DEFAULT_REMOTE_RECORDINGS_ROOT
+    vod_db.cleanup_stale_recording_claims()
 
     movie_items = []
     series_items: dict[str, dict] = {}
     local_paths_by_stream_id: dict[str, str] = {}
     profile_by_stream_id: dict[str, list[dict]] = {}
+    # A stream_id already registered as an episode (an earlier pass whose
+    # season/episode resolution succeeded, or a manual repair) must never be
+    # reclassified as a movie just because THIS pass's resolution came up
+    # empty -- see provider_stream_ids_with_episode_source's own docstring
+    # for the real recurrence this prevents.
+    known_episode_stream_ids = vod_db.provider_stream_ids_with_episode_source(provider_id)
+    # Fallback attribution for a TRUE single (portal_routes.
+    # portal_schedule_single's "Record this episode" -- no dvr_recording_
+    # profiles row at all, so profile_by_stream_id is always empty for it).
+    # create_recording already stamps custom_properties.scheduled_by onto
+    # the Dispatcharr Recording itself; this just reads it back so the
+    # attribution pass below has something to fall back to when no profile
+    # matched. Real gap found live 2026-07-28: every single ever recorded
+    # was invisible in its own portal user's Library until this existed.
+    scheduled_by_user_by_stream_id: dict[str, int | None] = {}
+    # Identity/channel per recording -- needed to consume any pending_
+    # recording_claims (portal_schedule_single's "Bill scheduled this while
+    # it was still recording" path) the moment each recording actually
+    # imports. Computed the exact same way find_existing_recording does for
+    # a live not-yet-completed Recording, so a claim made against the live
+    # API and the same recording read back here after completion always
+    # produce an identical key.
+    channel_id_by_stream_id: dict[str, int | None] = {}
+    identity_key_by_stream_id: dict[str, str] = {}
     skipped = 0
     downloaded = 0
     download_errors = 0
@@ -250,6 +291,13 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
             skipped += 1
             continue
         recording_id = str(recording["id"])
+        scheduled_by_user_by_stream_id[recording_id] = (
+            (recording.get("custom_properties") or {}).get("scheduled_by") or {}
+        ).get("dispatcharr_user_id")
+        channel_id_by_stream_id[recording_id] = recording.get("channel")
+        identity_key_by_stream_id[recording_id] = dispatcharr_dvr_client.episode_identity_key(
+            (recording.get("custom_properties") or {}).get("program") or {}
+        )
         if download_mode:
             # This is VOD Manager's own copy (Phase 1b), fully under our
             # control, unlike Phase 1a's shared-volume reference to a file
@@ -313,6 +361,13 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 "provider_stream_id": recording_id, "container_extension": container_extension,
                 "file_size_bytes": file_info.get("bytes_written"),
             })
+        elif recording_id in known_episode_stream_ids:
+            # This exact recording already lives correctly as an episode --
+            # this pass's season/episode resolution just came up empty (a
+            # stale Dispatcharr-side Recording predating a since-fixed
+            # capture bug, most commonly), not a sign it's actually a movie.
+            # Leave the existing episode alone rather than duplicating it.
+            pass
         else:
             movie_items.append({
                 "name": title, "year": None, "provider_stream_id": recording_id,
@@ -325,19 +380,32 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     # TMDB enrichment pass -- one search per distinct title, not per
     # recording, since multiple episodes/movies can share a title. Only
     # fills gaps (item.get(k) falsy) rather than overwriting unconditionally
-    # -- Dispatcharr's own EPG match (description, poster_url) is specific
-    # to this exact episode/instance, a higher-confidence source than a
-    # conservative exact-title search against the general show/movie, so it
-    # must win when both are present.
+    # -- Dispatcharr's own EPG match (description) is specific to this
+    # exact episode/instance, a higher-confidence source than a conservative
+    # exact-title search against the general show/movie, so it must win
+    # when both are present.
+    #
+    # poster_url is the one deliberate exception -- TMDB always wins there
+    # when it has a confident match, even overwriting an EPG poster_url that
+    # was already set. Real gap found live 2026-07-29: Dispatcharr's own EPG
+    # poster_url is a live-TV listing thumbnail (channel logo, or -- for
+    # General Hospital specifically -- a wide cast-photo montage), not
+    # actual portrait poster art; TMDB had a real poster for it the whole
+    # time but the old gap-fill-only rule meant it could never win once the
+    # EPG had supplied ANYTHING at all, which is effectively always.
     for item in movie_items:
         detail = await _enrich_from_tmdb(item["name"], "movie")
         for k, v in detail.items():
-            if v and not item.get(k):
+            if not v:
+                continue
+            if k == "poster_url" or not item.get(k):
                 item[k] = v
     for item in series_items.values():
         detail = await _enrich_from_tmdb(item["name"], "series")
         for k, v in detail.items():
-            if v and k != "year" and not item.get(k):  # a series' year comes from its earliest season, not one TMDB lookup here
+            if not v or k == "year":  # a series' year comes from its earliest season, not one TMDB lookup here
+                continue
+            if k == "poster_url" or not item.get(k):
                 item[k] = v
 
     movie_result = vod_db.bulk_import_plex_movies(provider_id, movie_items)
@@ -346,59 +414,190 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
     series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
 
-    # Attribute each recording to (one of) the profile(s) that scheduled it
-    # -- powers the end-user portal's "my completed recordings" library
-    # (vod_db.list_portal_library_movies/episodes), which has no other way
-    # to know which person a given recording belongs to. See
-    # set_movie_source_recording_profile's docstring for the single-owner
-    # caveat when more than one profile matched.
+    # Attribute each recording to EVERY profile owner that matched it, not
+    # just one -- match_recording_profiles' own docstring already documented
+    # that two different people can each have their own profile match the
+    # very same airing (Dispatcharr only ever produces one physical
+    # Recording regardless), and category placement below has always
+    # unioned all of their target categories. Library OWNERSHIP never did
+    # the same thing until now -- it kept a single recording_profile_id
+    # "winner" (profiles[0]) that decided who could see this in their
+    # portal Library, so the second person's profile matched for category
+    # purposes but their Library silently never got it. Real requirement
+    # from the user, 2026-07-28: if Bill schedules something Emby already
+    # has, Bill needs it in HIS library too, attached to the same file, and
+    # each of them removing it from their own Library must never affect the
+    # other's -- see movie_source_owners' own table comment. The old single
+    # recording_profile_id column is still set (to profiles[0]) purely as
+    # informal "which profile literally created this" metadata; it no
+    # longer decides who can see this recording.
     for stream_id, profiles in profile_by_stream_id.items():
-        if not profiles:
-            continue
-        owner_profile_id = profiles[0]["id"]
-        if stream_id in movie_id_by_stream_id:
-            vod_db.set_movie_source_recording_profile(provider_id, stream_id, owner_profile_id)
-        elif stream_id in series_id_by_stream_id:
-            vod_db.set_episode_source_recording_profile(provider_id, stream_id, owner_profile_id)
+        is_movie = stream_id in movie_id_by_stream_id
+        is_episode = stream_id in series_id_by_stream_id
+        if profiles:
+            owner_profile_id = profiles[0]["id"]
+            if is_movie:
+                vod_db.set_movie_source_recording_profile(provider_id, stream_id, owner_profile_id)
+            elif is_episode:
+                vod_db.set_episode_source_recording_profile(provider_id, stream_id, owner_profile_id)
+            owner_user_ids = {p["dispatcharr_user_id"] for p in profiles if p.get("dispatcharr_user_id") is not None}
+            for user_id in owner_user_ids:
+                if is_movie:
+                    vod_db.add_movie_source_owner(provider_id, stream_id, user_id)
+                elif is_episode:
+                    vod_db.add_episode_source_owner(provider_id, stream_id, user_id)
+        else:
+            # No profile matched at all -- a true single (see
+            # scheduled_by_user_by_stream_id's own comment above). Falls
+            # back to whoever's own portal login actually scheduled it, if
+            # known; unattributable (e.g. admin-scheduled, or scheduled_by
+            # never set) just means it never shows in anyone's portal
+            # Library, same as today's behavior for every recording before
+            # this fix existed.
+            scheduled_by_user = scheduled_by_user_by_stream_id.get(stream_id)
+            if scheduled_by_user is not None:
+                if is_movie:
+                    vod_db.set_movie_source_dispatcharr_user_id(provider_id, stream_id, scheduled_by_user)
+                    vod_db.add_movie_source_owner(provider_id, stream_id, scheduled_by_user)
+                elif is_episode:
+                    vod_db.set_episode_source_dispatcharr_user_id(provider_id, stream_id, scheduled_by_user)
+                    vod_db.add_episode_source_owner(provider_id, stream_id, scheduled_by_user)
+        # Claim consumption runs for every stream_id regardless of the
+        # profile/scheduled_by branches above -- a second person's claim
+        # (portal_schedule_single's "Bill scheduled this while it was still
+        # recording" path, see pending_recording_claims' own table comment)
+        # is independent of however the FIRST person ended up attributed.
+        if is_movie or is_episode:
+            channel_id = channel_id_by_stream_id.get(stream_id)
+            identity_key = identity_key_by_stream_id.get(stream_id)
+            if channel_id is not None and identity_key:
+                claimant_user_ids = vod_db.consume_pending_recording_claims(provider_id, channel_id, identity_key)
+                for user_id in claimant_user_ids:
+                    if is_movie:
+                        vod_db.add_movie_source_owner(provider_id, stream_id, user_id)
+                    elif is_episode:
+                        vod_db.add_episode_source_owner(provider_id, stream_id, user_id)
 
-    # Disk quota (opt-in, same dvr_user_limits row Part 1's stream check
-    # uses): a person at/over their disk_quota_bytes has NEW category
-    # placements withheld from this point forward -- existing placements and
-    # the underlying imported file are never touched/deleted, only further
-    # growth attributable to them is blocked. Computed once per import pass
-    # (not per recording) since it only needs to reflect state as of the
-    # start of this pass.
+    # Disk quota (opt-in, same dvr_user_limits row this loop also reads
+    # default categories from) -- a person at/over their disk_quota_bytes has
+    # NEW category placements withheld from this point forward -- existing
+    # placements and the underlying imported file are never touched/deleted,
+    # only further growth attributable to them is blocked. Computed once per
+    # import pass (not per recording) since it only needs to reflect state as
+    # of the start of this pass. default_{movie,series}_category_id is this
+    # person's own standing default -- e.g. set on a portal user who has no
+    # way to pick a category themselves (PortalRecordingRuleRequest has no
+    # category field), so without this every one of their recordings would
+    # only ever reach the provider-level default, never anything personal to
+    # them.
     over_quota_user_ids: set[int] = set()
+    user_default_categories: dict[int, dict] = {}
+    QUOTA_WARNING_THRESHOLDS = (80, 90, 100)
     for limit_row in vod_db.list_dvr_user_limits(provider_id):
+        user_default_categories[limit_row["dispatcharr_user_id"]] = {
+            "movie": limit_row.get("default_movie_category_id"),
+            "series": limit_row.get("default_series_category_id"),
+        }
         if limit_row.get("disk_quota_bytes") is None:
             continue
-        usage = vod_db.dvr_user_disk_usage_bytes(provider_id, limit_row["dispatcharr_user_id"])
-        if usage["total_bytes"] >= limit_row["disk_quota_bytes"]:
-            over_quota_user_ids.add(limit_row["dispatcharr_user_id"])
+        user_id = limit_row["dispatcharr_user_id"]
+        quota_bytes = limit_row["disk_quota_bytes"]
+        usage = vod_db.dvr_user_disk_usage_bytes(provider_id, user_id)
+        # quota_policy='delete_oldest' (the OTHER real requirement from the
+        # user, 2026-07-28, alongside 'hard_fail' -- see portal_routes.
+        # portal_schedule_single/portal_create_recording_rule for that half)
+        # -- evicts this person's own oldest-owned recordings, oldest first
+        # regardless of movie/episode, via the same reference-counted
+        # remove_movie/episode_library_owner the portal's own "remove from
+        # my library" button uses, so a recording someone else also owns
+        # survives intact for them even while being evicted here. Runs
+        # BEFORE the over-quota check below so a person who evicts back
+        # under quota this same pass isn't needlessly withheld from new
+        # category placements too.
+        if usage["total_bytes"] >= quota_bytes and limit_row.get("quota_policy") == "delete_oldest":
+            owned = sorted(
+                [{"kind": "movie", **m} for m in vod_db.list_owned_movies_oldest_first(provider_id, user_id)] +
+                [{"kind": "episode", **e} for e in vod_db.list_owned_episodes_oldest_first(provider_id, user_id)],
+                key=lambda x: x["added_at"],
+            )
+            for item in owned:
+                if usage["total_bytes"] < quota_bytes:
+                    break
+                if item["kind"] == "movie":
+                    result = vod_db.remove_movie_library_owner(item["movie_id"], provider_id, user_id)
+                else:
+                    result = vod_db.remove_episode_library_owner(item["episode_id"], provider_id, user_id)
+                logger.info("[dispatcharr_dvr_importer] quota_policy=delete_oldest: %s evicted a %s "
+                            "(fully_deleted=%s) to make room", limit_row["dispatcharr_username"],
+                            item["kind"], result.get("fully_deleted"))
+                usage = vod_db.dvr_user_disk_usage_bytes(provider_id, user_id)
+        if usage["total_bytes"] >= quota_bytes:
+            over_quota_user_ids.add(user_id)
             logger.info("[dispatcharr_dvr_importer] %s is over their DVR disk quota (%d >= %d bytes, "
                         "%d actual / %d virtual) -- withholding new category placements for them this pass",
-                        limit_row["dispatcharr_username"], usage["total_bytes"], limit_row["disk_quota_bytes"],
+                        limit_row["dispatcharr_username"], usage["total_bytes"], quota_bytes,
                         usage["actual_bytes"], usage["virtual_bytes"])
+        # Threshold warnings -- independent of quota_policy, fires for both
+        # 'hard_fail' and 'delete_oldest' alike (delete_oldest still means
+        # "you're accumulating enough to keep hitting this," worth knowing
+        # about even though it self-resolves). sync_quota_warnings_sent
+        # returns only newly-crossed thresholds this pass -- see its own
+        # docstring for the reset behavior.
+        pct = int(usage["total_bytes"] * 100 / quota_bytes) if quota_bytes else 0
+        met = {t for t in QUOTA_WARNING_THRESHOLDS if pct >= t}
+        newly_crossed = vod_db.sync_quota_warnings_sent(provider_id, user_id, met)
+        if newly_crossed:
+            account = next((a for a in vod_db.list_portal_accounts(provider_id) if a["dispatcharr_user_id"] == user_id), None)
+            smtp = config.get_smtp_settings()
+            notifications.notify_quota_threshold(
+                smtp.get("admin_recipients") or [], account.get("email") if account else None,
+                limit_row["dispatcharr_username"], provider["name"], max(newly_crossed),
+                usage["total_bytes"], quota_bytes,
+            )
 
     # Phase 2: a recording matched to one or more profiles (see
     # profile_by_stream_id above) routes into the UNION of those profiles'
-    # own target categories instead of the provider-level default -- e.g.
-    # two people who each set up their own profile for the same show both
-    # get their own copy-into-category out of the one recording. Falls back
-    # to the provider default only when nothing matched at all (or the
-    # matched profile(s) left that content-type's category blank). A
-    # profile whose owner is over quota (see above) doesn't contribute its
-    # category here, but other matched profiles still do. Grouped by
-    # category first so multiple recordings/profiles landing in the same
-    # category collapse into one bulk_place_*_in_category call rather than
-    # one call per recording.
+    # own effective target categories instead of the provider-level default
+    # -- e.g. two people who each set up their own profile for the same show
+    # both get their own copy-into-category out of the one recording. Each
+    # profile's effective category is its own target_*_category_id if set,
+    # else its owner's personal default_*_category_id (user_default_categories
+    # above), else nothing from that profile -- only when NO matched profile
+    # contributes any category at all does this fall back to the provider
+    # default. A profile whose owner is over quota (see above) doesn't
+    # contribute its category here, but other matched profiles still do.
+    # Grouped by category first so multiple recordings/profiles landing in
+    # the same category collapse into one bulk_place_*_in_category call
+    # rather than one call per recording.
+    # A true single (no profile at all -- portal_schedule_single's "Record
+    # this episode") never entered this loop's per-profile branch at all
+    # before this fix, so a person's own default_movie/series_category_id
+    # was silently ignored for every single they ever recorded even when
+    # correctly set (real gap found live 2026-07-28). Falls back to whoever
+    # scheduled_by_user_by_stream_id says scheduled it (same source
+    # set_movie/episode_source_dispatcharr_user_id already uses), respecting
+    # the same over-quota withholding as the profile path.
+    def _single_owner_category(stream_id: str, kind: str) -> int | None:
+        owner = scheduled_by_user_by_stream_id.get(stream_id)
+        if owner is None or owner in over_quota_user_ids:
+            return None
+        return user_default_categories.get(owner, {}).get(kind)
+
     movie_ids_by_category: dict[int, set[int]] = {}
     for stream_id, movie_id in movie_id_by_stream_id.items():
         profiles = profile_by_stream_id.get(stream_id) or []
-        category_ids = {
-            p["target_movie_category_id"] for p in profiles
-            if p.get("target_movie_category_id") and p.get("dispatcharr_user_id") not in over_quota_user_ids
-        }
+        category_ids = set()
+        for p in profiles:
+            if p.get("dispatcharr_user_id") in over_quota_user_ids:
+                continue
+            effective = p.get("target_movie_category_id") or \
+                user_default_categories.get(p.get("dispatcharr_user_id"), {}).get("movie")
+            if effective:
+                category_ids.add(effective)
+        if not category_ids:
+            single_owner_cat = _single_owner_category(stream_id, "movie")
+            if single_owner_cat:
+                category_ids = {single_owner_cat}
         if not category_ids and provider.get("dvr_movie_category_id"):
             category_ids = {provider["dvr_movie_category_id"]}
         for category_id in category_ids:
@@ -409,10 +608,18 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     series_ids_by_category: dict[int, set[int]] = {}
     for stream_id, series_id in series_id_by_stream_id.items():
         profiles = profile_by_stream_id.get(stream_id) or []
-        category_ids = {
-            p["target_series_category_id"] for p in profiles
-            if p.get("target_series_category_id") and p.get("dispatcharr_user_id") not in over_quota_user_ids
-        }
+        category_ids = set()
+        for p in profiles:
+            if p.get("dispatcharr_user_id") in over_quota_user_ids:
+                continue
+            effective = p.get("target_series_category_id") or \
+                user_default_categories.get(p.get("dispatcharr_user_id"), {}).get("series")
+            if effective:
+                category_ids.add(effective)
+        if not category_ids:
+            single_owner_cat = _single_owner_category(stream_id, "series")
+            if single_owner_cat:
+                category_ids = {single_owner_cat}
         if not category_ids and provider.get("dvr_series_category_id"):
             category_ids = {provider["dvr_series_category_id"]}
         for category_id in category_ids:
@@ -635,7 +842,7 @@ async def rescan_recording_profiles(provider_id: int) -> dict:
 def _same_episode(candidate: dict, season_number: int | None, episode_number: int | None, sub_title: str | None) -> bool:
     """Cross-channel "is this the same episode" check for
     reschedule_failed_recordings below -- deliberately NOT
-    dispatcharr_dvr_client._episode_identity_key, which folds tvg_id into
+    dispatcharr_dvr_client.episode_identity_key, which folds tvg_id into
     its key specifically to dedup two listings of the SAME channel (see
     is_already_scheduled) -- a replacement on a different channel
     legitimately has a different tvg_id, so that key would never match

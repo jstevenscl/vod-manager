@@ -18,13 +18,14 @@ walkthrough, see [README.md](README.md).
 4. [First-run setup](#4-first-run-setup)
 5. [Adding your first provider](#5-adding-your-first-provider)
 6. [Connecting Dispatcharr](#6-connecting-dispatcharr)
-7. [Security hardening](#7-security-hardening)
-8. [Browsing and managing your catalog](#8-browsing-and-managing-your-catalog)
-9. [AI-assisted features](#9-ai-assisted-features)
-10. [Curation tools](#10-curation-tools)
-11. [TMDB integration](#11-tmdb-integration)
-12. [Backup and restore](#12-backup-and-restore)
-13. [Troubleshooting](#13-troubleshooting)
+7. [DVR recordings](#7-dvr-recordings)
+8. [Security hardening](#8-security-hardening)
+9. [Browsing and managing your catalog](#9-browsing-and-managing-your-catalog)
+10. [AI-assisted features](#10-ai-assisted-features)
+11. [Curation tools](#11-curation-tools)
+12. [TMDB integration](#12-tmdb-integration)
+13. [Backup and restore](#13-backup-and-restore)
+14. [Troubleshooting](#14-troubleshooting)
 
 ---
 
@@ -92,7 +93,7 @@ Why this matters in practice:
   for enrichment, duplicate/year disambiguation, and the missing-artwork
   queue. The app works without one; those specific features just won't.
 - Optional: an API key from Anthropic, OpenAI, and/or Google (Gemini) if you
-  want the AI-assisted features (§9)
+  want the AI-assisted features (§10)
 
 ---
 
@@ -346,7 +347,92 @@ disallowed content even with a raw copied stream URL.
 
 ---
 
-## 7. Security hardening
+## 7. DVR recordings
+
+DVR isn't a provider you add — it's a capability you turn on for a
+Dispatcharr connection you already have (§6). There's no separate catalog to
+set up: enabling it just tells VOD Manager "also pull finished recordings
+from this instance," and they show up in your pool alongside everything else.
+
+Under **Configuration → Dispatcharr Connections**, each row has a DVR
+button — **Enable DVR** if it's off, **DVR ✓** once it's on. Either opens the
+same settings modal.
+
+![DVR settings modal on a Dispatcharr connection](docs/screenshots/dvr-settings-modal.png)
+
+### The path field — and why it's easy to get wrong
+
+The **Local/NFS path** field is not a path on your host machine, and not a
+path inside Dispatcharr's own container. It's a path **as seen from inside
+the VOD Manager container itself**. That distinction is the single most
+common way to misconfigure this.
+
+**Leave it blank** and VOD Manager downloads each recording's file once,
+over Dispatcharr's own API, into its own storage — no shared filesystem
+needed at all. This always works, regardless of where either instance runs,
+and is the right choice for a Dispatcharr instance on a different machine
+with no shared/NFS mount. It costs one extra copy of each recording's bytes
+and is a little slower to import than reading the file directly, but nothing
+about setup or ongoing use requires touching Docker volumes at all.
+
+**Set a path** only when VOD Manager's own container can read that
+Dispatcharr instance's recordings directory directly off disk — which means
+that directory has to be *mounted into VOD Manager's container*, not just
+present somewhere on the host. Two ways to get there:
+
+- **Same host, Dispatcharr also running in Docker** (the common case): mount
+  the *same* volume Dispatcharr's own container already uses for its
+  recordings into `vod-manager` as well. `docker inspect <dispatcharr
+  container>` shows what that volume is and where Dispatcharr mounts it
+  (typically `/data`, with recordings under `/data/recordings`). See the
+  commented example in `docker-compose.yml` for the exact syntax — put your
+  real values in a `docker-compose.override.yml` (gitignored) rather than
+  editing the tracked file, so a `git pull` never clobbers your local setup.
+- **Different host, reachable over NFS**: mount the NFS share at the host
+  level first (plain Docker/OS NFS client config — VOD Manager itself never
+  talks NFS), then bind-mount that host path into the container, same
+  syntax as any other bind mount.
+
+Either way, whatever path you land on **inside the container** is what goes
+in the field — e.g. `/mnt/dvr/dispatch-test/recordings`, not
+`/var/lib/docker/volumes/.../_data/recordings` and not Dispatcharr's own
+internal `/data/recordings`. Point it at the `recordings` subfolder
+specifically — Dispatcharr reports each file's path with a `/data/recordings`
+prefix, and VOD Manager strips that prefix and re-joins the remainder onto
+whatever you put here, so mounting one level too high or low silently
+produces file-not-found on every recording.
+
+If you're not sure whether the mount is right, leave the path blank and use
+download mode first — it needs zero Docker configuration and proves DVR
+import works end to end. Come back and wire up the local-path mount as a
+later optimization once that's confirmed.
+
+### Categories
+
+**Movie category** / **TV category** here are the *admin-level default* —
+where a recording lands when nothing more specific claims it. If you never
+set up per-person Recording Rules at all, every recording from this
+connection goes to whichever category you pick here (or nowhere, if left
+blank — it still imports, just uncategorized until placed manually).
+
+Per-person control lives one level down, in the DVR tab's own Recording
+Rules: each person's rule can set its own target movie/series category, and
+that wins over this default for anything matching their rule. This default
+only ever catches what's left over — a recording nobody's rule matched, or a
+matching rule that left its own category blank. You don't need any Recording
+Rules set up at all if you just want one shared bucket per connection.
+
+### Disabling DVR
+
+**Disable DVR** on the same modal removes that connection's recording rules,
+upcoming recordings, per-person limits, and portal accounts — the same
+cascade a regular provider delete does today. It does not touch the
+Dispatcharr connection itself, which stays fully usable for its other job
+(pushing usage data, checking live-TV viewer counts).
+
+---
+
+## 8. Security hardening
 
 If this is reachable beyond a network you fully trust — and especially if
 it's reachable from the public internet at all — do these:
@@ -380,12 +466,12 @@ it's reachable from the public internet at all — do these:
 7. **Provider passwords, Dispatcharr tokens, and XC client secrets are
    encrypted at rest** in the database (not just hashed logins) — the
    encryption key lives in `config.json` so it travels with that file's own
-   backup/restore lifecycle (§12). Existing plaintext values from before
+   backup/restore lifecycle (§13). Existing plaintext values from before
    this was added upgrade automatically on next startup, no action needed.
 
 ---
 
-## 8. Browsing and managing your catalog
+## 9. Browsing and managing your catalog
 
 The **Movies** and **TV Shows** tabs are the main catalog views, each with a
 **list** or **grid** (poster wall) mode.
@@ -394,7 +480,7 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
 
 - **Search / provider filter / page size** — top toolbar.
 - **Manage Categories**, **Needs Review**, **Missing Artwork**, **Language
-  Filter** — open the curation tool modals covered in §10, scoped to
+  Filter** — open the curation tool modals covered in §11, scoped to
   whichever tab (movies vs. series) you opened them from.
 - **Bulk actions** — check items individually, shift-click to select a range,
   or **Select all visible** to grab everything on the current page. **Place
@@ -423,11 +509,11 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
   disabled with an explanation): a real provider will just re-import it on
   the next sync no matter how many times you delete it locally, so Archive is
   the only way to durably hide something that's still provider-backed. Use
-  the **Orphan Checker** (§10) to find and clean up genuine orphans in bulk.
+  the **Orphan Checker** (§11) to find and clean up genuine orphans in bulk.
 
 ---
 
-## 9. AI-assisted features
+## 10. AI-assisted features
 
 An API key from **any** of Anthropic, OpenAI, or Google (Gemini) unlocks
 the AI-assisted features — configure one or more under **Configuration →
@@ -463,7 +549,7 @@ over a model id that belongs to a different provider.
 
 ---
 
-## 10. Curation tools
+## 11. Curation tools
 
 All of these live under the **Movies**/**TV Shows** toolbars or the
 **Curation & Maintenance** tab, and follow the same philosophy throughout:
@@ -601,7 +687,7 @@ not yet lazily enriched, not broken.
 
 ---
 
-## 11. TMDB integration
+## 12. TMDB integration
 
 A free [TMDB API key](https://www.themoviedb.org/settings/api) (v3 auth)
 under Configuration → API Keys unlocks:
@@ -617,7 +703,7 @@ under Configuration → API Keys unlocks:
 
 ---
 
-## 12. Backup and restore
+## 13. Backup and restore
 
 Configuration → Backup & Restore lets you download, restore, or reset each
 piece of state independently — configuration, login sessions, and the
@@ -636,7 +722,7 @@ build rather than a tagged release.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 **A provider's catalog won't import / times out.** Check the User-Agent
 override (§5) — some providers reject requests that don't look
@@ -660,12 +746,12 @@ instance's own network position*, not just from your browser — a
 Docker-internal hostname won't resolve from a remote instance, and vice
 versa.
 
-**Movies/series show up as duplicates.** Run Duplicate Finder (§10) — most
+**Movies/series show up as duplicates.** Run Duplicate Finder (§11) — most
 duplication is either a punctuation difference between providers (that
-tool) or a language variant (Language Filter, §10). If neither explains
+tool) or a language variant (Language Filter, §11). If neither explains
 it, check Needs Review for an unresolved year ambiguity.
 
-**A title has no poster.** Check Missing Artwork (§10) — it's usually
+**A title has no poster.** Check Missing Artwork (§11) — it's usually
 either genuinely unavailable from the source provider, or fixable with a
 real TMDB search from there.
 

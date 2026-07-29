@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 import dispatcharr_dvr_client
 import portal_auth
+import tmdb_sync
 import vod_db
 from portal_auth import require_portal_auth
 from secrets_util import decrypt_value, verify_password
@@ -115,6 +116,28 @@ class PortalRecordingRuleRequest(BaseModel):
     title_mode: str = "exact"
     mode: str = "all"
     channel_id: int
+
+
+class PortalScheduleSingleRequest(BaseModel):
+    channel_id: int
+    program_id: int
+    title: str
+    sub_title: Optional[str] = None
+    tvg_id: Optional[str] = None
+    start_time: str
+    end_time: str
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    onscreen_episode: Optional[str] = None
+
+
+class ConvertToSeriesRequest(BaseModel):
+    mode: str = "new"
+    label: Optional[str] = None
+
+
+class ConvertToSingleRequest(BaseModel):
+    keep: str = "next"  # "next" (cancel every other upcoming episode) or "all" (leave them all scheduled)
 
 
 # ── TOTP verification with anti-replay ──────────────────────────────────────
@@ -229,6 +252,131 @@ async def portal_logout(x_portal_session_token: Optional[str] = Header(None, ali
 
 # ── Data endpoints (all guarded, all scoped to the caller's own identity) ───
 
+@router.get("/channels/")
+async def portal_list_channels(account: dict = Depends(require_portal_auth)):
+    """id -> {name, channel_number} for labeling a channel_id already stored
+    on the caller's own recording rules/upcoming recordings -- those only
+    ever store the bare id (see dispatcharr_dvr_client.list_channels'
+    docstring), so without this the portal has nothing but a meaningless
+    number to show. Not scoped to the caller's own visible lineup (unlike
+    epg-search/upcoming) since this is pure display labeling of rules/
+    recordings the other endpoints already scoped -- a channel name isn't
+    sensitive."""
+    _, connection = _require_dvr_connection(account["provider_id"])
+    try:
+        channels = await dispatcharr_dvr_client.list_channels(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    return {c["id"]: {"name": c.get("name"), "channel_number": c.get("channel_number")} for c in channels}
+
+
+@router.get("/guide/")
+async def portal_guide(account: dict = Depends(require_portal_auth)):
+    """Real browsable guide -- every visible channel with its next few
+    airings, not just search-by-title results. Powers the Portal's Guide
+    tab (added 2026-07-28: search-only was the whole flow before this,
+    real user feedback that a guide/scrollable-browse mode was still
+    missing). Grid data has no channel info of its own (just tvg_id), so
+    it's cross-referenced against list_channels here.
+
+    Confirmed live (2026-07-28): a real Channel's own tvg_id field does not
+    always match its actual EPG program data's tvg_id -- e.g. channel
+    30625's tvg_id is "FOXKWKT.us" but its real programs carry
+    "KWKT-DT(FOX)(KWKTDT).us". Every local-affiliate channel checked hit
+    this, which is why the guide only ever showed higher-numbered
+    cable/streaming channels and never the local ones. Same underlying
+    class of tvg_id-string ambiguity create_recording's docstring already
+    documents for Dispatcharr's own Series Rules -- channel_id-scoped
+    lookups sidestep it, tvg_id-string lookups don't. Fix: only trust grid
+    data for a channel when it actually produced a match; every other
+    VISIBLE channel (never all ~2400 -- that's not worth the request count)
+    falls back to a real channel_id-scoped search, run concurrently."""
+    import asyncio
+    import datetime as _dt
+    _, connection = _require_dvr_connection(account["provider_id"])
+    try:
+        programs = await dispatcharr_dvr_client.get_epg_grid(connection)
+        channels = await dispatcharr_dvr_client.list_channels(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    visible = await dispatcharr_dvr_client.visible_channel_ids(connection, account["dispatcharr_user_id"])
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    by_tvg: dict[str, list[dict]] = {}
+    for p in programs:
+        tvg = p.get("tvg_id")
+        if tvg:
+            by_tvg.setdefault(tvg, []).append(p)
+
+    visible_channels = [ch for ch in channels if visible is None or ch.get("id") in visible]
+
+    grid_hits: dict[int, list[dict]] = {}
+    needs_fallback: list[dict] = []
+    for ch in visible_channels:
+        progs = by_tvg.get(ch.get("tvg_id"), [])
+        if progs:
+            grid_hits[ch["id"]] = progs
+        else:
+            needs_fallback.append(ch)
+    # visible=None means visible_channel_ids couldn't resolve a real lineup
+    # at all (fail-open, see its own docstring) -- visible_channels is then
+    # every channel Dispatcharr has (~2400), and exhaustively fallback-
+    # searching all of them one by one is never reasonable regardless of
+    # why resolution failed. Capped, not skipped entirely, so a real (if
+    # incomplete) guide still loads instead of an empty one.
+    needs_fallback = needs_fallback[:150]
+
+    async def _fallback(ch: dict) -> tuple[int, list[dict]]:
+        try:
+            found = await dispatcharr_dvr_client.search_epg_programs(connection, "", channel_id=ch["id"], limit=24, include_in_progress=True)
+        except Exception as exc:
+            logger.warning("[portal_routes] guide fallback search failed for channel=%s: %s", ch["id"], exc)
+            found = []
+        return ch["id"], found
+
+    if needs_fallback:
+        fallback_results = await asyncio.gather(*(_fallback(ch) for ch in needs_fallback))
+        for channel_id, found in fallback_results:
+            if found:
+                grid_hits[channel_id] = found
+
+    result = []
+    for ch in visible_channels:
+        progs = sorted(grid_hits.get(ch["id"], []), key=lambda p: p.get("start_time") or "")
+        upcoming = [p for p in progs if (_parse_epg_datetime(p.get("end_time")) or now) > now][:24]
+        if not upcoming:
+            continue
+        result.append({
+            "channel": {"id": ch.get("id"), "name": ch.get("name"), "channel_number": ch.get("channel_number")},
+            "programs": [_normalize_guide_program(p) for p in upcoming],
+        })
+    result.sort(key=lambda r: r["channel"]["channel_number"] if r["channel"]["channel_number"] is not None else 1e9)
+    return result
+
+
+def _normalize_guide_program(p: dict) -> dict:
+    """Season/episode/onscreen_episode genuinely exist in the underlying EPG
+    data (confirmed live 2026-07-28 -- Dispatcharr's own guide UI showed
+    "S63E222" for a recording whose season/episode came through as null
+    everywhere in this pipeline), but live in two different shapes depending
+    on which source supplied this program: /api/epg/grid/ puts them at the
+    top level, /api/epg/programs/search/ (used for every fallback-covered
+    channel) nests them under custom_properties. The Scheduler and
+    /schedule-single/ only ever saw the plain top-level fields before this,
+    so a recording made from a fallback-covered channel (which is most
+    local-affiliate channels, see get_epg_grid's docstring) always lost its
+    real episode identity -- directly why General Hospital imported as a
+    movie instead of an episode despite the EPG genuinely having "S63E222"
+    for that exact airing."""
+    props = p.get("custom_properties") or {}
+    return {
+        **p,
+        "season": p.get("season") if p.get("season") is not None else props.get("season"),
+        "episode": p.get("episode") if p.get("episode") is not None else props.get("episode"),
+        "onscreen_episode": p.get("onscreen_episode") if p.get("onscreen_episode") is not None else props.get("onscreen_episode"),
+    }
+
+
 @router.get("/me/")
 async def portal_me(account: dict = Depends(require_portal_auth)):
     provider = vod_db.get_provider(account["provider_id"])
@@ -244,13 +392,278 @@ async def portal_me(account: dict = Depends(require_portal_auth)):
         "username": account["username"],
         "dispatcharr_username": dispatcharr_username,
         "provider_name": provider["name"] if provider else None,
+        "email": account.get("email"),
     }
+
+
+class PortalUpdateEmailRequest(BaseModel):
+    email: str | None = None
+
+
+@router.put("/me/email/")
+async def portal_update_email(body: PortalUpdateEmailRequest, account: dict = Depends(require_portal_auth)):
+    """Self-service -- lets someone add/change/clear the email their own
+    DVR quota warnings go to (see notifications.notify_quota_threshold),
+    without needing an admin to do it for them. The admin's own Portal
+    Access edit still calls vod_db.set_portal_account_email directly for
+    the same field -- this is just the other caller. Real requirement from
+    the user, 2026-07-28 ('Both' -- admin always warned, the person
+    themselves also does if they've set an email)."""
+    email = (body.email or "").strip() or None
+    vod_db.set_portal_account_email(account["id"], email)
+    return {"email": email}
+
+
+def _enforce_hard_fail_quota(provider_id: int, dispatcharr_user_id: int) -> None:
+    """Raises 409 if this person is currently at/over their DVR disk quota
+    AND their dvr_user_limits.quota_policy is 'hard_fail' (the other real
+    policy, 'delete_oldest', instead auto-evicts old recordings in
+    dispatcharr_dvr_importer -- nothing to block here for that case).
+    Called from both portal_schedule_single and portal_create_recording_rule
+    -- real requirement from the user, 2026-07-28: quota policy is chosen
+    once at creation (see vod_db.create_dvr_user_limit) and actually
+    enforced, not just displayed. A person with no dvr_user_limits row at
+    all has no quota configured, so nothing to check."""
+    limit_row = vod_db.get_dvr_user_limit(provider_id, dispatcharr_user_id)
+    if not limit_row or limit_row.get("disk_quota_bytes") is None:
+        return
+    if limit_row.get("quota_policy") != "hard_fail":
+        return
+    usage = vod_db.dvr_user_disk_usage_bytes(provider_id, dispatcharr_user_id)
+    if usage["total_bytes"] >= limit_row["disk_quota_bytes"]:
+        raise HTTPException(
+            409,
+            detail=f"You're at your DVR storage quota ({usage['total_bytes'] / 1e9:.1f} GB of "
+                   f"{limit_row['disk_quota_bytes'] / 1e9:.1f} GB) -- remove something from your "
+                   "library before scheduling more.",
+        )
+
+
+@router.post("/schedule-single/")
+async def portal_schedule_single(body: PortalScheduleSingleRequest, account: dict = Depends(require_portal_auth)):
+    """One specific airing, no recurring rule -- the 'Record this episode'
+    choice in the Scheduler, as opposed to 'Record the series'
+    (portal_create_recording_rule below, which creates a dvr_recording_profiles
+    row that keeps discovering new episodes). Calls
+    dispatcharr_dvr_client.create_recording directly, same as the
+    channel_id-scoped path that function's own docstring explains is the fix
+    for Dispatcharr's own Series Rules tvg_id-collision bug -- appropriate
+    here too since this always has a real numeric channel_id already, never
+    an ambiguous tvg_id to resolve.
+
+    is_already_scheduled is the exact helper create_recording's own docstring
+    says exists for callers exactly like this one -- schedule_channel_
+    recordings has this dedup built into its own loop, but this path calls
+    create_recording directly and was missing it entirely, confirmed live
+    2026-07-28: the same airing could be scheduled 3+ times in a row with no
+    conflict error at all.
+
+    season/episode/onscreen_episode are threaded through here (from the
+    Scheduler grid, via _normalize_guide_program) rather than left to
+    default None -- without them, create_recording's own custom_properties
+    snapshot ends up with no real episode identity, and the DVR importer
+    falls back all the way to "must be a movie" (see _resolve_season_episode)
+    even when the EPG genuinely has it, confirmed live 2026-07-28 with a
+    real General Hospital recording that Dispatcharr's own guide showed as
+    "S63E222" but imported into the pool as an untitled movie.
+
+    An identity match against an EXISTING recording is no longer a flat
+    409: if that recording is already imported (a movie_sources/
+    episode_sources row exists for it), the calling person is attached as
+    an additional owner of that same file via add_movie/episode_source_owner
+    -- real requirement from the user, 2026-07-28: "Bill records the same
+    thing Emby already has" should share the one file, not error out, and
+    each of them later removing it from their own Library must not affect
+    the other (see remove_movie/episode_library_owner). Only a genuine
+    real-world time-slot overlap (no identity match at all -- see
+    find_existing_recording's own docstring) still means "you can't record
+    this, the channel's already busy" and stays a 409.
+
+    A match that ISN'T imported yet (still recording, or completed but not
+    yet swept by the importer) used to also 409 -- closed 2026-07-28 via
+    add_pending_recording_claim: rather than PATCHing Dispatcharr's own
+    Recording object (untested against a live instance, real risk of
+    malforming someone's actual in-progress recording), this just records
+    the claim locally, keyed by the same (provider, channel, identity)
+    triple find_existing_recording used to find the match. dispatcharr_dvr_
+    importer consumes it the moment that exact recording actually imports,
+    attaching this person then instead."""
+    provider_id = account["provider_id"]
+    _, connection = _require_dvr_connection(provider_id)
+    visible = await dispatcharr_dvr_client.visible_channel_ids(connection, account["dispatcharr_user_id"])
+    if visible is not None and body.channel_id not in visible:
+        raise HTTPException(403, detail="That channel isn't in your Dispatcharr lineup.")
+    _enforce_hard_fail_quota(provider_id, account["dispatcharr_user_id"])
+    identity_props = {"season": body.season, "episode": body.episode, "onscreen_episode": body.onscreen_episode}
+    match_program = {
+        "title": body.title, "sub_title": body.sub_title, "start_time": body.start_time, "end_time": body.end_time,
+        "custom_properties": identity_props,
+    }
+    existing_recording = await dispatcharr_dvr_client.find_existing_recording(connection, body.channel_id, match_program)
+    if existing_recording is not None:
+        existing_stream_id = str(existing_recording["id"])
+        attached = vod_db.attach_portal_user_to_existing_recording(provider_id, existing_stream_id, account["dispatcharr_user_id"])
+        if attached:
+            return {"attached_existing": True, "recording": existing_recording}
+        identity_key = dispatcharr_dvr_client.episode_identity_key(match_program)
+        vod_db.add_pending_recording_claim(provider_id, body.channel_id, identity_key, account["dispatcharr_user_id"])
+        return {"attached_existing": "pending", "recording": existing_recording}
+    already = await dispatcharr_dvr_client.is_already_scheduled(connection, body.channel_id, match_program)
+    if already:
+        raise HTTPException(409, detail="That time slot on this channel is already claimed by another recording.")
+    conflict = await _predict_stream_conflict(
+        provider_id, connection, account["dispatcharr_user_id"],
+        {"title": body.title, "channel_id": body.channel_id},
+    )
+    if conflict:
+        raise HTTPException(409, detail=conflict)
+    scheduled_by = {
+        "dispatcharr_user_id": account["dispatcharr_user_id"],
+        "dispatcharr_username": account["username"],
+        "profile_label": body.title,
+    }
+    program = {
+        "tvg_id": body.tvg_id, "title": body.title, "sub_title": body.sub_title,
+        "start_time": body.start_time, "end_time": body.end_time,
+        "custom_properties": identity_props,
+    }
+    try:
+        recording = await dispatcharr_dvr_client.create_recording(connection, body.channel_id, program, scheduled_by=scheduled_by)
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
+    return recording
 
 
 @router.get("/recording-rules/")
 async def portal_list_recording_rules(account: dict = Depends(require_portal_auth)):
     rules = vod_db.list_recording_profiles(account["provider_id"])
     return [r for r in rules if r.get("dispatcharr_user_id") == account["dispatcharr_user_id"]]
+
+
+@router.get("/my-recordings/")
+async def portal_my_recordings(account: dict = Depends(require_portal_auth)):
+    """Series (dvr_recording_profiles rows) plus true singles (one-off
+    Recordings with no backing profile) in one call, so My Recordings can
+    show both kinds and offer the right convert action for each. 'Single'
+    isn't a stored flag anywhere -- it's derived here as "one of my own
+    scheduled recordings whose (title, channel) doesn't match any of my own
+    profiles" -- deliberately, so converting either direction (delete/create
+    a profile) reclassifies a recording automatically on the next fetch,
+    with no separate field to keep in sync."""
+    provider_id = account["provider_id"]
+    _, connection = _require_dvr_connection(provider_id)
+    profiles = [p for p in vod_db.list_recording_profiles(provider_id) if p.get("dispatcharr_user_id") == account["dispatcharr_user_id"]]
+    profile_keys = {(p["title"].strip().lower(), p["channel_id"]) for p in profiles if p.get("title") and p.get("channel_id")}
+    try:
+        recordings = await dispatcharr_dvr_client.list_scheduled_recordings(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    singles = []
+    for r in recordings:
+        scheduled_by = (r.get("custom_properties") or {}).get("scheduled_by") or {}
+        if scheduled_by.get("dispatcharr_user_id") != account["dispatcharr_user_id"]:
+            continue
+        program = (r.get("custom_properties") or {}).get("program") or {}
+        title = program.get("title")
+        if not title:
+            continue
+        key = (title.strip().lower(), r.get("channel"))
+        if key in profile_keys:
+            continue
+        singles.append({
+            "id": r["id"], "title": title, "sub_title": program.get("sub_title"),
+            "channel_id": r.get("channel"), "start_time": r.get("start_time"), "end_time": r.get("end_time"),
+        })
+    return {"series": profiles, "singles": singles}
+
+
+@router.post("/singles/{recording_id}/convert-to-series/")
+async def portal_convert_single_to_series(recording_id: int, body: ConvertToSeriesRequest, account: dict = Depends(require_portal_auth)):
+    """The already-scheduled recording itself is never touched -- this just
+    adds a dvr_recording_profiles row for its (title, channel) so future
+    episodes get discovered too. schedule_channel_recordings' own dedup
+    (see its docstring) means its first scan pass correctly recognizes the
+    existing recording rather than double-booking it."""
+    provider_id = account["provider_id"]
+    _, connection = _require_dvr_connection(provider_id)
+    try:
+        recordings = await dispatcharr_dvr_client.list_scheduled_recordings(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    recording = next((r for r in recordings if r["id"] == recording_id), None)
+    if not recording:
+        raise HTTPException(404, detail="recording not found")
+    scheduled_by = (recording.get("custom_properties") or {}).get("scheduled_by") or {}
+    if scheduled_by.get("dispatcharr_user_id") != account["dispatcharr_user_id"]:
+        raise HTTPException(403, detail="not your recording")
+    program = (recording.get("custom_properties") or {}).get("program") or {}
+    title = program.get("title")
+    channel_id = recording.get("channel")
+    if not title or not channel_id:
+        raise HTTPException(400, detail="This recording is missing title/channel info -- can't convert it.")
+    new_scheduled_by = {
+        "dispatcharr_user_id": account["dispatcharr_user_id"],
+        "dispatcharr_username": account["username"],
+        "profile_label": body.label or title,
+    }
+    try:
+        schedule_result = await dispatcharr_dvr_client.schedule_channel_recordings(
+            connection, channel_id, title, body.mode, scheduled_by=new_scheduled_by,
+        )
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Dispatcharr rejected the recording: {exc}")
+    profile_id = vod_db.create_recording_profile(
+        provider_id, body.label or title, title, program.get("tvg_id"), "contains",
+        None, "contains", body.mode, channel_id,
+        None, None, account["dispatcharr_user_id"], None,
+    )
+    profile = vod_db.get_recording_profile(profile_id)
+    profile["scheduled_now"] = schedule_result.get("scheduled", 0)
+    return profile
+
+
+@router.post("/recording-rules/{profile_id}/convert-to-single/")
+async def portal_convert_series_to_single(profile_id: int, body: ConvertToSingleRequest, account: dict = Depends(require_portal_auth)):
+    """Deletes the profile (stops finding new episodes) -- keep='next'
+    additionally cancels every OTHER already-scheduled upcoming episode,
+    leaving just the earliest one; keep='all' leaves them all scheduled.
+    Same upcoming-recordings matching pattern portal_delete_recording_rule
+    already uses for its own cleanup."""
+    profile = vod_db.get_recording_profile(profile_id)
+    if not profile:
+        raise HTTPException(404, detail="recording rule not found")
+    if profile.get("dispatcharr_user_id") != account["dispatcharr_user_id"]:
+        raise HTTPException(403, detail="not your recording rule")
+    if profile.get("channel_id") and body.keep == "next":
+        try:
+            _, connection = _require_dvr_connection(profile["provider_id"])
+            upcoming = await dispatcharr_dvr_client.list_scheduled_recordings(connection)
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            target_title = (profile["title"] or "").strip().lower()
+            matches = []
+            for r in upcoming:
+                if r.get("channel") != profile["channel_id"]:
+                    continue
+                program = (r.get("custom_properties") or {}).get("program") or {}
+                if (program.get("title") or "").strip().lower() != target_title:
+                    continue
+                start = _parse_epg_datetime(r.get("start_time"))
+                if start and start <= now:
+                    continue
+                matches.append((start, r))
+            matches.sort(key=lambda m: m[0] or now)
+            for _, r in matches[1:]:
+                try:
+                    await dispatcharr_dvr_client.delete_recording(connection, r["id"])
+                except Exception as exc:
+                    logger.warning("[portal_routes] convert_series_to_single(%s): failed to cancel recording %s: %s",
+                                    profile_id, r.get("id"), exc)
+        except Exception as exc:
+            logger.warning("[portal_routes] convert_series_to_single(%s): failed to trim upcoming recordings: %s",
+                            profile_id, exc)
+    vod_db.delete_recording_profile(profile_id)
+    return {"ok": True}
 
 
 @router.post("/recording-rules/")
@@ -265,6 +678,7 @@ async def portal_create_recording_rule(body: PortalRecordingRuleRequest, account
     visible = await dispatcharr_dvr_client.visible_channel_ids(connection, account["dispatcharr_user_id"])
     if visible is not None and body.channel_id not in visible:
         raise HTTPException(403, detail="That channel isn't in your Dispatcharr lineup.")
+    _enforce_hard_fail_quota(provider_id, account["dispatcharr_user_id"])
     conflict = await _predict_stream_conflict(
         provider_id, connection, account["dispatcharr_user_id"],
         {"title": body.title, "channel_id": body.channel_id},
@@ -362,6 +776,33 @@ async def portal_upcoming(account: dict = Depends(require_portal_auth)):
     ]
 
 
+@router.delete("/upcoming/{recording_id}/")
+async def portal_cancel_upcoming(recording_id: int, account: dict = Depends(require_portal_auth)):
+    """Cancels one specific upcoming recording -- was genuinely missing
+    (Upcoming only ever showed a list, no way to act on a row). Ownership
+    check mirrors portal_upcoming's own filter exactly, so a person can only
+    ever cancel a recording that already belongs to them; deleting one that
+    a series rule created doesn't touch the rule itself, just this one
+    airing -- the rule's own periodic rescan simply finds it again unless
+    the underlying EPG listing goes away too."""
+    _, connection = _require_dvr_connection(account["provider_id"])
+    try:
+        upcoming = await dispatcharr_dvr_client.list_scheduled_recordings(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    recording = next((r for r in upcoming if r["id"] == recording_id), None)
+    if not recording:
+        raise HTTPException(404, detail="recording not found")
+    scheduled_by = (recording.get("custom_properties") or {}).get("scheduled_by") or {}
+    if scheduled_by.get("dispatcharr_user_id") != account["dispatcharr_user_id"]:
+        raise HTTPException(403, detail="not your recording")
+    try:
+        await dispatcharr_dvr_client.delete_recording(connection, recording_id)
+    except Exception as exc:
+        raise HTTPException(502, detail=f"Dispatcharr rejected the cancellation: {exc}")
+    return {"ok": True}
+
+
 @router.get("/usage/")
 async def portal_usage(account: dict = Depends(require_portal_auth)):
     provider_id, dispatcharr_user_id = account["provider_id"], account["dispatcharr_user_id"]
@@ -392,6 +833,98 @@ async def portal_library(account: dict = Depends(require_portal_auth)):
         "movies": vod_db.list_portal_library_movies(dispatcharr_user_id),
         "episodes": vod_db.list_portal_library_episodes(dispatcharr_user_id),
     }
+
+
+@router.delete("/library/movies/{movie_id}/")
+async def portal_remove_library_movie(movie_id: int, account: dict = Depends(require_portal_auth)):
+    """Removes this movie from the CALLING person's own Library only --
+    reference-counted (see vod_db.remove_movie_library_owner's docstring):
+    if someone else also has this same recording in their Library (Bill
+    recorded the same thing Emby already had, see
+    attach_portal_user_to_existing_recording), it stays fully intact for
+    them, file included. The file on disk is only actually deleted once
+    nobody has it left. Real requirement from the user, 2026-07-28."""
+    provider_id, dispatcharr_user_id = account["provider_id"], account["dispatcharr_user_id"]
+    if not vod_db.movie_owned_by_portal_user(movie_id, dispatcharr_user_id):
+        raise HTTPException(404, detail="That's not in your library.")
+    result = vod_db.remove_movie_library_owner(movie_id, provider_id, dispatcharr_user_id)
+    return result
+
+
+@router.delete("/library/episodes/{episode_id}/")
+async def portal_remove_library_episode(episode_id: int, account: dict = Depends(require_portal_auth)):
+    """Episode counterpart to portal_remove_library_movie."""
+    provider_id, dispatcharr_user_id = account["provider_id"], account["dispatcharr_user_id"]
+    if not vod_db.episode_owned_by_portal_user(episode_id, dispatcharr_user_id):
+        raise HTTPException(404, detail="That's not in your library.")
+    result = vod_db.remove_episode_library_owner(episode_id, provider_id, dispatcharr_user_id)
+    return result
+
+
+@router.get("/library/shows/{series_id}/episodes/")
+async def portal_show_canonical_episodes(series_id: int, account: dict = Depends(require_portal_auth)):
+    """Every episode TMDB knows this show ever had, each flagged against
+    what THIS person actually has -- recorded (a real file), upcoming (a
+    Dispatcharr recording scheduled but not finished yet), or missing
+    (nothing at all). Same idea as vod_routes' admin-only gap-view route,
+    but scoped to one portal person's own ownership instead of the whole
+    pool, and merged with /upcoming/ too. Real requirement from the user,
+    2026-07-29: the Library's season selector should show a long-running
+    show's real history, not just whatever few episodes happen to already
+    be recorded -- confirmed live that General Hospital alone has 63
+    seasons/~10.8k episodes on TMDB, so this always goes through
+    tmdb_sync's cache (get_series_episode_list_cached), never a live TMDB
+    call per page view.
+
+    canonical=False (not a 404) when the series has no tmdb_id yet -- the
+    Library should keep showing whatever's actually recorded/upcoming even
+    for a not-yet-enriched show, just without the full-history view."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    if not series.get("tmdb_id"):
+        return {"canonical": False, "episodes": []}
+    try:
+        canonical = await tmdb_sync.get_series_episode_list_cached(series["tmdb_id"])
+    except Exception as exc:
+        raise HTTPException(502, detail=f"TMDB lookup failed: {exc}")
+
+    dispatcharr_user_id = account["dispatcharr_user_id"]
+    recorded = {
+        (e["season_number"], e["episode_number"]): e
+        for e in vod_db.list_portal_library_episodes(dispatcharr_user_id)
+        if e["series_id"] == series_id
+    }
+    upcoming: dict[tuple, dict] = {}
+    try:
+        _, connection = _require_dvr_connection(account["provider_id"])
+        for r in await dispatcharr_dvr_client.list_scheduled_recordings(connection):
+            cp = r.get("custom_properties") or {}
+            if (cp.get("scheduled_by") or {}).get("dispatcharr_user_id") != dispatcharr_user_id:
+                continue
+            title = ((cp.get("program") or {}).get("title") or "").strip().lower()
+            if title != series["name"].strip().lower():
+                continue
+            key = (cp.get("season"), cp.get("episode"))
+            if key[0] is not None and key[1] is not None:
+                upcoming[key] = r
+    except Exception as exc:
+        logger.warning("[portal_routes] portal_show_canonical_episodes: couldn't check upcoming: %s", exc)
+
+    episodes = []
+    for ep in canonical:
+        key = (ep["season_number"], ep["episode_number"])
+        rec = recorded.get(key)
+        up = upcoming.get(key)
+        episodes.append({
+            **ep,
+            "status": "recorded" if rec else ("upcoming" if up else "missing"),
+            "library_episode_id": rec["id"] if rec else None,
+            "file_size_bytes": rec["file_size_bytes"] if rec else None,
+            "recording_id": up["id"] if up else None,
+            "start_time": up["start_time"] if up else None,
+        })
+    return {"canonical": True, "episodes": episodes}
 
 
 @router.get("/library/{kind}/{item_id}/stream/")

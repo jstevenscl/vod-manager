@@ -28,12 +28,12 @@ export function KpiTile({ icon, label, value, note, noteTone = 'default' }: {
 }) {
   return (
     <div className="rounded-lg border border-border bg-card p-3.5 shadow-sm">
-      <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
         <span className="text-primary [&_svg]:w-3.5 [&_svg]:h-3.5">{icon}</span>
         {label}
       </div>
-      <div className="mt-2 text-xl font-bold tracking-tight tabular-nums">{value}</div>
-      {note && <div className={`mt-0.5 text-[11px] ${noteTone === 'warn' ? 'text-warning' : 'text-muted-foreground/70'}`}>{note}</div>}
+      <div className="mt-2 text-2xl font-bold tracking-tight tabular-nums">{value}</div>
+      {note && <div className={`mt-0.5 text-xs ${noteTone === 'warn' ? 'text-warning' : 'text-muted-foreground/70'}`}>{note}</div>}
     </div>
   )
 }
@@ -51,7 +51,7 @@ export function StatusPill({ label, tone = 'success', icon }: {
   }[tone]
   const dotCls = { success: 'bg-success', warning: 'bg-warning', destructive: 'bg-destructive', info: 'bg-primary' }[tone]
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${toneCls}`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-semibold ${toneCls}`}>
       {icon ?? <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />}
       {label}
     </span>
@@ -62,8 +62,8 @@ export function Chip({ children, tone = 'default' }: { children: React.ReactNode
   return (
     <span className={
       tone === 'rec'
-        ? 'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-destructive bg-destructive/10'
-        : 'inline-flex items-center rounded border border-border bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground'
+        ? 'inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-bold uppercase tracking-wide text-destructive bg-destructive/10'
+        : 'inline-flex items-center rounded border border-border bg-secondary px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground'
     }>
       {children}
     </span>
@@ -110,5 +110,5 @@ export function QuotaBar({ actualGB, virtualGB, quotaGB }: {
 }
 
 export function inputCls(extra = '') {
-  return `h-7 px-2 rounded border border-border bg-background text-xs outline-none focus:ring-1 focus:ring-primary ${extra}`
+  return `h-8 px-2.5 rounded border border-border bg-background text-sm outline-none focus:ring-1 focus:ring-primary ${extra}`
 }

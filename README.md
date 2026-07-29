@@ -151,7 +151,7 @@ automatically — every one is a suggestion you still review and confirm:
   confidence level, as an extra hint alongside the normal TMDB suggestion
   list. You still click a candidate yourself to actually resolve it.
 
-See [USERGUIDE.md](USERGUIDE.md#10-curation-tools) for the full set of
+See [USERGUIDE.md](USERGUIDE.md#11-curation-tools) for the full set of
 curation tools (Missing Artwork, Language Filter, Duplicate Finder, Needs
 Review, Orphan Checker) with screenshots.
 
@@ -262,4 +262,4 @@ movies/episodes with zero sources at all). Every movie/series can also be
 manually renamed or have its year corrected from its own detail view, for
 whatever a provider's own catalog data got wrong with no other way to fix
 it. Full details and screenshots for each in
-[USERGUIDE.md](USERGUIDE.md#10-curation-tools).
+[USERGUIDE.md](USERGUIDE.md#11-curation-tools).

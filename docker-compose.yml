@@ -7,6 +7,39 @@ services:
       - "8282:8282"
     volumes:
       - vod_manager_data:/app/data
+      # --- Optional: local-path DVR mode -----------------------------------
+      # Only needed if you enable DVR on a Dispatcharr connection AND set a
+      # "local path" for it (Configuration -> Dispatcharr Connections -> DVR).
+      # That mode requires this container to be able to read that Dispatcharr
+      # instance's recordings directly off disk, same as any bind-mounted
+      # volume shared between two containers. Leave this out entirely to use
+      # "download mode" instead (DVR local path field left blank) -- VOD
+      # Manager then pulls each recording over Dispatcharr's own API one time
+      # instead, no shared filesystem access needed at all. See USERGUIDE.md
+      # section 7 ("DVR recordings") for the full walkthrough. Don't add your
+      # real mount here -- put it in docker-compose.override.yml instead
+      # (gitignored, merges automatically with `docker compose up`), so this
+      # file stays generic for anyone else deploying from this repo.
+      #
+      # Case A -- Dispatcharr on this same host, in its own Docker container:
+      # mount the SAME named volume that container already uses for its
+      # recordings, e.g. if `docker inspect <dispatcharr-container>` shows
+      # a volume mounted at /data, add here:
+      #   - dispatcharr_recordings_volume_name:/mnt/dvr/<label>:ro
+      # and declare it under `volumes:` below as external:
+      #   dispatcharr_recordings_volume_name:
+      #     external: true
+      # Then in the UI, the local path is /mnt/dvr/<label>/recordings (the
+      # "/recordings" subfolder specifically -- Dispatcharr reports file
+      # paths as /data/recordings/..., and that /data/recordings prefix gets
+      # stripped and re-joined onto whatever you mount here).
+      #
+      # Case B -- Dispatcharr on a different host, reachable via NFS: mount
+      # the NFS share at the HOST level (outside VOD Manager's concern, plain
+      # Docker/OS NFS client config), then bind-mount that host path in here
+      # same as any other bind mount:
+      #   - /mnt/nfs/<label>-recordings:/mnt/dvr/<label>:ro
+      # -----------------------------------------------------------------------
 
 volumes:
   vod_manager_data:

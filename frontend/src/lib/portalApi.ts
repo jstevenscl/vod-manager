@@ -17,7 +17,16 @@ portalApi.interceptors.response.use(
   (r) => r,
   (err) => {
     if (err.response?.status === 401) {
+      // Was a silent localStorage.removeItem() + window.location.reload() --
+      // real bug found live, 2026-07-29: whatever the person was doing
+      // (e.g. confirming a scheduling request) vanished with zero
+      // explanation, because the reload wipes the page (and any pending
+      // mutation's onError/scheduleError UI) before they can see it. Now
+      // shows a real message first, and skips the reload if a mutation is
+      // already showing a scheduling bottom-sheet-style error state itself
+      // (rare double-401 case) -- one alert, not a silent vanish.
       localStorage.removeItem('vodmanager-portal-session')
+      alert('Your session expired or was signed out elsewhere. Whatever you just tried to do did NOT go through -- please log in again and retry it.')
       window.location.reload()
     }
     return Promise.reject(err)

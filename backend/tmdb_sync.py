@@ -14,6 +14,7 @@ organizes what's already there according to an external list.
 
 import asyncio
 import logging
+import time
 
 import httpx
 
@@ -163,6 +164,25 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
 
         results = await asyncio.gather(*[_season(n) for n in seasons])
     return [ep for season_eps in results for ep in season_eps]
+
+
+_episode_list_cache: dict[str, tuple[float, list[dict]]] = {}
+_EPISODE_LIST_CACHE_TTL = 3600  # 1 hour -- a show's full history barely ever
+# changes; only the newest handful of episodes do. Added 2026-07-29 for the
+# portal Library's per-show episode view (season pill selector) -- a real,
+# long-running show (General Hospital: 63 seasons, ~10.8k episodes) takes
+# ~3s to fetch fresh every time (confirmed live), which is fine for an
+# occasional admin action but too slow to re-pay on every portal page open.
+
+
+async def get_series_episode_list_cached(tmdb_id: str) -> list[dict]:
+    now = time.time()
+    cached = _episode_list_cache.get(tmdb_id)
+    if cached and now - cached[0] < _EPISODE_LIST_CACHE_TTL:
+        return cached[1]
+    episodes = await get_series_episode_list(tmdb_id)
+    _episode_list_cache[tmdb_id] = (now, episodes)
+    return episodes
 
 
 async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:

@@ -140,6 +140,51 @@ def save_anthropic_api_key(api_key: str) -> None:
     _write_raw(data)
 
 
+# ── SMTP / notifications ─────────────────────────────────────────────────────
+# The one real credential in this settings block (the SMTP password) is
+# encrypted at rest via secrets_util, same as every other real credential in
+# this app (provider passwords, Dispatcharr tokens, XC client secrets) --
+# imported lazily inside these two functions rather than at module level,
+# since secrets_util itself imports config (for get_or_create_encryption_key)
+# and a top-level import here would be circular.
+
+def get_smtp_settings() -> dict:
+    data = _read_raw()
+    smtp = data.get("smtp") or {}
+    import secrets_util
+    return {
+        "host": smtp.get("host") or None,
+        "port": smtp.get("port") or 587,
+        "username": smtp.get("username") or None,
+        "password": secrets_util.decrypt_value(smtp.get("password")),
+        "from_address": smtp.get("from_address") or None,
+        "use_tls": smtp.get("use_tls", True),
+        "admin_recipients": smtp.get("admin_recipients") or [],
+    }
+
+
+def save_smtp_settings(
+    host: str | None, port: int, username: str | None, password: str | None,
+    from_address: str | None, use_tls: bool, admin_recipients: list[str],
+) -> None:
+    import secrets_util
+    data = _read_raw()
+    existing = data.get("smtp") or {}
+    data["smtp"] = {
+        "host": host,
+        "port": port,
+        "username": username,
+        # A blank password on save means "leave the existing one alone" --
+        # the settings form never round-trips the real decrypted password
+        # back to the browser, so an empty submit must not wipe it.
+        "password": secrets_util.encrypt_value(password) if password else existing.get("password"),
+        "from_address": from_address,
+        "use_tls": use_tls,
+        "admin_recipients": admin_recipients,
+    }
+    _write_raw(data)
+
+
 # ── AI provider selection ────────────────────────────────────────────────────
 # ai_assist.py can talk to any of these three -- a user might already have a
 # key for one and not another, or want to compare quality/cost, so the key

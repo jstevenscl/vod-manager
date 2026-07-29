@@ -10,11 +10,15 @@ export default function PortalApp() {
   const [authState, setAuthState] = useState<AuthState>('checking')
 
   useEffect(() => {
-    // No per-portal-user theme switcher for v1 -- just pick a sane default,
-    // same as the admin app's own initTheme default, rather than leaving it
-    // to an unset prefers-color-scheme fallback.
+    // No per-portal-user theme switcher for v1 -- just pick a sane default
+    // rather than leaving it to an unset prefers-color-scheme fallback.
+    // 'mid', not 'dark' or the admin app's own initTheme default -- 'dark'
+    // pushes card/border contrast too low against the page background for
+    // a screen most people are using briefly to schedule something, not
+    // settled into for hours (real feedback, 2026-07-28: "so dark you cant
+    // easily see the cards borders").
     if (!document.documentElement.getAttribute('data-theme')) {
-      document.documentElement.setAttribute('data-theme', 'dark')
+      document.documentElement.setAttribute('data-theme', 'mid')
     }
     const token = localStorage.getItem('vodmanager-portal-session')
     if (!token) { setAuthState('login'); return }

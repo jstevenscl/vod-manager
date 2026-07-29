@@ -142,7 +142,7 @@ async def download_recording_file(connection: dict, recording_id: int, dest_path
 
 
 async def search_epg_programs(
-    connection: dict, title: str, limit: int = 50, channel_id: int | None = None,
+    connection: dict, title: str, limit: int = 50, channel_id: int | None = None, include_in_progress: bool = False,
 ) -> list[dict]:
     """Real upcoming EPG airings for a title -- GET /api/epg/programs/search/,
     confirmed live (dispatch-test v0.27.2 and v0.28.2, 2026-07-26). Bounded to
@@ -161,13 +161,24 @@ async def search_epg_programs(
     carrying the title, each result's own 'channels' array of real Channel
     objects ({id, name, channel_number, channel_group, tvg_id}) -- confirmed
     live this is a genuine array despite the OpenAPI schema documenting it as
-    a plain string, so don't trust that doc field's type."""
+    a plain string, so don't trust that doc field's type.
+
+    include_in_progress=False (default, every existing caller) starts the
+    window at "now" -- correct for "what can I schedule going forward," but
+    it silently drops whatever's airing RIGHT NOW (already started, not yet
+    ended), which is wrong for a browsable guide (portal_guide's own
+    fallback search hit this live, 2026-07-28: the guide's first entry was
+    always ~an hour in the future, never what's currently on). True widens
+    start_after back to 4 hours ago so an in-progress program is still
+    found by its own start_time, while still bounded enough that this never
+    turns into an unbounded historical search."""
     from datetime import datetime, timedelta, timezone as _tz
     now = datetime.now(_tz.utc)
+    window_start = now - timedelta(hours=4) if include_in_progress else now
     client = DispatcharrClient(connection["url"], connection["token"])
     params = {
         "title": title, "title_whole_words": "true",
-        "start_after": now.isoformat(), "start_before": (now + timedelta(days=7)).isoformat(),
+        "start_after": window_start.isoformat(), "start_before": (now + timedelta(days=7)).isoformat(),
         "page_size": limit,
     }
     if channel_id:
@@ -176,7 +187,7 @@ async def search_epg_programs(
     return data.get("results", []) if isinstance(data, dict) else data
 
 
-def _episode_identity_key(program: dict) -> str:
+def episode_identity_key(program: dict) -> str:
     """Same identity heuristic Dispatcharr's own series-rules evaluator uses
     to tell two airings of the same episode apart from two genuinely
     different programs (apps/channels/tasks.py's _episode_key, dispatch-test
@@ -238,6 +249,28 @@ def _overlaps_any(start: str | None, end: str | None, intervals: list[tuple[str,
     return False
 
 
+async def find_existing_recording(connection: dict, channel_id: int, program: dict) -> dict | None:
+    """Same dedup schedule_channel_recordings applies internally (identity
+    key match against every existing Recording on this channel), but
+    returns the matched Recording itself rather than just a bool -- needed
+    by portal_schedule_single to attach a second person as a co-owner of an
+    already-existing recording instead of just refusing with a conflict
+    error (see is_already_scheduled below, kept as the simple bool-only
+    wrapper for callers that only need to know whether to skip). A pure
+    time-overlap match (no identity match, just an overlapping timeslot --
+    see _overlaps_any) is real for is_already_scheduled's dedup purposes but
+    has no single matched Recording to hand back for co-ownership, so that
+    case returns None here even though is_already_scheduled would say True
+    for it."""
+    existing = await _list_all_recordings(connection)
+    on_channel = [r for r in existing if r.get("channel") == channel_id]
+    key = episode_identity_key(program)
+    for r in on_channel:
+        if episode_identity_key((r.get("custom_properties") or {}).get("program") or {}) == key:
+            return r
+    return None
+
+
 async def is_already_scheduled(connection: dict, channel_id: int, program: dict) -> bool:
     """Same dedup schedule_channel_recordings applies internally (identity
     key OR real-world time-overlap against every existing Recording on this
@@ -247,12 +280,10 @@ async def is_already_scheduled(connection: dict, channel_id: int, program: dict)
     a real live gap while testing 2026-07-27: a Recording already existed
     for the exact episode being "found," and without this check the
     auto-record path would have silently created a duplicate."""
+    if await find_existing_recording(connection, channel_id, program) is not None:
+        return True
     existing = await _list_all_recordings(connection)
     on_channel = [r for r in existing if r.get("channel") == channel_id]
-    key = _episode_identity_key(program)
-    existing_keys = {_episode_identity_key((r.get("custom_properties") or {}).get("program") or {}) for r in on_channel}
-    if key in existing_keys:
-        return True
     existing_intervals = [(r["start_time"], r["end_time"]) for r in on_channel]
     return _overlaps_any(program.get("start_time"), program.get("end_time"), existing_intervals)
 
@@ -286,11 +317,11 @@ async def create_recording(connection: dict, channel_id: int, program: dict, sch
     writes (confirmed live -- RecordingSerializer.validate only applies the
     global pre/post-roll offsets when custom_properties.program is present
     as a dict), nested the same way search_epg_programs' own results are, so
-    _episode_identity_key produces the same key whether it's reading a fresh
+    episode_identity_key produces the same key whether it's reading a fresh
     search result or an already-created Recording.
 
     scheduled_by, when given, is stored as a sibling of "program" (not
-    nested inside it, so it never affects _episode_identity_key) --
+    nested inside it, so it never affects episode_identity_key) --
     {"dispatcharr_user_id", "dispatcharr_username", "profile_label"} --
     Dispatcharr's own Recording model has no concept of who scheduled it,
     so this is VOD Manager's own record for the Scheduled Recordings
@@ -310,12 +341,49 @@ async def create_recording(connection: dict, channel_id: int, program: dict, sch
                 "onscreen_episode": props.get("onscreen_episode"),
             },
         },
+        # ALSO at the top level, mirroring exactly where Dispatcharr's own
+        # native EPG-matched recordings put them (confirmed live, dispatch-
+        # test v0.27.2 -- see recording_program_info's docstring) -- that's
+        # the ONLY location dispatcharr_dvr_importer.py's classification
+        # step (recording_program_info -> _resolve_season_episode) ever
+        # reads. The nested copy above stays too, since episode_identity_key
+        # (this file's own dedup check) reads season/episode from THERE, not
+        # here -- two different real consumers, two different shapes, so a
+        # single recording needs both. Real bug found live 2026-07-28: every
+        # single ever scheduled via the portal had season/episode invisible
+        # to the importer, so any show without a distinct EPG sub_title
+        # (e.g. a soap opera like General Hospital) silently imported as a
+        # movie -- and kept re-importing as a movie on every later poll
+        # cycle even after being manually corrected, since nothing here ever
+        # satisfied the importer's structured-field check.
+        "season": props.get("season"),
+        "episode": props.get("episode"),
+        "onscreen_episode": props.get("onscreen_episode"),
     }
     if scheduled_by:
         custom_properties["scheduled_by"] = scheduled_by
+    # Confirmed live 2026-07-28: selecting an already-in-progress program
+    # (the guide's own include_in_progress fix means these are now real,
+    # pickable results) silently never actually recorded anything. Root
+    # cause: the TOP-LEVEL start_time below is what Dispatcharr's own
+    # recording task actually triggers on, as distinct from the identity/
+    # display copy nested under custom_properties.program above -- a task
+    # whose trigger time has already passed just never fires, the same way
+    # any real DVR can't retroactively start a recording in the past.
+    # Clamped to "now" (never to the nested copy, which stays the show's
+    # true original start time so identity/dedup and the info the person
+    # sees are both unaffected) -- the result is a real, if partial,
+    # recording from the moment they chose to record it, same as pressing
+    # record mid-episode on any real DVR.
+    from datetime import datetime, timezone as _tz
+    now_iso = datetime.now(_tz.utc).isoformat()
+    effective_start = program["start_time"]
+    parsed_start = _parse_iso(program["start_time"])
+    if parsed_start is not None and parsed_start < datetime.now(_tz.utc):
+        effective_start = now_iso
     body = {
         "channel": channel_id,
-        "start_time": program["start_time"],
+        "start_time": effective_start,
         "end_time": program["end_time"],
         "custom_properties": custom_properties,
     }
@@ -339,7 +407,7 @@ async def schedule_channel_recordings(
     background scan, since Dispatcharr's own recurring series-rules
     re-evaluation is what's being bypassed here, so VOD Manager now owns
     rediscovering newly-visible episodes as the EPG horizon rolls forward.
-    Already-scheduled airings are skipped via _episode_identity_key
+    Already-scheduled airings are skipped via episode_identity_key
     (compared against every existing Recording on this same channel, not
     just ones VOD Manager itself created), not re-created.
 
@@ -355,7 +423,7 @@ async def schedule_channel_recordings(
     upstream guide data spanning multiple EPG sources, not something this
     function invents) -- e.g. "Access Daily" search returned onscreen
     S16E187 and S16E179 both at 2026-07-28T08:00:00Z on the same channel,
-    on 4 of 5 days checked. _episode_identity_key alone would schedule
+    on 4 of 5 days checked. episode_identity_key alone would schedule
     both, since by season/episode metadata they genuinely look like
     different episodes -- but a channel can only physically produce one
     recording per timeslot, so this needs its own check. Keeps whichever
@@ -376,13 +444,18 @@ async def schedule_channel_recordings(
     for what the callback actually does; this function stays a pure
     Dispatcharr-API client with no vod_db dependency of its own, so the
     vod_db-aware decision lives in the caller instead of here."""
-    matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id)
+    # include_in_progress=True so a series rule created (or rescanned) while
+    # its own show is mid-airing still finds and schedules that specific
+    # episode, not just future ones -- safe on every rescan pass too, since
+    # the dedup below (identity key + time-overlap) already guards against
+    # re-creating a Recording for an episode this same call already handled.
+    matches = await search_epg_programs(connection, title, limit=limit, channel_id=channel_id, include_in_progress=True)
     if mode == "new":
         matches = [m for m in matches if (m.get("custom_properties") or {}).get("new")]
 
     existing = await _list_all_recordings(connection)
     existing_keys = {
-        _episode_identity_key((r.get("custom_properties") or {}).get("program") or {})
+        episode_identity_key((r.get("custom_properties") or {}).get("program") or {})
         for r in existing
         if r.get("channel") == channel_id
     }
@@ -392,7 +465,7 @@ async def schedule_channel_recordings(
 
     created, skipped, conflicts, backfilled = [], 0, 0, 0
     for program in matches:
-        key = _episode_identity_key(program)
+        key = episode_identity_key(program)
         if key in existing_keys:
             skipped += 1
             continue
@@ -435,6 +508,48 @@ async def schedule_channel_recordings(
         "total_matches": len(matches), "scheduled": len(created), "skipped_existing": skipped,
         "skipped_conflicts": conflicts, "backfilled": backfilled, "created": created,
     }
+
+
+async def get_epg_grid(connection: dict) -> list[dict]:
+    """Real cable-guide data -- GET /api/epg/grid/, "programs from the
+    previous hour, currently running and upcoming for the next 24 hours"
+    (Dispatcharr's own description) across every channel at once, unlike
+    search_epg_programs which requires a title. Each item only carries
+    tvg_id (not a channels[] array like search results do), so the caller
+    has to cross-reference against list_channels itself to know which
+    channel a program belongs to. Also carries is_new/is_live/is_premiere/
+    is_finale directly on the program -- confirmed live, richer and simpler
+    than search_epg_programs' custom_properties.previously_shown.
+
+    Confirmed live (dispatch-test, 2026-07-28) this returns a single
+    {"data": [...]} object, no "results" key and no pagination at all --
+    49991 programs in one call, no count/next/previous. The original
+    data.get("results", []) fallback was silently returning an empty list
+    every time (the wrong key), which is why the Scheduler showed "no
+    channels in your lineup" for every real account, not just one with a
+    genuinely empty profile."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    data = await client.get("/api/epg/grid/")
+    return data if isinstance(data, list) else data.get("data", [])
+
+
+async def list_channels(connection: dict) -> list[dict]:
+    """Real Dispatcharr Channels (id, name, channel_number, ...) -- GET
+    /api/channels/channels/. Only used to resolve a channel_id already
+    stored elsewhere (a recording rule, an upcoming/scheduled recording)
+    into a real display name -- those only ever store the bare id, matching
+    every other Dispatcharr-owned id in this codebase (dispatcharr_user_id
+    etc. are intentionally not local FKs, see visible_channel_ids' docstring
+    for why).
+
+    The OpenAPI schema documents page/page_size params on this endpoint,
+    but confirmed live: called with no params at all, it returns every
+    channel as a flat list in one shot (2388 real channels, no pagination
+    wrapper) -- passing page params instead switches it INTO a paginated
+    response. Deliberately not doing that here."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    data = await client.get("/api/channels/channels/")
+    return data if isinstance(data, list) else data.get("results", [])
 
 
 async def list_channel_profiles(connection: dict) -> list[dict]:

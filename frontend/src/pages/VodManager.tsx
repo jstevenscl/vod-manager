@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -93,6 +93,9 @@ interface DvrUserLimit {
   disk_quota_bytes: number | null
   retention_max_age_days: number | null
   retention_max_episodes_per_show: number | null
+  default_movie_category_id: number | null
+  default_series_category_id: number | null
+  quota_policy: 'hard_fail' | 'delete_oldest'
   created_at: string
 }
 
@@ -101,6 +104,7 @@ interface PortalAccount {
   provider_id: number
   dispatcharr_user_id: number
   username: string
+  email: string | null
   totp_enabled: number
   totp_last_counter: number | null
   created_at: string
@@ -3159,6 +3163,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       setTmdbApiKeyInput('')
     },
   })
+  // SMTP -- powers notifications.notify_quota_threshold (DVR disk-quota
+  // warnings, the only trigger today). Password never round-trips back to
+  // the browser (has_password only), same pattern as the TMDB key above.
+  const smtpSettingsQuery = useQuery<{
+    host: string | null; port: number; username: string | null; has_password: boolean
+    from_address: string | null; use_tls: boolean; admin_recipients: string[]
+  }>({
+    queryKey: ['vod-smtp-settings'],
+    queryFn:  () => api.get('/vod/smtp-settings/').then((r) => r.data),
+  })
+  const [smtpForm, setSmtpForm] = useState({
+    host: '', port: '587', username: '', password: '', from_address: '', use_tls: true, admin_recipients: '',
+  })
+  useEffect(() => {
+    if (!smtpSettingsQuery.data) return
+    const s = smtpSettingsQuery.data
+    setSmtpForm({
+      host: s.host ?? '', port: String(s.port ?? 587), username: s.username ?? '', password: '',
+      from_address: s.from_address ?? '', use_tls: s.use_tls, admin_recipients: (s.admin_recipients ?? []).join(', '),
+    })
+  }, [smtpSettingsQuery.data])
+  const saveSmtpSettings = useMutation({
+    mutationFn: () => api.post('/vod/smtp-settings/', {
+      host: smtpForm.host || null,
+      port: Number(smtpForm.port) || 587,
+      username: smtpForm.username || null,
+      password: smtpForm.password || null,
+      from_address: smtpForm.from_address || null,
+      use_tls: smtpForm.use_tls,
+      admin_recipients: smtpForm.admin_recipients.split(',').map((s) => s.trim()).filter(Boolean),
+    }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-smtp-settings'] }),
+  })
   const aiSettingsQuery = useQuery<{
     provider: AiProvider
     model: string
@@ -3584,8 +3621,30 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [dvrLimitForm, setDvrLimitForm] = useState({
     dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '',
     retention_max_age_days: '', retention_max_episodes_per_show: '',
+    default_movie_category_id: '', default_series_category_id: '',
+    quota_policy: 'hard_fail' as 'hard_fail' | 'delete_oldest',
   })
   const [dvrLimitError, setDvrLimitError] = useState<string | null>(null)
+  // Lets the DVR Users screen create a new category inline (typed via a
+  // quick prompt(), same pattern this file already uses for password resets
+  // and delete confirms) instead of forcing a trip to Manage Categories and
+  // back -- the picker's only other option before this was "pick from what
+  // already exists".
+  const quickCreateCategory = useMutation({
+    mutationFn: (v: { name: string; content_type: 'movie' | 'series' }) =>
+      api.post('/vod/categories/', { name: v.name, content_type: v.content_type, is_smart: false, rule_json: null }).then((r) => r.data.id as number),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  const promptNewCategory = async (contentType: 'movie' | 'series'): Promise<number | null> => {
+    const name = prompt(`New ${contentType === 'movie' ? 'movie' : 'TV'} category name:`)
+    if (!name || !name.trim()) return null
+    try {
+      return await quickCreateCategory.mutateAsync({ name: name.trim(), content_type: contentType })
+    } catch (e: any) {
+      alert(e?.response?.data?.detail ?? 'Failed to create category.')
+      return null
+    }
+  }
   const addDvrUserLimit = useMutation({
     mutationFn: () => {
       const user = dispatcharrUsersQuery.data?.find((u) => u.id === Number(dvrLimitForm.dispatcharr_user_id))
@@ -3597,11 +3656,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         disk_quota_bytes: dvrLimitForm.disk_quota_gb ? Math.round(Number(dvrLimitForm.disk_quota_gb) * 1024 ** 3) : null,
         retention_max_age_days: dvrLimitForm.retention_max_age_days ? Number(dvrLimitForm.retention_max_age_days) : null,
         retention_max_episodes_per_show: dvrLimitForm.retention_max_episodes_per_show ? Number(dvrLimitForm.retention_max_episodes_per_show) : null,
+        default_movie_category_id: dvrLimitForm.default_movie_category_id ? Number(dvrLimitForm.default_movie_category_id) : null,
+        default_series_category_id: dvrLimitForm.default_series_category_id ? Number(dvrLimitForm.default_series_category_id) : null,
+        quota_policy: dvrLimitForm.quota_policy,
       })
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] })
-      setDvrLimitForm({ dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '', retention_max_age_days: '', retention_max_episodes_per_show: '' })
+      setDvrLimitForm({
+        dispatcharr_user_id: '', stream_reserve: '0', disk_quota_gb: '', retention_max_age_days: '', retention_max_episodes_per_show: '',
+        default_movie_category_id: '', default_series_category_id: '', quota_policy: 'hard_fail',
+      })
       setDvrLimitError(null)
     },
     onError: (e: any) => setDvrLimitError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
@@ -3611,10 +3676,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
   })
   const updateDvrUserLimit = useMutation({
-    mutationFn: (v: { id: number; stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }) =>
+    mutationFn: (v: { id: number; stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null; default_movie_category_id: number | null; default_series_category_id: number | null; quota_policy?: string }) =>
       api.post(`/vod/dvr-user-limits/${v.id}/`, {
         stream_reserve: v.stream_reserve, disk_quota_bytes: v.disk_quota_bytes,
         retention_max_age_days: v.retention_max_age_days, retention_max_episodes_per_show: v.retention_max_episodes_per_show,
+        default_movie_category_id: v.default_movie_category_id, default_series_category_id: v.default_series_category_id,
+        quota_policy: v.quota_policy,
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dvr-user-limits', recordingProfilesProviderId] }),
   })
@@ -3627,7 +3694,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/portal-accounts/', { params: { provider_id: recordingProfilesProviderId } }).then((r) => r.data),
     enabled:  recordingProfilesProviderId != null,
   })
-  const [portalAccountForm, setPortalAccountForm] = useState({ dispatcharr_user_id: '', username: '', password: '' })
+  const [portalAccountForm, setPortalAccountForm] = useState({ dispatcharr_user_id: '', username: '', password: '', email: '' })
   const [portalAccountError, setPortalAccountError] = useState<string | null>(null)
   const createPortalAccount = useMutation({
     mutationFn: () => api.post('/vod/portal-accounts/', {
@@ -3635,10 +3702,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       dispatcharr_user_id: Number(portalAccountForm.dispatcharr_user_id),
       username: portalAccountForm.username,
       password: portalAccountForm.password,
+      email: portalAccountForm.email || null,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] })
-      setPortalAccountForm({ dispatcharr_user_id: '', username: '', password: '' })
+      setPortalAccountForm({ dispatcharr_user_id: '', username: '', password: '', email: '' })
       setPortalAccountError(null)
     },
     onError: (e: any) => setPortalAccountError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
@@ -3648,6 +3716,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const resetPortalAccountMfa = useMutation({
     mutationFn: (id: number) => api.post(`/vod/portal-accounts/${id}/reset-mfa/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] }),
+  })
+  const updatePortalAccountEmail = useMutation({
+    mutationFn: (v: { id: number; email: string | null }) => api.post(`/vod/portal-accounts/${v.id}/email/`, { email: v.email }),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-portal-accounts', recordingProfilesProviderId] }),
   })
   const deletePortalAccount = useMutation({
@@ -4425,6 +4497,59 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             )}
           </div>
         ))}
+      </SectionCard>
+
+      <SectionCard title="Notifications" icon={<Mail size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          SMTP — powers DVR disk-quota warnings (see DVR Users below). Sent to this admin recipient list, plus
+          each person's own email if they've set one on their portal account (Portal Access below, or they can
+          add it themselves).
+        </p>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <input
+            className={inputCls('w-40')} placeholder="SMTP host" value={smtpForm.host}
+            onChange={(e) => setSmtpForm({ ...smtpForm, host: e.target.value })}
+          />
+          <input
+            className={inputCls('w-20')} type="number" placeholder="Port" value={smtpForm.port}
+            onChange={(e) => setSmtpForm({ ...smtpForm, port: e.target.value })}
+          />
+          <input
+            className={inputCls('w-32')} placeholder="Username" value={smtpForm.username}
+            onChange={(e) => setSmtpForm({ ...smtpForm, username: e.target.value })}
+          />
+          <input
+            className={inputCls('w-32')} type="password"
+            placeholder={smtpSettingsQuery.data?.has_password ? '•••••••• (leave blank to keep)' : 'Password'}
+            value={smtpForm.password}
+            onChange={(e) => setSmtpForm({ ...smtpForm, password: e.target.value })}
+          />
+          <input
+            className={inputCls('w-40')} type="email" placeholder="From address" value={smtpForm.from_address}
+            onChange={(e) => setSmtpForm({ ...smtpForm, from_address: e.target.value })}
+          />
+          <label className="text-xs text-muted-foreground flex items-center gap-1">
+            <input
+              type="checkbox" checked={smtpForm.use_tls}
+              onChange={(e) => setSmtpForm({ ...smtpForm, use_tls: e.target.checked })}
+            />
+            STARTTLS
+          </label>
+        </div>
+        <input
+          className={inputCls('w-full')}
+          placeholder="Admin recipient emails, comma-separated"
+          value={smtpForm.admin_recipients}
+          onChange={(e) => setSmtpForm({ ...smtpForm, admin_recipients: e.target.value })}
+        />
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" disabled={saveSmtpSettings.isPending} onClick={() => saveSmtpSettings.mutate()}>
+            {saveSmtpSettings.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          {smtpSettingsQuery.data?.host && (
+            <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
+          )}
+        </div>
       </SectionCard>
 
       <SectionCard title="Security" icon={<ShieldCheck size={14} />}>
@@ -5857,11 +5982,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     const usage = dvrUserUsageQuery.data?.[lim.id]
                     const virtualGB = usage != null ? (usage.virtual_bytes / 1024 ** 3) : null
                     const quotaGB = lim.disk_quota_bytes != null ? (lim.disk_quota_bytes / 1024 ** 3) : null
-                    const pushUpdate = (patch: Partial<{ stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null }>) =>
+                    const pushUpdate = (patch: Partial<{ stream_reserve: number; disk_quota_bytes: number | null; retention_max_age_days: number | null; retention_max_episodes_per_show: number | null; default_movie_category_id: number | null; default_series_category_id: number | null; quota_policy: string }>) =>
                       updateDvrUserLimit.mutate({
                         id: lim.id,
                         stream_reserve: lim.stream_reserve, disk_quota_bytes: lim.disk_quota_bytes,
                         retention_max_age_days: lim.retention_max_age_days, retention_max_episodes_per_show: lim.retention_max_episodes_per_show,
+                        default_movie_category_id: lim.default_movie_category_id, default_series_category_id: lim.default_series_category_id,
+                        quota_policy: lim.quota_policy,
                         ...patch,
                       })
                     const actualGB = usage != null ? (usage.actual_bytes / 1024 ** 3) : null
@@ -5905,6 +6032,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                               }}
                             />
                           </label>
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1" title="What happens once this person is at/over quota: hard fail blocks new recordings, delete oldest auto-evicts their own oldest recording to make room">
+                            At quota
+                            <select
+                              className={inputCls('w-28')} value={lim.quota_policy}
+                              onChange={(e) => pushUpdate({ quota_policy: e.target.value })}
+                            >
+                              <option value="hard_fail">Hard fail</option>
+                              <option value="delete_oldest">Delete oldest</option>
+                            </select>
+                          </label>
                           <label className="text-[10px] text-muted-foreground flex items-center gap-1">
                             Max age (days)
                             <input
@@ -5932,6 +6069,54 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                               Review retention
                             </Button>
                           )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Default movie category
+                            <select
+                              className={inputCls('w-36')}
+                              defaultValue={lim.default_movie_category_id ?? ''}
+                              key={`dmc-${lim.id}-${lim.default_movie_category_id}`}
+                              title="Where this person's recorded movies land when their own recording rule doesn't specify a category -- their standing default, wins over the connection-wide default"
+                              onChange={(e) => {
+                                const v = e.target.value ? Number(e.target.value) : null
+                                if (v !== lim.default_movie_category_id) pushUpdate({ default_movie_category_id: v })
+                              }}
+                            >
+                              <option value="">none…</option>
+                              {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                            </select>
+                            <button
+                              type="button" className="text-muted-foreground hover:text-foreground"
+                              title="Create a new movie category" disabled={quickCreateCategory.isPending}
+                              onClick={async () => { const id = await promptNewCategory('movie'); if (id) pushUpdate({ default_movie_category_id: id }) }}
+                            >
+                              <Plus size={11} />
+                            </button>
+                          </label>
+                          <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            Default TV category
+                            <select
+                              className={inputCls('w-36')}
+                              defaultValue={lim.default_series_category_id ?? ''}
+                              key={`dsc-${lim.id}-${lim.default_series_category_id}`}
+                              title="Where this person's recorded series land when their own recording rule doesn't specify a category -- their standing default, wins over the connection-wide default"
+                              onChange={(e) => {
+                                const v = e.target.value ? Number(e.target.value) : null
+                                if (v !== lim.default_series_category_id) pushUpdate({ default_series_category_id: v })
+                              }}
+                            >
+                              <option value="">none…</option>
+                              {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                            </select>
+                            <button
+                              type="button" className="text-muted-foreground hover:text-foreground"
+                              title="Create a new TV category" disabled={quickCreateCategory.isPending}
+                              onClick={async () => { const id = await promptNewCategory('series'); if (id) pushUpdate({ default_series_category_id: id }) }}
+                            >
+                              <Plus size={11} />
+                            </button>
+                          </label>
                         </div>
                         {retentionReviewLimitId === lim.id && (
                           <div className="border-t border-border pt-1.5 mt-1.5 space-y-1.5">
@@ -5993,8 +6178,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     placeholder="Disk quota (GB)"
                     value={dvrLimitForm.disk_quota_gb}
                     onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, disk_quota_gb: e.target.value })}
-                    title="Optional -- leave blank for no disk quota. Once their recordings' categories hold this much, new category placements for them are withheld (nothing existing is ever deleted)."
+                    title="Optional -- leave blank for no disk quota. What happens once they're at/over it is set by the dropdown to the right."
                   />
+                  <select
+                    className={inputCls('w-32')}
+                    value={dvrLimitForm.quota_policy}
+                    onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, quota_policy: e.target.value as 'hard_fail' | 'delete_oldest' })}
+                    title="At quota: hard fail blocks new recordings until they free up space; delete oldest automatically evicts their own oldest recording to make room. Editable later per-person."
+                  >
+                    <option value="hard_fail">At quota: hard fail</option>
+                    <option value="delete_oldest">At quota: delete oldest</option>
+                  </select>
                   <input
                     className={inputCls('w-28')}
                     type="number"
@@ -6011,6 +6205,38 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, retention_max_episodes_per_show: e.target.value })}
                     title="Optional -- keep only this many most-recent episodes per show, flagging the rest as eligible for removal via Review retention."
                   />
+                  <select
+                    className={inputCls()}
+                    value={dvrLimitForm.default_movie_category_id}
+                    onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, default_movie_category_id: e.target.value })}
+                    title="Optional -- where this person's recorded movies land when their own recording rule doesn't specify a category"
+                  >
+                    <option value="">Default movie category…</option>
+                    {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                  <button
+                    type="button" className="text-muted-foreground hover:text-foreground"
+                    title="Create a new movie category" disabled={quickCreateCategory.isPending}
+                    onClick={async () => { const id = await promptNewCategory('movie'); if (id) setDvrLimitForm((f) => ({ ...f, default_movie_category_id: String(id) })) }}
+                  >
+                    <Plus size={13} />
+                  </button>
+                  <select
+                    className={inputCls()}
+                    value={dvrLimitForm.default_series_category_id}
+                    onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, default_series_category_id: e.target.value })}
+                    title="Optional -- where this person's recorded series land when their own recording rule doesn't specify a category"
+                  >
+                    <option value="">Default TV category…</option>
+                    {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                  <button
+                    type="button" className="text-muted-foreground hover:text-foreground"
+                    title="Create a new TV category" disabled={quickCreateCategory.isPending}
+                    onClick={async () => { const id = await promptNewCategory('series'); if (id) setDvrLimitForm((f) => ({ ...f, default_series_category_id: String(id) })) }}
+                  >
+                    <Plus size={13} />
+                  </button>
                   <Button
                     size="sm"
                     disabled={!dvrLimitForm.dispatcharr_user_id || addDvrUserLimit.isPending}
@@ -6041,6 +6267,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           <span className="font-semibold">{acct.username}</span>{' '}
                           <span className="text-muted-foreground">— {liveUser?.username ?? `user ${acct.dispatcharr_user_id}`}</span>
                         </div>
+                        <input
+                          className={inputCls('w-36')}
+                          type="email"
+                          placeholder="Email (optional)"
+                          defaultValue={acct.email ?? ''}
+                          key={`email-${acct.id}-${acct.email}`}
+                          title="Where this person's own DVR quota warnings go, if SMTP is set up in Settings."
+                          onBlur={(e) => {
+                            const v = e.target.value.trim() || null
+                            if (v !== acct.email) updatePortalAccountEmail.mutate({ id: acct.id, email: v })
+                          }}
+                        />
                         <StatusPill
                           label={acct.totp_enabled ? 'MFA enrolled' : 'MFA not set up'}
                           tone={acct.totp_enabled ? 'success' : 'warning'}
@@ -6094,6 +6332,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     placeholder="Initial password"
                     value={portalAccountForm.password}
                     onChange={(e) => setPortalAccountForm({ ...portalAccountForm, password: e.target.value })}
+                  />
+                  <input
+                    className={inputCls('w-40')}
+                    type="email"
+                    placeholder="Email (optional)"
+                    value={portalAccountForm.email}
+                    onChange={(e) => setPortalAccountForm({ ...portalAccountForm, email: e.target.value })}
+                    title="Where their own DVR quota warnings go, if you set up SMTP in Settings. They can also add/change this themselves later."
                   />
                   <Button
                     size="sm"

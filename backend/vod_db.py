@@ -259,6 +259,86 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- Who has a given DVR-recorded item in their own portal Library --
+        -- many-to-many, deliberately separate from movie_sources.
+        -- recording_profile_id/dispatcharr_user_id (which stay as informal
+        -- "who/what originally created this source" info, unchanged).
+        -- Needed because a single physical recording can legitimately be
+        -- shared: two people can each have their own recording profile
+        -- matching the very same airing (match_recording_profiles' own
+        -- docstring already documented this "fan-out" for category
+        -- placement), or one person can schedule something another person
+        -- already has. Real requirement from the user, 2026-07-28: if Bill
+        -- schedules something Emby already recorded, Bill should see it in
+        -- his own Library too (attached to the SAME file, not a duplicate
+        -- recording) -- and if Emby then removes it from her Library, it
+        -- must disappear from HER Library only, not Bill's, and the
+        -- underlying file must only actually be deleted from disk once
+        -- EVERY owner has removed it (see remove_movie_library_owner /
+        -- remove_episode_library_owner). ON DELETE CASCADE so deleting the
+        -- source row itself (e.g. the admin's own hard delete) cleans these
+        -- up automatically rather than leaving orphans.
+        CREATE TABLE IF NOT EXISTS movie_source_owners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            movie_source_id INTEGER NOT NULL REFERENCES movie_sources(id) ON DELETE CASCADE,
+            dispatcharr_user_id INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            UNIQUE(movie_source_id, dispatcharr_user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS episode_source_owners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_source_id INTEGER NOT NULL REFERENCES episode_sources(id) ON DELETE CASCADE,
+            dispatcharr_user_id INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            UNIQUE(episode_source_id, dispatcharr_user_id)
+        );
+
+        -- Closes the one remaining gap in the shared-ownership model: Bill
+        -- scheduling something Emby's recording of is STILL IN PROGRESS (no
+        -- movie_sources/episode_sources row exists yet to attach him to --
+        -- attach_portal_user_to_existing_recording can only work once one
+        -- does). Rather than PATCHing Dispatcharr's own Recording object
+        -- (untested against a live instance, real risk of malforming
+        -- someone's actual in-progress recording), this is purely local:
+        -- portal_schedule_single stores a claim keyed by the same
+        -- (provider, channel, identity) triple find_existing_recording
+        -- already uses to find the match in the first place, and
+        -- dispatcharr_dvr_importer consumes (reads + deletes) any matching
+        -- claims the moment that exact recording actually imports, adding
+        -- each claimant as an owner alongside whoever the normal
+        -- attribution pass already found. Real requirement from the user,
+        -- 2026-07-28. identity_key is dispatcharr_dvr_client.
+        -- episode_identity_key's own output -- see its docstring for what
+        -- it folds in (season/episode, or onscreen_episode, or sub_title,
+        -- or failing all of those the airing's own start/end time).
+        CREATE TABLE IF NOT EXISTS pending_recording_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            channel_id INTEGER NOT NULL,
+            identity_key TEXT NOT NULL,
+            dispatcharr_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        -- Dedup for notifications.notify_quota_threshold -- one row per
+        -- (person, threshold) they've already been warned about, so the
+        -- importer's per-pass quota check doesn't re-email them every
+        -- single import cycle. dispatcharr_dvr_importer clears a person's
+        -- rows for any threshold their CURRENT usage no longer meets before
+        -- checking for new ones, so dropping back under 90% and crossing it
+        -- again later re-fires that warning -- this only suppresses
+        -- re-sending while they're continuously still at/above a threshold
+        -- already warned about.
+        CREATE TABLE IF NOT EXISTS quota_warnings_sent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            dispatcharr_user_id INTEGER NOT NULL,
+            threshold_pct INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(provider_id, dispatcharr_user_id, threshold_pct)
+        );
+
         -- Per-person DVR resource limits, one row per (DVR provider, real
         -- Dispatcharr login user) -- both the stream-concurrency reserve and
         -- the disk quota live together since they're conceptually "this
@@ -409,9 +489,18 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(dispatcharr_user_id);
         CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
+        CREATE INDEX IF NOT EXISTS idx_movie_source_owners_user_id ON movie_source_owners(dispatcharr_user_id);
+        CREATE INDEX IF NOT EXISTS idx_episode_source_owners_source_id ON episode_source_owners(episode_source_id);
+        CREATE INDEX IF NOT EXISTS idx_episode_source_owners_user_id ON episode_source_owners(dispatcharr_user_id);
+        CREATE INDEX IF NOT EXISTS idx_pending_recording_claims_lookup
+            ON pending_recording_claims(provider_id, channel_id, identity_key);
+        CREATE INDEX IF NOT EXISTS idx_quota_warnings_sent_lookup
+            ON quota_warnings_sent(provider_id, dispatcharr_user_id);
     """)
     _commit_with_retry(conn)
     _migrate(conn)
+    _backfill_source_owners(conn)
     # dispatcharr_connection_id only exists on `providers` from here on (it's
     # an ALTER TABLE in _migrate, not a base column -- providers predates
     # DVR support) -- this index has to wait until after that call on a
@@ -420,6 +509,33 @@ def init_db() -> None:
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_one_dvr_per_connection
             ON providers(dispatcharr_connection_id) WHERE provider_type='dispatcharr_dvr'
+    """)
+    # Same reasoning as the index above -- recording_profile_id/
+    # dispatcharr_user_id are ALSO ALTER-added migration columns on
+    # movie_sources/episode_sources, not base columns, so these have to
+    # wait until after _migrate() too. Real bug found live 2026-07-29: these
+    # 4 lines originally sat in the executescript block above (alongside
+    # base-column indexes), which crashed init_db() outright on any
+    # genuinely fresh database with "no such column: recording_profile_id"
+    # -- never caught earlier because every test this session ran against a
+    # copy of the already-migrated live DB, never a truly fresh install.
+    # Without these, _backfill_source_owners' filtered scans/joins over
+    # movie_sources/episode_sources (which can genuinely run into the
+    # millions of rows across every provider, not just DVR -- confirmed
+    # live 2026-07-28: 1.89M episode_sources rows, mostly ordinary catalog
+    # content with these columns always NULL) degrade to full table scans
+    # -- measured live at ~30s PER query on a real DB this size.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_movie_sources_recording_profile_id ON movie_sources(recording_profile_id);
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_movie_sources_dispatcharr_user_id ON movie_sources(dispatcharr_user_id);
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episode_sources_recording_profile_id ON episode_sources(recording_profile_id);
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episode_sources_dispatcharr_user_id ON episode_sources(dispatcharr_user_id);
     """)
     _commit_with_retry(conn)
     _migrate_primary_dispatcharr_connection(conn)
@@ -569,11 +685,51 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("dvr_recording_profiles", "monitored", "INTEGER NOT NULL DEFAULT 1"),
         ("movie_sources", "recording_profile_id", "INTEGER"),
         ("episode_sources", "recording_profile_id", "INTEGER"),
+        ("dvr_user_limits", "default_movie_category_id", "INTEGER"),
+        ("dvr_user_limits", "default_series_category_id", "INTEGER"),
+        ("movie_sources", "dispatcharr_user_id", "INTEGER"),
+        ("episode_sources", "dispatcharr_user_id", "INTEGER"),
+        ("portal_accounts", "email", "TEXT"),
+        ("dvr_user_limits", "quota_policy", "TEXT NOT NULL DEFAULT 'hard_fail'"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    _commit_with_retry(conn)
+
+
+def _backfill_source_owners(conn: sqlite3.Connection) -> None:
+    """One-time (but idempotent -- safe to run every startup) backfill of
+    movie_source_owners/episode_source_owners from the legacy single-owner
+    columns (recording_profile_id's own dispatcharr_user_id, or the direct
+    dispatcharr_user_id column) that predate the owners tables above. Every
+    source that already had exactly one known owner keeps that owner; goes
+    from implicit/single to explicit/multi without changing who currently
+    sees what. INSERT OR IGNORE against the UNIQUE(*_id, dispatcharr_user_id)
+    constraint makes re-running this a no-op once caught up."""
+    conn.execute("""
+        INSERT OR IGNORE INTO movie_source_owners (movie_source_id, dispatcharr_user_id, added_at)
+        SELECT ms.id, p.dispatcharr_user_id, ms.added_at
+        FROM movie_sources ms JOIN dvr_recording_profiles p ON p.id = ms.recording_profile_id
+        WHERE p.dispatcharr_user_id IS NOT NULL
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO movie_source_owners (movie_source_id, dispatcharr_user_id, added_at)
+        SELECT ms.id, ms.dispatcharr_user_id, ms.added_at
+        FROM movie_sources ms WHERE ms.dispatcharr_user_id IS NOT NULL
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO episode_source_owners (episode_source_id, dispatcharr_user_id, added_at)
+        SELECT es.id, p.dispatcharr_user_id, es.added_at
+        FROM episode_sources es JOIN dvr_recording_profiles p ON p.id = es.recording_profile_id
+        WHERE p.dispatcharr_user_id IS NOT NULL
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO episode_source_owners (episode_source_id, dispatcharr_user_id, added_at)
+        SELECT es.id, es.dispatcharr_user_id, es.added_at
+        FROM episode_sources es WHERE es.dispatcharr_user_id IS NOT NULL
+    """)
     _commit_with_retry(conn)
 
 
@@ -829,6 +985,313 @@ def set_episode_source_recording_profile(provider_id: int, stream_id: str, recor
     conn.close()
 
 
+def set_movie_source_dispatcharr_user_id(provider_id: int, stream_id: str, dispatcharr_user_id: int) -> None:
+    """Fallback attribution for a TRUE single (portal_routes.
+    portal_schedule_single's 'Record this episode', no dvr_recording_profiles
+    row at all) -- set_movie_source_recording_profile can't apply since
+    there's no profile to point at, but the portal library still needs to
+    know whose recording this is. Real gap found live 2026-07-28: every
+    single ever recorded was invisible in every portal user's own Library,
+    since list_portal_library_movies/episodes only ever joined through a
+    profile. Only called when dispatcharr_dvr_importer's attribution pass
+    found no profile match for this stream_id at all -- a profile-owned
+    recording keeps using that path instead, unchanged."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE movie_sources SET dispatcharr_user_id=? WHERE provider_id=? AND provider_stream_id=?",
+        (dispatcharr_user_id, provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_episode_source_dispatcharr_user_id(provider_id: int, stream_id: str, dispatcharr_user_id: int) -> None:
+    """Episode counterpart to set_movie_source_dispatcharr_user_id."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE episode_sources SET dispatcharr_user_id=? WHERE provider_id=? AND provider_stream_id=?",
+        (dispatcharr_user_id, provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def add_movie_source_owner(provider_id: int, stream_id: str, dispatcharr_user_id: int) -> None:
+    """Registers one more person as having this recording in their own
+    Library -- additive, not exclusive (see movie_source_owners' own table
+    comment for why: two people's recording profiles can legitimately match
+    the same airing, or one person schedules something another already has).
+    INSERT OR IGNORE against the source's UNIQUE(movie_source_id,
+    dispatcharr_user_id) constraint, so calling this again for someone
+    who's already an owner is a harmless no-op. Silently does nothing if
+    this stream_id has no movie_sources row yet (caller ordering issue,
+    not this function's problem to raise on)."""
+    conn = _connect()
+    conn.execute(
+        """INSERT OR IGNORE INTO movie_source_owners (movie_source_id, dispatcharr_user_id, added_at)
+           SELECT id, ?, ? FROM movie_sources WHERE provider_id=? AND provider_stream_id=?""",
+        (dispatcharr_user_id, _now(), provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def add_episode_source_owner(provider_id: int, stream_id: str, dispatcharr_user_id: int) -> None:
+    """Episode counterpart to add_movie_source_owner."""
+    conn = _connect()
+    conn.execute(
+        """INSERT OR IGNORE INTO episode_source_owners (episode_source_id, dispatcharr_user_id, added_at)
+           SELECT id, ?, ? FROM episode_sources WHERE provider_id=? AND provider_stream_id=?""",
+        (dispatcharr_user_id, _now(), provider_id, stream_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def attach_portal_user_to_existing_recording(provider_id: int, stream_id: str, dispatcharr_user_id: int) -> bool:
+    """portal_schedule_single's "someone else already recorded this" path --
+    a Dispatcharr Recording with a matching identity already exists, so
+    instead of creating a duplicate (Dispatcharr wouldn't allow it anyway)
+    or flatly refusing, this attaches the calling person as an additional
+    owner of whatever VOD Manager already imported for that same
+    provider_stream_id, movie or episode, whichever it turns out to be.
+    Returns False (does nothing) if this stream_id hasn't been imported
+    yet -- still recording, or completed but not yet swept by the importer
+    -- there's no source row to attach ownership to yet; the caller falls
+    back to add_pending_recording_claim in that case, so the person still
+    gets attached once it does import."""
+    conn = _connect()
+    movie_source = conn.execute(
+        "SELECT id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?", (provider_id, stream_id)
+    ).fetchone()
+    if movie_source:
+        conn.execute(
+            "INSERT OR IGNORE INTO movie_source_owners (movie_source_id, dispatcharr_user_id, added_at) VALUES (?,?,?)",
+            (movie_source["id"], dispatcharr_user_id, _now()),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+        return True
+    episode_source = conn.execute(
+        "SELECT id FROM episode_sources WHERE provider_id=? AND provider_stream_id=?", (provider_id, stream_id)
+    ).fetchone()
+    if episode_source:
+        conn.execute(
+            "INSERT OR IGNORE INTO episode_source_owners (episode_source_id, dispatcharr_user_id, added_at) VALUES (?,?,?)",
+            (episode_source["id"], dispatcharr_user_id, _now()),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+
+def add_pending_recording_claim(provider_id: int, channel_id: int, identity_key: str, dispatcharr_user_id: int) -> None:
+    """Records that this person also wants whatever recording eventually
+    matches this (provider, channel, identity) triple -- see
+    pending_recording_claims' own table comment. consume_pending_recording_
+    claims (called from dispatcharr_dvr_importer once that recording
+    actually imports) is what turns this into a real ownership row."""
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO pending_recording_claims (provider_id, channel_id, identity_key, dispatcharr_user_id, created_at) VALUES (?,?,?,?,?)",
+        (provider_id, channel_id, identity_key, dispatcharr_user_id, _now()),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def consume_pending_recording_claims(provider_id: int, channel_id: int, identity_key: str) -> list[int]:
+    """Called by dispatcharr_dvr_importer for every recording it just
+    imported -- returns every dispatcharr_user_id that claimed this exact
+    (provider, channel, identity) triple via add_pending_recording_claim,
+    and deletes those claim rows in the same call (single-use: once
+    consumed here, the caller is about to add each of these as a real
+    owner, so the claim has done its job)."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, dispatcharr_user_id FROM pending_recording_claims WHERE provider_id=? AND channel_id=? AND identity_key=?",
+        (provider_id, channel_id, identity_key),
+    ).fetchall()
+    if rows:
+        conn.executemany("DELETE FROM pending_recording_claims WHERE id=?", [(r["id"],) for r in rows])
+        _commit_with_retry(conn)
+    conn.close()
+    return [r["dispatcharr_user_id"] for r in rows]
+
+
+def cleanup_stale_recording_claims(max_age_days: int = 7) -> int:
+    """A claim whose target recording never actually completes/imports
+    (cancelled, failed, or the person just gave up and never checked back)
+    would otherwise sit here forever -- called once per dispatcharr_dvr_
+    importer run, cheap (this table stays tiny in practice) and bounded."""
+    conn = _connect()
+    cutoff = str(time.time() - max_age_days * 86400)
+    cur = conn.execute("DELETE FROM pending_recording_claims WHERE created_at < ?", (cutoff,))
+    _commit_with_retry(conn)
+    conn.close()
+    return cur.rowcount
+
+
+def list_owned_movies_oldest_first(provider_id: int, dispatcharr_user_id: int) -> list[dict]:
+    """Ordered oldest-first by when THIS person became an owner (their own
+    movie_source_owners.added_at), not necessarily the source row's own
+    added_at -- for quota_policy='delete_oldest' eviction, "oldest" means
+    oldest FOR THIS PERSON, since a shared recording's source could predate
+    when they specifically were attached to it (see add_movie_source_owner/
+    attach_portal_user_to_existing_recording)."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT m.id AS movie_id, ms.id AS source_id, mso.added_at
+        FROM movie_source_owners mso
+        JOIN movie_sources ms ON ms.id = mso.movie_source_id
+        JOIN movies m ON m.id = ms.movie_id
+        WHERE mso.dispatcharr_user_id = ? AND ms.provider_id = ?
+        ORDER BY mso.added_at ASC
+    """, (dispatcharr_user_id, provider_id)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_owned_episodes_oldest_first(provider_id: int, dispatcharr_user_id: int) -> list[dict]:
+    """Episode counterpart to list_owned_movies_oldest_first."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT e.id AS episode_id, es.id AS source_id, eso.added_at
+        FROM episode_source_owners eso
+        JOIN episode_sources es ON es.id = eso.episode_source_id
+        JOIN episodes e ON e.id = es.episode_id
+        WHERE eso.dispatcharr_user_id = ? AND es.provider_id = ?
+        ORDER BY eso.added_at ASC
+    """, (dispatcharr_user_id, provider_id)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def sync_quota_warnings_sent(provider_id: int, dispatcharr_user_id: int, currently_met_thresholds: set[int]) -> set[int]:
+    """Reconciles quota_warnings_sent against which thresholds this
+    person's CURRENT usage actually meets -- clears any previously-sent
+    threshold no longer met (so crossing it again later re-warns instead of
+    staying permanently suppressed) and records every currently-met
+    threshold. Returns only the NEWLY crossed thresholds from this call;
+    the caller (dispatcharr_dvr_importer) only sends a notification for
+    those, not ones already warned about in an earlier pass."""
+    conn = _connect()
+    already = {r["threshold_pct"] for r in conn.execute(
+        "SELECT threshold_pct FROM quota_warnings_sent WHERE provider_id=? AND dispatcharr_user_id=?",
+        (provider_id, dispatcharr_user_id),
+    ).fetchall()}
+    for t in already - currently_met_thresholds:
+        conn.execute(
+            "DELETE FROM quota_warnings_sent WHERE provider_id=? AND dispatcharr_user_id=? AND threshold_pct=?",
+            (provider_id, dispatcharr_user_id, t),
+        )
+    newly_crossed = currently_met_thresholds - already
+    for t in newly_crossed:
+        conn.execute(
+            "INSERT OR IGNORE INTO quota_warnings_sent (provider_id, dispatcharr_user_id, threshold_pct, sent_at) VALUES (?,?,?,?)",
+            (provider_id, dispatcharr_user_id, t, _now()),
+        )
+    _commit_with_retry(conn)
+    conn.close()
+    return newly_crossed
+
+
+def remove_movie_library_owner(movie_id: int, provider_id: int, dispatcharr_user_id: int) -> dict:
+    """The portal-facing 'remove from my Library' action -- removes only
+    the calling person's own ownership row. The underlying movie_sources
+    row (and its file on disk, if any) is only deleted once NO owner
+    remains at all, i.e. reference-counted deletion: a recording shared by
+    two people via add_movie_source_owner survives on disk for the one who
+    keeps it after the other removes theirs. Real requirement from the
+    user, 2026-07-28.
+
+    The file is deliberately left alone if any OTHER source row (any
+    movie/episode, any provider) still points at that exact path --
+    defensive, given a real duplicate-row bug found live this same session
+    where two different source rows ended up pointing at the same file; far
+    better to leak a file than to delete one a different, unrelated row
+    still depends on."""
+    conn = _connect()
+    source = conn.execute(
+        "SELECT id, local_file_path FROM movie_sources WHERE movie_id=? AND provider_id=?",
+        (movie_id, provider_id),
+    ).fetchone()
+    if not source:
+        conn.close()
+        return {"removed": False, "fully_deleted": False}
+    source_id = source["id"]
+    conn.execute(
+        "DELETE FROM movie_source_owners WHERE movie_source_id=? AND dispatcharr_user_id=?",
+        (source_id, dispatcharr_user_id),
+    )
+    remaining = conn.execute(
+        "SELECT COUNT(*) c FROM movie_source_owners WHERE movie_source_id=?", (source_id,)
+    ).fetchone()["c"]
+    file_path = None
+    fully_deleted = False
+    if remaining == 0:
+        fully_deleted = True
+        if source["local_file_path"]:
+            other_ref = conn.execute(
+                """SELECT 1 FROM movie_sources WHERE local_file_path=? AND id!=?
+                   UNION SELECT 1 FROM episode_sources WHERE local_file_path=? LIMIT 1""",
+                (source["local_file_path"], source_id, source["local_file_path"]),
+            ).fetchone()
+            if not other_ref:
+                file_path = source["local_file_path"]
+        conn.execute("DELETE FROM movie_sources WHERE id=?", (source_id,))
+        _purge_if_sourceless_movie(conn, movie_id)
+    _commit_with_retry(conn)
+    conn.close()
+    if fully_deleted:
+        _delete_file_if_present(file_path)
+    return {"removed": True, "fully_deleted": fully_deleted}
+
+
+def remove_episode_library_owner(episode_id: int, provider_id: int, dispatcharr_user_id: int) -> dict:
+    """Episode counterpart to remove_movie_library_owner."""
+    conn = _connect()
+    source = conn.execute(
+        "SELECT id, local_file_path FROM episode_sources WHERE episode_id=? AND provider_id=?",
+        (episode_id, provider_id),
+    ).fetchone()
+    if not source:
+        conn.close()
+        return {"removed": False, "fully_deleted": False}
+    source_id = source["id"]
+    conn.execute(
+        "DELETE FROM episode_source_owners WHERE episode_source_id=? AND dispatcharr_user_id=?",
+        (source_id, dispatcharr_user_id),
+    )
+    remaining = conn.execute(
+        "SELECT COUNT(*) c FROM episode_source_owners WHERE episode_source_id=?", (source_id,)
+    ).fetchone()["c"]
+    file_path = None
+    fully_deleted = False
+    episode_row = conn.execute("SELECT series_id FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if remaining == 0:
+        fully_deleted = True
+        if source["local_file_path"]:
+            other_ref = conn.execute(
+                """SELECT 1 FROM episode_sources WHERE local_file_path=? AND id!=?
+                   UNION SELECT 1 FROM movie_sources WHERE local_file_path=? LIMIT 1""",
+                (source["local_file_path"], source_id, source["local_file_path"]),
+            ).fetchone()
+            if not other_ref:
+                file_path = source["local_file_path"]
+        conn.execute("DELETE FROM episode_sources WHERE id=?", (source_id,))
+        _purge_if_sourceless_episode(conn, episode_id)
+        if episode_row:
+            _purge_if_sourceless_series(conn, episode_row["series_id"])
+    _commit_with_retry(conn)
+    conn.close()
+    if fully_deleted:
+        _delete_file_if_present(file_path)
+    return {"removed": True, "fully_deleted": fully_deleted}
+
+
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
 # Per-person/per-schedule routing on top of a DVR provider's own default
 # categories -- see dispatcharr_dvr_client.schedule_channel_recordings and
@@ -962,7 +1425,7 @@ def find_pool_backfill_match(title: str, program: dict) -> dict | None:
     _normalize_title_for_dedup in the first place.
 
     program carrying season/episode (custom_properties, same shape
-    dispatcharr_dvr_client._episode_identity_key reads) means it's a series
+    dispatcharr_dvr_client.episode_identity_key reads) means it's a series
     airing: matches a series by normalized name, then a specific episode by
     season+episode number within it. No season/episode means a movie:
     matches by normalized name alone -- EPG program data essentially never
@@ -1136,15 +1599,27 @@ def create_dvr_user_limit(
     provider_id: int, dispatcharr_user_id: int, dispatcharr_username: str,
     stream_reserve: int = 0, disk_quota_bytes: int | None = None,
     retention_max_age_days: int | None = None, retention_max_episodes_per_show: int | None = None,
+    default_movie_category_id: int | None = None, default_series_category_id: int | None = None,
+    quota_policy: str = "hard_fail",
 ) -> int:
+    """quota_policy: 'hard_fail' (new recordings refused once at/over quota,
+    see portal_routes.portal_schedule_single/portal_create_recording_rule)
+    or 'delete_oldest' (dispatcharr_dvr_importer automatically evicts this
+    person's own oldest owned recordings to make room -- reference-counted
+    via remove_movie/episode_library_owner, so a recording someone ELSE
+    also owns survives). Chosen once at creation per the user's own
+    explicit call, 2026-07-28 -- editable later via update_dvr_user_limit
+    like every other field here."""
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO dvr_user_limits
            (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes,
-            retention_max_age_days, retention_max_episodes_per_show, created_at)
-           VALUES (?,?,?,?,?,?,?,?)""",
+            retention_max_age_days, retention_max_episodes_per_show, default_movie_category_id,
+            default_series_category_id, quota_policy, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (provider_id, dispatcharr_user_id, dispatcharr_username, stream_reserve, disk_quota_bytes,
-         retention_max_age_days, retention_max_episodes_per_show, _now()),
+         retention_max_age_days, retention_max_episodes_per_show, default_movie_category_id,
+         default_series_category_id, quota_policy, _now()),
     )
     limit_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -1177,13 +1652,26 @@ def get_dvr_user_limit(provider_id: int, dispatcharr_user_id: int) -> dict | Non
 def update_dvr_user_limit(
     limit_id: int, stream_reserve: int, disk_quota_bytes: int | None,
     retention_max_age_days: int | None = None, retention_max_episodes_per_show: int | None = None,
+    default_movie_category_id: int | None = None, default_series_category_id: int | None = None,
+    quota_policy: str | None = None,
 ) -> None:
     conn = _connect()
-    conn.execute(
-        """UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=?,
-           retention_max_age_days=?, retention_max_episodes_per_show=? WHERE id=?""",
-        (stream_reserve, disk_quota_bytes, retention_max_age_days, retention_max_episodes_per_show, limit_id),
-    )
+    if quota_policy is None:
+        conn.execute(
+            """UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=?,
+               retention_max_age_days=?, retention_max_episodes_per_show=?,
+               default_movie_category_id=?, default_series_category_id=? WHERE id=?""",
+            (stream_reserve, disk_quota_bytes, retention_max_age_days, retention_max_episodes_per_show,
+             default_movie_category_id, default_series_category_id, limit_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE dvr_user_limits SET stream_reserve=?, disk_quota_bytes=?,
+               retention_max_age_days=?, retention_max_episodes_per_show=?,
+               default_movie_category_id=?, default_series_category_id=?, quota_policy=? WHERE id=?""",
+            (stream_reserve, disk_quota_bytes, retention_max_age_days, retention_max_episodes_per_show,
+             default_movie_category_id, default_series_category_id, quota_policy, limit_id),
+        )
     _commit_with_retry(conn)
     conn.close()
 
@@ -1203,19 +1691,31 @@ def delete_dvr_user_limit(limit_id: int) -> None:
 
 def create_portal_account(
     provider_id: int, dispatcharr_user_id: int, username: str,
-    password_salt: str, password_hash: str,
+    password_salt: str, password_hash: str, email: str | None = None,
 ) -> int:
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO portal_accounts
-           (provider_id, dispatcharr_user_id, username, password_salt, password_hash, created_at)
-           VALUES (?,?,?,?,?,?)""",
-        (provider_id, dispatcharr_user_id, username, password_salt, password_hash, _now()),
+           (provider_id, dispatcharr_user_id, username, password_salt, password_hash, email, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (provider_id, dispatcharr_user_id, username, password_salt, password_hash, email, _now()),
     )
     account_id = cur.lastrowid
     _commit_with_retry(conn)
     conn.close()
     return account_id
+
+
+def set_portal_account_email(account_id: int, email: str | None) -> None:
+    """Admin edit (Portal Access row) or the person's own self-service
+    update (new portal Account tab) both call this -- same underlying
+    field, only used for notifications.notify_quota_threshold today
+    (see the user's 'Both' call, 2026-07-28: admin always gets warned,
+    the person themselves also does if they've set an email here)."""
+    conn = _connect()
+    conn.execute("UPDATE portal_accounts SET email=? WHERE id=?", (email, account_id))
+    _commit_with_retry(conn)
+    conn.close()
 
 
 def list_portal_accounts(provider_id: int | None = None) -> list[dict]:
@@ -1309,13 +1809,22 @@ def delete_portal_account(account_id: int) -> None:
 # caveat when a recording matched more than one profile.
 
 def list_portal_library_movies(dispatcharr_user_id: int) -> list[dict]:
+    """category_name is a scalar subquery, not a JOIN -- a movie can sit in
+    more than one category (movie_category_placements has no uniqueness
+    across categories, only per movie+category pair), and JOINing would
+    silently multiply the DISTINCT row set, breaking the "one card per
+    movie" assumption the portal Library UI depends on. Picks whichever
+    category sorts first by the admin's own configured sort_order."""
     conn = _connect()
     rows = conn.execute("""
-        SELECT DISTINCT m.id, m.name, m.year, m.poster_url, m.duration_secs
+        SELECT DISTINCT m.id, m.name, m.year, m.poster_url, m.duration_secs, m.description,
+               ms.file_size_bytes, ms.added_at,
+               (SELECT c.name FROM movie_category_placements mcp JOIN categories c ON c.id = mcp.category_id
+                WHERE mcp.movie_id = m.id ORDER BY c.sort_order LIMIT 1) AS category_name
         FROM movies m
         JOIN movie_sources ms ON ms.movie_id = m.id
-        JOIN dvr_recording_profiles p ON p.id = ms.recording_profile_id
-        WHERE p.dispatcharr_user_id = ?
+        JOIN movie_source_owners mso ON mso.movie_source_id = ms.id
+        WHERE mso.dispatcharr_user_id = ?
         ORDER BY m.name
     """, (dispatcharr_user_id,)).fetchall()
     conn.close()
@@ -1323,15 +1832,22 @@ def list_portal_library_movies(dispatcharr_user_id: int) -> list[dict]:
 
 
 def list_portal_library_episodes(dispatcharr_user_id: int) -> list[dict]:
+    """category_name: same scalar-subquery reasoning as list_portal_library_
+    movies, against series_category_placements (a series' category, not a
+    per-episode one -- Dispatcharr's own VOD catalog places whole shows into
+    categories, never individual episodes)."""
     conn = _connect()
     rows = conn.execute("""
-        SELECT DISTINCT e.id, e.name, e.season_number, e.episode_number, e.duration_secs,
-               s.id AS series_id, s.name AS series_name, s.poster_url AS series_poster_url
+        SELECT DISTINCT e.id, e.name, e.description, e.season_number, e.episode_number, e.duration_secs,
+               es.file_size_bytes, es.added_at,
+               s.id AS series_id, s.name AS series_name, s.poster_url AS series_poster_url, s.description AS series_description,
+               (SELECT c.name FROM series_category_placements scp JOIN categories c ON c.id = scp.category_id
+                WHERE scp.series_id = s.id ORDER BY c.sort_order LIMIT 1) AS category_name
         FROM episodes e
         JOIN series s ON s.id = e.series_id
         JOIN episode_sources es ON es.episode_id = e.id
-        JOIN dvr_recording_profiles p ON p.id = es.recording_profile_id
-        WHERE p.dispatcharr_user_id = ?
+        JOIN episode_source_owners eso ON eso.episode_source_id = es.id
+        WHERE eso.dispatcharr_user_id = ?
         ORDER BY s.name, e.season_number, e.episode_number
     """, (dispatcharr_user_id,)).fetchall()
     conn.close()
@@ -1342,8 +1858,8 @@ def movie_owned_by_portal_user(movie_id: int, dispatcharr_user_id: int) -> bool:
     conn = _connect()
     row = conn.execute("""
         SELECT 1 FROM movie_sources ms
-        JOIN dvr_recording_profiles p ON p.id = ms.recording_profile_id
-        WHERE ms.movie_id = ? AND p.dispatcharr_user_id = ? LIMIT 1
+        JOIN movie_source_owners mso ON mso.movie_source_id = ms.id
+        WHERE ms.movie_id = ? AND mso.dispatcharr_user_id = ? LIMIT 1
     """, (movie_id, dispatcharr_user_id)).fetchone()
     conn.close()
     return row is not None
@@ -1353,8 +1869,8 @@ def episode_owned_by_portal_user(episode_id: int, dispatcharr_user_id: int) -> b
     conn = _connect()
     row = conn.execute("""
         SELECT 1 FROM episode_sources es
-        JOIN dvr_recording_profiles p ON p.id = es.recording_profile_id
-        WHERE es.episode_id = ? AND p.dispatcharr_user_id = ? LIMIT 1
+        JOIN episode_source_owners eso ON eso.episode_source_id = es.id
+        WHERE es.episode_id = ? AND eso.dispatcharr_user_id = ? LIMIT 1
     """, (episode_id, dispatcharr_user_id)).fetchone()
     conn.close()
     return row is not None
@@ -1391,6 +1907,23 @@ def dvr_user_disk_usage_bytes(provider_id: int, dispatcharr_user_id: int) -> dic
     ).fetchall()
     movie_cat_ids = {p["target_movie_category_id"] for p in profiles if p["target_movie_category_id"]}
     series_cat_ids = {p["target_series_category_id"] for p in profiles if p["target_series_category_id"]}
+    # A true single (no profile at all) still lands in this person's own
+    # default_movie/series_category_id (dispatcharr_dvr_importer's fallback
+    # placement, added 2026-07-28) -- without also counting those categories
+    # here, anyone who only ever records singles (e.g. emby, 0 profiles) has
+    # movie_cat_ids/series_cat_ids permanently empty and usage always reads
+    # 0 no matter how much content is actually sitting in their categories.
+    # Real gap found live 2026-07-28 right after the placement fix shipped.
+    limit_row = conn.execute(
+        "SELECT default_movie_category_id, default_series_category_id FROM dvr_user_limits "
+        "WHERE provider_id=? AND dispatcharr_user_id=?",
+        (provider_id, dispatcharr_user_id),
+    ).fetchone()
+    if limit_row:
+        if limit_row["default_movie_category_id"]:
+            movie_cat_ids.add(limit_row["default_movie_category_id"])
+        if limit_row["default_series_category_id"]:
+            series_cat_ids.add(limit_row["default_series_category_id"])
     actual, virtual = 0, 0
     if movie_cat_ids:
         placeholders = ",".join("?" * len(movie_cat_ids))
@@ -1687,6 +2220,30 @@ def set_provider_active(provider_id: int, is_active: bool) -> None:
     conn.execute("UPDATE providers SET is_active=?, updated_at=? WHERE id=?", (int(is_active), _now(), provider_id))
     _commit_with_retry(conn)
     conn.close()
+
+
+def _delete_file_if_present(file_path: str | None) -> bool:
+    """Actually removes a DVR recording's file from disk -- nothing in this
+    codebase did this before 2026-07-28 for ANY delete path, admin or
+    portal, so files were silently orphaned on every delete, forever. Only
+    ever called with a path a caller has already confirmed (within the same
+    transaction) no other movie_sources/episode_sources row still
+    references -- deleting the row is what makes this safe to call, never
+    the other way around. missing_ok=True since a file can legitimately
+    already be gone (a previous partial cleanup, or Phase 1a's shared-mount
+    reference having been removed by Dispatcharr itself); a permission or
+    other OS-level failure is logged, not raised -- the DB row is already
+    gone by the time this runs, and failing the whole delete over a
+    filesystem hiccup would leave the DB and disk in a WORSE mismatch, not
+    a better one."""
+    if not file_path:
+        return False
+    try:
+        Path(file_path).unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        logger.warning("[vod_db] couldn't delete file %s: %s", file_path, exc)
+        return False
 
 
 def _purge_if_sourceless_movie(conn: sqlite3.Connection, movie_id: int) -> None:
@@ -2994,11 +3551,31 @@ def set_movie_adult(movie_id: int, is_adult: bool) -> None:
 
 
 def delete_movie_source(movie_id: int, source_id: int) -> None:
+    """Admin hard delete -- unlike remove_movie_library_owner, this isn't
+    reference-counted against portal owners (an admin deleting a source
+    removes it outright, cascading movie_source_owners via ON DELETE
+    CASCADE regardless of how many people had it in their Library). Also
+    now deletes the underlying file from disk, if any -- nothing did that
+    before this (real gap found live 2026-07-28: DVR recording files were
+    never cleaned up on delete, admin or portal, silently growing disk
+    usage forever). Skipped if another source row still points at the
+    exact same path, same defensive check as remove_movie_library_owner."""
     conn = _connect()
+    row = conn.execute("SELECT local_file_path FROM movie_sources WHERE id=? AND movie_id=?", (source_id, movie_id)).fetchone()
+    file_path = None
+    if row and row["local_file_path"]:
+        other_ref = conn.execute(
+            """SELECT 1 FROM movie_sources WHERE local_file_path=? AND id!=?
+               UNION SELECT 1 FROM episode_sources WHERE local_file_path=? LIMIT 1""",
+            (row["local_file_path"], source_id, row["local_file_path"]),
+        ).fetchone()
+        if not other_ref:
+            file_path = row["local_file_path"]
     conn.execute("DELETE FROM movie_sources WHERE id=? AND movie_id=?", (source_id, movie_id))
     _purge_if_sourceless_movie(conn, movie_id)
     _commit_with_retry(conn)
     conn.close()
+    _delete_file_if_present(file_path)
 
 
 def remove_movie_from_category(movie_id: int, category_id: int) -> None:
@@ -3524,7 +4101,21 @@ def set_series_adult(series_id: int, is_adult: bool) -> None:
 
 
 def delete_episode_source(episode_id: int, source_id: int) -> None:
+    """Episode counterpart to delete_movie_source -- see its docstring for
+    why this now also deletes the underlying file from disk, and why this
+    isn't reference-counted against portal owners the way
+    remove_episode_library_owner is."""
     conn = _connect()
+    row = conn.execute("SELECT local_file_path FROM episode_sources WHERE id=? AND episode_id=?", (source_id, episode_id)).fetchone()
+    file_path = None
+    if row and row["local_file_path"]:
+        other_ref = conn.execute(
+            """SELECT 1 FROM episode_sources WHERE local_file_path=? AND id!=?
+               UNION SELECT 1 FROM movie_sources WHERE local_file_path=? LIMIT 1""",
+            (row["local_file_path"], source_id, row["local_file_path"]),
+        ).fetchone()
+        if not other_ref:
+            file_path = row["local_file_path"]
     conn.execute("DELETE FROM episode_sources WHERE id=? AND episode_id=?", (source_id, episode_id))
     episode_row = conn.execute("SELECT series_id FROM episodes WHERE id=?", (episode_id,)).fetchone()
     _purge_if_sourceless_episode(conn, episode_id)
@@ -3532,6 +4123,7 @@ def delete_episode_source(episode_id: int, source_id: int) -> None:
         _purge_if_sourceless_series(conn, episode_row["series_id"])
     _commit_with_retry(conn)
     conn.close()
+    _delete_file_if_present(file_path)
 
 
 def remove_series_from_category(series_id: int, category_id: int) -> None:
@@ -4239,6 +4831,27 @@ def _plex_detail_update_sql(detail: dict, tmdb_id: str | None) -> tuple[str, lis
         sets += ", tmdb_id=COALESCE(tmdb_id, ?)"
         params.append(tmdb_id)
     return sets, params
+
+
+def provider_stream_ids_with_episode_source(provider_id: int) -> set[str]:
+    """Every provider_stream_id already registered as an episode for this
+    provider -- dispatcharr_dvr_importer calls this before classifying a
+    recording as a movie, so a stream_id already correctly living as an
+    episode (from an earlier import pass, or a manual repair) never gets
+    silently duplicated into a movie on a later pass just because that
+    pass's season/episode resolution came up empty (e.g. a show with no
+    EPG sub_title, whose Dispatcharr Recording object was created before a
+    since-fixed capture bug and can never retroactively gain the data).
+    Real bug found live 2026-07-28: the exact same General Hospital
+    recording got reclassified as a duplicate movie on the very next import
+    pass after being manually corrected, because nothing here checked
+    first."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT provider_stream_id FROM episode_sources WHERE provider_id=?", (provider_id,)
+    ).fetchall()
+    conn.close()
+    return {r["provider_stream_id"] for r in rows}
 
 
 def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:

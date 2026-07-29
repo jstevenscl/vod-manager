@@ -6,6 +6,10 @@
 !.env.example
 _workshop/
 
+# local per-machine deploy overrides (real container/volume names, local
+# image tags) — never something another deployer's compose run should see
+docker-compose.override.yml
+
 # python
 __pycache__/
 *.pyc

@@ -108,3 +108,15 @@
   * { @apply border-border; }
   body { @apply bg-background text-foreground; }
 }
+
+/* Hides the OS scrollbar track on an element while leaving it fully
+   scrollable (touch/wheel/drag) -- used on the portal's horizontal
+   program strips, where a visible scrollbar under a row of chips reads as
+   a leftover desktop-web artifact rather than a native swipe. */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
