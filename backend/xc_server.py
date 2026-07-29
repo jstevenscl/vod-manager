@@ -319,7 +319,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "stream_type": "movie",
             "stream_id": row["export_stream_id"],
             "stream_icon": row.get("poster_url") or "",
-            "rating": "0",
+            "rating": row.get("rating") or "0",
             "rating_5based": 0,
             "year": row["year"],
             "added": str(int(time.time())),
@@ -345,9 +345,11 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "plot": row["description"] or "",
                 "cast": row.get("cast_list") or "",
                 "director": row.get("director") or "",
-                "release_date": "",
+                "country": row.get("country") or "",
+                "release_date": row.get("release_date") or "",
                 "year": row["year"],
-                "rating": "0",
+                "rating": row.get("rating") or "0",
+                "bitrate": row.get("bitrate") or 0,
                 "duration_secs": row["duration_secs"] or 0,
             },
             "movie_data": {
@@ -379,8 +381,8 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "cast": row.get("cast_list") or "",
             "director": row.get("director") or "",
             "genre": row["genre"] or "",
-            "releaseDate": "",
-            "rating": "0",
+            "releaseDate": row.get("release_date") or "",
+            "rating": row.get("rating") or "0",
             "rating_5based": 0,
             "last_modified": str(int(time.time())),
             "category_id": str(row["category_id"]),
@@ -409,6 +411,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "info": {
                     "plot": ep["description"] or "",
                     "duration_secs": ep["duration_secs"] or 0,
+                    "bitrate": ep.get("bitrate") or 0,
                 },
             })
 
@@ -419,10 +422,11 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "cover": row.get("poster_url") or "",
                 "plot": row["description"] or "",
                 "genre": row["genre"] or "",
-                "releaseDate": "",
+                "releaseDate": row.get("release_date") or "",
                 "cast": row.get("cast_list") or "",
                 "director": row.get("director") or "",
-                "rating": "0",
+                "country": row.get("country") or "",
+                "rating": row.get("rating") or "0",
                 "year": row["year"],
             },
             "episodes": episodes_by_season,
@@ -524,18 +528,29 @@ def kill_session(conn_id: str) -> bool:
     return True
 
 
-async def _live_viewer_count(connection: dict, dispatcharr_account_id: int) -> int:
-    cache_key = (connection["id"], dispatcharr_account_id)
+async def _live_viewer_count(connection: dict, dispatcharr_account_id: int, dispatcharr_profile_id: int | None = None) -> int:
+    """Sums current_viewers across every profile on this Dispatcharr M3U
+    account by default -- correct when the account represents one real
+    upstream login with N connections. When dispatcharr_profile_id is set
+    (vod_db.provider_live_accounts), scopes to just that one profile instead
+    -- needed when the account actually bundles several separate real logins
+    as distinct profiles (see set_provider_live_account's docstring); summing
+    all of them would blend in viewer counts from logins VOD Manager itself
+    has no connection to and isn't allowed to count against its own limit."""
+    cache_key = (connection["id"], dispatcharr_account_id, dispatcharr_profile_id)
     now = time.monotonic()
     cached = _live_viewer_cache.get(cache_key)
     if cached and (now - cached[1]) < _LIVE_VIEWER_CACHE_TTL:
         return cached[0]
     try:
         account = await DispatcharrClient(connection["url"], connection["token"]).get(f"/api/m3u/accounts/{dispatcharr_account_id}/")
-        count = sum(p.get("current_viewers", 0) for p in account.get("profiles", []))
+        profiles = account.get("profiles", [])
+        if dispatcharr_profile_id is not None:
+            profiles = [p for p in profiles if p.get("id") == dispatcharr_profile_id]
+        count = sum(p.get("current_viewers", 0) for p in profiles)
     except Exception as exc:
-        logger.warning("[xc_server] failed to fetch live viewer count from connection=%s account=%s: %s",
-                        connection["label"], dispatcharr_account_id, exc)
+        logger.warning("[xc_server] failed to fetch live viewer count from connection=%s account=%s profile=%s: %s",
+                        connection["label"], dispatcharr_account_id, dispatcharr_profile_id, exc)
         return _live_viewer_cache.get(cache_key, (0, 0))[0]
     _live_viewer_cache[cache_key] = (count, now)
     return count
@@ -549,24 +564,49 @@ async def _has_capacity(provider: dict) -> bool:
     connection pool is one thing regardless of how many different
     Dispatcharr instances happen to have their own native live-TV account
     against it (see vod_db.provider_live_accounts) -- one real subscription
-    limit, summed across all of them. Only coordinates when the provider has
-    both shared_connection_limit and at least one linked live account;
-    otherwise always returns True (no coordination attempted)."""
-    limit = provider.get("shared_connection_limit")
-    if not limit:
+    limit, summed across all of them.
+
+    Also pools across every OTHER provider sharing the exact same real
+    login (vod_db.find_providers_sharing_credentials) -- mirrors
+    Dispatcharr's own credential-fingerprint pooling (confirmed via its real
+    source, 2026-07-29), for VOD Manager's equivalent scenario: a provider
+    whose real upstream account was split into several VOD Manager provider
+    rows (e.g. a "5x1"-style subscription, one row per real login, each
+    scoped to its own Dispatcharr profile via set_provider_live_account) so
+    each can be independently profile-scoped. Without this, two sibling
+    providers sharing one real login would each track VOD Manager's own
+    concurrent usage separately, undercounting the true shared total the
+    moment more than one streams at once. The group's effective limit is
+    the MINIMUM shared_connection_limit declared across the whole group
+    (self + siblings) -- the true physical cap can't be looser than the
+    most cautious admin-set number in the group, even if only one of them
+    has it configured.
+
+    Only coordinates when the group has both a declared limit and at least
+    one linked live account somewhere in it; otherwise always returns True
+    (no coordination attempted)."""
+    siblings = await asyncio.to_thread(vod_db.find_providers_sharing_credentials, provider["id"])
+    group = [provider] + siblings
+
+    limits = [p["shared_connection_limit"] for p in group if p.get("shared_connection_limit")]
+    if not limits:
         return True
-    live_accounts = await asyncio.to_thread(vod_db.list_provider_live_accounts, provider["id"])
-    if not live_accounts:
-        return True
+    limit = min(limits)
 
     live_count = 0
-    for link in live_accounts:
-        connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
-        if not connection:
-            continue
-        live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"])
+    any_live_accounts = False
+    for p in group:
+        live_accounts = await asyncio.to_thread(vod_db.list_provider_live_accounts, p["id"])
+        for link in live_accounts:
+            any_live_accounts = True
+            connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
+            if not connection:
+                continue
+            live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"], link.get("dispatcharr_profile_id"))
+    if not any_live_accounts:
+        return True
 
-    our_count = _active_vod_streams.get(provider["id"], 0)
+    our_count = sum(_active_vod_streams.get(p["id"], 0) for p in group)
     return (live_count + our_count) < limit
 
 

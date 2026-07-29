@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import ai_assist
 from backup import router as backup_router
 from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
@@ -146,15 +147,15 @@ async def _vod_catalog_refresher() -> None:
                         logger.info("[vod_catalog_refresher] %s: %s", p["name"], result)
                     except Exception as exc:
                         logger.warning("[vod_catalog_refresher] provider=%s failed: %s", p["name"], exc)
-                # Catch-all smart categories (the built-in "All Movies"/"All TV
-                # Shows", see vod_db._seed_default_categories) don't get the
-                # manual "click evaluate" treatment ordinary smart categories
-                # rely on -- nobody's expected to remember to keep them
-                # current. Re-evaluate just those after new content actually
-                # landed this cycle. (Also called directly after a manual
-                # "Import catalog" click -- see vod_routes.py -- so that
-                # doesn't have to wait for this loop's next cycle either.)
-                await vod_importer.refresh_catchall_categories()
+                # Every smart category gets re-evaluated after new content
+                # actually landed this cycle -- nobody's expected to
+                # remember to click "Evaluate rule now" every time a
+                # provider's catalog changes (vod_importer.
+                # resweep_smart_categories's own docstring has the full
+                # reasoning). (Also called directly after a manual "Import
+                # catalog" click -- see vod_routes.py -- so that doesn't have
+                # to wait for this loop's next cycle either.)
+                await vod_importer.resweep_smart_categories()
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 
@@ -302,6 +303,79 @@ async def _category_schedule_loop() -> None:
         await asyncio.sleep(_CATEGORY_SCHEDULE_POLL_SECONDS)
 
 
+_UNCATEGORIZED_SWEEP_POLL_SECONDS = 900  # 15 min -- independent of any
+# provider's own configured refresh interval, closing a real gap: before
+# this loop existed, resweep_smart_categories only ever ran as a side
+# effect of a provider's catalog refresh actually being "due" (main.py's
+# _vod_catalog_refresher) or a manual "Import catalog" click, so a Plex/Emby
+# provider with a long configured interval (or one nobody's manually
+# re-imported in a while) could leave newly-imported items sitting outside
+# All Movies/All TV Shows -- and therefore invisible to Dispatcharr -- for
+# up to that whole interval. Cheap to run this often: it's one purge query
+# plus a full-table scan per smart category, not a full provider refresh.
+
+
+async def _uncategorized_sweep_loop() -> None:
+    """Background task: re-evaluates every smart category (see
+    resweep_smart_categories) on its own fixed cadence, independent of
+    provider refresh timing -- see _UNCATEGORIZED_SWEEP_POLL_SECONDS above
+    for why this exists as its own loop rather than only ever running as a
+    side effect of something else being due."""
+    while True:
+        try:
+            await vod_importer.resweep_smart_categories()
+        except Exception as exc:
+            logger.warning("[uncategorized_sweep_loop] run failed: %s", exc)
+        await asyncio.sleep(_UNCATEGORIZED_SWEEP_POLL_SECONDS)
+
+
+_SMART_CATEGORY_SCHEDULE_POLL_SECONDS = 300  # 5 min -- matches the minimum
+# interval a rule can even be configured with (vod_routes.set_category_schedule),
+# so no due rule waits longer than its own configured interval to actually run.
+_SCHEDULED_AI_EVAL_CANDIDATE_LIMIT = 2000  # same hard ceiling as the manual
+# AI Evaluate button (vod_routes.ai_evaluate_category) -- unattended AI
+# evaluation needs this even more than the manual path does: nobody's
+# watching to notice a runaway cost the way they would clicking a button.
+
+
+async def _smart_category_scheduler() -> None:
+    """Background task: re-evaluates every smart category that's opted into
+    a recurring schedule (vod_db.categories_due_for_scheduled_evaluation) --
+    off by default for every category (schedule_interval_seconds is null
+    until an admin sets one), so this is a true no-op for anyone who hasn't
+    opted in. Rule-based evaluation is free (no external API call); AI-
+    assisted evaluation only runs here if use_ai_evaluation was ALSO
+    explicitly turned on for that specific rule -- real recurring API cost
+    otherwise, see set_category_schedule_interval's docstring."""
+    while True:
+        try:
+            for category in await asyncio.to_thread(vod_db.categories_due_for_scheduled_evaluation):
+                try:
+                    if category.get("use_ai_evaluation") and category.get("ai_description"):
+                        candidates, _total = await asyncio.to_thread(
+                            vod_db.get_ai_candidate_rows, category["content_type"], category["rule_json"],
+                            _SCHEDULED_AI_EVAL_CANDIDATE_LIMIT,
+                        )
+                        matched_ids = await ai_assist.evaluate_candidates_for_category(
+                            category["ai_description"], category["content_type"], candidates,
+                        )
+                        if category["content_type"] == "movie":
+                            await asyncio.to_thread(vod_db.bulk_place_movies_in_category, matched_ids, category["id"])
+                        else:
+                            await asyncio.to_thread(vod_db.bulk_place_series_in_category, matched_ids, category["id"])
+                        await asyncio.to_thread(vod_db.mark_category_evaluated, category["id"])
+                        logger.info("[smart_category_scheduler] category=%s AI-evaluated: %d/%d matched",
+                                    category["id"], len(matched_ids), len(candidates))
+                    else:
+                        result = await asyncio.to_thread(vod_db.evaluate_smart_category, category["id"])
+                        logger.info("[smart_category_scheduler] category=%s: %s", category["id"], result)
+                except Exception as exc:
+                    logger.warning("[smart_category_scheduler] category=%s failed: %s", category["id"], exc)
+        except Exception as exc:
+            logger.warning("[smart_category_scheduler] run failed: %s", exc)
+        await asyncio.sleep(_SMART_CATEGORY_SCHEDULE_POLL_SECONDS)
+
+
 _TMDB_SYNC_DISABLED_POLL_SECONDS = 300
 
 
@@ -336,6 +410,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(_category_schedule_loop()),
+        asyncio.create_task(_uncategorized_sweep_loop()),
+        asyncio.create_task(_smart_category_scheduler()),
         asyncio.create_task(hls_sweep_loop()),
     ]
     yield

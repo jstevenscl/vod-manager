@@ -566,6 +566,20 @@ async def list_channel_profiles(connection: dict) -> list[dict]:
     return data if isinstance(data, list) else data.get("results", [])
 
 
+async def list_m3u_account_profiles(connection: dict, account_id: int) -> list[dict]:
+    """Real Dispatcharr M3U profiles under one account -- GET
+    /api/m3u/accounts/{id}/profiles/, the same shape vod_sync.py already
+    creates/updates one of (its own outbound-relay max_streams profile, a
+    completely separate concern). Returns [{"id", "name", "current_viewers",
+    "max_streams", ...}, ...] -- used to let an admin scope a provider's
+    live-account link to one specific profile instead of the whole account,
+    for the case where the account bundles several separate real upstream
+    logins as distinct profiles."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    data = await client.get(f"/api/m3u/accounts/{account_id}/profiles/")
+    return data if isinstance(data, list) else data.get("results", [])
+
+
 async def list_users(connection: dict) -> list[dict]:
     """Real Dispatcharr login accounts (apps/accounts/models.py's User model,
     confirmed live -- GET /api/accounts/users/, same X-API-Key auth as

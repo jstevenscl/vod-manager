@@ -450,6 +450,32 @@ def _enforce_hard_fail_quota(provider_id: int, dispatcharr_user_id: int) -> None
         )
 
 
+def _enforce_dvr_category_assigned(provider_id: int, dispatcharr_user_id: int, kind: str) -> None:
+    """Raises 403 if this person has no dvr_user_limits.default_{kind}_
+    category_id of their own. Real requirement from the user, 2026-07-29:
+    DVR categories are per-person, deliberately assigned by the admin when
+    setting the person up (vod_db.update_dvr_user_limit) -- never a silent
+    shared fallback for a portal user's own scheduling. Before this, a
+    person with nothing assigned could still schedule a recording that
+    later imports with no category to land in -- dispatcharr_dvr_importer's
+    resolution chain used to fall through further, all the way to the
+    provider-level dvr_movie_category_id/dvr_series_category_id, which is
+    exactly the shared "default" the user said they don't want relied on
+    for a portal user's own recordings. That provider-level fallback still
+    exists for admin-created recording rules (vod_routes.
+    create_recording_profile), which is a separate, admin-controlled path
+    -- this only gates the portal's own self-service scheduling."""
+    limit_row = vod_db.get_dvr_user_limit(provider_id, dispatcharr_user_id)
+    category_id = (limit_row or {}).get(f"default_{kind}_category_id")
+    if not category_id:
+        noun = "movie" if kind == "movie" else "series"
+        raise HTTPException(
+            403,
+            detail=f"You don't have a {noun} category assigned for DVR yet -- ask your admin to set one up "
+                   f"before you can schedule a {noun} recording.",
+        )
+
+
 @router.post("/schedule-single/")
 async def portal_schedule_single(body: PortalScheduleSingleRequest, account: dict = Depends(require_portal_auth)):
     """One specific airing, no recurring rule -- the 'Record this episode'
@@ -505,6 +531,11 @@ async def portal_schedule_single(body: PortalScheduleSingleRequest, account: dic
     if visible is not None and body.channel_id not in visible:
         raise HTTPException(403, detail="That channel isn't in your Dispatcharr lineup.")
     _enforce_hard_fail_quota(provider_id, account["dispatcharr_user_id"])
+    # season presence mirrors the DVR importer's own movie-vs-episode
+    # heuristic (see dispatcharr_dvr_importer's "must be a movie" fallback
+    # when there's no real episode identity) -- same signal, checked here at
+    # schedule time instead of after the fact at import time.
+    _enforce_dvr_category_assigned(provider_id, account["dispatcharr_user_id"], "series" if body.season is not None else "movie")
     identity_props = {"season": body.season, "episode": body.episode, "onscreen_episode": body.onscreen_episode}
     match_program = {
         "title": body.title, "sub_title": body.sub_title, "start_time": body.start_time, "end_time": body.end_time,
@@ -682,14 +713,26 @@ async def portal_create_recording_rule(body: PortalRecordingRuleRequest, account
     """Same underlying scheduling call vod_routes.create_recording_profile
     uses, but dispatcharr_user_id/provider_id are always forced to the
     caller's own identity, and no category fields are exposed here -- a
-    portal user's recordings fall back to the provider's own default DVR
-    categories rather than picking a specific one."""
+    portal user always records into their own personally-assigned DVR
+    category (dvr_user_limits.default_movie/series_category_id, set by the
+    admin), never a category they pick themselves and never a shared
+    provider-level fallback -- see _enforce_dvr_category_assigned above."""
     provider_id = account["provider_id"]
     _, connection = _require_dvr_connection(provider_id)
     visible = await dispatcharr_dvr_client.visible_channel_ids(connection, account["dispatcharr_user_id"])
     if visible is not None and body.channel_id not in visible:
         raise HTTPException(403, detail="That channel isn't in your Dispatcharr lineup.")
     _enforce_hard_fail_quota(provider_id, account["dispatcharr_user_id"])
+    # A recording rule discovers episodes over time, and each one resolves
+    # to movie- or series-type on its own at import time (an unnumbered
+    # talk-show airing imports as a movie even under a channel-scoped rule)
+    # -- there's no single kind to check here the way schedule-single can
+    # check season presence. Requiring at least one of the two assigned
+    # categories is the practical floor: someone with neither has nowhere
+    # for ANY of this rule's recordings to land.
+    limit_row = vod_db.get_dvr_user_limit(provider_id, account["dispatcharr_user_id"])
+    if not (limit_row or {}).get("default_movie_category_id") and not (limit_row or {}).get("default_series_category_id"):
+        raise HTTPException(403, detail="You don't have a DVR category assigned yet -- ask your admin to set one up before you can schedule recordings.")
     conflict = await _predict_stream_conflict(
         provider_id, connection, account["dispatcharr_user_id"],
         {"title": body.title, "channel_id": body.channel_id},
@@ -839,10 +882,10 @@ async def portal_usage(account: dict = Depends(require_portal_auth)):
 
 @router.get("/library/")
 async def portal_library(account: dict = Depends(require_portal_auth)):
-    dispatcharr_user_id = account["dispatcharr_user_id"]
+    provider_id, dispatcharr_user_id = account["provider_id"], account["dispatcharr_user_id"]
     return {
-        "movies": vod_db.list_portal_library_movies(dispatcharr_user_id),
-        "episodes": vod_db.list_portal_library_episodes(dispatcharr_user_id),
+        "movies": vod_db.list_portal_library_movies(provider_id, dispatcharr_user_id),
+        "episodes": vod_db.list_portal_library_episodes(provider_id, dispatcharr_user_id),
     }
 
 
@@ -903,7 +946,7 @@ async def portal_show_canonical_episodes(series_id: int, account: dict = Depends
     dispatcharr_user_id = account["dispatcharr_user_id"]
     recorded = {
         (e["season_number"], e["episode_number"]): e
-        for e in vod_db.list_portal_library_episodes(dispatcharr_user_id)
+        for e in vod_db.list_portal_library_episodes(account["provider_id"], dispatcharr_user_id)
         if e["series_id"] == series_id
     }
     upcoming: dict[tuple, dict] = {}

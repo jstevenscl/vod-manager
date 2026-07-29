@@ -13,6 +13,7 @@ bounded concurrency instead of a human clicking one movie at a time.
 import asyncio
 import logging
 import re
+import sqlite3
 import time
 
 import httpx
@@ -67,6 +68,18 @@ _YEAR_SUFFIX_RE = re.compile(
 # httpx's default ("python-httpx/x.y.z") included. A generic desktop-browser
 # UA is enough to get a normal response.
 _UPSTREAM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
+
+def _coerce_int(value) -> int | None:
+    """Same reasoning as _coerce_year below, generalized -- bitrate in
+    particular has been observed as a plain int from one real provider and
+    there's no guarantee another sends it consistently."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_year(value) -> int | None:
@@ -176,6 +189,15 @@ async def import_provider_catalog(provider_id: int) -> dict:
             "provider_stream_id": str(s["stream_id"]),
             "container_extension": s.get("container_extension") or "mp4",
             "provider_category_name": category_name,
+            # The provider's own unstripped name, before parse_name_year and
+            # Title & Metadata Rules clean it up -- "4K"/"UHD"-style quality
+            # markers commonly live in exactly the prefix those rules are
+            # meant to strip, and movies.name is shared across every source
+            # of this movie (that's what makes them the same movie), so it
+            # can never differentiate between two sources' quality on its
+            # own. This is the real per-source signal a quality-based stream
+            # priority feature would need (see vod_manager-ghi).
+            "raw_name": s.get("name", ""),
             "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
@@ -201,6 +223,20 @@ async def import_provider_catalog(provider_id: int) -> dict:
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
 
+    if provider.get("auto_create_categories"):
+        try:
+            created = await asyncio.to_thread(
+                _auto_create_categories_from_provider,
+                set(category_names.values()), "movie", exclude_categories,
+            ) + await asyncio.to_thread(
+                _auto_create_categories_from_provider,
+                set(series_category_names.values()), "series", exclude_categories,
+            )
+            if created:
+                logger.info("[vod_importer] provider=%s auto-created %d categor(y/ies) from its own category list", provider["name"], created)
+        except Exception as exc:
+            logger.warning("[vod_importer] provider=%s auto-create-categories failed: %s", provider["name"], exc)
+
     return {
         "provider": provider["name"],
         "movie_categories": len(categories),
@@ -208,6 +244,86 @@ async def import_provider_catalog(provider_id: int) -> dict:
         **movie_result,
         **series_result,
     }
+
+
+def _auto_create_categories_from_provider(category_names: set[str | None], content_type: str, exclude_categories: list[str]) -> int:
+    """User request (Discord, KNM [BEES]/sjsteve, 2026-07-29): "the option at
+    the provider connection to enable recreating the categories on import."
+    Opt-in per provider (providers.auto_create_categories, default off).
+
+    One VOD Manager smart category per distinct provider category name seen
+    this import, matched via the provider_category rule field (see
+    vod_db._SMART_CATEGORY_FIELDS) rather than scoped to just this one
+    provider -- if two providers both have a category literally named
+    "Comedy", they share the one VOD Manager "Comedy" category rather than
+    creating "Comedy" and "Comedy (2)". upsert_category is itself an upsert
+    keyed on (name, content_type), so re-running this on every import is a
+    correct no-op for a category that already exists -- this only ever
+    creates what's missing, never duplicates or overwrites an admin's own
+    edits to an already-existing category with the same name.
+
+    Evaluated immediately (not left for the next scheduled sweep) so the
+    category shows real content right after the import that created it,
+    same "auto-run on create" principle as vod_routes.upsert_category."""
+    import json
+    created = 0
+    for name in category_names:
+        name = (name or "").strip()
+        if not name or name in exclude_categories:
+            continue
+        # Real bug caught live 2026-07-29, before this ever ran against real
+        # data: upsert_category is a plain upsert that OVERWRITES rule_json
+        # unconditionally on an existing row -- calling it here for a
+        # category name that already exists (e.g. a user's own hand-built
+        # "Music" category matched on genre) would have silently clobbered
+        # their rule with this provider_category one. Skip entirely for an
+        # existing category instead -- this only ever creates what's
+        # missing, exactly as the module docstring always claimed but the
+        # code didn't actually do until this fix.
+        if vod_db.get_category_by_name(name, content_type):
+            continue
+        # Real race condition caught live 2026-07-29: the get_category_by_name
+        # check above and upsert_category's own INSERT aren't atomic --
+        # nothing here is unusual about that in isolation, except this
+        # feature makes the SAME category name being auto-created from TWO
+        # PROVIDERS AT ONCE a routine occurrence (e.g. the periodic catalog
+        # refresher importing several providers back to back, more than one
+        # with a "Comedy" category, or just two providers happening to
+        # finish their own import right on top of each other) -- ordinary
+        # sqlite3.IntegrityError on categories.name's UNIQUE constraint when
+        # that happens, not exceptional. Catching it here and falling
+        # through to re-fetch + evaluate (rather than letting it propagate
+        # and abort every category still left in this loop) is what makes
+        # this correct under real concurrent imports, not just a single one.
+        try:
+            category_id = vod_db.upsert_category(
+                name, content_type, is_smart=True,
+                rule_json=json.dumps({"match": "all", "conditions": [{"field": "provider_category", "op": "equals", "value": name}]}),
+            )
+            created += 1
+        except sqlite3.IntegrityError:
+            existing = vod_db.get_category_by_name(name, content_type)
+            if not existing:
+                # Lost the race in a way that isn't "someone else just made
+                # it" (e.g. a genuinely different constraint) -- skip this
+                # one name rather than crash the rest of the batch.
+                logger.warning("[vod_importer] auto-create-categories: could not create or find %r (%s)", name, content_type)
+                continue
+            category_id = existing["id"]
+        except sqlite3.OperationalError as exc:
+            # Same reasoning as bulk_import_movies's own lock-retry handling
+            # -- real concurrent-import contention observed live 2026-07-29
+            # (heavy "database is locked" activity during simultaneous
+            # imports). One category failing to create this pass isn't fatal
+            # to the rest of the batch or the import itself; it'll pick up
+            # on the next import/sweep.
+            logger.warning("[vod_importer] auto-create-categories: %r (%s) hit %s, will retry next pass", name, content_type, exc)
+            continue
+        try:
+            vod_db.evaluate_smart_category(category_id)
+        except Exception as exc:
+            logger.warning("[vod_importer] auto-created category=%s evaluate failed: %s", category_id, exc)
+    return created
 
 
 def _apply_field_rules(content_type: str, fields: dict) -> dict:
@@ -247,9 +363,25 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
     info = _as_dict(await client.get_vod_info(source["provider_stream_id"]))
     detail = _as_dict(info.get("info"))
 
+    # Overwriting name with the provider's own clean title (e.g. "L.A.
+    # Confidential (1997)" instead of the raw imported filename "123.L.A.
+    # Confidential.1997") is only safe as of 2026-07-29's bulk_import_movies
+    # rewrite: re-imports now match primarily by movie_sources.
+    # (provider_id, provider_stream_id), not by re-deriving identity from
+    # (name, year) every pass -- so changing name here no longer risks the
+    # next scheduled refresh failing to find this row and creating a
+    # duplicate. Applies the same user-configured title cleanup rules
+    # (Title & Metadata Rules) that a fresh import already runs the name
+    # through, so e.g. a "4K:" prefix-strip rule still applies here too.
+    name_fields = {}
+    if detail.get("name"):
+        name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+        name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
+
     await asyncio.to_thread(
         vod_db.set_movie_enrichment,
         movie_id,
+        **name_fields,
         **_apply_field_rules("movie", {
             "genre": detail.get("genre") or None,
             "description": detail.get("plot") or detail.get("description") or None,
@@ -260,7 +392,18 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
         tmdb_id=detail.get("tmdb_id") or None,
         poster_url=detail.get("cover_big") or detail.get("movie_image") or None,
         duration_secs=detail.get("duration_secs") or None,
+        # rating/release_date not run through _apply_field_rules -- those
+        # regex find/replace rules exist for cleaning up freeform text
+        # (titles, descriptions), not for a numeric rating or an ISO date.
+        rating=detail.get("rating") or None,
+        release_date=detail.get("releasedate") or None,
     )
+    # bitrate is per-SOURCE (see vod_db.set_movie_source_bitrate's docstring),
+    # not per-movie -- this get_vod_info call was made against this specific
+    # source, so it's the only one this bitrate value is actually true for.
+    bitrate = _coerce_int(detail.get("bitrate"))
+    if bitrate is not None:
+        await asyncio.to_thread(vod_db.set_movie_source_bitrate, source["id"], bitrate)
     return True
 
 
@@ -309,9 +452,19 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
     info = _as_dict(await client.get_series_info(str(series["import_provider_series_id"])))
     detail = _as_dict(info.get("info"))
 
+    # See enrich_movie's identical comment -- safe as of 2026-07-29's
+    # bulk_import_series rewrite, which now matches primarily by
+    # (import_provider_id, import_provider_series_id), not by re-deriving
+    # identity from (name, year) every pass.
+    name_fields = {}
+    if detail.get("name"):
+        name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+        name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
+
     await asyncio.to_thread(
         vod_db.set_series_enrichment,
         series_id,
+        **name_fields,
         **_apply_field_rules("series", {
             "genre": detail.get("genre") or None,
             "description": detail.get("plot") or None,
@@ -325,6 +478,8 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         # let alone across others.
         tmdb_id=detail.get("tmdb") or detail.get("tmdb_id") or None,
         poster_url=detail.get("cover") or None,
+        rating=detail.get("rating") or None,
+        release_date=detail.get("releasedate") or None,
     )
 
     # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
@@ -348,11 +503,15 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
                 description=(ep.get("info") or {}).get("plot") or None,
                 duration_secs=(ep.get("info") or {}).get("duration_secs") or None,
             )
-            await asyncio.to_thread(
+            episode_source_id = await asyncio.to_thread(
                 vod_db.add_episode_source,
                 episode_id, provider["id"], str(ep["id"]),
                 ep.get("container_extension") or "mp4",
+                raw_name=ep.get("title") or None,
             )
+            episode_bitrate = _coerce_int((ep.get("info") or {}).get("bitrate"))
+            if episode_bitrate is not None:
+                await asyncio.to_thread(vod_db.set_episode_source_bitrate, episode_source_id, episode_bitrate)
 
     return {"fetched": True, "reason": None}
 
@@ -432,15 +591,24 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         )
 
 
-async def refresh_catchall_categories() -> None:
-    """Re-evaluate the built-in "All Movies"/"All TV Shows" catch-all
-    categories (see vod_db._seed_default_categories) so newly imported
-    content actually shows up in them without a manual "evaluate" click --
-    unlike ordinary smart categories, these are meant to always be current.
-    Shared by both the periodic catalog refresher (main.py) and the manual
-    "Import catalog" button (vod_routes.py) -- calling it from both means a
-    manual import doesn't have to wait for the next background cycle to be
-    reflected.
+async def resweep_smart_categories() -> None:
+    """Re-evaluate every smart category with a rule configured (see
+    vod_db.list_smart_category_ids_with_rules) so newly imported content
+    actually shows up in them without a manual "evaluate" click -- broadened
+    2026-07-29 from catch-all-only per user direction ("categories in
+    general need some sort of sweep... on whatever the normal provider list
+    update is"): rule-based evaluation is free (no external API call) and
+    purely additive, so there's no real downside to keeping every rule
+    fresh by default rather than requiring an explicit opt-in schedule for
+    each one. (AI-assisted evaluation stays opt-in-only, see
+    main.py._smart_category_scheduler -- that one has real recurring cost.)
+
+    Shared by the periodic catalog refresher (main.py, fires right after a
+    provider's own due catalog refresh -- "whatever the normal provider list
+    update is"), the manual "Import catalog" button (vod_routes.py), the
+    independent fixed-interval sweep (main.py._uncategorized_sweep_loop),
+    and apply_exclusions_job.py -- calling it from all of them means none of
+    those paths has to wait on another one to be reflected.
 
     Also retroactively purges any already-review_excluded item still sitting
     in a category (vod_db.purge_excluded_from_categories) -- covers an
@@ -454,9 +622,9 @@ async def refresh_catchall_categories() -> None:
     except Exception as exc:
         logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
 
-    for category_id in await asyncio.to_thread(vod_db.list_catchall_category_ids):
+    for category_id in await asyncio.to_thread(vod_db.list_smart_category_ids_with_rules):
         try:
             result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
-            logger.info("[vod_importer] catch-all category=%s: %s", category_id, result)
+            logger.info("[vod_importer] smart category=%s: %s", category_id, result)
         except Exception as exc:
-            logger.warning("[vod_importer] catch-all category=%s failed: %s", category_id, exc)
+            logger.warning("[vod_importer] smart category=%s failed: %s", category_id, exc)

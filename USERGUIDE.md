@@ -407,28 +407,150 @@ download mode first — it needs zero Docker configuration and proves DVR
 import works end to end. Come back and wire up the local-path mount as a
 later optimization once that's confirmed.
 
-### Categories
+### Connection-level categories — the last-resort fallback, not the main path
 
-**Movie category** / **TV category** here are the *admin-level default* —
-where a recording lands when nothing more specific claims it. If you never
-set up per-person Recording Rules at all, every recording from this
-connection goes to whichever category you pick here (or nowhere, if left
-blank — it still imports, just uncategorized until placed manually).
+**Movie category** / **TV category** on the connection's own DVR settings
+modal are the *lowest-priority* fallback in a 4-step chain a completed
+recording's category goes through on import:
 
-Per-person control lives one level down, in the DVR tab's own Recording
-Rules: each person's rule can set its own target movie/series category, and
-that wins over this default for anything matching their rule. This default
-only ever catches what's left over — a recording nobody's rule matched, or a
-matching rule that left its own category blank. You don't need any Recording
-Rules set up at all if you just want one shared bucket per connection.
+1. The **Recording Rule** that matched it has its own target category set →
+   use that.
+2. Otherwise, whoever's rule matched it (or, for a one-off "record this
+   episode" with no rule at all, whoever scheduled it) has their own
+   personal DVR category set (see **Users**, below) → use that.
+3. Otherwise, this connection-level category, if you set one here.
+4. Otherwise, the recording still imports and still counts toward whoever
+   owns it — it just isn't placed in any category, so it won't show up
+   anywhere in the exported catalog until placed manually.
+
+This connection-level setting is a safety net for admin-managed setups —
+e.g. you're not using per-person Recording Rules at all and just want every
+recording from this connection to land in one shared bucket. It is
+**deliberately not available** to the self-service Portal: a Portal user can
+only ever schedule into their own personal category (step 2), never fall
+back to this one — see **Users** below for why.
+
+### Recording Rules
+
+A **Recording Rule** (renamed from "Recording Profiles" — you may see the
+old name in older screenshots) watches one EPG channel for anything matching
+a title, and keeps discovering and scheduling new airings as Dispatcharr's
+guide data updates — this is VOD Manager's own replacement for Dispatcharr's
+built-in Series Rules, which have a channel-matching bug of their own for
+this kind of setup. Create one from the DVR tab's **Scheduled Recordings**
+page or the EPG search.
+
+Each rule can set:
+
+- Its own **target movie/series category** — takes priority over everything
+  else in the resolution chain above. Leave blank to fall through to the
+  rule owner's personal category instead.
+- **Backfill mode** (optional) — before recording a new airing, check
+  whether the same title already exists somewhere in your pool (from a
+  regular provider, or another recording) and reuse it instead of recording
+  again:
+  - **Pointer** — no extra disk cost; just references the existing source's
+    stream. The file stays wherever it already lived.
+  - **Download-and-store** — makes a real local copy of the existing
+    source's bytes under VOD Manager's own storage, same as a normal
+    recording, but without needing Dispatcharr to record it again.
+  - Either mode still counts the matched item toward the rule owner's disk
+    quota (as virtual usage for pointer mode, real usage for download mode)
+    and places it in the rule's own target category exactly like a fresh
+    recording would.
+- **Monitored** toggle — an unmonitored rule stops being checked for new
+  episodes (e.g. a show you've finished collecting) without deleting its
+  history or already-scheduled recordings.
+
+### The DVR tab's subpages
+
+DVR is split into five subpages once you're actually using it day to day:
+
+- **Scheduled Recordings** — your Recording Rules and what's currently
+  upcoming/in-progress on Dispatcharr's side, plus the EPG search used to
+  create new rules or one-off single recordings.
+- **Users** — per-person configuration: stream-concurrency reserve (how many
+  of this connection's total stream slots are held back for this person's
+  own recordings), disk quota (with a choice of **hard fail**, block new
+  recordings once they're at quota, or **delete oldest**, auto-evict their
+  own oldest recordings to make room), retention policy (max age / max
+  episodes per show, surfaced for manual review rather than auto-deleted),
+  and — new — each person's own **DVR movie category** and **DVR TV
+  category**.
+
+  These two categories are the person's own, not a shared default: nothing
+  stops two different people from being assigned the *same* category if you
+  want that (e.g. a shared "Family Recordings" bucket), but each person only
+  ever manages their *own* content in the Portal even when a category is
+  shared — the Portal's Library is always scoped to what that person
+  actually owns, never to everyone who happens to share the same category.
+  What a category *does* determine is what shows up together when browsing
+  it as a regular category in an IPTV player/Dispatcharr — that view has no
+  concept of per-person ownership at all, same as any other category.
+
+  ![DVR Users card showing a person with no category assigned yet](docs/screenshots/dvr-users-category-required.png)
+
+  **A person can't schedule anything from the Portal until you've assigned
+  them a category for that content type.** This is intentional, not a
+  missing default: DVR categories share the same underlying table as every
+  other VOD category (smart categories, TMDB Lists, provider-created ones),
+  so an unmistakable, deliberately-assigned name is what keeps disk-quota
+  accounting and the Portal's own display honest — a category name like
+  "Emby TV Shows" left over from general catalog curation has nothing to do
+  with any particular person's recordings and shouldn't be silently reused
+  as if it did. When creating a person's category from this screen, name it
+  something that says whose it is and what it's for — e.g. **"Steven DVR
+  Movies"** / **"Steven DVR TV Shows"** — the quick-create button here
+  pre-fills exactly that suggestion.
+- **DVR Library** — browse, preview, and delete recordings directly
+  (admin view of everything, not scoped to one person).
+- **Missing Episodes** — a Sonarr/Radarr-style view per show: episodes a
+  monitored Recording Rule hasn't captured yet, with a find/record cascade
+  (checks the show's own known channel first, falls back to a cross-channel
+  EPG search).
+- **Metrics** — rule health (is each rule's channel/title still matching
+  anything real) and disk usage, split into actual bytes (real files this
+  connection owns) vs. virtual bytes (pointer-backfilled content that lives
+  elsewhere but still counts toward someone's quota).
+
+### The self-service Portal
+
+DVR also ships a separate, lightweight web app for end users — not admins —
+to manage their own recordings without touching the main VOD Manager UI at
+all. It has its own login (a **Portal account**, created per-person under
+the Users page — separate from both the admin login and their Dispatcharr
+credentials) and its own URL.
+
+From the Portal, a person can:
+
+- Browse the EPG and schedule a single episode or a recurring series rule
+  for anything on a channel visible to their Dispatcharr user
+- See their own upcoming/in-progress recordings
+- Browse their own Library — everything they've recorded or been attached to
+  (see below), grouped by their own assigned DVR category — and play, or
+  remove, anything in it
+- See their own disk usage against their quota, and their stream-limit
+  budget
+
+**Shared recordings, not duplicated ones.** If two people's rules both match
+the same airing, or someone schedules something another person already has,
+they share the one real file — each person's Library entry for it is
+independent, so one person removing it from their own Library never affects
+the other; the file itself is only actually deleted once nobody has it left.
+
+**Nothing schedules without a category.** As covered under Users above, a
+Portal account can't schedule a movie recording without their own DVR movie
+category assigned, or a series recording without their own DVR TV category
+— they'll see a clear message telling them to ask their admin, rather than
+a recording silently succeeding with nowhere to be filed.
 
 ### Disabling DVR
 
-**Disable DVR** on the same modal removes that connection's recording rules,
-upcoming recordings, per-person limits, and portal accounts — the same
-cascade a regular provider delete does today. It does not touch the
-Dispatcharr connection itself, which stays fully usable for its other job
-(pushing usage data, checking live-TV viewer counts).
+**Disable DVR** on the connection's settings modal removes that connection's
+recording rules, upcoming recordings, per-person limits, and portal
+accounts — the same cascade a regular provider delete does today. It does
+not touch the Dispatcharr connection itself, which stays fully usable for
+its other job (pushing usage data, checking live-TV viewer counts).
 
 ---
 

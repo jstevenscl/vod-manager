@@ -10,6 +10,8 @@ backup/restore/reset lifecycle instead of being a separate thing a restore
 onto a fresh instance could silently leave behind.
 """
 
+import base64
+import binascii
 import hashlib
 import secrets
 
@@ -54,6 +56,33 @@ def is_encrypted(value: str | None) -> bool:
         return True
     except InvalidToken:
         return False
+
+
+def looks_like_fernet_token(value: str | None) -> bool:
+    """Structural check for "is this a Fernet token AT ALL" -- deliberately
+    key-INDEPENDENT, unlike is_encrypted() (which only recognizes a token
+    encrypted under the CURRENT key). Every Fernet token, regardless of
+    which key produced it, is base64url of [version byte 0x80][8-byte
+    timestamp][16-byte IV][ciphertext, padded to a 16-byte boundary][32-byte
+    HMAC] -- minimum 73 bytes, always starting with 0x80.
+
+    Exists specifically to catch the case is_encrypted() can't: a value
+    encrypted under a DIFFERENT (e.g. since-rotated, or restored-from-an-
+    older-config-backup) key. decrypt_value's InvalidToken fallback returns
+    that raw ciphertext unchanged either way -- if the caller then blindly
+    re-encrypts whatever it got back (as a "keep the existing value on a
+    blank edit" pattern does, e.g. vod_routes.upsert_provider), a value that
+    merely fails under the CURRENT key looks identical to genuine plaintext
+    to is_encrypted(), and gets silently double-encrypted into permanent
+    garbage. This check still recognizes it as "clearly not a real
+    password" regardless of which key it was actually encrypted under."""
+    if not value:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(value.encode())
+    except (binascii.Error, ValueError):
+        return False
+    return len(raw) >= 73 and raw[0] == 0x80 and (len(raw) - 57) % 16 == 0
 
 
 # PBKDF2-HMAC-SHA256, 260k iterations -- the same scheme/cost config.py's

@@ -29,6 +29,7 @@ interface Provider {
   dvr_local_path: string | null
   dvr_movie_category_id: number | null
   dvr_series_category_id: number | null
+  auto_create_categories: number
 }
 
 interface RecordingProfile {
@@ -160,7 +161,15 @@ interface ProviderLiveAccount {
   provider_id: number
   dispatcharr_connection_id: number
   dispatcharr_account_id: number
+  dispatcharr_profile_id: number | null
   connection_label: string
+}
+
+interface DispatcharrAccountProfile {
+  id: number
+  name: string
+  current_viewers?: number
+  max_streams?: number
 }
 
 interface XcCredentials { username: string; password: string }
@@ -228,6 +237,13 @@ interface OrphanReport {
   orphaned_series: OrphanGroup
   sourceless_movies: OrphanGroup
   sourceless_episodes: OrphanGroup
+}
+
+interface UncategorizedReport {
+  movies_needing_year_review: OrphanGroup
+  series_needing_year_review: OrphanGroup
+  movies_uncategorized: OrphanGroup
+  series_uncategorized: OrphanGroup
 }
 
 interface TmdbSuggestion {
@@ -770,6 +786,8 @@ interface Category {
   is_active: number
   schedule_start_mmdd: string | null
   schedule_end_mmdd: string | null
+  schedule_interval_seconds: number | null
+  use_ai_evaluation: number
 }
 
 const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr', string> = {
@@ -824,7 +842,7 @@ const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string 
     { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable, priciest' },
   ],
 }
-const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult'] as const
+const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult', 'provider_category'] as const
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
 
@@ -853,7 +871,7 @@ interface MetadataRule {
   sort_order: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; file_size_bytes?: number | null }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null }
 interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[] }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
@@ -1800,12 +1818,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           </button>
         </span>
       </div>
-      {(movie.placements.length > 0 || movie.genre) && (
+      {movie.placements.length > 0 && (
         <div className="flex flex-wrap items-center gap-1 mt-1.5">
           {movie.placements.map((p) => <Chip key={p.id}>{p.category_name}</Chip>)}
-          {movie.genre && <Chip>{movie.genre}</Chip>}
         </div>
       )}
+      {movie.genre && <div className="text-muted-foreground mt-0.5">genre: {movie.genre}</div>}
+      {(() => {
+        const cats = [...new Set(movie.sources.map((s) => s.provider_category_name).filter(Boolean))]
+        return cats.length > 0 ? <div className="text-muted-foreground mt-0.5">provider category: {cats.join(', ')}</div> : null
+      })()}
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
@@ -2049,12 +2071,16 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           })()}
         </span>
       </div>
-      {(series.genre || series.import_provider_name) && (
+      {series.import_provider_name && (
         <div className="flex flex-wrap items-center gap-1 mt-1.5">
-          {series.genre && <Chip>{series.genre}</Chip>}
-          {series.import_provider_name && <Chip>matched: {series.import_provider_name}</Chip>}
+          <Chip>matched: {series.import_provider_name}</Chip>
         </div>
       )}
+      {series.genre && <div className="text-muted-foreground mt-0.5">genre: {series.genre}</div>}
+      {(() => {
+        const cats = [...new Set(series.episodes?.flatMap((e) => e.sources?.map((s) => s.provider_category_name) ?? []).filter(Boolean) ?? [])]
+        return cats.length > 0 ? <div className="text-muted-foreground mt-0.5">provider category: {cats.join(', ')}</div> : null
+      })()}
 
       {open && (
         <div className="mt-2 pt-2 border-t border-border/50 space-y-2">
@@ -2225,6 +2251,13 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
   })
+  const setCategoryEvalSchedule = useMutation({
+    mutationFn: ({ id, schedule_interval_seconds, use_ai_evaluation }: { id: number; schedule_interval_seconds: number | null; use_ai_evaluation: boolean }) =>
+      api.post(`/vod/categories/${id}/eval-schedule/`, { schedule_interval_seconds, use_ai_evaluation }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+  })
   const [aiRuleDescription, setAiRuleDescription] = useState('')
   const [aiRuleSuggestion, setAiRuleSuggestion] = useState<{ name: string; match: string; conditions: { field: string; op: string; value: string }[] } | null>(null)
   const suggestAiRule = useMutation({
@@ -2369,6 +2402,27 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                   <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
                     <Zap size={12} />
                   </button>
+                )}
+                {!!c.is_smart && (
+                  <select
+                    className={inputCls('w-20 text-[10px]')}
+                    title="Recurring auto-evaluation schedule. AI-assisted scheduling only applies if this rule also has an AI Evaluate description saved (the Sparkles button) -- real recurring API cost, opt in deliberately."
+                    value={c.schedule_interval_seconds ? `${c.schedule_interval_seconds}:${c.use_ai_evaluation ? 'ai' : 'rule'}` : ''}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (!v) { setCategoryEvalSchedule.mutate({ id: c.id, schedule_interval_seconds: null, use_ai_evaluation: false }); return }
+                      const [secs, mode] = v.split(':')
+                      setCategoryEvalSchedule.mutate({ id: c.id, schedule_interval_seconds: Number(secs), use_ai_evaluation: mode === 'ai' })
+                    }}
+                  >
+                    <option value="">manual only</option>
+                    <option value="3600:rule">hourly</option>
+                    <option value="21600:rule">every 6h</option>
+                    <option value="86400:rule">daily</option>
+                    <option value="3600:ai">hourly (AI)</option>
+                    <option value="21600:ai">every 6h (AI)</option>
+                    <option value="86400:ai">daily (AI)</option>
+                  </select>
                 )}
                 <button
                   title={c.ai_description ? `AI Evaluate — "${c.ai_description}"` : 'AI Evaluate (judges actual titles against a plain-English description)'}
@@ -3450,7 +3504,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
 
   const startBulkEnrich = useMutation({
-    mutationFn: () => api.post('/vod/enrich-all/'),
+    mutationFn: (force: boolean) => api.post('/vod/enrich-all/', null, { params: { force } }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-enrich-progress'] })
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
@@ -3559,6 +3613,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       api.post(`/vod/providers/${id}/shared-limit/`, null, { params: { shared_connection_limit } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
   })
+  const setProviderAutoCreateCategories = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.post(`/vod/providers/${id}/auto-create-categories/`, null, { params: { enabled } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
   const [excludeCategoriesProviderId, setExcludeCategoriesProviderId] = useState<number | null>(null)
   const [excludeCategoriesDraft, setExcludeCategoriesDraft] = useState<Set<string>>(new Set())
   const [excludeCategoriesSearch, setExcludeCategoriesSearch] = useState('')
@@ -3644,8 +3703,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       api.post('/vod/categories/', { name: v.name, content_type: v.content_type, is_smart: false, rule_json: null }).then((r) => r.data.id as number),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
   })
-  const promptNewCategory = async (contentType: 'movie' | 'series'): Promise<number | null> => {
-    const name = prompt(`New ${contentType === 'movie' ? 'movie' : 'TV'} category name:`)
+  const promptNewCategory = async (contentType: 'movie' | 'series', suggestedName?: string): Promise<number | null> => {
+    // Pre-filled suggestion nudges the admin toward a per-person naming
+    // convention (e.g. "Steven DVR Movies") -- real requirement from the
+    // user, 2026-07-29: DVR categories stay in the same shared categories
+    // table as general VOD curation (no separate concept), so an
+    // unmistakable name is what keeps a person's DVR category from being
+    // confused with -- or accidentally reused as -- a general pool category,
+    // which the user specifically flagged as a disk-quota-tracking risk.
+    const name = prompt(`New ${contentType === 'movie' ? 'movie' : 'TV'} category name:`, suggestedName ?? '')
     if (!name || !name.trim()) return null
     try {
       return await quickCreateCategory.mutateAsync({ name: name.trim(), content_type: contentType })
@@ -3949,13 +4015,24 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [newLiveAccountConnId, setNewLiveAccountConnId] = useState('')
   const [newLiveAccountAcctId, setNewLiveAccountAcctId] = useState('')
+  const [newLiveAccountProfileId, setNewLiveAccountProfileId] = useState('')
+  // Only fetched once both a connection and an account id are entered --
+  // lets the admin scope the link to one specific Dispatcharr M3U profile
+  // instead of the whole account, for the "one Dispatcharr source actually
+  // bundles several separate real upstream logins as profiles" case (see
+  // backend/vod_db.py's set_provider_live_account docstring).
+  const accountProfilesQuery = useQuery<DispatcharrAccountProfile[]>({
+    queryKey: ['dispatcharr-account-profiles', newLiveAccountConnId, newLiveAccountAcctId],
+    queryFn:  () => api.get(`/vod/dispatcharr-connections/${newLiveAccountConnId}/accounts/${newLiveAccountAcctId}/profiles/`).then((r) => r.data),
+    enabled:  Boolean(newLiveAccountConnId && newLiveAccountAcctId),
+  })
   const setProviderLiveAccount = useMutation({
-    mutationFn: ({ providerId, connectionId, accountId }: { providerId: number; connectionId: number; accountId: number }) =>
-      api.post(`/vod/providers/${providerId}/live-accounts/`, { dispatcharr_connection_id: connectionId, dispatcharr_account_id: accountId }),
+    mutationFn: ({ providerId, connectionId, accountId, profileId }: { providerId: number; connectionId: number; accountId: number; profileId: number | null }) =>
+      api.post(`/vod/providers/${providerId}/live-accounts/`, { dispatcharr_connection_id: connectionId, dispatcharr_account_id: accountId, dispatcharr_profile_id: profileId }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-provider-live-accounts'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
-      setNewLiveAccountConnId(''); setNewLiveAccountAcctId('')
+      setNewLiveAccountConnId(''); setNewLiveAccountAcctId(''); setNewLiveAccountProfileId('')
     },
   })
   const removeProviderLiveAccount = useMutation({
@@ -4066,6 +4143,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     if (end === null) return
     setCategorySchedule2.mutate({ id: c.id, start_mmdd: start.trim(), end_mmdd: end.trim() })
   }
+  // ── Stream source priority mode (quality vs. provider, user-selectable) ──
+  const streamPriorityModeQuery = useQuery<{ mode: string }>({
+    queryKey: ['vod-stream-priority-mode'],
+    queryFn:  () => api.get('/vod/stream-priority-mode/').then((r) => r.data),
+  })
+  const setStreamPriorityMode = useMutation({
+    mutationFn: (mode: string) => api.post('/vod/stream-priority-mode/', { mode }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-priority-mode'] }),
+  })
   const setCategorySyncSource = useMutation({
     mutationFn: ({ id, sync_source }: { id: number; sync_source: string | null }) =>
       api.post(`/vod/categories/${id}/sync-source/`, null, { params: sync_source ? { sync_source } : {} }),
@@ -4112,6 +4198,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
+  })
+
+  // ── Uncategorized checker (real sources, zero category placements --
+  // invisible to Dispatcharr no matter how many sources exist) ──
+  const uncategorizedQuery = useQuery<UncategorizedReport>({
+    queryKey: ['vod-uncategorized'],
+    queryFn:  () => api.get('/vod/uncategorized/').then((r) => r.data),
+    enabled:  false,  // scan on demand only, same reasoning as Orphan Checker above
+  })
+  const resweepUncategorized = useMutation({
+    mutationFn: () => api.post('/vod/uncategorized/resweep/').then((r) => r.data),
+    onSuccess: (data) => {
+      qc.setQueryData(['vod-uncategorized'], data)
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
   })
 
@@ -4358,9 +4460,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <div className="p-5 space-y-3">
             <h2 className="text-base font-semibold">Include 18+ content in the default categories?</h2>
             <p className="text-sm text-muted-foreground">
-              VOD Manager just created two starting categories — "All Movies" and "All TV Shows" — so Dispatcharr has
-              something to sync against right away. By default they exclude 18+ titles. You can change this later,
-              per category, in Manage Categories.
+              VOD Manager keeps two catch-all categories — "All Movies" and "All TV Shows" — so Dispatcharr always has
+              something to sync against. By default they exclude 18+ titles. You can change this later, per category,
+              in Manage Categories.
             </p>
             <div className="flex justify-end gap-2 pt-2">
               <Button
@@ -5159,9 +5261,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           and series in the pool. Runs in the background — safe to navigate away while it works.
         </p>
         <div className="flex items-center gap-1.5">
-          <Button size="sm" disabled={!!enrichProgress?.running || startBulkEnrich.isPending} onClick={() => startBulkEnrich.mutate()}>
+          <Button size="sm" disabled={!!enrichProgress?.running || startBulkEnrich.isPending} onClick={() => startBulkEnrich.mutate(false)}>
             {enrichProgress?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
             {enrichProgress?.running ? 'Enriching…' : 'Bulk Enrich All'}
+          </Button>
+          <Button
+            size="sm" variant="outline" disabled={!!enrichProgress?.running || startBulkEnrich.isPending}
+            title="Re-fetches every movie/series from its provider even if it was already enriched -- use this once after an update adds new captured fields (e.g. rating, release date, bitrate), so existing items backfill them right away instead of waiting out the normal freshness window."
+            onClick={() => { if (confirm('Re-enrich the ENTIRE pool from scratch, ignoring the normal freshness window? This re-fetches every movie/series from its provider, not just what changed.')) startBulkEnrich.mutate(true) }}
+          >
+            <RefreshCw size={12} className="mr-1" /> Force Re-Enrich All
           </Button>
           {enrichProgress && !enrichProgress.running && enrichProgress.started_at && enrichProgress.finished_at && (
             <span className="text-xs text-muted-foreground">took {Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s</span>
@@ -5269,7 +5378,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <th className="py-2 px-2 font-semibold" title="Higher number wins when multiple providers carry the same title">Priority</th>
               <th className="py-2 px-2 font-semibold">Max Streams</th>
               <th className="py-2 px-2 font-semibold" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
-              <th className="py-2 px-2 font-semibold" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it">Shared Limit / Live Accounts</th>
+              <th className="py-2 px-2 font-semibold" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it. If another provider entry has the exact same username/password (e.g. a '5x1' account split into separate rows, one per real login), their usage is pooled together automatically, mirroring how Dispatcharr itself treats a shared login.">Shared Limit / Live Accounts</th>
               <th className="py-2 px-2 font-semibold" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
               <th className="py-2 px-2 font-semibold"></th>
             </tr>
@@ -5340,7 +5449,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       className={inputCls('w-14')}
                       type="number"
                       placeholder="limit"
-                      title="Real total connection cap for this provider, shared across every linked live-TV account plus our own VOD usage"
+                      title="Real total connection cap for this provider, shared across every linked live-TV account plus our own VOD usage. Pooled automatically with any other provider entry sharing the exact same username/password."
                       defaultValue={p.shared_connection_limit ?? ''}
                       key={`limit-${p.shared_connection_limit}`}
                       onBlur={(e) => {
@@ -5359,7 +5468,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     <div className="mt-1 p-1.5 border border-border rounded space-y-1">
                       {providerLiveAccountsQuery.data?.map((la) => (
                         <div key={la.id} className="flex items-center gap-1.5">
-                          <span>{la.connection_label}: acct #{la.dispatcharr_account_id}</span>
+                          <span>
+                            {la.connection_label}: acct #{la.dispatcharr_account_id}
+                            {la.dispatcharr_profile_id != null && <> · profile #{la.dispatcharr_profile_id}</>}
+                          </span>
                           <button className="text-muted-foreground hover:text-destructive" onClick={() => removeProviderLiveAccount.mutate(la.id)}>
                             <X size={10} />
                           </button>
@@ -5369,16 +5481,36 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         <select
                           className={inputCls('w-24')}
                           value={newLiveAccountConnId}
-                          onChange={(e) => setNewLiveAccountConnId(e.target.value)}
+                          onChange={(e) => { setNewLiveAccountConnId(e.target.value); setNewLiveAccountProfileId('') }}
                         >
                           <option value="">connection…</option>
                           {dispatcharrConnectionsQuery.data?.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
                         </select>
-                        <input className={inputCls('w-16')} type="number" placeholder="acct id" value={newLiveAccountAcctId} onChange={(e) => setNewLiveAccountAcctId(e.target.value)} />
+                        <input
+                          className={inputCls('w-16')} type="number" placeholder="acct id" value={newLiveAccountAcctId}
+                          onChange={(e) => { setNewLiveAccountAcctId(e.target.value); setNewLiveAccountProfileId('') }}
+                        />
+                        <select
+                          className={inputCls('w-32')}
+                          value={newLiveAccountProfileId}
+                          onChange={(e) => setNewLiveAccountProfileId(e.target.value)}
+                          disabled={!accountProfilesQuery.data?.length}
+                          title="Optional -- scope this link to ONE Dispatcharr profile instead of the whole account. Needed when this account actually bundles several separate real logins as distinct profiles; leave unset for the common case of one login shared across the whole account."
+                        >
+                          <option value="">
+                            {accountProfilesQuery.isFetching ? 'loading profiles…' : accountProfilesQuery.data?.length ? 'whole account (all profiles)' : 'no profiles found'}
+                          </option>
+                          {accountProfilesQuery.data?.map((prof) => (
+                            <option key={prof.id} value={prof.id}>{prof.name} (#{prof.id})</option>
+                          ))}
+                        </select>
                         <Button
                           size="sm"
                           disabled={!newLiveAccountConnId || !newLiveAccountAcctId || setProviderLiveAccount.isPending}
-                          onClick={() => setProviderLiveAccount.mutate({ providerId: p.id, connectionId: Number(newLiveAccountConnId), accountId: Number(newLiveAccountAcctId) })}
+                          onClick={() => setProviderLiveAccount.mutate({
+                            providerId: p.id, connectionId: Number(newLiveAccountConnId), accountId: Number(newLiveAccountAcctId),
+                            profileId: newLiveAccountProfileId ? Number(newLiveAccountProfileId) : null,
+                          })}
                         >
                           Add
                         </Button>
@@ -5421,6 +5553,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   >
                     Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
                   </Button>
+                  <label
+                    className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer"
+                    title="On each import, auto-creates a Smart Category for every one of this provider's own category names (skipping any in Exclude Categories) -- an existing category with the same name is reused, never duplicated."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!p.auto_create_categories}
+                      disabled={setProviderAutoCreateCategories.isPending}
+                      onChange={(e) => setProviderAutoCreateCategories.mutate({ id: p.id, enabled: e.target.checked })}
+                    />
+                    Auto-create categories
+                  </label>
                   <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
@@ -6085,47 +6229,47 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         </div>
                         <div className="flex flex-wrap items-center gap-1.5">
                           <label className="text-[10px] text-muted-foreground flex items-center gap-1">
-                            Default movie category
+                            DVR movie category
                             <select
                               className={inputCls('w-36')}
                               defaultValue={lim.default_movie_category_id ?? ''}
                               key={`dmc-${lim.id}-${lim.default_movie_category_id}`}
-                              title="Where this person's recorded movies land when their own recording rule doesn't specify a category -- their standing default, wins over the connection-wide default"
+                              title="This person's own DVR movie category -- required before they can schedule a movie recording from the Portal (a recording rule with its own target category uses that instead). Not a shared/connection-wide default -- exclusively theirs."
                               onChange={(e) => {
                                 const v = e.target.value ? Number(e.target.value) : null
                                 if (v !== lim.default_movie_category_id) pushUpdate({ default_movie_category_id: v })
                               }}
                             >
-                              <option value="">none…</option>
+                              <option value="">not set -- can't schedule movies yet</option>
                               {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                             </select>
                             <button
                               type="button" className="text-muted-foreground hover:text-foreground"
-                              title="Create a new movie category" disabled={quickCreateCategory.isPending}
-                              onClick={async () => { const id = await promptNewCategory('movie'); if (id) pushUpdate({ default_movie_category_id: id }) }}
+                              title="Create a new movie category for this person" disabled={quickCreateCategory.isPending}
+                              onClick={async () => { const id = await promptNewCategory('movie', `${lim.dispatcharr_username} DVR Movies`); if (id) pushUpdate({ default_movie_category_id: id }) }}
                             >
                               <Plus size={11} />
                             </button>
                           </label>
                           <label className="text-[10px] text-muted-foreground flex items-center gap-1">
-                            Default TV category
+                            DVR TV category
                             <select
                               className={inputCls('w-36')}
                               defaultValue={lim.default_series_category_id ?? ''}
                               key={`dsc-${lim.id}-${lim.default_series_category_id}`}
-                              title="Where this person's recorded series land when their own recording rule doesn't specify a category -- their standing default, wins over the connection-wide default"
+                              title="This person's own DVR TV category -- required before they can schedule a series recording from the Portal (a recording rule with its own target category uses that instead). Not a shared/connection-wide default -- exclusively theirs."
                               onChange={(e) => {
                                 const v = e.target.value ? Number(e.target.value) : null
                                 if (v !== lim.default_series_category_id) pushUpdate({ default_series_category_id: v })
                               }}
                             >
-                              <option value="">none…</option>
+                              <option value="">not set -- can't schedule series yet</option>
                               {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                             </select>
                             <button
                               type="button" className="text-muted-foreground hover:text-foreground"
-                              title="Create a new TV category" disabled={quickCreateCategory.isPending}
-                              onClick={async () => { const id = await promptNewCategory('series'); if (id) pushUpdate({ default_series_category_id: id }) }}
+                              title="Create a new TV category for this person" disabled={quickCreateCategory.isPending}
+                              onClick={async () => { const id = await promptNewCategory('series', `${lim.dispatcharr_username} DVR TV Shows`); if (id) pushUpdate({ default_series_category_id: id }) }}
                             >
                               <Plus size={11} />
                             </button>
@@ -6222,15 +6366,19 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     className={inputCls()}
                     value={dvrLimitForm.default_movie_category_id}
                     onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, default_movie_category_id: e.target.value })}
-                    title="Optional -- where this person's recorded movies land when their own recording rule doesn't specify a category"
+                    title="This person's own DVR movie category -- required before they can schedule a movie recording from the Portal. Not a shared/connection-wide default -- exclusively theirs."
                   >
-                    <option value="">Default movie category…</option>
+                    <option value="">DVR movie category… (required to schedule movies)</option>
                     {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                   </select>
                   <button
                     type="button" className="text-muted-foreground hover:text-foreground"
-                    title="Create a new movie category" disabled={quickCreateCategory.isPending}
-                    onClick={async () => { const id = await promptNewCategory('movie'); if (id) setDvrLimitForm((f) => ({ ...f, default_movie_category_id: String(id) })) }}
+                    title="Create a new movie category for this person" disabled={quickCreateCategory.isPending}
+                    onClick={async () => {
+                      const username = dispatcharrUsersQuery.data?.find((u) => u.id === Number(dvrLimitForm.dispatcharr_user_id))?.username
+                      const id = await promptNewCategory('movie', username ? `${username} DVR Movies` : undefined)
+                      if (id) setDvrLimitForm((f) => ({ ...f, default_movie_category_id: String(id) }))
+                    }}
                   >
                     <Plus size={13} />
                   </button>
@@ -6238,15 +6386,19 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     className={inputCls()}
                     value={dvrLimitForm.default_series_category_id}
                     onChange={(e) => setDvrLimitForm({ ...dvrLimitForm, default_series_category_id: e.target.value })}
-                    title="Optional -- where this person's recorded series land when their own recording rule doesn't specify a category"
+                    title="This person's own DVR TV category -- required before they can schedule a series recording from the Portal. Not a shared/connection-wide default -- exclusively theirs."
                   >
-                    <option value="">Default TV category…</option>
+                    <option value="">DVR TV category… (required to schedule series)</option>
                     {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                   </select>
                   <button
                     type="button" className="text-muted-foreground hover:text-foreground"
-                    title="Create a new TV category" disabled={quickCreateCategory.isPending}
-                    onClick={async () => { const id = await promptNewCategory('series'); if (id) setDvrLimitForm((f) => ({ ...f, default_series_category_id: String(id) })) }}
+                    title="Create a new TV category for this person" disabled={quickCreateCategory.isPending}
+                    onClick={async () => {
+                      const username = dispatcharrUsersQuery.data?.find((u) => u.id === Number(dvrLimitForm.dispatcharr_user_id))?.username
+                      const id = await promptNewCategory('series', username ? `${username} DVR TV Shows` : undefined)
+                      if (id) setDvrLimitForm((f) => ({ ...f, default_series_category_id: String(id) }))
+                    }}
                   >
                     <Plus size={13} />
                   </button>
@@ -6728,6 +6880,78 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </div>
           </div>
         )}
+      </SectionCard>
+
+      <SectionCard title="Uncategorized Checker" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Finds movies/series with real sources that still aren't visible to Dispatcharr, because they're in zero
+          categories -- the catch-all sweep (All Movies/All TV Shows) should normally catch these on its own within
+          its interval; a nonzero count here either means it hasn't gotten to them yet (Re-sweep now to force it), or
+          they're stuck in Year Review, which only a human can resolve.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" variant="outline" disabled={uncategorizedQuery.isFetching} onClick={() => uncategorizedQuery.refetch()}>
+            {uncategorizedQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            Scan
+          </Button>
+          {!!uncategorizedQuery.data && (
+            <Button size="sm" variant="outline" disabled={resweepUncategorized.isPending} onClick={() => resweepUncategorized.mutate()}>
+              {resweepUncategorized.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+              Re-sweep now
+            </Button>
+          )}
+        </div>
+        {!!uncategorizedQuery.data && (
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={uncategorizedQuery.data.movies_uncategorized.count ? 'warning' : 'success'} label="Uncategorized movies" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {uncategorizedQuery.data.movies_uncategorized.count} -- has sources, in zero categories
+                {!!uncategorizedQuery.data.movies_uncategorized.sample.length && ` · e.g. ${uncategorizedQuery.data.movies_uncategorized.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={uncategorizedQuery.data.series_uncategorized.count ? 'warning' : 'success'} label="Uncategorized series" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {uncategorizedQuery.data.series_uncategorized.count} -- has sources, in zero categories
+                {!!uncategorizedQuery.data.series_uncategorized.sample.length && ` · e.g. ${uncategorizedQuery.data.series_uncategorized.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={uncategorizedQuery.data.movies_needing_year_review.count ? 'warning' : 'success'} label="Movies needing Year Review" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {uncategorizedQuery.data.movies_needing_year_review.count} -- resolve in Year Review to unblock
+                {!!uncategorizedQuery.data.movies_needing_year_review.sample.length && ` · e.g. ${uncategorizedQuery.data.movies_needing_year_review.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+              <StatusPill tone={uncategorizedQuery.data.series_needing_year_review.count ? 'warning' : 'success'} label="Series needing Year Review" />
+              <span className="flex-1 text-muted-foreground truncate">
+                {uncategorizedQuery.data.series_needing_year_review.count} -- resolve in Year Review to unblock
+                {!!uncategorizedQuery.data.series_needing_year_review.sample.length && ` · e.g. ${uncategorizedQuery.data.series_needing_year_review.sample.slice(0, 5).map((s) => s.name).join(', ')}`}
+              </span>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Stream Priority" icon={<Zap size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          When a title has sources from more than one provider, which one plays: by provider priority (Providers
+          page), by quality (detected from "4K"/"UHD"/"FHD"/"HD" markers in the provider's own stream name or
+          category), or a combination. Applies pool-wide, immediately.
+        </p>
+        <select
+          className={inputCls('w-56')}
+          value={streamPriorityModeQuery.data?.mode ?? 'provider'}
+          disabled={streamPriorityModeQuery.isLoading || setStreamPriorityMode.isPending}
+          onChange={(e) => setStreamPriorityMode.mutate(e.target.value)}
+        >
+          <option value="provider">Provider priority only (default)</option>
+          <option value="quality">Quality only</option>
+          <option value="quality_then_provider">Quality first, provider priority as tiebreak</option>
+          <option value="provider_then_quality">Provider priority first, quality as tiebreak</option>
+        </select>
       </SectionCard>
 
       <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>

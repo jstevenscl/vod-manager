@@ -155,6 +155,23 @@ See [USERGUIDE.md](USERGUIDE.md#11-curation-tools) for the full set of
 curation tools (Missing Artwork, Language Filter, Duplicate Finder, Needs
 Review, Orphan Checker) with screenshots.
 
+## DVR recordings
+
+DVR isn't a separate provider you add — it's a capability you turn on for a
+Dispatcharr connection you already have, so a connection's finished
+recordings flow into the same pool as everything else. Beyond ingestion, it
+covers EPG-driven Recording Rules (VOD Manager's own replacement for
+Dispatcharr's own Series Rules, which have a channel-matching bug), backfill
+(reuse existing pooled content instead of re-recording), per-person disk
+quotas/stream limits/retention, a Missing Episodes view, Metrics, and a
+separate self-service Portal so end users can schedule and manage their own
+recordings without touching the admin UI at all. Each person's Portal
+account records into their own explicitly-assigned DVR category — there's
+no silent shared default, by design (see
+[USERGUIDE.md](USERGUIDE.md#7-dvr-recordings) for why). Full setup
+(including the local-path-vs-download-mode decision, which is easy to get
+wrong) and screenshots in [USERGUIDE.md](USERGUIDE.md#7-dvr-recordings).
+
 ## Shared connection-limit coordination
 
 If a real provider also has its own native live-TV account somewhere in
@@ -166,14 +183,23 @@ default. Configure it under Providers → *Shared Limit / Live Accounts*:
 - **Shared Limit** — the provider's real total connection cap (from your
   subscription).
 - **Live accounts** — link the provider to its native live-TV account on
-  each Dispatcharr connection that has one. A provider can have a different
-  live-TV account on more than one Dispatcharr instance; all of them count
-  toward the same real limit.
+  each Dispatcharr connection that has one, optionally scoped to one
+  specific M3U profile on that account rather than the whole thing. A
+  provider can have a different live-TV account on more than one
+  Dispatcharr instance; all of them count toward the same real limit.
 
 VOD Manager checks the current combined usage (its own active streams +
 every linked live account's viewer count) before opening a new stream
 against that provider, and fails over to the next available source instead
 of exceeding the real limit.
+
+**Multiple providers on the same real login** are also automatically pooled
+together, the same way Dispatcharr's own connection tracking does it:
+credentials are compared (username + password, decrypted for the
+comparison) across your active providers, and any that share the exact same
+real login count against one shared limit rather than each getting their
+own — since they *are* the same underlying subscription regardless of how
+many separate provider rows you've set up for it.
 
 ## Security and deployment
 
@@ -261,5 +287,26 @@ leave behind — a series whose only source provider no longer exists, or
 movies/episodes with zero sources at all). Every movie/series can also be
 manually renamed or have its year corrected from its own detail view, for
 whatever a provider's own catalog data got wrong with no other way to fix
-it. Full details and screenshots for each in
+it.
+
+**Auto-create categories** (per provider, Providers → *Auto-create
+categories*) creates a Smart Category for every distinct category name a
+provider reports on import, matched via that item's own provider-category
+tag — so your VOD Manager categories mirror the provider's own grouping
+without hand-building a rule for each one. Two providers that both have a
+category literally named "Comedy" share one VOD Manager "Comedy" category
+rather than creating a duplicate. Never overwrites a category you've already
+built by hand with the same name — it only ever fills in what's missing.
+
+![Auto-create categories checkbox on a provider](docs/screenshots/provider-auto-create-categories.png)
+
+**Stream priority** (Curation & Maintenance → *Stream Priority*) controls
+which of a pool item's multiple real sources gets used first when more than
+one provider has the same content: by provider priority (today's default),
+by detected quality (4K/1080p/HD, sniffed from the source's own name/
+category), or either one as primary with the other as tiebreaker.
+
+![Stream Priority selector](docs/screenshots/stream-priority.png)
+
+Full details and screenshots for each in
 [USERGUIDE.md](USERGUIDE.md#11-curation-tools).

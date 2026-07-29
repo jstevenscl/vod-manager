@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.1.06"
+APP_VERSION = "0.1.07"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -182,6 +182,28 @@ def save_smtp_settings(
         "use_tls": use_tls,
         "admin_recipients": admin_recipients,
     }
+    _write_raw(data)
+
+
+# ── Stream source priority mode ──────────────────────────────────────────────
+# User-definable (Curation & Maintenance), per the user's own words 2026-07-29:
+# "quality>provider, provider>quality, or just provider, or just quality."
+# Default MUST stay "provider" -- this changes live stream selection for
+# every source-ordering query in vod_db.py, not something to default-flip.
+STREAM_PRIORITY_MODES = ("provider", "quality", "quality_then_provider", "provider_then_quality")
+
+
+def get_stream_priority_mode() -> str:
+    data = _read_raw()
+    mode = data.get("stream_priority_mode")
+    return mode if mode in STREAM_PRIORITY_MODES else "provider"
+
+
+def save_stream_priority_mode(mode: str) -> None:
+    if mode not in STREAM_PRIORITY_MODES:
+        raise ValueError(f"invalid stream_priority_mode: {mode!r}")
+    data = _read_raw()
+    data["stream_priority_mode"] = mode
     _write_raw(data)
 
 

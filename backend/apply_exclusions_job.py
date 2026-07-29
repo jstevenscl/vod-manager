@@ -54,6 +54,16 @@ async def _run_job(job_id: str) -> None:
                 logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], exc)
                 job["results"].append({"provider": p["name"], "error": str(exc)})
             job["completed"] += 1
+        # Real gap found live 2026-07-29: without this, an item newly
+        # un-excluded by re-running import exclusions doesn't reappear in
+        # All Movies/All TV Shows (and therefore stays invisible to
+        # Dispatcharr) until the next independent sweep or provider-due
+        # refresh cycle happens to run -- an admin who just fixed their
+        # exclusion rules and re-ran this expects the fix reflected now.
+        try:
+            await vod_importer.resweep_smart_categories()
+        except Exception as exc:
+            logger.warning("[apply_exclusions_job] job=%s: catch-all re-sweep failed: %s", job_id, exc)
         job["current_provider"] = None
         job["status"] = "done"
         logger.info("[apply_exclusions_job] job=%s done: %d provider(s)", job_id, job["completed"])

@@ -17,6 +17,7 @@ from config import (
     get_openai_api_key,
     get_refresh_settings,
     get_smtp_settings,
+    get_stream_priority_mode,
     get_tmdb_api_key,
     save_ai_provider,
     save_anthropic_api_key,
@@ -26,11 +27,12 @@ from config import (
     save_openai_api_key,
     save_refresh_settings,
     save_smtp_settings,
+    save_stream_priority_mode,
     save_tmdb_api_key,
     set_default_categories_prompt_dismissed,
 )
 from routes import require_auth
-from secrets_util import hash_password
+from secrets_util import hash_password, looks_like_fernet_token
 import ai_assist
 import apply_exclusions_job
 import dispatcharr_dvr_client
@@ -265,6 +267,7 @@ class DispatcharrConnectionUpdateRequest(BaseModel):
 class ProviderLiveAccountRequest(BaseModel):
     dispatcharr_connection_id: int
     dispatcharr_account_id: int
+    dispatcharr_profile_id: Optional[int] = None
 
 
 class CategoryRequest(BaseModel):
@@ -637,6 +640,24 @@ async def save_smtp_settings_route(body: SmtpSettingsRequest):
     return {"ok": True}
 
 
+@router.get("/stream-priority-mode/", dependencies=_GUARDS)
+async def get_stream_priority_mode_route():
+    return {"mode": get_stream_priority_mode()}
+
+
+class StreamPriorityModeRequest(BaseModel):
+    mode: str
+
+
+@router.post("/stream-priority-mode/", dependencies=_GUARDS)
+async def save_stream_priority_mode_route(body: StreamPriorityModeRequest):
+    try:
+        save_stream_priority_mode(body.mode)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True}
+
+
 @router.get("/default-categories-prompt/", dependencies=_GUARDS)
 async def get_default_categories_prompt():
     # Only relevant if seeding actually created a catch-all category --
@@ -766,6 +787,7 @@ async def ai_evaluate_category(category_id: int, body: AiEvaluateCategoryRequest
     else:
         newly_placed = vod_db.bulk_place_series_in_category(matched_ids, category_id)
     vod_db.set_category_ai_description(category_id, body.description)
+    vod_db.mark_category_evaluated(category_id)
 
     return {
         "considered": len(candidates),
@@ -852,6 +874,41 @@ async def upsert_provider(body: ProviderRequest):
     if not password:
         existing = next((p for p in vod_db.list_providers() if p["name"] == body.name), None)
         password = existing["password"] if existing else ""
+        # Real bug found live 2026-07-29 (confirmed against a test copy, not
+        # this instance's real data at the time, but a genuine latent risk
+        # given Backup & Restore lets config.json and the database be
+        # restored independently of each other): list_providers() decrypts
+        # with whatever key config.json currently holds. If that key doesn't
+        # match what actually encrypted this password (e.g. an old config
+        # backup was restored, rolling the key back, while keeping a newer
+        # database), decrypt_value's fallback silently returns the raw
+        # ciphertext AS IF it were plaintext -- upsert_provider below would
+        # then encrypt that ciphertext AGAIN, permanently corrupting the
+        # credential into a double-encrypted, forever-unusable value with no
+        # error or warning.
+        #
+        # Deliberately uses looks_like_fernet_token, NOT is_encrypted, here:
+        # is_encrypted only recognizes ciphertext under the CURRENT key, so
+        # it correctly catches "this password was already double-encrypted
+        # under today's key by an earlier bug" but misses the cross-key
+        # restore case entirely (a value encrypted under a DIFFERENT key
+        # decrypts to garbage under this one, which is just as much "not a
+        # real password" but is_encrypted() would call it False, i.e. "looks
+        # like real plaintext," and let it through to be corrupted).
+        # looks_like_fernet_token checks Fernet's structural signature
+        # (version byte + length), which holds regardless of which key
+        # produced it. Verified live: caught the real double-encryption bug
+        # this comment describes, and a direct test confirmed is_encrypted
+        # alone would have missed a genuine cross-key mismatch.
+        if password and looks_like_fernet_token(password):
+            raise HTTPException(
+                409,
+                detail=(
+                    f"'{body.name}'s saved password can't be read with the current encryption key "
+                    "(likely a config backup was restored separately from the database) -- re-enter "
+                    "the password to fix this provider."
+                ),
+            )
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
     )
@@ -925,9 +982,12 @@ async def list_provider_live_accounts(provider_id: int):
 async def set_provider_live_account(provider_id: int, body: ProviderLiveAccountRequest):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
-    if not vod_db.get_dispatcharr_connection(body.dispatcharr_connection_id):
+    connection = vod_db.get_dispatcharr_connection(body.dispatcharr_connection_id)
+    if not connection:
         raise HTTPException(404, detail="dispatcharr connection not found")
-    link_id = vod_db.set_provider_live_account(provider_id, body.dispatcharr_connection_id, body.dispatcharr_account_id)
+    link_id = vod_db.set_provider_live_account(
+        provider_id, body.dispatcharr_connection_id, body.dispatcharr_account_id, body.dispatcharr_profile_id,
+    )
     return {"id": link_id}
 
 
@@ -937,11 +997,35 @@ async def remove_provider_live_account(link_id: int):
     return {"ok": True}
 
 
+@router.get("/dispatcharr-connections/{connection_id}/accounts/{account_id}/profiles/", dependencies=_GUARDS)
+async def list_dispatcharr_account_profiles(connection_id: int, account_id: int):
+    """Real Dispatcharr M3U profiles under this account -- lets a provider's
+    live-account link be scoped to ONE profile instead of the whole account,
+    for the case where one Dispatcharr M3U source actually bundles several
+    separate real upstream logins as distinct profiles (see
+    vod_db.set_provider_live_account's docstring)."""
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    try:
+        return await dispatcharr_dvr_client.list_m3u_account_profiles(connection, account_id)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
 @router.post("/providers/{provider_id}/user-agent/", dependencies=_GUARDS)
 async def set_provider_custom_user_agent(provider_id: int, custom_user_agent: Optional[str] = None):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
     vod_db.set_provider_custom_user_agent(provider_id, custom_user_agent.strip() if custom_user_agent else None)
+    return {"ok": True}
+
+
+@router.post("/providers/{provider_id}/auto-create-categories/", dependencies=_GUARDS)
+async def set_provider_auto_create_categories(provider_id: int, enabled: bool):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    vod_db.set_provider_auto_create_categories(provider_id, enabled)
     return {"ok": True}
 
 
@@ -1035,7 +1119,7 @@ async def import_provider_catalog(provider_id: int):
     # a manual import's content shows up in Dispatcharr-visible categories
     # right away instead of up to a full refresh interval later.
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
-    await vod_importer.refresh_catchall_categories()
+    await vod_importer.resweep_smart_categories()
     return result
 
 
@@ -1801,6 +1885,17 @@ async def upsert_category(body: CategoryRequest):
     )
     if body.sync_source is not None:
         vod_db.set_category_sync_source(category_id, body.sync_source or None)
+    # Auto-evaluate on create/edit instead of leaving a brand-new (or just
+    # changed) rule sitting empty until someone remembers to click "Evaluate
+    # rule now" -- real user ask: creating a rule should show its results
+    # immediately, same as the built-in All Movies/All TV Shows catch-alls
+    # already do (see vod_db._seed_default_categories). Best-effort: a bad
+    # rule_json shouldn't block the category itself from being saved.
+    if body.is_smart and body.rule_json:
+        try:
+            vod_db.evaluate_smart_category(category_id)
+        except Exception as exc:
+            logger.warning("[vod_routes] auto-evaluate on save failed for category=%s: %s", category_id, exc)
     return {"id": category_id}
 
 
@@ -1887,6 +1982,25 @@ async def evaluate_smart_category(category_id: int):
     return result
 
 
+class CategoryScheduleRequest(BaseModel):
+    schedule_interval_seconds: Optional[int] = None  # null = manual only (default, unchanged)
+    use_ai_evaluation: bool = False  # opt-in, default off -- see vod_db.set_category_schedule_interval
+
+
+@router.post("/categories/{category_id}/eval-schedule/", dependencies=_GUARDS)
+async def set_category_eval_schedule(category_id: int, body: CategoryScheduleRequest):
+    """Distinct from POST .../schedule/ above (that's the annual on/off
+    Halloween/Christmas-style date-range schedule) -- this is "how often
+    should this smart category's RULE re-evaluate," an unrelated concept
+    that happens to also be called a schedule."""
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    if body.schedule_interval_seconds is not None and body.schedule_interval_seconds < 300:
+        raise HTTPException(400, detail="Minimum schedule interval is 5 minutes.")
+    vod_db.set_category_schedule_interval(category_id, body.schedule_interval_seconds, body.use_ai_evaluation)
+    return {"ok": True}
+
+
 # ── Year review ──────────────────────────────────────────────────────────────
 # Items imported with no year, where more than one existing pool entry shares
 # the same name -- too ambiguous to auto-merge, so they're held out of every
@@ -1910,6 +2024,26 @@ async def scan_orphans():
 @router.post("/orphans/purge/", dependencies=_GUARDS)
 async def purge_orphans_route():
     return vod_db.purge_orphans()
+
+
+# ── Uncategorized checker ────────────────────────────────────────────────────
+# Different from orphans above (sourceless rows) -- these have real sources
+# but zero category placements, so Dispatcharr can't see them at all (see
+# vod_db.find_uncategorized's docstring). No purge action here: the fix is
+# either the catch-all sweep catching up, or a human resolving Year Review.
+
+@router.get("/uncategorized/", dependencies=_GUARDS)
+async def scan_uncategorized():
+    return vod_db.find_uncategorized()
+
+
+@router.post("/uncategorized/resweep/", dependencies=_GUARDS)
+async def resweep_uncategorized():
+    """Manual trigger for the same sweep the independent background loop
+    runs on its own interval (main.py's _uncategorized_sweep_loop) -- lets
+    an admin get an immediate result instead of waiting for the next tick."""
+    await vod_importer.resweep_smart_categories()
+    return vod_db.find_uncategorized()
 
 
 # ── Duplicate finder ─────────────────────────────────────────────────────────
