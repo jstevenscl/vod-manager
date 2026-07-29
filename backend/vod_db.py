@@ -126,6 +126,7 @@ def init_db() -> None:
             is_adult_manual INTEGER NOT NULL DEFAULT 0,
             import_provider_id INTEGER REFERENCES providers(id) ON DELETE SET NULL,
             import_provider_series_id TEXT,
+            provider_category_name TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT,
             last_enriched_at TEXT
@@ -870,6 +871,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "auto_create_categories", "INTEGER NOT NULL DEFAULT 0"),
         ("movie_sources", "raw_name", "TEXT"),
         ("episode_sources", "raw_name", "TEXT"),
+        ("series", "provider_category_name", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -4458,6 +4460,7 @@ def list_episode_sources_for_episode_ids(episode_ids: list[int]) -> dict[int, li
 def add_episode_source(
     episode_id: int, provider_id: int, provider_stream_id: str, container_extension: str = "mp4",
     file_size_bytes: int | None = None, local_file_path: str | None = None, raw_name: str | None = None,
+    provider_category_name: str | None = None,
 ) -> int:
     """See add_movie_source's docstring -- file_size_bytes/local_file_path
     are download-backfill-only, null for every other caller. Returns the
@@ -4465,17 +4468,27 @@ def add_episode_source(
     isn't reliable across the ON CONFLICT DO UPDATE branch) -- needed by
     callers that set a per-source field afterward, e.g. vod_importer.
     enrich_series stamping bitrate onto the row this specific get_series_info
-    call was actually about."""
+    call was actually about.
+
+    provider_category_name: real bug found live 2026-07-29 -- this parameter
+    didn't exist at all until now, so evaluate_smart_category's
+    provider_category rule field (and auto-create-categories) had literally
+    no series-side data to ever match against, for any provider. XC only
+    reports category at the series level, not per-episode (see
+    vod_importer.enrich_series, which reads it back off the series row --
+    bulk_import_series is what stamps it there, since episodes aren't known
+    yet at that earlier, cheap bulk-list stage)."""
     conn = _connect()
     conn.execute(
-        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, added_at, last_seen_at)
-           VALUES (?,?,?,?,?,?,?,?,?)
+        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, added_at, last_seen_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at,
                file_size_bytes=COALESCE(excluded.file_size_bytes, episode_sources.file_size_bytes),
                local_file_path=COALESCE(excluded.local_file_path, episode_sources.local_file_path),
-               raw_name=excluded.raw_name""",
-        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, _now(), _now()),
+               raw_name=excluded.raw_name,
+               provider_category_name=excluded.provider_category_name""",
+        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, _now(), _now()),
     )
     _commit_with_retry(conn)
     source_id = conn.execute(
@@ -5109,6 +5122,21 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                 ).fetchone()
                 if existing:
                     did_match = True
+                    # Real bug found live 2026-07-29: this value was captured
+                    # in `item` on every single import pass but never
+                    # actually written anywhere -- episode_sources.
+                    # provider_category_name (what evaluate_smart_category's
+                    # provider_category rule field and auto-create-categories
+                    # both actually read) was NULL for every episode of every
+                    # series ever imported through this path, so series-side
+                    # provider-category matching never worked for any
+                    # provider, not just whichever one happened to be tested.
+                    # Stored here (unconditionally overwritten -- provider-
+                    # sourced, not user-editable) so enrich_series can read it
+                    # back and stamp it onto each episode as episodes are
+                    # discovered (episodes aren't known yet at this cheap
+                    # bulk-list stage, only lazily via get_series_info).
+                    conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), existing["id"]))
                     if category_looks_adult and not existing["is_adult"] and not existing["is_adult_manual"]:
                         conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (existing["id"],))
                     if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
@@ -5131,8 +5159,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     # is a genuinely new item.
                     placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
                     conn.execute(
-                        "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), now),
+                        "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
                     )
                     did_create = True
                     did_flag = True
@@ -5144,6 +5172,9 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     ).fetchone()
                     if row:
                         did_match = True
+                        # See the identical comment on the existing-identity
+                        # match branch above -- same fix, same reasoning.
+                        conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), row["id"]))
                         if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                             conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
                         if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
@@ -5173,6 +5204,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         ).fetchall()
                         if len(candidates) == 1:
                             did_match = True
+                            conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), candidates[0]["id"]))
                             if candidates[0]["import_provider_id"] is None:
                                 conn.execute(
                                     "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
@@ -5190,8 +5222,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 did_unarchive = True
                         else:
                             conn.execute(
-                                "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), now),
+                                "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
                             )
                             did_create = True
                             did_archive = should_archive
@@ -5199,8 +5231,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 did_flag = True
                     else:
                         conn.execute(
-                            "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, created_at) VALUES (?,?,?,?,?,?,?)",
-                            (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), now),
+                            "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
                         )
                         did_create = True
                         did_archive = should_archive

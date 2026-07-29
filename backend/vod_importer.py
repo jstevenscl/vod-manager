@@ -508,6 +508,15 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
                 episode_id, provider["id"], str(ep["id"]),
                 ep.get("container_extension") or "mp4",
                 raw_name=ep.get("title") or None,
+                # XC only reports category at the series level, not per-
+                # episode -- bulk_import_series stamped it onto `series`
+                # itself for exactly this moment, since episodes weren't
+                # known yet back at that earlier, cheap bulk-list stage.
+                # Real bug found live 2026-07-29: this was never threaded
+                # through at all, so provider_category-based series
+                # matching (evaluate_smart_category, auto-create-categories)
+                # had no data to work with for any provider, ever.
+                provider_category_name=series.get("provider_category_name"),
             )
             episode_bitrate = _coerce_int((ep.get("info") or {}).get("bitrate"))
             if episode_bitrate is not None:
