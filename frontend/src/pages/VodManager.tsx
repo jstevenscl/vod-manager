@@ -150,7 +150,7 @@ interface DispatcharrConnection {
   id: number
   label: string
   url: string
-  token: string
+  has_token: boolean
   vod_relay_account_id: number | null
   created_at: string
 }
@@ -3087,7 +3087,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] }),
     onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
+  // The real token is deliberately never included in dispatcharrConnectionsQuery's
+  // response (backend/vod_routes.py's _redact_connection) -- fetched on demand
+  // here only when the admin actually clicks "reveal," instead of sitting in an
+  // already-fetched query cache the moment the page loads.
   const [revealedConnId, setRevealedConnId] = useState<number | null>(null)
+  const [revealedConnToken, setRevealedConnToken] = useState<string | null>(null)
+  const revealDispatcharrConnectionToken = useMutation({
+    mutationFn: (id: number) => api.get(`/vod/dispatcharr-connections/${id}/token/`).then((r) => r.data.token as string),
+    onSuccess: (token, id) => { setRevealedConnToken(token); setRevealedConnId(id) },
+  })
 
   // DVR is a capability of a connection, not a separate "provider" the
   // admin adds elsewhere -- see backend/vod_db.py's enable_dvr_for_connection
@@ -4906,14 +4915,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   />
                 </td>
                 <td className="py-1 pr-2">
-                  {revealedConnId === c.id ? (
+                  {revealedConnId === c.id && revealedConnToken ? (
                     <div className="flex items-center gap-1">
-                      {c.token}
-                      <CopyUrlButton url={c.token} />
+                      {revealedConnToken}
+                      <CopyUrlButton url={revealedConnToken} />
                     </div>
                   ) : (
-                    <button className="text-muted-foreground hover:text-foreground flex items-center gap-1" onClick={() => setRevealedConnId(c.id)}>
-                      <Eye size={12} /> reveal
+                    <button
+                      className="text-muted-foreground hover:text-foreground flex items-center gap-1 disabled:opacity-50"
+                      disabled={!c.has_token || revealDispatcharrConnectionToken.isPending}
+                      onClick={() => revealDispatcharrConnectionToken.mutate(c.id)}
+                    >
+                      <Eye size={12} /> {c.has_token ? 'reveal' : 'none set'}
                     </button>
                   )}
                 </td>

@@ -161,6 +161,22 @@ def _strip_remote_root(file_path: str, remote_root: str) -> str:
     return normalized.lstrip("/")
 
 
+def _resolve_under_root(local_path: str, relative: str) -> str | None:
+    """file_path comes from the paired Dispatcharr instance's own API, not
+    from an untrusted anonymous caller, but it's still an external system's
+    output -- a "../" segment in a misbehaving/compromised instance's report
+    would otherwise let os.path.join walk target_path outside local_path
+    entirely, and that path gets persisted as local_file_path and later
+    handed straight to FileResponse (xc_server._proxy_vod_stream) with only
+    an isfile() check. Returns None (caller skips the recording) instead of
+    a path outside local_path's own real, resolved directory tree."""
+    root = os.path.realpath(local_path)
+    candidate = os.path.realpath(os.path.join(local_path, relative))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate
+
+
 def _guess_title(recording: dict, program: dict, file_path: str | None) -> str:
     """EPG program title is higher-confidence than anything derived from
     the file path (Dispatcharr already matched it against the channel's
@@ -313,7 +329,15 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
             hashed_name = hashlib.sha256(f"{provider_id}:{recording_id}".encode()).hexdigest() + ext
             target_path = os.path.join(local_path, hashed_name)
         else:
-            target_path = os.path.join(local_path, _strip_remote_root(file_path, remote_root))
+            target_path = _resolve_under_root(local_path, _strip_remote_root(file_path, remote_root))
+            if target_path is None:
+                skipped += 1
+                logger.warning(
+                    "[dispatcharr_dvr_importer] recording=%s reported a file_path outside the configured "
+                    "local path (%r) -- skipping rather than serving/storing it: %s",
+                    recording_id, local_path, file_path,
+                )
+                continue
 
         if download_mode and not os.path.isfile(target_path):
             try:
@@ -716,7 +740,11 @@ async def _apply_download_backfill(match: dict, dvr_provider_id: int) -> None:
         raise ValueError(f"source provider {source['provider_id']} not found")
     kind = "movie" if match["type"] == "movie" else "series"
     url = xc_server._build_upstream_url(kind, provider, source)
-    ext = source.get("container_extension") or "mp4"
+    # container_extension comes from the source provider's own catalog JSON,
+    # not something VOD Manager generates -- stripped to bare alphanumerics
+    # so a malicious/malformed value (e.g. containing "../") can't steer
+    # hashed_name's path outside dest_dir below.
+    ext = re.sub(r"[^a-zA-Z0-9]", "", source.get("container_extension") or "") or "mp4"
     item_id = match.get("movie_id") or match["episode_id"]
     key = f"{match['type']}-{item_id}"
     hashed_name = hashlib.sha256(key.encode()).hexdigest() + "." + ext

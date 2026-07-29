@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from auth import create_session, revoke_session, verify_session
+from auth import create_session, revoke_all_sessions, revoke_session, verify_session
 from config import APP_VERSION, has_credentials, set_credentials, verify_credentials
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,10 @@ async def set_credentials_endpoint(
     if len(body.password) < 6:
         raise HTTPException(400, detail="Password must be at least 6 characters.")
     set_credentials(body.username.strip(), body.password)
+    # Any session token minted under the old credentials must not keep
+    # working for the rest of its TTL -- keep the caller's own session alive
+    # so changing your own password doesn't immediately log you out.
+    revoke_all_sessions(except_token=x_session_token)
     return {"ok": True}
 
 

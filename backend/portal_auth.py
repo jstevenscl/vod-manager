@@ -106,6 +106,17 @@ def revoke_session(token: str) -> None:
     _save()
 
 
+def revoke_sessions_for_account(portal_account_id: int) -> None:
+    """Called from the admin's reset-password/reset-MFA routes -- a session
+    token issued before the reset must not keep working for the rest of its
+    7-day TTL just because the credential/MFA it was issued under got reset
+    (e.g. the person lost their device, or the admin suspects a leak)."""
+    for token, entry in list(_SESSIONS.items()):
+        if entry.get("portal_account_id") == portal_account_id:
+            del _SESSIONS[token]
+    _save()
+
+
 async def require_portal_auth(
     x_portal_session_token: Optional[str] = Header(None, alias="X-Portal-Session-Token"),
 ) -> dict:

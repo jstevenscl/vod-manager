@@ -48,4 +48,15 @@ def revoke_session(token: str) -> None:
     _save()
 
 
+def revoke_all_sessions(except_token: str | None = None) -> None:
+    """Called when the admin credentials change -- a session token minted
+    under the old password must not keep working for the rest of its 7-day
+    TTL just because the password that guarded it was rotated (e.g. after a
+    suspected leak). except_token keeps the caller's own current session
+    alive so changing your own password doesn't immediately log you out."""
+    for token in [t for t in _SESSIONS if t != except_token]:
+        del _SESSIONS[token]
+    _save()
+
+
 _load()

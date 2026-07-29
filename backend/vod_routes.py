@@ -38,6 +38,7 @@ import dispatcharr_dvr_importer
 import duplicate_confirm
 import emby_vod_importer
 import plex_importer
+import portal_auth
 import tmdb_sync
 import vod_db
 import vod_importer
@@ -481,9 +482,27 @@ async def delete_xc_client(client_id: int):
 # above (who's allowed to pull from VOD Manager). See vod_db.py's comment
 # on the dispatcharr_connections table for what each is used for.
 
+def _redact_connection(c: dict) -> dict:
+    # Mirrors _redact_provider below -- this is a real bearer credential for
+    # an external system's API, not something the browser needs sitting in
+    # an already-fetched query cache. The frontend's "reveal" button fetches
+    # the real value on demand via the dedicated route below instead.
+    c = dict(c)
+    c["has_token"] = bool(c.pop("token", None))
+    return c
+
+
 @router.get("/dispatcharr-connections/", dependencies=_GUARDS)
 async def list_dispatcharr_connections():
-    return vod_db.list_dispatcharr_connections()
+    return [_redact_connection(c) for c in vod_db.list_dispatcharr_connections()]
+
+
+@router.get("/dispatcharr-connections/{connection_id}/token/", dependencies=_GUARDS)
+async def reveal_dispatcharr_connection_token(connection_id: int):
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    return {"token": connection["token"]}
 
 
 @router.post("/dispatcharr-connections/", dependencies=_GUARDS)
@@ -494,7 +513,7 @@ async def create_dispatcharr_connection(body: DispatcharrConnectionRequest):
     if not label or not url or not token:
         raise HTTPException(400, detail="label, url, and token are all required")
     connection_id = vod_db.create_dispatcharr_connection(label, url, token)
-    return vod_db.get_dispatcharr_connection(connection_id)
+    return _redact_connection(vod_db.get_dispatcharr_connection(connection_id))
 
 
 @router.post("/dispatcharr-connections/connect/", dependencies=_GUARDS)
@@ -509,9 +528,11 @@ async def connect_dispatcharr_instance(body: ConnectDispatcharrInstanceRequest):
     if not label or not url or not token or not public_url:
         raise HTTPException(400, detail="label, url, token, and vod_manager_public_url are all required")
     try:
-        return await vod_sync.connect_dispatcharr_instance(label, url, token, public_url)
+        result = await vod_sync.connect_dispatcharr_instance(label, url, token, public_url)
     except Exception as exc:
         raise HTTPException(502, detail=f"Failed to connect: {exc}")
+    result["connection"] = _redact_connection(result["connection"])
+    return result
 
 
 @router.patch("/dispatcharr-connections/{connection_id}/", dependencies=_GUARDS)
@@ -526,7 +547,7 @@ async def update_dispatcharr_connection(connection_id: int, body: DispatcharrCon
         vod_relay_account_id=body.vod_relay_account_id,
         clear_vod_relay_account_id=body.clear_vod_relay_account_id,
     )
-    return vod_db.get_dispatcharr_connection(connection_id)
+    return _redact_connection(vod_db.get_dispatcharr_connection(connection_id))
 
 
 @router.delete("/dispatcharr-connections/{connection_id}/", dependencies=_GUARDS)
@@ -1735,6 +1756,9 @@ async def reset_portal_account_password(account_id: int, body: PortalAccountPass
         raise HTTPException(404, detail="portal account not found")
     salt, hashed = hash_password(body.password)
     vod_db.set_portal_account_password(account_id, salt, hashed)
+    # A session token issued before this reset must not keep working for the
+    # rest of its TTL just because the password it was issued under changed.
+    portal_auth.revoke_sessions_for_account(account_id)
     return {"ok": True}
 
 
@@ -1747,6 +1771,9 @@ async def reset_portal_account_mfa(account_id: int):
     if not vod_db.get_portal_account(account_id):
         raise HTTPException(404, detail="portal account not found")
     vod_db.set_portal_account_totp(account_id, None, totp_enabled=False)
+    # Same reasoning as reset-password above -- an existing session survived
+    # by the old (now-revoked) MFA enrollment shouldn't keep working either.
+    portal_auth.revoke_sessions_for_account(account_id)
     return {"ok": True}
 
 

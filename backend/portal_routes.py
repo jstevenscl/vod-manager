@@ -221,9 +221,18 @@ async def portal_confirm_mfa(body: PortalMfaCodeRequest):
 
 
 @router.post("/auth/verify-mfa/")
-async def portal_verify_mfa(body: PortalMfaCodeRequest):
+async def portal_verify_mfa(body: PortalMfaCodeRequest, request: Request):
     """Returning-user login step: pending token (password already checked)
-    + a code from their already-enrolled authenticator app."""
+    + a code from their already-enrolled authenticator app. Reuses the same
+    per-IP lockout as the password step above -- a correct password alone
+    doesn't bypass it: an attacker who already has valid credentials could
+    otherwise mint fresh 5-minute pending tokens (portal_login never counts
+    as a "failure") and hammer 6-digit TOTP guesses with no throttle at
+    all. A wrong code here counts as a failed attempt exactly like a wrong
+    password does."""
+    ip = _client_ip(request)
+    if _login_locked_out(ip):
+        raise HTTPException(429, detail="Too many failed login attempts. Try again later.")
     account_id = portal_auth.get_pending_account_id(body.pending_token)
     if account_id is None:
         raise HTTPException(401, detail="login session expired, please log in again")
@@ -231,7 +240,9 @@ async def portal_verify_mfa(body: PortalMfaCodeRequest):
     if account is None or not account["totp_enabled"] or not account.get("totp_secret"):
         raise HTTPException(400, detail="MFA is not enrolled for this account")
     if not _verify_totp_code(account, body.code):
+        _record_login_failure(ip)
         raise HTTPException(401, detail="Invalid code")
+    _login_failed_attempts.pop(ip, None)
     token = portal_auth.promote_to_full_session(body.pending_token)
     if not token:
         raise HTTPException(401, detail="login session expired, please log in again")
