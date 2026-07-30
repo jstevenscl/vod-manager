@@ -17,6 +17,19 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ACCOUNT_MAX_STREAMS = 50
+# Dispatcharr's own M3U account model defaults refresh_interval to 0 (hours)
+# -- disabled -- and this call never included it, so every auto-created
+# connection silently inherited that disabled default. Confirmed against
+# Dispatcharr's actual source (apps/m3u/models.py, apps/m3u/signals.py):
+# it's a plain hours value, directly scheduling a Celery refresh task at
+# that cadence. Real gap found live 2026-07-30. 4 hours, not VOD Manager's
+# own 6-hour default catalog-refresh cadence (Configuration -> Refresh
+# Schedule) -- Dispatcharr pulling from VOD Manager somewhat more often
+# than VOD Manager itself re-pulls from upstream providers is harmless (a
+# no-op re-fetch when nothing changed) and keeps Dispatcharr from lagging
+# behind whenever the pool does change, which matters more for DVR
+# recordings appearing promptly than for the slower-moving general catalog.
+_DEFAULT_ACCOUNT_REFRESH_INTERVAL_HOURS = 4
 
 
 class VodXcAccountNotConfigured(Exception):
@@ -58,6 +71,7 @@ async def connect_dispatcharr_instance(label: str, url: str, token: str, vod_man
             # concurrent viewers, got hard-rejected with zero indication why
             # -- looked identical to a codec/client problem from the outside.
             "max_streams": _DEFAULT_ACCOUNT_MAX_STREAMS,
+            "refresh_interval": _DEFAULT_ACCOUNT_REFRESH_INTERVAL_HOURS,
         })
     except Exception:
         vod_db.delete_xc_client(client_record["id"])

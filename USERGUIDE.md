@@ -319,7 +319,10 @@ Click **Connect**. VOD Manager automatically:
 1. Creates its own high-entropy client credentials
 2. Creates the Dispatcharr-side XC M3U account for you, capped at 50
    concurrent streams at the account level (generous on purpose — your real
-   per-provider limits are enforced separately, per source, not here)
+   per-provider limits are enforced separately, per source, not here), with
+   its refresh interval set to 4 hours — Dispatcharr's own default for a
+   new M3U account is 0 (disabled), which would otherwise mean it never
+   auto-refreshes on its own
 
 The only thing left is on Dispatcharr's own side: open the new M3U account,
 enable VOD, and pick which groups/categories to turn on — the same setup

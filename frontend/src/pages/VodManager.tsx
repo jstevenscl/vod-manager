@@ -22,6 +22,8 @@ interface Provider {
   movie_count: number
   series_count: number
   episode_count: number
+  last_movie_provider_total: number | null
+  last_series_provider_total: number | null
   synced_connection_count: number
   live_account_count: number
   import_exclude_categories: string[]
@@ -5397,8 +5399,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <tr className="text-muted-foreground text-left bg-secondary/50">
               <th className="py-2 px-2 font-semibold">Name</th>
               <th className="py-2 px-2 font-semibold">Base URL</th>
-              <th className="py-2 px-2 font-semibold">Movies</th>
-              <th className="py-2 px-2 font-semibold" title="Distinct series with at least one episode from this provider">Series</th>
+              <th className="py-2 px-2 font-semibold" title="Imported (in the pool) / the provider's own reported total, as of its last import pass — a gap between them can mean items are stuck (Needs Review, blank names) or the provider's list changed since. XC providers only; Plex/Emby import differently and don't report this.">Movies (Imported / Provider)</th>
+              <th className="py-2 px-2 font-semibold" title="Distinct series with at least one episode from this provider. Imported (in the pool) / the provider's own reported total, as of its last import pass — XC providers only.">Series (Imported / Provider)</th>
               <th className="py-2 px-2 font-semibold" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
               <th className="py-2 px-2 font-semibold" title="Higher number wins when multiple providers carry the same title">Priority</th>
               <th className="py-2 px-2 font-semibold">Max Streams</th>
@@ -5439,8 +5441,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     }}
                   />
                 </td>
-                <td className="py-1 pr-2 text-muted-foreground">{p.movie_count.toLocaleString()}</td>
-                <td className="py-1 pr-2 text-muted-foreground">{p.series_count.toLocaleString()}</td>
+                <td className="py-1 pr-2 text-muted-foreground">
+                  {p.movie_count.toLocaleString()}{p.last_movie_provider_total != null && ` / ${p.last_movie_provider_total.toLocaleString()}`}
+                </td>
+                <td className="py-1 pr-2 text-muted-foreground">
+                  {p.series_count.toLocaleString()}{p.last_series_provider_total != null && ` / ${p.last_series_provider_total.toLocaleString()}`}
+                </td>
                 <td className="py-1 pr-2 text-muted-foreground">{p.episode_count.toLocaleString()}</td>
                 <td className="py-1 pr-2">
                   <input
@@ -5652,6 +5658,109 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
         </div>
       </SectionCard>
+
+      {excludeCategoriesProviderId != null && (() => {
+        const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
+        const visible = allNames.filter((name) => {
+          if (excludeCategoriesSearch && !name.toLowerCase().includes(excludeCategoriesSearch.toLowerCase())) return false
+          if (excludeCategoriesShowFilter === 'selected' && !excludeCategoriesDraft.has(name)) return false
+          if (excludeCategoriesShowFilter === 'unselected' && excludeCategoriesDraft.has(name)) return false
+          return true
+        })
+        return (
+        <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-lg">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">
+              Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Movies/series in a checked category get auto-archived on import, using this provider's own category
+              names. Archived, not deleted — still browsable if you change your mind.
+            </p>
+            {providerAvailableCategoriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading this provider's categories…</p>}
+            {providerAvailableCategoriesQuery.data && !providerAvailableCategoriesQuery.data.categories.length && (
+              <p className="text-xs text-muted-foreground">No categories reported by this provider.</p>
+            )}
+            {!!allNames.length && (
+              <>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    className={inputCls('flex-1')}
+                    placeholder="Search categories…"
+                    value={excludeCategoriesSearch}
+                    onChange={(e) => setExcludeCategoriesSearch(e.target.value)}
+                  />
+                  <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                    {(['all', 'selected', 'unselected'] as const).map((f) => (
+                      <button
+                        key={f}
+                        className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${excludeCategoriesShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                        onClick={() => setExcludeCategoriesShowFilter(f)}
+                      >
+                        {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5 text-xs">
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                    onClick={() => setExcludeCategoriesDraft(new Set([...excludeCategoriesDraft, ...visible]))}
+                  >
+                    Select visible ({visible.length})
+                  </button>
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                    onClick={() => { const next = new Set(excludeCategoriesDraft); visible.forEach((n) => next.delete(n)); setExcludeCategoriesDraft(next) }}
+                  >
+                    Deselect visible ({visible.filter((n) => excludeCategoriesDraft.has(n)).length})
+                  </button>
+                  <span className="text-muted-foreground ml-auto">{excludeCategoriesDraft.size} selected total · shift-click to select a range</span>
+                </div>
+              </>
+            )}
+            <div className="max-h-64 overflow-y-auto space-y-1 border border-border rounded p-2">
+              {visible.map((name, i) => (
+                <label key={name} className="flex items-center gap-1.5 text-xs select-none">
+                  <input
+                    type="checkbox"
+                    checked={excludeCategoriesDraft.has(name)}
+                    onChange={() => {}}
+                    onClick={(e) => {
+                      const willBeChecked = !excludeCategoriesDraft.has(name)
+                      const next = new Set(excludeCategoriesDraft)
+                      if (e.shiftKey && excludeCategoriesLastClickedIndex != null) {
+                        const [start, end] = [excludeCategoriesLastClickedIndex, i].sort((a, b) => a - b)
+                        for (let j = start; j <= end; j++) {
+                          if (willBeChecked) next.add(visible[j]); else next.delete(visible[j])
+                        }
+                      } else {
+                        if (willBeChecked) next.add(name); else next.delete(name)
+                      }
+                      setExcludeCategoriesDraft(next)
+                      setExcludeCategoriesLastClickedIndex(i)
+                    }}
+                  />
+                  {name}
+                </label>
+              ))}
+              {!!allNames.length && !visible.length && <p className="text-muted-foreground">No categories match.</p>}
+            </div>
+            {excludeCategoriesError && <p className="text-xs text-destructive">{excludeCategoriesError}</p>}
+            <div className="flex justify-end gap-2 pt-2">
+              <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
+              <Button
+                size="sm"
+                disabled={setProviderImportExcludeCategories.isPending}
+                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft) })}
+              >
+                {setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+        )
+      })()}
       </>
       )}
 
@@ -5781,109 +5890,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         )}
       </SectionCard>
-
-      {excludeCategoriesProviderId != null && (() => {
-        const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
-        const visible = allNames.filter((name) => {
-          if (excludeCategoriesSearch && !name.toLowerCase().includes(excludeCategoriesSearch.toLowerCase())) return false
-          if (excludeCategoriesShowFilter === 'selected' && !excludeCategoriesDraft.has(name)) return false
-          if (excludeCategoriesShowFilter === 'unselected' && excludeCategoriesDraft.has(name)) return false
-          return true
-        })
-        return (
-        <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-lg">
-          <div className="p-5 space-y-3">
-            <h2 className="text-base font-semibold">
-              Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Movies/series in a checked category get auto-archived on import, using this provider's own category
-              names. Archived, not deleted — still browsable if you change your mind.
-            </p>
-            {providerAvailableCategoriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading this provider's categories…</p>}
-            {providerAvailableCategoriesQuery.data && !providerAvailableCategoriesQuery.data.categories.length && (
-              <p className="text-xs text-muted-foreground">No categories reported by this provider.</p>
-            )}
-            {!!allNames.length && (
-              <>
-                <div className="flex items-center gap-1.5">
-                  <input
-                    className={inputCls('flex-1')}
-                    placeholder="Search categories…"
-                    value={excludeCategoriesSearch}
-                    onChange={(e) => setExcludeCategoriesSearch(e.target.value)}
-                  />
-                  <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
-                    {(['all', 'selected', 'unselected'] as const).map((f) => (
-                      <button
-                        key={f}
-                        className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${excludeCategoriesShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                        onClick={() => setExcludeCategoriesShowFilter(f)}
-                      >
-                        {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5 text-xs">
-                  <button
-                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                    onClick={() => setExcludeCategoriesDraft(new Set([...excludeCategoriesDraft, ...visible]))}
-                  >
-                    Select visible ({visible.length})
-                  </button>
-                  <button
-                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                    onClick={() => { const next = new Set(excludeCategoriesDraft); visible.forEach((n) => next.delete(n)); setExcludeCategoriesDraft(next) }}
-                  >
-                    Deselect visible ({visible.filter((n) => excludeCategoriesDraft.has(n)).length})
-                  </button>
-                  <span className="text-muted-foreground ml-auto">{excludeCategoriesDraft.size} selected total · shift-click to select a range</span>
-                </div>
-              </>
-            )}
-            <div className="max-h-64 overflow-y-auto space-y-1 border border-border rounded p-2">
-              {visible.map((name, i) => (
-                <label key={name} className="flex items-center gap-1.5 text-xs select-none">
-                  <input
-                    type="checkbox"
-                    checked={excludeCategoriesDraft.has(name)}
-                    onChange={() => {}}
-                    onClick={(e) => {
-                      const willBeChecked = !excludeCategoriesDraft.has(name)
-                      const next = new Set(excludeCategoriesDraft)
-                      if (e.shiftKey && excludeCategoriesLastClickedIndex != null) {
-                        const [start, end] = [excludeCategoriesLastClickedIndex, i].sort((a, b) => a - b)
-                        for (let j = start; j <= end; j++) {
-                          if (willBeChecked) next.add(visible[j]); else next.delete(visible[j])
-                        }
-                      } else {
-                        if (willBeChecked) next.add(name); else next.delete(name)
-                      }
-                      setExcludeCategoriesDraft(next)
-                      setExcludeCategoriesLastClickedIndex(i)
-                    }}
-                  />
-                  {name}
-                </label>
-              ))}
-              {!!allNames.length && !visible.length && <p className="text-muted-foreground">No categories match.</p>}
-            </div>
-            {excludeCategoriesError && <p className="text-xs text-destructive">{excludeCategoriesError}</p>}
-            <div className="flex justify-end gap-2 pt-2">
-              <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
-              <Button
-                size="sm"
-                disabled={setProviderImportExcludeCategories.isPending}
-                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft) })}
-              >
-                {setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
-              </Button>
-            </div>
-          </div>
-        </Modal>
-        )
-      })()}
       </>
       )}
 

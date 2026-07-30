@@ -223,6 +223,8 @@ async def import_provider_catalog(provider_id: int) -> dict:
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
 
+    await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, len(streams), len(series_list))
+
     if provider.get("auto_create_categories"):
         try:
             created = await asyncio.to_thread(
