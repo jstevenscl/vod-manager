@@ -1606,6 +1606,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   const deleteSource = useMutation({
     mutationFn: (sourceId: number) => api.delete(`/vod/movies/${movie.id}/sources/${sourceId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const removePlacement = useMutation({
     mutationFn: (categoryId: number) => api.delete(`/vod/movies/${movie.id}/categories/${categoryId}/`),
@@ -1663,7 +1664,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                 title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
               />
               <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
-              <button title="Remove source" className="hover:text-destructive" onClick={() => deleteSource.mutate(s.id)}>
+              <button
+                title="Remove source"
+                className="hover:text-destructive"
+                onClick={() => {
+                  const msg = movie.sources.length === 1
+                    ? `Remove the only source (${s.provider_name}) from "${movie.name}"? This deletes the movie itself (and its file, if local) -- it has no other source to fall back on. Can't be undone.`
+                    : `Remove the ${s.provider_name} source from "${movie.name}"? The movie stays available from its other source(s). Can't be undone.`
+                  if (confirm(msg)) deleteSource.mutate(s.id)
+                }}
+              >
                 <X size={12} />
               </button>
             </span>
