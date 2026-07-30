@@ -168,7 +168,11 @@ separate self-service Portal so end users can schedule and manage their own
 recordings without touching the admin UI at all. Each person's Portal
 account records into their own explicitly-assigned DVR category — there's
 no silent shared default, by design (see
-[USERGUIDE.md](USERGUIDE.md#7-dvr-recordings) for why). Full setup
+[USERGUIDE.md](USERGUIDE.md#7-dvr-recordings) for why). An opt-in **delete
+from Dispatcharr once safely copied** setting keeps Dispatcharr's own
+storage from filling up forever with content VOD Manager has already
+absorbed — off by default, and only ever deletes after a byte-verified
+independent copy exists. Full setup
 (including the local-path-vs-download-mode decision, which is easy to get
 wrong) and screenshots in [USERGUIDE.md](USERGUIDE.md#7-dvr-recordings).
 

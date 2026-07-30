@@ -52,6 +52,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import unicodedata
 from datetime import datetime, timezone
 
@@ -66,6 +67,40 @@ import vod_db
 import xc_server
 
 logger = logging.getLogger(__name__)
+
+
+def _file_matches_size(path: str, expected_size: int | None) -> bool:
+    """Verification gate for dvr_delete_after_copy -- expected_size is
+    Dispatcharr's own custom_properties.bytes_written for this recording
+    (the authoritative source, not something VOD Manager measured), so a
+    match here is real confirmation the local copy is byte-complete before
+    anything asks Dispatcharr to delete its original. expected_size=None
+    (Dispatcharr didn't report a size) or a missing file both return False
+    -- never treated as "good enough," since a false positive here means
+    deleting the only remaining copy of someone's real recording."""
+    if expected_size is None or not os.path.isfile(path):
+        return False
+    try:
+        return os.path.getsize(path) == expected_size
+    except OSError:
+        return False
+
+
+def _copy_local_file(source_path: str, dest_path: str) -> None:
+    """Local-filesystem counterpart to dispatcharr_dvr_client.
+    download_recording_file's atomic-write pattern -- same .part-then-
+    rename discipline, so a concurrent reader (this importer's own isfile
+    check on a later pass, or xc_server serving playback) can never observe
+    a truncated file at the final path. Only used when dvr_delete_after_copy
+    is on for a shared-volume (Phase 1a) provider, to give it an
+    independent copy before its Dispatcharr original gets deleted -- Phase
+    1b's download already writes straight into VOD Manager's own storage
+    via download_recording_file, so this is Phase 1a's equivalent of that."""
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    tmp_path = dest_path + ".part"
+    shutil.copyfile(source_path, tmp_path)
+    os.replace(tmp_path, dest_path)
+
 
 # Serializes a given provider's own import against itself -- the background
 # _dispatcharr_dvr_poller loop and a manual "Import catalog" click (or the
@@ -267,6 +302,15 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     recordings = await dispatcharr_dvr_client.list_completed_recordings(connection)
     remote_root = provider.get("dvr_remote_recordings_root") or _DEFAULT_REMOTE_RECORDINGS_ROOT
     vod_db.cleanup_stale_recording_claims()
+    # Opt-in, default off -- see vod_db.enable_dvr_for_connection's docstring
+    # for why. own_storage_dir is Phase 1b's existing DATA_DIR/dvr_recordings
+    # convention, reused here as the destination for Phase 1a's copy too, so
+    # both modes end up with an independent copy in the same place.
+    delete_after_copy = bool(provider.get("dvr_delete_after_copy"))
+    own_storage_dir = str(config.DATA_DIR / "dvr_recordings" / str(provider_id))
+    ready_to_delete_recording_ids: list[int] = []
+    deleted_from_dispatcharr = 0
+    delete_errors = 0
 
     movie_items = []
     series_items: dict[str, dict] = {}
@@ -350,6 +394,42 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 # Retried on the next poll cycle rather than registering a
                 # source that points at a file that doesn't actually exist.
                 continue
+
+        if delete_after_copy:
+            expected_size = file_info.get("bytes_written")
+            verified_own_copy = False
+            if download_mode:
+                # Phase 1b already downloads straight into our own storage --
+                # target_path here already IS our own independent copy.
+                verified_own_copy = _file_matches_size(target_path, expected_size)
+            else:
+                # Phase 1a: target_path currently points at Dispatcharr's own
+                # file via the shared mount, not something we own -- copy it
+                # into our own storage first. This exact same check runs for
+                # EVERY completed recording on EVERY pass, not just newly-
+                # discovered ones, so turning this setting on naturally
+                # backfills every recording imported under the old
+                # reference-only behavior too, one pass at a time, without
+                # any separate migration step.
+                shared_path = target_path
+                hashed_name = hashlib.sha256(f"{provider_id}:{recording_id}".encode()).hexdigest() + (os.path.splitext(file_path)[1] or ".mkv")
+                own_path = os.path.join(own_storage_dir, hashed_name)
+                if not _file_matches_size(own_path, expected_size):
+                    try:
+                        await asyncio.to_thread(_copy_local_file, shared_path, own_path)
+                    except Exception as exc:
+                        logger.warning(
+                            "[dispatcharr_dvr_importer] delete_after_copy: failed to copy recording=%s "
+                            "from the shared mount into local storage: %s", recording_id, exc)
+                if _file_matches_size(own_path, expected_size):
+                    target_path = own_path
+                    verified_own_copy = True
+            if verified_own_copy:
+                ready_to_delete_recording_ids.append(recording["id"])
+            elif expected_size is not None:
+                logger.warning(
+                    "[dispatcharr_dvr_importer] delete_after_copy: recording=%s has no verified independent "
+                    "copy yet -- not deleting the Dispatcharr original this pass", recording_id)
 
         local_paths_by_stream_id[recording_id] = target_path
 
@@ -437,6 +517,31 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
 
     series_result = vod_db.bulk_import_plex_series(provider_id, list(series_items.values()))
     series_id_by_stream_id = vod_db.set_episode_source_local_paths(provider_id, local_paths_by_stream_id)
+
+    # dvr_delete_after_copy cleanup -- only reached for a recording_id that
+    # made it through the per-recording verified_own_copy check above, so by
+    # this point local_paths_by_stream_id[recording_id] already points at
+    # VOD Manager's own independently-verified copy, and that path has just
+    # been written to movie_sources/episode_sources above -- deleting the
+    # Dispatcharr original now can't leave anything unplayable. Runs after
+    # both DB writes succeed, never before, so a crash between copying and
+    # here just means Dispatcharr's original survives for another pass
+    # rather than the reverse (safe direction to fail in). Dispatcharr's own
+    # file removal is itself best-effort and asynchronous (confirmed against
+    # its real source, apps/channels/api_views.py's RecordingViewSet.
+    # destroy() -- the DB row is deleted synchronously but the file unlink
+    # happens in a background thread after the response is already sent),
+    # so this doesn't wait for or verify the space was actually reclaimed --
+    # only that the delete request itself was accepted.
+    for recording_id in ready_to_delete_recording_ids:
+        try:
+            await dispatcharr_dvr_client.delete_recording(connection, recording_id)
+            deleted_from_dispatcharr += 1
+        except Exception as exc:
+            delete_errors += 1
+            logger.warning(
+                "[dispatcharr_dvr_importer] delete_after_copy: failed to delete recording=%s from "
+                "Dispatcharr after a verified local copy -- will retry next pass: %s", recording_id, exc)
 
     # Attribute each recording to EVERY profile owner that matched it, not
     # just one -- match_recording_profiles' own docstring already documented
@@ -651,8 +756,10 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
     for category_id, ids in series_ids_by_category.items():
         vod_db.bulk_place_series_in_category(list(ids), category_id)
 
-    logger.info("[dispatcharr_dvr_importer] provider=%s movies=%s series=%s skipped=%d downloaded=%d download_errors=%d",
-                provider["name"], movie_result, series_result, skipped, downloaded, download_errors)
+    logger.info("[dispatcharr_dvr_importer] provider=%s movies=%s series=%s skipped=%d downloaded=%d download_errors=%d "
+                "deleted_from_dispatcharr=%d delete_errors=%d",
+                provider["name"], movie_result, series_result, skipped, downloaded, download_errors,
+                deleted_from_dispatcharr, delete_errors)
 
     return {
         "provider": provider["name"],
@@ -661,6 +768,8 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
         "skipped_no_file_path": skipped,
         "downloaded": downloaded,
         "download_errors": download_errors,
+        "deleted_from_dispatcharr": deleted_from_dispatcharr,
+        "delete_errors": delete_errors,
     }
 
 

@@ -29,6 +29,7 @@ interface Provider {
   dvr_local_path: string | null
   dvr_movie_category_id: number | null
   dvr_series_category_id: number | null
+  dvr_delete_after_copy: number
   auto_create_categories: number
 }
 
@@ -3161,6 +3162,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [dvrModalConnectionId, setDvrModalConnectionId] = useState<number | null>(null)
   const [dvrModalForm, setDvrModalForm] = useState({
     dvr_local_path: '', dvr_movie_category_id: '', dvr_series_category_id: '', priority: '0',
+    dvr_delete_after_copy: false,
   })
   const enableDvrForConnection = useMutation({
     mutationFn: (connectionId: number) => api.post(`/vod/dispatcharr-connections/${connectionId}/dvr/`, {
@@ -3168,6 +3170,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       dvr_movie_category_id: dvrModalForm.dvr_movie_category_id ? Number(dvrModalForm.dvr_movie_category_id) : null,
       dvr_series_category_id: dvrModalForm.dvr_series_category_id ? Number(dvrModalForm.dvr_series_category_id) : null,
       priority: Number(dvrModalForm.priority) || 0,
+      dvr_delete_after_copy: dvrModalForm.dvr_delete_after_copy,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
@@ -5063,6 +5066,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         dvr_movie_category_id: dvrProvider?.dvr_movie_category_id ? String(dvrProvider.dvr_movie_category_id) : '',
                         dvr_series_category_id: dvrProvider?.dvr_series_category_id ? String(dvrProvider.dvr_series_category_id) : '',
                         priority: dvrProvider ? String(dvrProvider.priority) : '0',
+                        dvr_delete_after_copy: !!dvrProvider?.dvr_delete_after_copy,
                       })
                       setDvrModalConnectionId(c.id)
                     }}
@@ -5141,6 +5145,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   title="Only matters if the same movie/episode also comes from another provider -- higher priority streams first"
                 />
               </div>
+              <label
+                className="flex items-center gap-1.5 text-sm cursor-pointer"
+                title="Off by default. Once a recording has an independently verified copy in VOD Manager's own storage (an actual local copy either way -- Local/NFS path recordings get copied out of the shared mount first, download-mode recordings already are one), deletes the original from Dispatcharr to free its disk space. Verified by comparing file size against what Dispatcharr itself reports before anything is deleted -- never deletes without a confirmed independent copy. Turning this on also gradually cleans up recordings already imported before this setting existed, a few per import pass, not all at once."
+              >
+                <input
+                  type="checkbox"
+                  checked={dvrModalForm.dvr_delete_after_copy}
+                  onChange={(e) => setDvrModalForm({ ...dvrModalForm, dvr_delete_after_copy: e.target.checked })}
+                />
+                Delete from Dispatcharr once safely copied
+              </label>
             </div>
             <div className="flex items-center justify-between pt-1">
               {dvrProvider ? (

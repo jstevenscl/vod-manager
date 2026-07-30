@@ -430,6 +430,46 @@ recording from this connection to land in one shared bucket. It is
 only ever schedule into their own personal category (step 2), never fall
 back to this one — see **Users** below for why.
 
+### Deleting from Dispatcharr once safely copied
+
+Neither ingestion mode ever cleaned up the original recording on
+Dispatcharr's own side — Dispatcharr has no automatic retention of its own,
+so left alone, its disk just fills up forever with content VOD Manager has
+already absorbed. **Delete from Dispatcharr once safely copied**, on the
+same DVR settings modal, fixes this — off by default, so it's always a
+deliberate choice, never a surprise the moment you update.
+
+What it actually does depends on which mode you're using:
+
+- **Local/NFS path (shared-volume) mode** — normally just references
+  Dispatcharr's own file directly, no bytes ever copied. With this on,
+  a completed recording gets copied into VOD Manager's own storage first
+  (independent of Dispatcharr's file), verified against the exact byte size
+  Dispatcharr itself reports for that recording, and only *after* that
+  verified copy exists does VOD Manager ask Dispatcharr to delete the
+  original — which removes the underlying file too, not just Dispatcharr's
+  own database record.
+- **Download mode** — already makes an independent copy of every recording;
+  this just adds the same verify-then-delete step afterward.
+
+**Turning this on also gradually cleans up recordings you already imported
+before this setting existed.** Every completed recording Dispatcharr reports
+goes through the same check on every import pass, whether it's brand new or
+was ingested months ago under the old reference-only behavior — so nothing
+needs a separate migration step, it just catches up a few recordings at a
+time as your normal import schedule runs.
+
+A couple of things worth knowing:
+
+- The size check only ever proceeds on a **confirmed match** — if
+  Dispatcharr hasn't reported a size, or the copy doesn't match it, nothing
+  gets deleted that pass; it's simply retried on the next one. Nothing is
+  ever deleted without a verified independent copy already in place first.
+- Dispatcharr's own file deletion is best-effort on its side (it happens in
+  the background after the delete request is accepted), so don't expect
+  Dispatcharr's disk usage to drop the instant an import pass finishes —
+  give it a little time.
+
 ### Recording Rules
 
 A **Recording Rule** (renamed from "Recording Profiles" — you may see the

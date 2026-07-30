@@ -872,6 +872,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "raw_name", "TEXT"),
         ("episode_sources", "raw_name", "TEXT"),
         ("series", "provider_category_name", "TEXT"),
+        ("providers", "dvr_delete_after_copy", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1006,7 +1007,7 @@ def upsert_provider(
 def enable_dvr_for_connection(
     connection_id: int, dvr_local_path: str | None, dvr_movie_category_id: int | None,
     dvr_series_category_id: int | None, dvr_remote_recordings_root: str | None = None,
-    priority: int = 0,
+    priority: int = 0, dvr_delete_after_copy: bool = False,
 ) -> int:
     """Upserts the one providers row for this connection's DVR -- a second
     call with different settings edits the existing row rather than
@@ -1015,7 +1016,15 @@ def enable_dvr_for_connection(
     WHERE provider_type='dispatcharr_dvr' is what actually enforces "one per
     connection" at the DB layer; this function's own SELECT-then-INSERT/
     UPDATE is just how it finds the existing row to update, not the
-    enforcement itself."""
+    enforcement itself.
+
+    dvr_delete_after_copy: opt-in, default off -- real user requirement,
+    2026-07-29: neither DVR ingestion mode ever cleaned up the original
+    recording on Dispatcharr's own side, so its disk fills up forever with
+    content VOD Manager has already safely absorbed. Defaults off so
+    turning this on is always a deliberate admin choice, never a surprise
+    the moment they update -- see dispatcharr_dvr_importer's own docstring
+    for exactly what "safely absorbed" means before this deletes anything."""
     connection = get_dispatcharr_connection(connection_id)
     if not connection:
         raise ValueError(f"Dispatcharr connection {connection_id} not found")
@@ -1027,9 +1036,9 @@ def enable_dvr_for_connection(
     if row:
         conn.execute(
             """UPDATE providers SET name=?, dvr_local_path=?, dvr_movie_category_id=?, dvr_series_category_id=?,
-               dvr_remote_recordings_root=?, priority=?, is_active=1, updated_at=? WHERE id=?""",
+               dvr_remote_recordings_root=?, priority=?, dvr_delete_after_copy=?, is_active=1, updated_at=? WHERE id=?""",
             (connection["label"], dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-             dvr_remote_recordings_root, priority, _now(), row["id"]),
+             dvr_remote_recordings_root, priority, int(dvr_delete_after_copy), _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
@@ -1037,10 +1046,10 @@ def enable_dvr_for_connection(
             """INSERT INTO providers
                (name, base_url, username, password, max_streams, priority, provider_type, is_active,
                 dispatcharr_connection_id, dvr_local_path, dvr_movie_category_id, dvr_series_category_id,
-                dvr_remote_recordings_root, created_at)
-               VALUES (?,'','','',0,?,'dispatcharr_dvr',1,?,?,?,?,?,?)""",
+                dvr_remote_recordings_root, dvr_delete_after_copy, created_at)
+               VALUES (?,'','','',0,?,'dispatcharr_dvr',1,?,?,?,?,?,?,?)""",
             (connection["label"], priority, connection_id, dvr_local_path, dvr_movie_category_id,
-             dvr_series_category_id, dvr_remote_recordings_root, _now()),
+             dvr_series_category_id, dvr_remote_recordings_root, int(dvr_delete_after_copy), _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)

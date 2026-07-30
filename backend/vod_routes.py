@@ -158,6 +158,7 @@ class EnableDvrRequest(BaseModel):
     dvr_series_category_id: Optional[int] = None
     dvr_remote_recordings_root: Optional[str] = None
     priority: int = 0
+    dvr_delete_after_copy: bool = False
 
 
 class RecordingProfileRequest(BaseModel):
@@ -572,7 +573,7 @@ async def enable_dvr_for_connection(connection_id: int, body: EnableDvrRequest):
     try:
         provider_id = vod_db.enable_dvr_for_connection(
             connection_id, body.dvr_local_path, body.dvr_movie_category_id, body.dvr_series_category_id,
-            body.dvr_remote_recordings_root, body.priority,
+            body.dvr_remote_recordings_root, body.priority, body.dvr_delete_after_copy,
         )
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
