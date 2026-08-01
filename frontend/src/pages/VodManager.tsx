@@ -3833,6 +3833,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       setLockoutForm(null)
     },
   })
+  const hideDvrTabSettingQuery = useQuery<{ hidden: boolean }>({
+    queryKey: ['hide-dvr-tab'],
+    queryFn:  () => api.get('/vod/hide-dvr-tab/').then((r) => r.data),
+  })
+  const setHideDvrTab = useMutation({
+    mutationFn: (hidden: boolean) => api.post('/vod/hide-dvr-tab/', { hidden }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['hide-dvr-tab'] }),
+  })
   const refreshSettingsQuery = useQuery<RefreshSettings>({
     queryKey: ['vod-refresh-settings'],
     queryFn:  () => api.get('/vod/refresh-settings/').then((r) => r.data),
@@ -5249,6 +5257,23 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <Button size="sm" variant="outline" onClick={() => setLockoutForm(null)}>Cancel</Button>
           )}
         </div>
+      </SectionCard>
+
+      <SectionCard title="Navigation" icon={<LayoutGrid size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Hide the whole DVR section from the sidebar for installs that don't use it, without touching anything
+          already configured — recording rules, scheduled recordings, and portal accounts stay intact and start
+          showing again the moment this is turned back off.
+        </p>
+        <label className="flex items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={!!hideDvrTabSettingQuery.data?.hidden}
+            disabled={hideDvrTabSettingQuery.isLoading || setHideDvrTab.isPending}
+            onChange={(e) => setHideDvrTab.mutate(e.target.checked)}
+          />
+          Hide DVR tab
+        </label>
       </SectionCard>
 
       <SectionCard title="Refresh Schedule" icon={<RefreshCw size={14} />}>

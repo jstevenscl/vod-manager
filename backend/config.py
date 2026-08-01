@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -271,6 +271,21 @@ def get_default_categories_prompt_dismissed() -> bool:
 def set_default_categories_prompt_dismissed() -> None:
     data = _read_raw()
     data["default_categories_prompt_dismissed"] = True
+    _write_raw(data)
+
+
+def get_hide_dvr_tab() -> bool:
+    """A deployment-wide display preference, not a per-browser one (unlike
+    the active-tab/theme choices App.tsx keeps in localStorage) -- whether
+    DVR is used at all is a decision about this VOD Manager instance, not
+    about who's currently looking at it. Defaults to False (shown) so
+    existing installs see no change until an admin opts in."""
+    return bool(_read_raw().get("hide_dvr_tab"))
+
+
+def set_hide_dvr_tab(hidden: bool) -> None:
+    data = _read_raw()
+    data["hide_dvr_tab"] = hidden
     _write_raw(data)
 
 
