@@ -11,6 +11,7 @@ just a different meaning for that one column.
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -18,6 +19,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 20.0
+
+_TOKEN_RE = re.compile(r"(X-Plex-Token=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _redact(exc: Exception) -> str:
+    """str(exc) on an httpx.HTTPStatusError embeds the full request URL --
+    X-Plex-Token included, since Plex takes it as a query param, not a
+    header -- so this must wrap every logged Plex exception or a real
+    token ends up in plaintext in container logs."""
+    return _TOKEN_RE.sub(r"\1***", str(exc))
 
 # A stable identifier so Plex treats every VOD-Manager-relayed session as
 # coming from the same logical "client" — we don't track individual end
@@ -122,7 +133,7 @@ class PlexClient:
                 "X-Plex-Product": "VOD Manager",
             })
         except Exception as exc:
-            logger.warning("[plex_client] timeline report failed: %s", exc)
+            logger.warning("[plex_client] timeline report failed: %s", _redact(exc))
 
 
 def extract_part(item: dict) -> tuple[str | None, str]:
@@ -160,6 +171,17 @@ def extract_common_fields(item: dict) -> dict:
     genres = [g["tag"] for g in (item.get("Genre") or []) if g.get("tag")]
     directors = [d["tag"] for d in (item.get("Director") or []) if d.get("tag")]
     cast = [r["tag"] for r in (item.get("Role") or []) if r.get("tag")]
+    # Real bug found live 2026-07-31: this never extracted a rating at all,
+    # so every Plex/Emby-sourced movie/series showed 0.0 no matter what --
+    # confirmed against real data (100% of PMS/Emby VOD items had a null/0
+    # rating despite being fully enriched, vs. 68-92% real coverage on XC
+    # providers going through the separate get_vod_info enrichment path).
+    # "rating" is Plex's critic score (its default agent's usual source);
+    # "audienceRating" is the audience score -- prefer critic, fall back to
+    # audience rather than leaving it blank when only one is populated.
+    rating = item.get("rating")
+    if rating is None:
+        rating = item.get("audienceRating")
     return {
         "genre": ", ".join(genres) or None,
         "description": item.get("summary") or None,
@@ -167,4 +189,12 @@ def extract_common_fields(item: dict) -> dict:
         "cast_list": ", ".join(cast) or None,
         "poster_url": item.get("thumb") or None,
         "tmdb_id": extract_tmdb_id(item),
+        "rating": str(rating) if rating is not None else None,
+        # Same gap as rating (found live 2026-07-31 doing a completeness
+        # pass after fixing that one) -- never extracted at all, so a
+        # Plex-sourced movie/series' release date was always blank no
+        # matter what Plex itself had. originallyAvailableAt is already a
+        # plain "YYYY-MM-DD" string, same shape XC's own releasedate field
+        # uses, so no reformatting needed.
+        "release_date": item.get("originallyAvailableAt") or None,
     }

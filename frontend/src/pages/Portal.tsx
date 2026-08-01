@@ -191,9 +191,30 @@ function groupSeasons(episodes: EpisodeItem[]) {
     .sort((a, b) => b.season - a.season)
 }
 
+// Provider poster_url values are plain http:// -- once the portal is served
+// over https (a reverse proxy or Cloudflare Tunnel, the admin README's own
+// recommended remote-access setup), the browser hard-blocks a http:// <img>
+// on a https:// page as mixed content, so posters would silently render as
+// nothing. Same fix as VodManager.tsx's posterSrc/PosterThumb, using the
+// portal's own token/route since portal users aren't admins.
+function portalPosterSrc(url: string): string {
+  if (!url.startsWith('http://')) return url
+  const token = localStorage.getItem('vodmanager-portal-session') ?? ''
+  return `/api/portal/image-proxy?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`
+}
+
 function PosterTile({ seed, posterUrl, size = 'w-full aspect-[2/3]' }: { seed: string; posterUrl?: string | null; size?: string }) {
-  if (posterUrl) {
-    return <img src={posterUrl} alt="" className={`${size} rounded-md object-cover shadow-sm`} />
+  const [failed, setFailed] = useState(false)
+  if (posterUrl && !failed) {
+    return (
+      <img
+        src={portalPosterSrc(posterUrl)}
+        alt=""
+        loading="lazy"
+        className={`${size} rounded-md object-cover shadow-sm`}
+        onError={() => setFailed(true)}
+      />
+    )
   }
   return (
     <div className={`relative ${size} rounded-md bg-gradient-to-br ${posterGradient(seed)} flex items-center justify-center text-white font-bold text-2xl shadow-inner`}>

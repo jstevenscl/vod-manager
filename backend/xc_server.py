@@ -23,11 +23,12 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import tempfile
 import time
 
 import httpx
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 import config
@@ -487,6 +488,11 @@ _active_vod_streams: dict[int, int] = {}  # provider_id -> count of VOD streams 
 _live_viewer_cache: dict[int, tuple[int, float]] = {}  # dispatcharr_account_id -> (viewer_count, monotonic_at)
 _LIVE_VIEWER_CACHE_TTL = 5.0  # seconds — short, since range-seek requests can fire many proxy calls in quick succession
 
+# Guards the read-count/compare/reserve sequence in _try_reserve_capacity --
+# NOT held across the slow upstream connect. See that function's docstring
+# for the race it closes.
+_capacity_lock = asyncio.Lock()
+
 # conn_id -> session info, for the "Activity" panel in VOD Manager and for
 # driving Plex timeline heartbeats. Best-effort/in-memory only — a restart
 # clears it, same as _active_vod_streams above.
@@ -556,15 +562,31 @@ async def _live_viewer_count(connection: dict, dispatcharr_account_id: int, disp
     return count
 
 
-async def _has_capacity(provider: dict) -> bool:
-    """True if opening one more VOD stream against this provider wouldn't
-    exceed its real, total connection cap — which is shared across every
-    live-TV account (on any Dispatcharr instance) plus VOD Manager's own
-    usage that draws from the same real upstream. A single real provider's
-    connection pool is one thing regardless of how many different
-    Dispatcharr instances happen to have their own native live-TV account
-    against it (see vod_db.provider_live_accounts) -- one real subscription
-    limit, summed across all of them.
+async def _try_reserve_capacity(provider: dict) -> bool:
+    """Atomically checks AND claims one connection slot for this provider,
+    returning True only if the slot is now ours -- release it with
+    _release_capacity if the connect that follows doesn't pan out. Replaces
+    a separate _has_capacity() that only informed a decision without
+    claiming anything: the real upstream connect this gates routinely took
+    1-8s in live testing (2026-07-31 concurrent-stream test against real
+    4KLive profiles), and the old code only incremented _active_vod_streams
+    *after* that connect succeeded -- leaving a multi-second window where
+    every concurrently-arriving request read the same stale (pre-increment)
+    count, all saw capacity, and all proceeded. Confirmed live: 22 concurrent
+    requests all opened against a provider whose shared_connection_limit was
+    5. The fix is to reserve the slot the instant we decide to use it, before
+    any slow I/O -- the checked-and-claimed step below is the only part that
+    must be atomic, guarded by _capacity_lock; the slow parts (Dispatcharr's
+    live-viewer-count lookup, the siblings/limit lookup) run before the lock
+    is taken, since they don't touch our own counter and don't need to
+    serialize against it.
+
+    Pools across every live-TV account (on any Dispatcharr instance) plus
+    VOD Manager's own usage that draws from the same real upstream. A single
+    real provider's connection pool is one thing regardless of how many
+    different Dispatcharr instances happen to have their own native live-TV
+    account against it (see vod_db.provider_live_accounts) -- one real
+    subscription limit, summed across all of them.
 
     Also pools across every OTHER provider sharing the exact same real
     login (vod_db.find_providers_sharing_credentials) -- mirrors
@@ -584,7 +606,7 @@ async def _has_capacity(provider: dict) -> bool:
 
     Only coordinates when the group has both a declared limit and at least
     one linked live account somewhere in it; otherwise always returns True
-    (no coordination attempted)."""
+    (no coordination attempted, nothing reserved)."""
     siblings = await asyncio.to_thread(vod_db.find_providers_sharing_credentials, provider["id"])
     group = [provider] + siblings
 
@@ -606,8 +628,23 @@ async def _has_capacity(provider: dict) -> bool:
     if not any_live_accounts:
         return True
 
-    our_count = sum(_active_vod_streams.get(p["id"], 0) for p in group)
-    return (live_count + our_count) < limit
+    async with _capacity_lock:
+        our_count = sum(_active_vod_streams.get(p["id"], 0) for p in group)
+        if live_count + our_count >= limit:
+            return False
+        _active_vod_streams[provider["id"]] = _active_vod_streams.get(provider["id"], 0) + 1
+        return True
+
+
+def _release_capacity(provider: dict) -> None:
+    """Undo a _try_reserve_capacity reservation that didn't lead to an open
+    stream (connect failed, or upstream returned an error status) -- without
+    this the slot leaks forever, since the only other release path is
+    relay()'s finally block, which never runs for a source that never
+    actually opened."""
+    pid = provider["id"]
+    if pid in _active_vod_streams:
+        _active_vod_streams[pid] = max(0, _active_vod_streams[pid] - 1)
 
 
 _PLEX_PROBE_GRACE_SECONDS = 3.0  # short connections under this are treated as
@@ -718,6 +755,78 @@ def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
                 f"?Static=true&api_key={provider['password']}")
     ext = source["container_extension"] or "mp4"
     return f"{provider['base_url'].rstrip('/')}/{kind}/{provider['username']}/{provider['password']}/{source['provider_stream_id']}.{ext}"
+
+
+def _is_safe_proxy_target(url: str) -> bool:
+    """Rejects loopback/link-local/reserved/multicast targets before
+    fetching -- poster_url values come from provider CATALOG DATA
+    (untrusted, not admin-typed), so without this a malicious/compromised
+    provider could point a poster at this server's own internal network
+    (e.g. a cloud metadata endpoint at a link-local address) and have it
+    fetched server-side on every viewer's behalf.
+
+    Deliberately does NOT block RFC1918 private ranges (10/8, 172.16/12,
+    192.168/16) even though ipaddress.is_private covers those too -- real
+    bug found live 2026-07-31 testing against this instance's own actual
+    Plex/Emby servers: they're self-hosted on the same home LAN as VOD
+    Manager itself (192.168.x.x), which is the COMMON case for this kind of
+    deployment, not an edge case. Blocking is_private outright meant this
+    fix would have traded "browser blocks it as mixed content" for
+    "backend blocks it as a private IP" -- same broken poster, different
+    layer. Loopback/link-local/reserved/multicast are never legitimate
+    poster hosts for anyone's real setup, so those stay blocked.
+
+    Real defense-in-depth, not airtight: this only validates the URL's own
+    hostname at check time. A redirect to a different host is blocked
+    separately (fetch_proxied_image disables follow_redirects, since a
+    provider can trivially 302 a poster URL anywhere and that's the more
+    easily exploited variant); a DNS answer that differs between this check
+    and the connection a moment later (DNS rebinding) is NOT closed --
+    that would need pinning the connection to this resolved IP, which isn't
+    done here. Judged acceptable given both callers (vod_routes.
+    image_proxy, portal_routes.portal_image_proxy) already require a valid
+    session before reaching this at all."""
+    try:
+        host = httpx.URL(url).host
+    except Exception:
+        return False
+    if not host:
+        return False
+    try:
+        addr = socket.gethostbyname(host)
+        ip = ipaddress.ip_address(addr)
+    except (socket.gaierror, ValueError):
+        return False
+    return not (ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
+
+
+async def fetch_proxied_image(url: str) -> Response:
+    """Fetches an image server-side and streams it back from our own origin.
+    Shared by /api/vod/image-proxy (admin) and /api/portal/image-proxy
+    (portal) -- each does its own auth check (different session systems)
+    before calling this.
+
+    Exists because poster_url values are plain http:// (XC providers never
+    serve https for catalog art) while an HTTPS-fronted deployment (reverse
+    proxy or Cloudflare Tunnel -- the README's own recommended remote-access
+    setup) makes the browser hard-block them as mixed content: not a
+    warning, the request never goes out, so posters just silently render as
+    nothing. Fetching here is server-to-server, no browser involved, so
+    mixed-content restrictions don't apply -- the response comes back from
+    our own already-https origin either way."""
+    if not url.startswith(("http://", "https://")) or not _is_safe_proxy_target(url):
+        raise HTTPException(status_code=400, detail="invalid or disallowed URL")
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="upstream fetch failed")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"upstream returned {resp.status_code}")
+    content_type = resp.headers.get("content-type", "")
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=502, detail="upstream did not return an image")
+    return Response(content=resp.content, media_type=content_type, headers={"cache-control": "public, max-age=86400"})
 
 
 async def _transcode_vod_stream(kind: str, source: dict, request: Request, start_secs: int = 0, title: str = "?") -> Response:
@@ -1021,6 +1130,7 @@ async def _proxy_vod_stream(
 
     if not sources:
         logger.warning("[xc_server] %s stream 404 id=%s (no active source)", kind, conn_id)
+        vod_db.log_stream_failure(kind, title, username, [], "no active source")
         return Response(status_code=404, content="not found")
 
     forward_headers = {}
@@ -1029,9 +1139,11 @@ async def _proxy_vod_stream(
     logger.info("[xc_server] %s stream request id=%s range=%s", kind, conn_id, forward_headers.get("range", "(none)"))
 
     last_error = None
+    attempts: list[dict] = []
     for idx, source in enumerate(sources):
         provider = vod_db.get_provider(source["provider_id"])
         if not provider:
+            attempts.append({"provider": f"provider {source['provider_id']} (deleted)", "error": "provider no longer exists"})
             continue
 
         if provider.get("provider_type") == "dispatcharr_dvr":
@@ -1045,16 +1157,20 @@ async def _proxy_vod_stream(
             local_path = source.get("local_file_path")
             if not local_path or not os.path.isfile(local_path):
                 last_error = "local file not found"
+                attempts.append({"provider": provider["name"], "error": last_error})
+                vod_db.record_source_failure(kind, source["source_id"])
                 logger.warning("[xc_server] %s stream source %d/%d (%s) local file missing id=%s: %s, trying next",
                                 kind, idx + 1, len(sources), provider["name"], conn_id, local_path)
                 continue
             media_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
             logger.info("[xc_server] %s stream OPEN id=%s -> provider=%s (source %d/%d) local file=%s",
                         kind, conn_id, provider["name"], idx + 1, len(sources), local_path)
+            vod_db.record_source_success(kind, source["source_id"])
             return FileResponse(local_path, media_type=media_type)
 
-        if not await _has_capacity(provider):
+        if not await _try_reserve_capacity(provider):
             last_error = "at shared connection capacity"
+            attempts.append({"provider": provider["name"], "error": last_error})
             logger.warning("[xc_server] %s stream source %d/%d (%s) at shared capacity id=%s, trying next",
                             kind, idx + 1, len(sources), provider["name"], conn_id)
             continue
@@ -1076,7 +1192,10 @@ async def _proxy_vod_stream(
             upstream_resp = await client.send(upstream_req, stream=True)
         except Exception as exc:
             await client.aclose()
-            last_error = str(exc)
+            _release_capacity(provider)
+            vod_db.record_source_failure(kind, source["source_id"])
+            last_error = f"{type(exc).__name__}: {_redact_upstream_url(str(exc))}"
+            attempts.append({"provider": provider["name"], "error": last_error})
             logger.warning("[xc_server] %s stream source %d/%d (%s) connect FAILED id=%s after %.1fs: %s: %s",
                             kind, idx + 1, len(sources), provider["name"], conn_id,
                             time.monotonic() - t_connect_start, type(exc).__name__, _redact_upstream_url(str(exc)))
@@ -1084,10 +1203,13 @@ async def _proxy_vod_stream(
 
         if upstream_resp.status_code >= 400:
             last_error = f"HTTP {upstream_resp.status_code}"
+            attempts.append({"provider": provider["name"], "error": last_error})
             logger.warning("[xc_server] %s stream source %d/%d (%s) returned %s id=%s, trying next",
                             kind, idx + 1, len(sources), provider["name"], last_error, conn_id)
             await upstream_resp.aclose()
             await client.aclose()
+            _release_capacity(provider)
+            vod_db.record_source_failure(kind, source["source_id"])
             continue
 
         logger.info(
@@ -1095,7 +1217,7 @@ async def _proxy_vod_stream(
             kind, conn_id, provider["name"], idx + 1, len(sources),
             upstream_resp.status_code, time.monotonic() - t_connect_start, _redact_upstream_url(upstream_url),
         )
-        _active_vod_streams[provider["id"]] = _active_vod_streams.get(provider["id"], 0) + 1
+        vod_db.record_source_success(kind, source["source_id"])
 
         # Approximate playback position from the requested Range's start byte
         # — we're relaying raw bytes, not a real player, so this is the only
@@ -1151,6 +1273,16 @@ async def _proxy_vod_stream(
                     yield chunk
             except Exception as exc:
                 outcome = f"{type(exc).__name__}: {exc}"
+                # Only a genuine mid-stream break is logged here -- "killed"
+                # (admin action) and "client disconnected" (user stopped
+                # watching normally) go through the `break` path above, not
+                # this except, and are expected outcomes, not failures.
+                vod_db.log_stream_failure(
+                    kind, title, username,
+                    [{"provider": provider["name"], "error": f"started OK, broke mid-stream after {bytes_sent} bytes"}],
+                    outcome,
+                )
+                vod_db.record_source_failure(kind, source["source_id"])
                 raise
             finally:
                 _kill_requested.discard(conn_id)
@@ -1199,6 +1331,7 @@ async def _proxy_vod_stream(
 
     logger.warning("[xc_server] %s stream id=%s exhausted %d source(s), last error: %s",
                     kind, conn_id, len(sources), last_error)
+    vod_db.log_stream_failure(kind, title, username, attempts, last_error or "all sources failed")
     return Response(status_code=502, content="all sources failed")
 
 

@@ -75,14 +75,32 @@ async def _run_job(job_id: str, content_type: str) -> None:
         confirmed = []
         for g in pure_groups:
             tmdb_id = g["items"][0]["tmdb_id"]
-            keeper = _find_keeper(g["items"], details.get(tmdb_id, {}).get("title"))
-            if not keeper:
-                continue
+            # Real bug found live 2026-07-31 (user report: 1710 items stuck
+            # in review, "many with two candidates both matching TMDB" but
+            # zero confirmed matches): this used to require an EXACT
+            # candidate-name-to-TMDB-title match to confirm the group at
+            # all, not just to pick which candidate to keep -- so a group
+            # where every candidate agreed on tmdb_id (already, by itself,
+            # real proof they're duplicates -- see this module's docstring)
+            # was silently dropped whenever BOTH candidates' own names
+            # differed from TMDB's exact title string, which real provider
+            # naming (year suffixes, punctuation, "Director's Cut", etc.)
+            # makes the common case, not the exception. The shared tmdb_id
+            # is the actual confirmation; the exact-title match was only
+            # ever meant to help pick a keeper. Now: still prefer the exact
+            # match when one exists (keeps the "airtight" pick), but fall
+            # back to items[0] -- find_duplicate_groups already sorts each
+            # group by (-source_count, -category_count), i.e. the most-
+            # sourced/most-placed candidate -- rather than dropping the
+            # group outright.
+            exact_match = _find_keeper(g["items"], details.get(tmdb_id, {}).get("title"))
+            keeper = exact_match or g["items"][0]
             confirmed.append({
                 "keep_id": keeper["id"],
                 "merge_ids": [i["id"] for i in g["items"] if i["id"] != keeper["id"]],
                 "matched_title": keeper["name"],
                 "tmdb_id": tmdb_id,
+                "exact_title_match": exact_match is not None,
             })
         job["confirmed"] = confirmed
         job["status"] = "done"

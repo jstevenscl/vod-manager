@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -159,6 +159,18 @@ interface DispatcharrConnection {
   created_at: string
 }
 
+interface DiscoveredAccount {
+  dispatcharr_account_id: number
+  dispatcharr_profile_id: number
+  name: string
+  username: string | null
+  password: string | null
+  credentials_unparseable: boolean
+  server_url: string
+  max_streams: number
+  already_linked: boolean
+}
+
 interface ProviderLiveAccount {
   id: number
   provider_id: number
@@ -212,6 +224,16 @@ interface ActivitySession {
   total_bytes: number
   duration_secs: number | null
   range_start_byte: number
+}
+
+interface StreamFailure {
+  id: number
+  kind: string
+  title: string
+  username: string | null
+  attempts: { provider: string; error: string }[]
+  final_reason: string
+  created_at: string
 }
 
 interface NeedsReviewItem {
@@ -313,6 +335,34 @@ function buildStreamUrl(kind: 'movie' | 'series', exportId: number, ext: string,
 function buildPreviewUrl(kind: 'movie' | 'series', itemId: number, ext: string, creds?: XcCredentials) {
   if (!creds) return null
   return `${window.location.origin}/preview/${kind}/${creds.username}/${creds.password}/${itemId}.${ext}`
+}
+
+// Provider poster_url values are plain http:// (XC providers never serve
+// catalog art over https) -- once this app is served over https (a reverse
+// proxy or Cloudflare Tunnel, the README's own recommended remote-access
+// setup), the browser hard-blocks a http:// <img> on a https:// page as
+// mixed content: not a warning, the request never goes out, so posters just
+// silently render as nothing. Routing through the backend's image-proxy
+// (which fetches server-side, no browser involved) sidesteps that
+// entirely. TMDB-sourced posters (already https://) pass through untouched.
+function posterSrc(url: string): string {
+  if (!url.startsWith('http://')) return url
+  const token = localStorage.getItem('vodmanager-session') ?? ''
+  return `/api/vod/image-proxy?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`
+}
+
+// Centralizes the proxy rewrite above and adds the onError fallback none of
+// the raw <img src={poster_url}> call sites had -- a poster that fails
+// mid-load (dead link, upstream timeout) previously just showed a broken-
+// image icon forever instead of falling back. `fallback` lets each call
+// site keep its own existing no-poster art (a Film/Tv/ImageOff icon, or
+// nothing at all) rather than forcing one look everywhere.
+function PosterThumb({ url, className, fallback }: { url: string | null; className: string; fallback?: React.ReactNode }) {
+  const [failed, setFailed] = useState(false)
+  if (url && !failed) {
+    return <img src={posterSrc(url)} alt="" className={className} loading="lazy" onError={() => setFailed(true)} />
+  }
+  return <>{fallback !== undefined ? fallback : <div className={`${className} bg-muted`} />}</>
 }
 
 // Forces one specific provider's copy — belongs on each Sources row (testing
@@ -849,7 +899,7 @@ const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult'
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
 
-interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null }
+interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null }
 interface MoviePlacement { id: number; category_id: number; export_stream_id: number; name_suffix: string; category_name: string }
 interface Movie {
   id: number
@@ -860,6 +910,7 @@ interface Movie {
   poster_url: string | null
   is_adult: number
   review_excluded: number
+  tmdb_id: string | null
   sources: MovieSource[]
   placements: MoviePlacement[]
 }
@@ -872,9 +923,10 @@ interface MetadataRule {
   replacement: string
   is_active: number
   sort_order: number
+  is_regex: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; consecutive_failures?: number; last_failed_at?: string | null }
 interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[] }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
@@ -888,6 +940,7 @@ interface Series {
   review_excluded: number
   import_provider_name: string | null
   tmdb_id: string | null
+  raw_name: string | null
   episodes: Episode[]
   placements: SeriesPlacement[]
 }
@@ -1130,9 +1183,11 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
                   className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left"
                   onClick={() => resolve.mutate({ year: s.year ?? 0, tmdb_id: s.tmdb_id })}
                 >
-                  {s.poster_url
-                    ? <img src={s.poster_url} alt="" className="w-10 h-14 object-cover rounded shrink-0" />
-                    : <div className="w-10 h-14 rounded bg-muted shrink-0" />}
+                  <PosterThumb
+                    url={s.poster_url}
+                    className="w-10 h-14 object-cover rounded shrink-0"
+                    fallback={<div className="w-10 h-14 rounded bg-muted shrink-0" />}
+                  />
                   <div className="min-w-0 space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="font-medium">{s.name} {s.year ? `(${s.year})` : ''}</span>
@@ -1277,9 +1332,11 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
                     year: s.year ?? undefined,
                   })}
                 >
-                  {s.poster_url
-                    ? <img src={s.poster_url} alt="" className="w-10 h-14 object-cover rounded shrink-0" />
-                    : <div className="w-10 h-14 rounded bg-muted shrink-0 flex items-center justify-center"><ImageOff size={14} className="text-muted-foreground" /></div>}
+                  <PosterThumb
+                    url={s.poster_url}
+                    className="w-10 h-14 object-cover rounded shrink-0"
+                    fallback={<div className="w-10 h-14 rounded bg-muted shrink-0 flex items-center justify-center"><ImageOff size={14} className="text-muted-foreground" /></div>}
+                  />
                   <div className="min-w-0 space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="font-medium">{s.name} {s.year ? `(${s.year})` : ''}</span>
@@ -1471,9 +1528,7 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
         const otherHasTmdbId = group.items.some((other) => other.id !== item.id && other.tmdb_id != null)
         return (
           <div key={item.id} className="flex gap-2">
-            {item.poster_url && (
-              <img src={item.poster_url} alt="" className="w-12 h-[72px] object-cover rounded shrink-0" loading="lazy" />
-            )}
+            <PosterThumb url={item.poster_url} className="w-12 h-[72px] object-cover rounded shrink-0" fallback={null} />
             <div className="flex-1 min-w-0">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="radio" checked={keepId === item.id} onChange={() => setKeepId(item.id)} />
@@ -1549,6 +1604,96 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
   )
 }
 
+function MoveMoviePicker({ onPick, onCancel }: { onPick: (movieId: number) => void; onCancel: () => void }) {
+  const [q, setQ] = useState('')
+  const searchQuery = useQuery<Page<Movie>>({
+    queryKey: ['move-movie-search', q],
+    queryFn: () => api.get('/vod/movies/', { params: { search: q, limit: 8 } }).then((r) => r.data),
+    enabled: q.trim().length > 1,
+  })
+  return (
+    <div className="pl-2 pt-1 space-y-1 border-l-2 border-border">
+      <div className="flex items-center gap-1.5">
+        <input
+          autoFocus
+          className={inputCls('flex-1 min-w-32')}
+          placeholder="Search movies to move this source to…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        <Button size="sm" variant="outline" onClick={onCancel}>Cancel</Button>
+      </div>
+      {searchQuery.isFetching && <p className="text-muted-foreground">Searching…</p>}
+      {searchQuery.data?.items.map((m) => (
+        <button key={m.id} className="block w-full text-left hover:text-foreground" onClick={() => onPick(m.id)}>
+          {m.name}{m.year ? ` (${m.year})` : ''}
+        </button>
+      ))}
+      {q.trim().length > 1 && searchQuery.data?.items.length === 0 && <p className="text-muted-foreground">No matches.</p>}
+    </div>
+  )
+}
+
+function MoveEpisodePicker({ initialSeason, initialEpisode, initialName, onPick, onCancel }: {
+  initialSeason: number
+  initialEpisode: number
+  initialName: string
+  onPick: (v: { targetSeriesId: number; seasonNumber: number; episodeNumber: number; name: string }) => void
+  onCancel: () => void
+}) {
+  const [q, setQ] = useState('')
+  const [picked, setPicked] = useState<{ id: number; name: string } | null>(null)
+  const [season, setSeason] = useState(String(initialSeason))
+  const [episode, setEpisode] = useState(String(initialEpisode))
+  const [name, setName] = useState(initialName)
+  const searchQuery = useQuery<Page<Series>>({
+    queryKey: ['move-series-search', q],
+    queryFn: () => api.get('/vod/series/', { params: { search: q, limit: 8 } }).then((r) => r.data),
+    enabled: !picked && q.trim().length > 1,
+  })
+  if (!picked) {
+    return (
+      <div className="pl-2 pt-1 space-y-1 border-l-2 border-border">
+        <div className="flex items-center gap-1.5">
+          <input
+            autoFocus
+            className={inputCls('flex-1 min-w-32')}
+            placeholder="Search series to move this episode to…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+          <Button size="sm" variant="outline" onClick={onCancel}>Cancel</Button>
+        </div>
+        {searchQuery.isFetching && <p className="text-muted-foreground">Searching…</p>}
+        {searchQuery.data?.items.map((s) => (
+          <button key={s.id} className="block w-full text-left hover:text-foreground" onClick={() => setPicked({ id: s.id, name: s.name })}>
+            {s.name}{s.year ? ` (${s.year})` : ''}
+          </button>
+        ))}
+        {q.trim().length > 1 && searchQuery.data?.items.length === 0 && <p className="text-muted-foreground">No matches.</p>}
+      </div>
+    )
+  }
+  return (
+    <div className="pl-2 pt-1 space-y-1 border-l-2 border-border">
+      <p>Move to <span className="font-medium text-foreground">{picked.name}</span>:</p>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <input className={inputCls('w-16')} type="number" placeholder="Season" value={season} onChange={(e) => setSeason(e.target.value)} />
+        <input className={inputCls('w-16')} type="number" placeholder="Episode" value={episode} onChange={(e) => setEpisode(e.target.value)} />
+        <input className={inputCls('flex-1 min-w-32')} placeholder="Episode name" value={name} onChange={(e) => setName(e.target.value)} />
+        <Button
+          size="sm"
+          disabled={!season || !episode || !name.trim()}
+          onClick={() => onPick({ targetSeriesId: picked.id, seasonNumber: Number(season), episodeNumber: Number(episode), name: name.trim() })}
+        >
+          Move
+        </Button>
+        <Button size="sm" variant="outline" onClick={onCancel}>Cancel</Button>
+      </div>
+    </div>
+  )
+}
+
 function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived }: {
   movie: Movie
   movieCategories: Category[]
@@ -1573,6 +1718,28 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       setRenameForm(null)
     },
+  })
+
+  // Restores the movie's name to exactly what a given source's provider
+  // originally called it, before parse_name_year/Title & Metadata Rules
+  // touched it (see MovieSource.raw_name). Year is left untouched -- this
+  // is a name-only revert, not a full undo of everything a rule might
+  // have changed. A separate mutation (not reusing `rename` above) so
+  // there's no stale-closure risk from setting renameForm and firing the
+  // mutation in the same click handler.
+  const revertToRawName = useMutation({
+    mutationFn: (name: string) => api.post(`/vod/movies/${movie.id}/rename/`, { name, year: movie.year ?? undefined }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+  })
+
+  // Real user request 2026-07-31: fetch TMDB's own canonical title (and
+  // release year, so the two never end up mismatched) for this movie's
+  // already-confirmed tmdb_id and rename to it. Manual/one-click only --
+  // never runs automatically, so it can't fight a Title & Metadata Rule or
+  // a manual rename with no way to opt out.
+  const useTmdbTitle = useMutation({
+    mutationFn: () => api.post(`/vod/movies/${movie.id}/tmdb-title/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
 
   const addSource = useMutation({
@@ -1610,6 +1777,13 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
     onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
   })
+  const [movingSourceId, setMovingSourceId] = useState<number | null>(null)
+  const moveSource = useMutation({
+    mutationFn: (v: { sourceId: number; target_movie_id: number }) =>
+      api.post(`/vod/movies/${movie.id}/sources/${v.sourceId}/move/`, { target_movie_id: v.target_movie_id }),
+    onSuccess:  () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); setMovingSourceId(null) },
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Move failed.'),
+  })
   const removePlacement = useMutation({
     mutationFn: (categoryId: number) => api.delete(`/vod/movies/${movie.id}/categories/${categoryId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
@@ -1617,9 +1791,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
 
   const detailContent = (
     <>
-      {movie.poster_url && mode === 'list' && (
-        <img src={movie.poster_url} alt="" className="w-24 rounded" loading="lazy" />
-      )}
+      {mode === 'list' && <PosterThumb url={movie.poster_url} className="w-24 rounded" fallback={null} />}
       <div>
         {renameForm ? (
           <div className="flex items-center gap-1.5 flex-wrap">
@@ -1642,43 +1814,91 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
             <Button size="sm" variant="outline" onClick={() => setRenameForm(null)}>Cancel</Button>
           </div>
         ) : (
-          <button
-            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-            onClick={() => setRenameForm({ name: movie.name, year: movie.year ? String(movie.year) : '' })}
-          >
-            Rename / fix year
-          </button>
+          <span className="flex items-center gap-2">
+            <button
+              className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+              onClick={() => setRenameForm({ name: movie.name, year: movie.year ? String(movie.year) : '' })}
+            >
+              Rename / fix year
+            </button>
+            {movie.tmdb_id && (
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+                title="Fetch TMDB's own canonical title (and release year) for this movie's confirmed TMDB match and rename to it"
+                disabled={useTmdbTitle.isPending}
+                onClick={() => useTmdbTitle.mutate()}
+              >
+                {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
+              </button>
+            )}
+          </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
+        {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
       </div>
       {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
 
       <div>
         <p className="font-medium mb-1">Sources</p>
         {movie.sources.map((s) => (
-          <div key={s.id} className="flex items-center justify-between text-muted-foreground">
-            <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
-            <span className="flex items-center gap-1.5">
-              <PlayButton
-                url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
-                transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
-                hlsUrl={buildHlsPreviewSourceUrl('movie', s.id, xcCredentials)}
-                title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
+          <div key={s.id} className="text-muted-foreground">
+            <div className="flex items-center justify-between">
+              <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
+              <span className="flex items-center gap-1.5">
+                <PlayButton
+                  url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
+                  transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
+                  hlsUrl={buildHlsPreviewSourceUrl('movie', s.id, xcCredentials)}
+                  title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
+                />
+                <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
+                <button
+                  title="Move to a different movie (fixes a wrong match)"
+                  className="hover:text-foreground"
+                  onClick={() => setMovingSourceId(movingSourceId === s.id ? null : s.id)}
+                >
+                  <ArrowRightLeft size={12} />
+                </button>
+                <button
+                  title="Remove source"
+                  className="hover:text-destructive"
+                  onClick={() => {
+                    const msg = movie.sources.length === 1
+                      ? `Remove the only source (${s.provider_name}) from "${movie.name}"? This deletes the movie itself (and its file, if local) -- it has no other source to fall back on. Can't be undone.`
+                      : `Remove the ${s.provider_name} source from "${movie.name}"? The movie stays available from its other source(s). Can't be undone.`
+                    if (confirm(msg)) deleteSource.mutate(s.id)
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            </div>
+            {!!s.consecutive_failures && s.consecutive_failures > 0 && (
+              <div className="text-[11px] pl-2 text-destructive flex items-center gap-1">
+                <AlertCircle size={11} />
+                <span>
+                  Failed {s.consecutive_failures}x in a row{s.last_failed_at ? `, last ${new Date(Number(s.last_failed_at) * 1000).toLocaleString()}` : ''} — likely dead, consider removing
+                </span>
+              </div>
+            )}
+            {s.raw_name && s.raw_name !== movie.name && (
+              <div className="text-[11px] pl-2 flex items-center gap-1.5">
+                <span>Provider's original name: "{s.raw_name}"</span>
+                <button
+                  className="underline decoration-dotted hover:text-foreground disabled:opacity-50"
+                  disabled={revertToRawName.isPending}
+                  onClick={() => revertToRawName.mutate(s.raw_name!)}
+                >
+                  Revert to this
+                </button>
+              </div>
+            )}
+            {movingSourceId === s.id && (
+              <MoveMoviePicker
+                onCancel={() => setMovingSourceId(null)}
+                onPick={(targetMovieId) => moveSource.mutate({ sourceId: s.id, target_movie_id: targetMovieId })}
               />
-              <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
-              <button
-                title="Remove source"
-                className="hover:text-destructive"
-                onClick={() => {
-                  const msg = movie.sources.length === 1
-                    ? `Remove the only source (${s.provider_name}) from "${movie.name}"? This deletes the movie itself (and its file, if local) -- it has no other source to fall back on. Can't be undone.`
-                    : `Remove the ${s.provider_name} source from "${movie.name}"? The movie stays available from its other source(s). Can't be undone.`
-                  if (confirm(msg)) deleteSource.mutate(s.id)
-                }}
-              >
-                <X size={12} />
-              </button>
-            </span>
+            )}
           </div>
         ))}
         <div className="flex items-center gap-1.5 pt-1">
@@ -1739,13 +1959,11 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           {movie.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
         </button>
         <button className="block w-full text-left" onClick={() => setOpen(true)}>
-          {movie.poster_url ? (
-            <img src={movie.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
-          ) : (
-            <div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center">
-              <Film size={24} className="text-muted-foreground" />
-            </div>
-          )}
+          <PosterThumb
+            url={movie.poster_url}
+            className="w-full aspect-[2/3] object-cover"
+            fallback={<div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center"><Film size={24} className="text-muted-foreground" /></div>}
+          />
           <div className="p-2 text-xs">
             <p className="font-semibold truncate leading-snug">{movie.name}</p>
             <p className="text-muted-foreground text-[11px] mt-0.5">{movie.year ?? ''}</p>
@@ -1778,13 +1996,11 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   return (
     <div className="rounded-lg border border-border bg-card p-2.5 text-xs flex gap-3 shadow-sm hover:border-primary/30 transition-colors">
       <input type="checkbox" className="mt-1 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
-      {movie.poster_url ? (
-        <img src={movie.poster_url} alt="" className="w-10 h-14 object-cover rounded-md shrink-0" loading="lazy" />
-      ) : (
-        <div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center">
-          <Film size={14} className="text-muted-foreground" />
-        </div>
-      )}
+      <PosterThumb
+        url={movie.poster_url}
+        className="w-10 h-14 object-cover rounded-md shrink-0"
+        fallback={<div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center"><Film size={14} className="text-muted-foreground" /></div>}
+      />
       <div className="flex-1 min-w-0">
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
@@ -1876,6 +2092,21 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     },
   })
 
+  // See Movie's identical revertToRawName -- series only ever have one
+  // raw_name (not one per source, since XC series don't carry a per-source
+  // stream_id -- see bulk_import_series's docstring), so no source picker
+  // is needed here.
+  const revertToRawName = useMutation({
+    mutationFn: (name: string) => api.post(`/vod/series/${series.id}/rename/`, { name, year: series.year ?? undefined }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
+  // See Movie's identical useTmdbTitle -- same reasoning.
+  const useTmdbTitle = useMutation({
+    mutationFn: () => api.post(`/vod/series/${series.id}/tmdb-title/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
   const addPlacement = useMutation({
     mutationFn: () => api.post(`/vod/series/${series.id}/categories/`, { category_id: Number(categoryPick) }),
     onSuccess: () => {
@@ -1900,12 +2131,45 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     mutationFn: (categoryId: number) => api.delete(`/vod/series/${series.id}/categories/${categoryId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
+  const deleteEpisodeSource = useMutation({
+    mutationFn: (v: { episodeId: number; sourceId: number }) => api.delete(`/vod/episodes/${v.episodeId}/sources/${v.sourceId}/`),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+  })
+  const [movingEpisodeSourceId, setMovingEpisodeSourceId] = useState<number | null>(null)
+  const moveEpisodeSource = useMutation({
+    mutationFn: (v: { episodeId: number; sourceId: number; targetSeriesId: number; seasonNumber: number; episodeNumber: number; name: string }) =>
+      api.post(`/vod/episodes/${v.episodeId}/sources/${v.sourceId}/move/`, {
+        target_series_id: v.targetSeriesId, season_number: v.seasonNumber, episode_number: v.episodeNumber, name: v.name,
+      }),
+    onSuccess:  () => { qc.invalidateQueries({ queryKey: ['vod-series'] }); setMovingEpisodeSourceId(null) },
+    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Move failed.'),
+  })
+  // Grouped by provider so a provider whose copies of this series are
+  // almost entirely broken shows up as one obvious pattern, not something
+  // you'd only notice by scrolling every episode -- see
+  // list_failing_episode_sources_for_series.
+  const failingSourcesQuery = useQuery<{
+    source_id: number; provider_id: number; provider_name: string
+    episode_id: number; season_number: number; episode_number: number
+    consecutive_failures: number; last_failed_at: string | null
+  }[]>({
+    queryKey: ['vod-series-failing-sources', series.id],
+    queryFn: () => api.get(`/vod/series/${series.id}/failing-sources/`).then((r) => r.data),
+    enabled: open,
+  })
+  const removeProviderSources = useMutation({
+    mutationFn: (providerId: number) => api.delete(`/vod/series/${series.id}/sources/by-provider/${providerId}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      qc.invalidateQueries({ queryKey: ['vod-series-failing-sources', series.id] })
+    },
+    onError: (e: any) => alert(e?.response?.data?.detail ?? 'Remove failed.'),
+  })
 
   const detailContent = (
     <>
-      {series.poster_url && mode === 'list' && (
-        <img src={series.poster_url} alt="" className="w-24 rounded" loading="lazy" />
-      )}
+      {mode === 'list' && <PosterThumb url={series.poster_url} className="w-24 rounded" fallback={null} />}
       <div>
         {renameForm ? (
           <div className="flex items-center gap-1.5 flex-wrap">
@@ -1928,16 +2192,67 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
             <Button size="sm" variant="outline" onClick={() => setRenameForm(null)}>Cancel</Button>
           </div>
         ) : (
-          <button
-            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-            onClick={() => setRenameForm({ name: series.name, year: series.year ? String(series.year) : '' })}
-          >
-            Rename / fix year
-          </button>
+          <span className="flex items-center gap-2">
+            <button
+              className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+              onClick={() => setRenameForm({ name: series.name, year: series.year ? String(series.year) : '' })}
+            >
+              Rename / fix year
+            </button>
+            {series.tmdb_id && (
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+                title="Fetch TMDB's own canonical title (and release year) for this series' confirmed TMDB match and rename to it"
+                disabled={useTmdbTitle.isPending}
+                onClick={() => useTmdbTitle.mutate()}
+              >
+                {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
+              </button>
+            )}
+          </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
+        {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
+        {series.raw_name && series.raw_name !== series.name && (
+          <div className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+            <span>Provider's original name: "{series.raw_name}"</span>
+            <button
+              className="underline decoration-dotted hover:text-foreground disabled:opacity-50"
+              disabled={revertToRawName.isPending}
+              onClick={() => revertToRawName.mutate(series.raw_name!)}
+            >
+              Revert to this
+            </button>
+          </div>
+        )}
       </div>
       {series.description && <p className="text-muted-foreground">{series.description}</p>}
+
+      {!!failingSourcesQuery.data?.length && (() => {
+        const byProvider = new Map<number, { name: string; count: number }>()
+        for (const f of failingSourcesQuery.data!) {
+          const cur = byProvider.get(f.provider_id) ?? { name: f.provider_name, count: 0 }
+          cur.count += 1
+          byProvider.set(f.provider_id, cur)
+        }
+        return (
+          <div className="rounded border border-destructive/40 bg-destructive/5 p-2 space-y-1">
+            <p className="font-medium text-destructive flex items-center gap-1"><AlertCircle size={12} /> Failing sources</p>
+            {[...byProvider.entries()].map(([providerId, info]) => (
+              <div key={providerId} className="flex items-center justify-between text-muted-foreground">
+                <span>{info.name} — {info.count} episode source{info.count === 1 ? '' : 's'} repeatedly failing</span>
+                <Button
+                  size="sm" variant="outline"
+                  disabled={removeProviderSources.isPending}
+                  onClick={() => { if (confirm(`Remove all ${info.count} failing ${info.name} source(s) from "${series.name}"? Can't be undone.`)) removeProviderSources.mutate(providerId) }}
+                >
+                  Remove all
+                </Button>
+              </div>
+            ))}
+          </div>
+        )
+      })()}
 
       <div>
         <p className="font-medium mb-1">Episodes</p>
@@ -1945,20 +2260,64 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
         )}
         {series.episodes.map((e) => (
-          <div key={e.id} className="flex items-center justify-between text-muted-foreground">
-            <span>
-              S{e.season_number}E{e.episode_number} — {e.name}
-              {e.sources.length > 0 && <span className="text-[10px]"> ({e.sources.map((s) => s.provider_name).join(', ')})</span>}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <PlayButton
-                url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
-                transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
+          <div key={e.id} className="text-muted-foreground">
+            <div className="flex items-center justify-between">
+              <span>S{e.season_number}E{e.episode_number} — {e.name}</span>
+              <span className="flex items-center gap-1.5">
+                <PlayButton
+                  url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
+                  transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                  hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                  title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
+                />
+                <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
+              </span>
+            </div>
+            {e.sources.map((s) => (
+              <div key={s.id} className="pl-3 text-[11px] flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  {s.provider_name} → {s.provider_stream_id}
+                  {!!s.consecutive_failures && s.consecutive_failures > 0 && (
+                    <span className="text-destructive flex items-center gap-0.5" title={s.last_failed_at ? `Last failed ${new Date(Number(s.last_failed_at) * 1000).toLocaleString()}` : undefined}>
+                      <AlertCircle size={10} /> failed {s.consecutive_failures}x
+                    </span>
+                  )}
+                </span>
+                <span className="flex items-center gap-1">
+                  <button
+                    title="Move to a different series/episode (fixes a wrong match)"
+                    className="hover:text-foreground"
+                    onClick={() => setMovingEpisodeSourceId(movingEpisodeSourceId === s.id ? null : s.id)}
+                  >
+                    <ArrowRightLeft size={11} />
+                  </button>
+                  <button
+                    title="Remove source"
+                    className="hover:text-destructive"
+                    onClick={() => {
+                      const msg = e.sources.length === 1
+                        ? `Remove the only source (${s.provider_name}) from S${e.season_number}E${e.episode_number}? This deletes the episode itself -- it has no other source to fall back on. Can't be undone.`
+                        : `Remove the ${s.provider_name} source from S${e.season_number}E${e.episode_number}? The episode stays available from its other source(s). Can't be undone.`
+                      if (confirm(msg)) deleteEpisodeSource.mutate({ episodeId: e.id, sourceId: s.id })
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              </div>
+            ))}
+            {movingEpisodeSourceId != null && e.sources.some((s) => s.id === movingEpisodeSourceId) && (
+              <MoveEpisodePicker
+                initialSeason={e.season_number}
+                initialEpisode={e.episode_number}
+                initialName={e.name}
+                onCancel={() => setMovingEpisodeSourceId(null)}
+                onPick={(v) => moveEpisodeSource.mutate({
+                  episodeId: e.id, sourceId: movingEpisodeSourceId,
+                  targetSeriesId: v.targetSeriesId, seasonNumber: v.seasonNumber, episodeNumber: v.episodeNumber, name: v.name,
+                })}
               />
-              <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
-            </span>
+            )}
           </div>
         ))}
       </div>
@@ -2008,13 +2367,11 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           {series.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
         </button>
         <button className="block w-full text-left" onClick={() => setOpen(true)}>
-          {series.poster_url ? (
-            <img src={series.poster_url} alt="" className="w-full aspect-[2/3] object-cover" loading="lazy" />
-          ) : (
-            <div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center">
-              <Tv size={24} className="text-muted-foreground" />
-            </div>
-          )}
+          <PosterThumb
+            url={series.poster_url}
+            className="w-full aspect-[2/3] object-cover"
+            fallback={<div className="w-full aspect-[2/3] bg-secondary flex items-center justify-center"><Tv size={24} className="text-muted-foreground" /></div>}
+          />
           <div className="p-2 text-xs">
             <p className="font-semibold truncate leading-snug">{series.name}</p>
             <p className="text-muted-foreground text-[11px] mt-0.5">{series.year ?? ''}</p>
@@ -2037,13 +2394,11 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   return (
     <div className="rounded-lg border border-border bg-card p-2.5 text-xs flex gap-3 shadow-sm hover:border-primary/30 transition-colors">
       <input type="checkbox" className="mt-1 shrink-0" checked={selected} onChange={() => {}} onClick={(e) => onToggleSelect(e.shiftKey)} title="Select for bulk placement (shift-click to select a range)" />
-      {series.poster_url ? (
-        <img src={series.poster_url} alt="" className="w-10 h-14 object-cover rounded-md shrink-0" loading="lazy" />
-      ) : (
-        <div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center">
-          <Tv size={14} className="text-muted-foreground" />
-        </div>
-      )}
+      <PosterThumb
+        url={series.poster_url}
+        className="w-10 h-14 object-cover rounded-md shrink-0"
+        fallback={<div className="w-10 h-14 rounded-md shrink-0 bg-secondary flex items-center justify-center"><Tv size={14} className="text-muted-foreground" /></div>}
+      />
       <div className="flex-1 min-w-0">
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
@@ -3087,6 +3442,21 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-activity'] }),
   })
 
+  // ── Failed VOD streams ──
+  const streamFailuresQuery = useQuery<StreamFailure[]>({
+    queryKey: ['vod-stream-failures'],
+    queryFn:  () => api.get('/vod/stream-failures/').then((r) => r.data),
+    refetchInterval: 10000,
+  })
+  const dismissStreamFailure = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/stream-failures/${id}/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-failures'] }),
+  })
+  const clearStreamFailures = useMutation({
+    mutationFn: () => api.delete('/vod/stream-failures/'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-failures'] }),
+  })
+
 
   // ── Connected Instances (per-instance XC credentials) ──
   const xcClientsQuery = useQuery<XcClient[]>({
@@ -3194,6 +3564,55 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
       setDvrModalConnectionId(null)
+    },
+  })
+
+  // Real user request 2026-07-31: the admin already told Dispatcharr about
+  // every real XC login when they set it up for live TV -- no reason to
+  // make them retype the same username/password into a provider row here
+  // too, or keep the two in sync by hand if a login's password ever
+  // changes. Works at the PROFILE level, not just the account: live
+  // testing against real multi-login providers showed one Dispatcharr
+  // account can represent several separate real logins as distinct
+  // profiles, each independently capped -- see backend/vod_sync.py's
+  // list_discoverable_profiles docstring for the full story (confirmed
+  // live: summing real profiles' max_streams reproduced known real
+  // per-provider connection totals exactly).
+  const [discoverModalConnectionId, setDiscoverModalConnectionId] = useState<number | null>(null)
+  const [discoverSelectedIds, setDiscoverSelectedIds] = useState<Set<string>>(new Set())
+  const discoverKey = (a: { dispatcharr_account_id: number; dispatcharr_profile_id: number }) =>
+    `${a.dispatcharr_account_id}:${a.dispatcharr_profile_id}`
+  const discoverAccountsQuery = useQuery<DiscoveredAccount[]>({
+    queryKey: ['vod-dispatcharr-discover-accounts', discoverModalConnectionId],
+    queryFn:  () => api.get(`/vod/dispatcharr-connections/${discoverModalConnectionId}/discover-accounts/`).then((r) => r.data),
+    enabled:  discoverModalConnectionId != null,
+  })
+  const importDiscoveredAccounts = useMutation({
+    mutationFn: () => api.post(`/vod/dispatcharr-connections/${discoverModalConnectionId}/discover-accounts/import/`, {
+      profiles: Array.from(discoverSelectedIds).map((key) => {
+        const [dispatcharr_account_id, dispatcharr_profile_id] = key.split(':').map(Number)
+        return { dispatcharr_account_id, dispatcharr_profile_id }
+      }),
+    }).then((r) => r.data),
+    onSuccess: (data: { imported: unknown[]; skipped: { name: string; reason: string }[] }) => {
+      qc.invalidateQueries({ queryKey: ['vod-dispatcharr-discover-accounts', discoverModalConnectionId] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setDiscoverSelectedIds(new Set())
+      if (data.skipped.length) {
+        setRecheckResult(`Imported ${data.imported.length}. Skipped: ${data.skipped.map((s) => `${s.name} (${s.reason})`).join('; ')}`)
+      }
+    },
+  })
+  const [recheckResult, setRecheckResult] = useState<string | null>(null)
+  const recheckDiscoveredCredentials = useMutation({
+    mutationFn: () => api.post(`/vod/dispatcharr-connections/${discoverModalConnectionId}/discover-accounts/recheck/`).then((r) => r.data),
+    onSuccess: (data: { changed: string[]; unchanged_count: number }) => {
+      setRecheckResult(
+        data.changed.length
+          ? `Updated credentials for: ${data.changed.join(', ')}. ${data.unchanged_count} unchanged.`
+          : `No changes — all ${data.unchanged_count} already-imported provider(s) still match Dispatcharr.`
+      )
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
     },
   })
 
@@ -3544,13 +3963,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [ruleForm, setRuleForm] = useState({
     content_type: 'both' as 'movie' | 'series' | 'both',
     field: 'name' as typeof REWRITABLE_FIELDS[number],
-    pattern: '', replacement: '',
+    pattern: '', replacement: '', is_regex: false,
   })
   const addRule = useMutation({
     mutationFn: () => api.post('/vod/metadata-rules/', ruleForm),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-metadata-rules'] })
-      setRuleForm({ content_type: 'both', field: 'name', pattern: '', replacement: '' })
+      setRuleForm({ content_type: 'both', field: 'name', pattern: '', replacement: '', is_regex: false })
     },
   })
   const toggleRuleActive = useMutation({
@@ -3562,12 +3981,43 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (id: number) => api.delete(`/vod/metadata-rules/${id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-metadata-rules'] }),
   })
+
+  // Live preview of the rule currently being drafted, debounced so it
+  // doesn't fire a query on every keystroke -- real user request
+  // 2026-07-31, alongside the literal-by-default matching and the apply-
+  // time blast-radius guard below: a rule meant to strip a literal string
+  // had no way to check what it would actually match before committing it
+  // against the whole pool.
+  const [debouncedRuleForm, setDebouncedRuleForm] = useState(ruleForm)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedRuleForm(ruleForm), 400)
+    return () => clearTimeout(t)
+  }, [ruleForm.field, ruleForm.pattern, ruleForm.replacement, ruleForm.is_regex])
+  const rulePreviewQuery = useQuery<{ total_pool: number; match_count: number; samples: { id: number; before: string | null; after: string | null }[] }>({
+    queryKey: ['vod-metadata-rule-preview', debouncedRuleForm],
+    queryFn:  () => api.post('/vod/metadata-rules/preview/', {
+      content_type: debouncedRuleForm.content_type === 'both' ? 'movie' : debouncedRuleForm.content_type,
+      field: debouncedRuleForm.field, pattern: debouncedRuleForm.pattern,
+      replacement: debouncedRuleForm.replacement, is_regex: debouncedRuleForm.is_regex,
+    }).then((r) => r.data),
+    enabled: !!debouncedRuleForm.pattern.trim(),
+  })
+
   const [applyRulesResult, setApplyRulesResult] = useState<string | null>(null)
   const applyRules = useMutation({
-    mutationFn: (content_type: 'movie' | 'series') => api.post('/vod/metadata-rules/apply/', null, { params: { content_type } }),
-    onSuccess: (r, content_type) => {
-      setApplyRulesResult(`${content_type}: checked ${r.data.checked}, changed ${r.data.changed}.`)
-      qc.invalidateQueries({ queryKey: [content_type === 'movie' ? 'vod-movies' : 'vod-series'] })
+    mutationFn: ({ contentType, force }: { contentType: 'movie' | 'series'; force: boolean }) =>
+      api.post('/vod/metadata-rules/apply/', null, { params: { content_type: contentType, force } }).then((r) => r.data),
+    onSuccess: (data, { contentType }) => {
+      if (data.blocked) {
+        const ok = confirm(
+          `This would change ${data.changed} of ${data.checked} ${contentType === 'movie' ? 'movies' : 'series'} -- `
+          + `above the normal threshold (${data.threshold}). Proceed anyway?`
+        )
+        if (ok) applyRules.mutate({ contentType, force: true })
+        return
+      }
+      setApplyRulesResult(`${contentType}: checked ${data.checked}, changed ${data.changed}.`)
+      qc.invalidateQueries({ queryKey: [contentType === 'movie' ? 'vod-movies' : 'vod-series'] })
     },
   })
 
@@ -4069,7 +4519,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [importingId, setImportingId] = useState<number | null>(null)
   const [importResult, setImportResult] = useState<string | null>(null)
   const importCatalog = useMutation({
-    mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 180_000 }) },
+    // Real bug found live: import is one synchronous backend call (network
+    // pull + per-item DB upsert for the whole catalog, no background-job/
+    // poll pattern), and a 100K+/50K+ movie/series library can genuinely
+    // take longer than a few minutes -- the old 180s cap turned a slow but
+    // successful import into a spurious "Import failed" every time on a
+    // catalog this size. 30 minutes is generous enough for even a very
+    // large library while still eventually giving up on something truly
+    // stuck, rather than removing the cap outright.
+    mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 1_800_000 }) },
     onSuccess: (r) => {
       const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
       const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
@@ -4081,7 +4539,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
     },
-    onError: (e: any) => setImportResult(`Import failed: ${e?.response?.data?.detail ?? e.message}`),
+    onError: (e: any) => {
+      // A client-side timeout doesn't mean the import actually failed --
+      // the backend keeps working even after the browser gives up waiting
+      // on the response, so the counts below may already be climbing.
+      if (e?.code === 'ECONNABORTED') {
+        setImportResult(
+          'Import is taking longer than usual and the browser stopped waiting for a response -- it may still be running on the server. '
+          + 'Refresh this page in a bit and check this provider\'s movie/series counts before assuming it failed.'
+        )
+      } else {
+        setImportResult(`Import failed: ${e?.response?.data?.detail ?? e.message}`)
+      }
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
     onSettled: () => setImportingId(null),
   })
 
@@ -4272,7 +4743,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: () => api.post('/vod/duplicates/confirm-scan/', null, { params: { content_type: duplicatesContentType } }),
     onSuccess: (r) => setDuplicatesConfirmJobId(r.data.job_id),
   })
-  const confirmScanQuery = useQuery<{ status: string; checked: number; total: number; confirmed: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string }[]; error: string | null }>({
+  const confirmScanQuery = useQuery<{ status: string; checked: number; total: number; confirmed: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string; exact_title_match: boolean }[]; error: string | null }>({
     queryKey: ['vod-duplicates-confirm-scan', duplicatesConfirmJobId],
     queryFn:  () => api.get(`/vod/duplicates/confirm-scan/${duplicatesConfirmJobId}/`).then((r) => r.data),
     enabled:  !!duplicatesConfirmJobId,
@@ -4539,6 +5010,59 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               })}
             </tbody>
           </table>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Failed Streams" icon={<AlertCircle size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Playback attempts that failed outright (every source exhausted) or broke mid-stream after starting —
+          persisted across restarts, unlike Activity above.
+        </p>
+        {!streamFailuresQuery.data?.length && <p className="text-xs text-muted-foreground">No failures recorded.</p>}
+        {!!streamFailuresQuery.data?.length && (
+          <>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-muted-foreground text-left">
+                  <th className="pb-1 font-normal">When</th>
+                  <th className="pb-1 font-normal">Title</th>
+                  <th className="pb-1 font-normal">Tried</th>
+                  <th className="pb-1 font-normal">Reason</th>
+                  <th className="pb-1 font-normal"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {streamFailuresQuery.data.map((f) => (
+                  <tr key={f.id} className="border-t border-border/50">
+                    <td className="py-1 pr-2 text-muted-foreground whitespace-nowrap">
+                      {new Date(Number(f.created_at) * 1000).toLocaleString()}
+                    </td>
+                    <td className="py-1 pr-2">{f.title} <span className="text-muted-foreground">({f.kind})</span></td>
+                    <td
+                      className="py-1 pr-2 text-muted-foreground max-w-[16rem] truncate"
+                      title={f.attempts.map((a) => `${a.provider}: ${a.error}`).join('\n') || '(no sources to try)'}
+                    >
+                      {f.attempts.length ? f.attempts.map((a) => a.provider).join(', ') : '—'}
+                    </td>
+                    <td className="py-1 pr-2 text-muted-foreground max-w-[16rem] truncate" title={f.final_reason}>{f.final_reason}</td>
+                    <td className="py-1">
+                      <button
+                        title="Dismiss"
+                        className="text-muted-foreground hover:text-destructive"
+                        disabled={dismissStreamFailure.isPending}
+                        onClick={() => dismissStreamFailure.mutate(f.id)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Button size="sm" variant="outline" disabled={clearStreamFailures.isPending} onClick={() => clearStreamFailures.mutate()}>
+              Clear all
+            </Button>
+          </>
         )}
       </SectionCard>
 
@@ -5011,6 +5535,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <th className="pb-1 font-normal">Token</th>
               <th className="pb-1 font-normal">VOD-relay account ID</th>
               <th className="pb-1 font-normal">DVR</th>
+              <th className="pb-1 font-normal">Providers</th>
               <th className="pb-1 font-normal"></th>
             </tr>
           </thead>
@@ -5084,6 +5609,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     }}
                   >
                     <CalendarClock size={12} className="mr-1" /> {dvrProvider ? 'DVR ✓' : 'Enable DVR'}
+                  </Button>
+                </td>
+                <td className="py-1 pr-2">
+                  <Button
+                    size="sm" variant="outline"
+                    disabled={!c.vod_relay_account_id}
+                    title={c.vod_relay_account_id ? 'Read real upstream logins already configured in Dispatcharr and import them as providers here' : 'Set a VOD-relay account ID first'}
+                    onClick={() => { setRecheckResult(null); setDiscoverSelectedIds(new Set()); setDiscoverModalConnectionId(c.id) }}
+                  >
+                    <RefreshCw size={12} className="mr-1" /> Discover
                   </Button>
                 </td>
                 <td className="py-1">
@@ -5213,6 +5748,94 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )
       })()}
 
+      {discoverModalConnectionId != null && (() => {
+        const connection = dispatcharrConnectionsQuery.data?.find((c) => c.id === discoverModalConnectionId)
+        return (
+        <Modal onClose={() => setDiscoverModalConnectionId(null)} maxWidth="max-w-2xl">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">Discover Providers — {connection?.label}</h2>
+            <p className="text-sm text-muted-foreground">
+              Real upstream XC logins Dispatcharr already has configured on this connection — one entry per Dispatcharr
+              "profile", since a single Dispatcharr account can represent several separate real logins that way, each
+              independently capped. Pick which ones to import as providers here — credentials, base URL, and max
+              streams all come straight from Dispatcharr, nothing to retype. Re-running this later (or clicking
+              "Re-check credentials" below) picks up any password Dispatcharr's own copy has since rotated to, without
+              touching anything else you've set here (priority, category exclusions, etc.).
+            </p>
+            {discoverAccountsQuery.isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
+            {discoverAccountsQuery.isError && (
+              <p className="text-sm text-destructive">Couldn't reach Dispatcharr — check the connection's URL/token above.</p>
+            )}
+            {discoverAccountsQuery.data && discoverAccountsQuery.data.length === 0 && (
+              <p className="text-sm text-muted-foreground">No real upstream XC accounts found on this connection.</p>
+            )}
+            {!!discoverAccountsQuery.data?.length && (
+              <label className="flex items-center gap-2 text-sm py-1 border-b border-border/50 pb-2">
+                <input
+                  type="checkbox"
+                  checked={discoverAccountsQuery.data.every((a) => a.credentials_unparseable || discoverSelectedIds.has(discoverKey(a)))}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      setDiscoverSelectedIds(new Set(discoverAccountsQuery.data!.filter((a) => !a.credentials_unparseable).map(discoverKey)))
+                    } else {
+                      setDiscoverSelectedIds(new Set())
+                    }
+                  }}
+                />
+                <span className="font-medium">Select all valid logins</span>
+              </label>
+            )}
+            {!!discoverAccountsQuery.data?.length && (
+              <div className="space-y-1 max-h-80 overflow-y-auto border border-border rounded p-2">
+                {discoverAccountsQuery.data.map((a) => (
+                  <label key={discoverKey(a)} className={`flex items-center gap-2 text-sm py-1 ${a.credentials_unparseable ? 'opacity-50' : ''}`}>
+                    <input
+                      type="checkbox"
+                      disabled={a.credentials_unparseable}
+                      checked={discoverSelectedIds.has(discoverKey(a))}
+                      onChange={(e) => {
+                        const next = new Set(discoverSelectedIds)
+                        if (e.target.checked) next.add(discoverKey(a)); else next.delete(discoverKey(a))
+                        setDiscoverSelectedIds(next)
+                      }}
+                    />
+                    <span className="flex-1">
+                      <span className="font-medium">{a.name}</span>{' '}
+                      <span className="text-muted-foreground">
+                        {a.credentials_unparseable
+                          ? "couldn't determine real credentials — configure manually"
+                          : <>{a.username} · max {a.max_streams || 'unlimited'}</>}
+                      </span>
+                    </span>
+                    {a.already_linked && <span className="text-muted-foreground text-xs">already imported</span>}
+                  </label>
+                ))}
+              </div>
+            )}
+            {recheckResult && <p className="text-sm text-muted-foreground">{recheckResult}</p>}
+            <div className="flex items-center gap-1.5">
+              <Button
+                size="sm" variant="outline"
+                disabled={recheckDiscoveredCredentials.isPending}
+                onClick={() => recheckDiscoveredCredentials.mutate()}
+              >
+                {recheckDiscoveredCredentials.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+                Re-check credentials
+              </Button>
+              <Button
+                size="sm"
+                disabled={!discoverSelectedIds.size || importDiscoveredAccounts.isPending}
+                onClick={() => importDiscoveredAccounts.mutate()}
+              >
+                {importDiscoveredAccounts.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                Import selected ({discoverSelectedIds.size})
+              </Button>
+            </div>
+          </div>
+        </Modal>
+        )
+      })()}
+
       <SectionCard title="Backup & Restore" icon={<HardDriveDownload size={14} />}>
         <p className="text-xs text-muted-foreground">
           Each piece can be backed up, restored, or reset independently — e.g. wipe a corrupt
@@ -5306,8 +5929,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
           <div className="space-y-1.5">
             {(() => {
-              const mPct = enrichProgress.movies_total ? Math.round((enrichProgress.movies_done / enrichProgress.movies_total) * 100) : 100
-              const sPct = enrichProgress.series_total ? Math.round((enrichProgress.series_done / enrichProgress.series_total) * 100) : 100
+              // Real bug found live: unclamped, so movies_done could exceed
+              // the movies_total snapshot taken when the run started (new
+              // items land mid-run on a real catalog that's still importing/
+              // syncing) and read "101%" -- same Math.min(100, ...) guard
+              // the playback-progress bar already uses elsewhere.
+              const mPct = enrichProgress.movies_total ? Math.min(100, Math.round((enrichProgress.movies_done / enrichProgress.movies_total) * 100)) : 100
+              const sPct = enrichProgress.series_total ? Math.min(100, Math.round((enrichProgress.series_done / enrichProgress.series_total) * 100)) : 100
               return (
                 <>
                   <div>
@@ -5337,15 +5965,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Title & Metadata Rules" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Regex find/replace applied to imported text, e.g. stripping a provider's own quality-tier
-          prefix ("4K: Movie" → "Movie"). Runs automatically on new imports/enrichment; use "Apply to pool"
-          to re-run against everything already imported.
+          Find/replace applied to imported text, e.g. stripping a provider's own quality-tier prefix ("4K: Movie" → "Movie").
+          Matches plain text by default (safest for the common case — a stray regex character like "|" can't accidentally
+          mean something else); check "Regex" for pattern matching. Runs automatically on new imports/enrichment; use
+          "Apply to pool" to re-run against everything already imported.
         </p>
         <ul className="text-xs space-y-1">
           {metadataRulesQuery.data?.map((r) => (
             <li key={r.id} className={`flex items-center justify-between gap-2 ${!r.is_active ? 'opacity-50' : ''}`}>
               <span className="font-mono">
-                [{r.content_type}] {r.field}: /{r.pattern}/ → "{r.replacement}"
+                [{r.content_type}] {r.field}: {r.is_regex ? `/${r.pattern}/` : `"${r.pattern}"`} → "{r.replacement}"
               </span>
               <span className="flex items-center gap-1.5 shrink-0">
                 <button
@@ -5371,15 +6000,42 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <select className={inputCls()} value={ruleForm.field} onChange={(e) => setRuleForm({ ...ruleForm, field: e.target.value as typeof ruleForm.field })}>
             {REWRITABLE_FIELDS.map((f) => <option key={f} value={f}>{f}</option>)}
           </select>
-          <input className={inputCls('w-40')} placeholder="regex pattern, e.g. ^4K:\s*" value={ruleForm.pattern} onChange={(e) => setRuleForm({ ...ruleForm, pattern: e.target.value })} />
+          <input
+            className={inputCls('w-40')}
+            placeholder={ruleForm.is_regex ? 'regex pattern, e.g. ^4K:\\s*' : 'text to find, e.g. EN| '}
+            value={ruleForm.pattern}
+            onChange={(e) => setRuleForm({ ...ruleForm, pattern: e.target.value })}
+          />
           <input className={inputCls('w-24')} placeholder="replacement" value={ruleForm.replacement} onChange={(e) => setRuleForm({ ...ruleForm, replacement: e.target.value })} />
+          <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer">
+            <input type="checkbox" checked={ruleForm.is_regex} onChange={(e) => setRuleForm({ ...ruleForm, is_regex: e.target.checked })} />
+            Regex
+          </label>
           <Button size="sm" disabled={!ruleForm.pattern || addRule.isPending} onClick={() => addRule.mutate()}>
             <Plus size={12} className="mr-1" /> Add rule
           </Button>
         </div>
+        {ruleForm.pattern.trim() && (
+          <p className="text-xs text-muted-foreground">
+            {rulePreviewQuery.isFetching
+              ? 'Checking against the pool…'
+              : rulePreviewQuery.data
+                ? (
+                    <>
+                      Would match <span className="font-medium text-foreground">{rulePreviewQuery.data.match_count}</span> of {rulePreviewQuery.data.total_pool} items.
+                      {!!rulePreviewQuery.data.samples.length && (
+                        <span className="block font-mono mt-0.5">
+                          {rulePreviewQuery.data.samples.slice(0, 3).map((s) => `"${s.before}" → "${s.after}"`).join('  ·  ')}
+                        </span>
+                      )}
+                    </>
+                  )
+                : null}
+          </p>
+        )}
         <div className="flex items-center gap-1.5">
-          <Button size="sm" variant="outline" disabled={applyRules.isPending} onClick={() => applyRules.mutate('movie')}>Apply to movie pool</Button>
-          <Button size="sm" variant="outline" disabled={applyRules.isPending} onClick={() => applyRules.mutate('series')}>Apply to series pool</Button>
+          <Button size="sm" variant="outline" disabled={applyRules.isPending} onClick={() => applyRules.mutate({ contentType: 'movie', force: false })}>Apply to movie pool</Button>
+          <Button size="sm" variant="outline" disabled={applyRules.isPending} onClick={() => applyRules.mutate({ contentType: 'series', force: false })}>Apply to series pool</Button>
           {applyRulesResult && <span className="text-xs text-muted-foreground">{applyRulesResult}</span>}
         </div>
       </SectionCard>
@@ -7028,7 +7684,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <div className="flex items-center gap-1.5 rounded border border-green-500/30 bg-green-500/5 px-2 py-1.5">
             {!duplicatesConfirmJobId ? (
               <>
-                <span className="text-xs text-muted-foreground">Check every group in this scan against TMDB to find airtight matches (shared tmdb_id + exact title match) that can merge without a manual pick.</span>
+                <span className="text-xs text-muted-foreground">Check every group in this scan against TMDB -- any group where every candidate shares the same confirmed tmdb_id can merge without a manual pick (preferring whichever candidate's name matches TMDB's own title exactly to decide which one to keep, falling back to the most-sourced candidate when none do).</span>
                 <Button size="sm" variant="outline" disabled={startConfirmScan.isPending} onClick={() => startConfirmScan.mutate()}>
                   {startConfirmScan.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
                   Check TMDB-confirmed matches
@@ -7055,7 +7711,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   size="sm"
                   disabled={!duplicatesConfirmed.length || mergeConfirmedDuplicates.isPending}
                   onClick={() => mergeConfirmedDuplicates.mutate()}
-                  title="Every candidate here shares a confirmed TMDB id, and one name matches TMDB's own title exactly -- no manual pick needed"
+                  title="Every candidate here shares a confirmed TMDB id -- no manual pick needed. The kept candidate matched TMDB's own title exactly where possible, otherwise it's whichever had the most sources/placements"
                 >
                   {mergeConfirmedDuplicates.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
                   Merge all confirmed matches ({duplicatesConfirmed.length})
@@ -7198,6 +7854,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <input
             className={inputCls('w-64')}
             placeholder="Search movies…"
+            title="Also matches each source's original provider name, even if a Title & Metadata Rule has since changed the displayed name"
             value={movieSearch}
             onChange={(e) => { setMovieSearch(e.target.value); setMovieOffset(0) }}
           />
@@ -7347,6 +8004,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <input
             className={inputCls('w-64')}
             placeholder="Search series…"
+            title="Also matches the original provider name, even if a Title & Metadata Rule has since changed the displayed name"
             value={seriesSearch}
             onChange={(e) => { setSeriesSearch(e.target.value); setSeriesOffset(0) }}
           />

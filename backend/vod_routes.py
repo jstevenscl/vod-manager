@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from auth import verify_session
 from config import (
     get_ai_model,
     get_ai_provider,
@@ -19,6 +20,7 @@ from config import (
     get_smtp_settings,
     get_stream_priority_mode,
     get_tmdb_api_key,
+    has_credentials,
     save_ai_provider,
     save_anthropic_api_key,
     save_gemini_api_key,
@@ -45,7 +47,7 @@ import tmdb_sync
 import vod_db
 import vod_importer
 import vod_sync
-from xc_server import get_active_sessions, kill_session
+from xc_server import fetch_proxied_image, get_active_sessions, kill_session
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/vod", tags=["vod-manager"])
@@ -140,6 +142,15 @@ class MetadataRuleRequest(BaseModel):
     pattern: str
     replacement: str = ""
     sort_order: int = 0
+    is_regex: bool = False  # literal-text matching by default -- see vod_db's is_regex migration comment
+
+
+class MetadataRulePreviewRequest(BaseModel):
+    content_type: str
+    field: str
+    pattern: str
+    replacement: str = ""
+    is_regex: bool = False
 
 
 class ProviderRequest(BaseModel):
@@ -271,6 +282,15 @@ class ProviderLiveAccountRequest(BaseModel):
     dispatcharr_profile_id: Optional[int] = None
 
 
+class DiscoveredProfileKey(BaseModel):
+    dispatcharr_account_id: int
+    dispatcharr_profile_id: int
+
+
+class ImportDiscoveredProfilesRequest(BaseModel):
+    profiles: list[DiscoveredProfileKey]
+
+
 class CategoryRequest(BaseModel):
     name: str
     content_type: str  # 'movie' or 'series'
@@ -362,6 +382,17 @@ class MovieSourceRequest(BaseModel):
     provider_id: int
     provider_stream_id: str
     container_extension: str = "mp4"
+
+
+class MoveMovieSourceRequest(BaseModel):
+    target_movie_id: int
+
+
+class MoveEpisodeSourceRequest(BaseModel):
+    target_series_id: int
+    season_number: int
+    episode_number: int
+    name: str
 
 
 class PlacementRequest(BaseModel):
@@ -603,6 +634,40 @@ async def kill_activity(conn_id: str):
     if not kill_session(conn_id):
         raise HTTPException(404, detail="session not found (it may have already closed)")
     return {"ok": True}
+
+
+@router.get("/stream-failures/", dependencies=_GUARDS)
+async def list_stream_failures():
+    """Recent failed VOD playback attempts -- every source exhausted, or a
+    mid-stream relay crash. Persisted (unlike Activity above), so these
+    survive a restart and don't require watching logs live to notice."""
+    return vod_db.list_stream_failures()
+
+
+@router.delete("/stream-failures/{failure_id}/", dependencies=_GUARDS)
+async def dismiss_stream_failure(failure_id: int):
+    vod_db.delete_stream_failure(failure_id)
+    return {"ok": True}
+
+
+@router.delete("/stream-failures/", dependencies=_GUARDS)
+async def clear_stream_failures():
+    vod_db.clear_stream_failures()
+    return {"ok": True}
+
+
+# Deliberately NOT under dependencies=_GUARDS (the X-Session-Token HEADER
+# guard) -- a plain <img src> can't attach a custom header, so this takes
+# the session token as a `?token=` query param instead, same pattern as
+# portal_routes.py's /library/{kind}/{item_id}/stream/. See
+# xc_server.fetch_proxied_image's docstring for why this route exists at
+# all (poster_url is plain http://, which an HTTPS-fronted deployment's
+# browser hard-blocks as mixed content).
+@router.get("/image-proxy")
+async def image_proxy(url: str, token: str):
+    if has_credentials() and not verify_session(token):
+        raise HTTPException(401, detail="unauthorized")
+    return await fetch_proxied_image(url)
 
 
 @router.get("/tmdb-settings/", dependencies=_GUARDS)
@@ -1010,6 +1075,55 @@ async def list_dispatcharr_account_profiles(connection_id: int, account_id: int)
         raise HTTPException(404, detail="connection not found")
     try:
         return await dispatcharr_dvr_client.list_m3u_account_profiles(connection, account_id)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.get("/dispatcharr-connections/{connection_id}/discover-accounts/", dependencies=_GUARDS)
+async def discover_dispatcharr_accounts(connection_id: int):
+    """Real upstream XC logins already configured in Dispatcharr on this
+    connection, one entry per PROFILE -- see
+    vod_sync.list_discoverable_profiles for what's filtered out and why,
+    and why profile rather than account."""
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    try:
+        return await vod_sync.list_discoverable_profiles(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+
+
+@router.post("/dispatcharr-connections/{connection_id}/discover-accounts/import/", dependencies=_GUARDS)
+async def import_discovered_dispatcharr_accounts(connection_id: int, body: ImportDiscoveredProfilesRequest):
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    try:
+        candidates = await vod_sync.list_discoverable_profiles(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    by_key = {(c["dispatcharr_account_id"], c["dispatcharr_profile_id"]): c for c in candidates}
+    imported = []
+    skipped = []
+    for key in body.profiles:
+        profile = by_key.get((key.dispatcharr_account_id, key.dispatcharr_profile_id))
+        if not profile:
+            continue
+        try:
+            imported.append(vod_sync.import_discovered_profile(connection_id, profile))
+        except ValueError as exc:
+            skipped.append({"name": profile["name"], "reason": str(exc)})
+    return {"imported": imported, "skipped": skipped}
+
+
+@router.post("/dispatcharr-connections/{connection_id}/discover-accounts/recheck/", dependencies=_GUARDS)
+async def recheck_discovered_dispatcharr_credentials(connection_id: int):
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    try:
+        return await vod_sync.recheck_discovered_credentials(connection)
     except Exception as exc:
         raise HTTPException(502, detail=str(exc))
 
@@ -2056,7 +2170,12 @@ async def resweep_uncategorized():
 async def scan_duplicates(content_type: str):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    return vod_db.find_duplicate_groups(content_type)
+    # Real bug found live 2026-07-31: this ran inline on the event loop.
+    # find_duplicate_groups takes 60+s against a real ~250K-item catalog,
+    # and since it's plain sync sqlite3 code, that froze the ENTIRE server
+    # (every other request, including unrelated ones) for the whole scan --
+    # not just this endpoint. to_thread hands it to a worker thread instead.
+    return await asyncio.to_thread(vod_db.find_duplicate_groups, content_type)
 
 
 @router.post("/duplicates/merge/", dependencies=_GUARDS)
@@ -2104,17 +2223,27 @@ class MergeConfirmedDuplicatesRequest(BaseModel):
     groups: list[MergeDuplicateGroupPair]
 
 
+def _merge_confirmed_groups(content_type: str, groups: list) -> dict:
+    merged_groups = 0
+    merged_items = 0
+    for pair in groups:
+        result = vod_db.merge_duplicate_group(content_type, pair.keep_id, pair.merge_ids)
+        merged_groups += 1
+        merged_items += result["merged_count"]
+    return {"merged_groups": merged_groups, "merged_items": merged_items}
+
+
 @router.post("/duplicates/merge-confirmed/", dependencies=_GUARDS)
 async def merge_confirmed_duplicates(body: MergeConfirmedDuplicatesRequest):
     if body.content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    merged_groups = 0
-    merged_items = 0
-    for pair in body.groups:
-        result = vod_db.merge_duplicate_group(body.content_type, pair.keep_id, pair.merge_ids)
-        merged_groups += 1
-        merged_items += result["merged_count"]
-    return {"merged_groups": merged_groups, "merged_items": merged_items}
+    # Real bug found live 2026-07-31 (same shape as scan_duplicates): a real
+    # confirm-scan against the full catalog can hand back thousands of
+    # confirmed groups (2273 in this instance's own real data) -- looping
+    # vod_db.merge_duplicate_group synchronously inline blocked the whole
+    # server for ~19s measured directly against real data (8.35ms/merge x
+    # 2273). asyncio.to_thread offloads the whole batch to a worker thread.
+    return await asyncio.to_thread(_merge_confirmed_groups, body.content_type, body.groups)
 
 
 @router.post("/duplicates/confirm-scan/", dependencies=_GUARDS)
@@ -2455,6 +2584,17 @@ async def delete_movie_source(movie_id: int, source_id: int):
     return {"ok": True}
 
 
+@router.post("/movies/{movie_id}/sources/{source_id}/move/", dependencies=_GUARDS)
+async def move_movie_source(movie_id: int, source_id: int, body: MoveMovieSourceRequest):
+    if not vod_db.get_movie(movie_id):
+        raise HTTPException(404, detail="movie not found")
+    try:
+        vod_db.move_movie_source(source_id, movie_id, body.target_movie_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+    return {"ok": True}
+
+
 @router.post("/movies/{movie_id}/categories/", dependencies=_GUARDS)
 async def place_movie_in_category(movie_id: int, body: PlacementRequest):
     if not vod_db.get_movie(movie_id):
@@ -2485,6 +2625,41 @@ async def rename_movie(movie_id: int, body: RenameRequest):
         return vod_db.rename_item("movie", movie_id, body.name, body.year)
     except ValueError as exc:
         raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+
+
+@router.post("/movies/{movie_id}/tmdb-title/", dependencies=_GUARDS)
+async def apply_tmdb_title_movie(movie_id: int):
+    """Manual, one-click 'use TMDB's own title' -- real user request
+    2026-07-31. Only ever runs on demand against a single already-confirmed
+    tmdb_id (never automatically on import/enrichment, which would risk
+    fighting a user's own Title & Metadata Rules or a manual rename with no
+    way to opt out). Also adopts TMDB's own release year alongside the
+    title -- renaming to TMDB's title while keeping a provider-mislabeled
+    year would just create a different kind of inconsistency."""
+    movie = vod_db.get_movie(movie_id)
+    if not movie:
+        raise HTTPException(404, detail="movie not found")
+    if not movie.get("tmdb_id"):
+        raise HTTPException(400, detail="no confirmed TMDB id for this movie")
+    # Real bug found live 2026-07-31 (browser-testing this feature): with no
+    # TMDB API key configured, get_tmdb_details_for_ids raises ValueError,
+    # which without this went completely unhandled -- a raw 500 instead of
+    # the same clean 400 duplicate_tmdb_details already gives for the exact
+    # same underlying condition (see its identical except clause above).
+    try:
+        details = await tmdb_sync.get_tmdb_details_for_ids([movie["tmdb_id"]], "movie")
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    detail = details.get(movie["tmdb_id"], {})
+    if not detail.get("title"):
+        raise HTTPException(502, detail="TMDB lookup failed or returned no title")
+    try:
+        result = vod_db.rename_item("movie", movie_id, detail["title"], detail.get("year") or movie["year"])
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+    if "merged_into" in result:
+        vod_db.backfill_tmdb_id_if_missing("movie", result["merged_into"], movie["tmdb_id"])
+    return result
 
 
 @router.delete("/movies/{movie_id}/", dependencies=_GUARDS)
@@ -2590,6 +2765,32 @@ async def delete_episode_source(episode_id: int, source_id: int):
     return {"ok": True}
 
 
+@router.post("/episodes/{episode_id}/sources/{source_id}/move/", dependencies=_GUARDS)
+async def move_episode_source(episode_id: int, source_id: int, body: MoveEpisodeSourceRequest):
+    try:
+        target_episode_id = vod_db.move_episode_source(
+            source_id, episode_id, body.target_series_id, body.season_number, body.episode_number, body.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+    return {"ok": True, "target_episode_id": target_episode_id}
+
+
+@router.get("/series/{series_id}/failing-sources/", dependencies=_GUARDS)
+async def get_failing_episode_sources(series_id: int):
+    if not vod_db.get_series(series_id):
+        raise HTTPException(404, detail="series not found")
+    return vod_db.list_failing_episode_sources_for_series(series_id)
+
+
+@router.delete("/series/{series_id}/sources/by-provider/{provider_id}/", dependencies=_GUARDS)
+async def remove_series_provider_sources(series_id: int, provider_id: int):
+    if not vod_db.get_series(series_id):
+        raise HTTPException(404, detail="series not found")
+    removed = vod_db.remove_provider_sources_from_series(series_id, provider_id)
+    return {"removed": removed}
+
+
 @router.post("/series/{series_id}/categories/", dependencies=_GUARDS)
 async def place_series_in_category(series_id: int, body: PlacementRequest):
     if not vod_db.get_series(series_id):
@@ -2620,6 +2821,30 @@ async def rename_series(series_id: int, body: RenameRequest):
         return vod_db.rename_item("series", series_id, body.name, body.year)
     except ValueError as exc:
         raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+
+
+@router.post("/series/{series_id}/tmdb-title/", dependencies=_GUARDS)
+async def apply_tmdb_title_series(series_id: int):
+    """See apply_tmdb_title_movie's identical docstring -- same reasoning."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    if not series.get("tmdb_id"):
+        raise HTTPException(400, detail="no confirmed TMDB id for this series")
+    try:
+        details = await tmdb_sync.get_tmdb_details_for_ids([series["tmdb_id"]], "series")
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    detail = details.get(series["tmdb_id"], {})
+    if not detail.get("title"):
+        raise HTTPException(502, detail="TMDB lookup failed or returned no title")
+    try:
+        result = vod_db.rename_item("series", series_id, detail["title"], detail.get("year") or series["year"])
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+    if "merged_into" in result:
+        vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], series["tmdb_id"])
+    return result
 
 
 @router.delete("/series/{series_id}/", dependencies=_GUARDS)
@@ -2674,13 +2899,30 @@ async def create_metadata_rule(body: MetadataRuleRequest):
         raise HTTPException(400, detail="content_type must be 'movie', 'series', or 'both'")
     if body.field not in vod_db.REWRITABLE_FIELDS:
         raise HTTPException(400, detail=f"field must be one of {vod_db.REWRITABLE_FIELDS}")
-    import re
-    try:
-        re.compile(body.pattern)
-    except re.error as exc:
-        raise HTTPException(400, detail=f"invalid regex: {exc}")
-    rule_id = vod_db.create_metadata_rule(body.content_type, body.field, body.pattern, body.replacement, body.sort_order)
+    # Only meaningful for is_regex=True -- a literal pattern is always
+    # re.escape()'d before use, so it can never fail to compile. This only
+    # catches a syntactically broken regex; it was never able to catch (and
+    # still can't) a syntactically VALID but semantically wrong one, like
+    # an unescaped "|" -- that's what preview_metadata_rule is for.
+    if body.is_regex:
+        import re
+        try:
+            re.compile(body.pattern)
+        except re.error as exc:
+            raise HTTPException(400, detail=f"invalid regex: {exc}")
+    rule_id = vod_db.create_metadata_rule(
+        body.content_type, body.field, body.pattern, body.replacement, body.sort_order, body.is_regex,
+    )
     return {"id": rule_id}
+
+
+@router.post("/metadata-rules/preview/", dependencies=_GUARDS)
+async def preview_metadata_rule(body: MetadataRulePreviewRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if body.field not in vod_db.REWRITABLE_FIELDS:
+        raise HTTPException(400, detail=f"field must be one of {vod_db.REWRITABLE_FIELDS}")
+    return vod_db.preview_metadata_rule(body.content_type, body.field, body.pattern, body.replacement, body.is_regex)
 
 
 @router.post("/metadata-rules/{rule_id}/active/", dependencies=_GUARDS)
@@ -2696,7 +2938,12 @@ async def delete_metadata_rule(rule_id: int):
 
 
 @router.post("/metadata-rules/apply/", dependencies=_GUARDS)
-async def apply_metadata_rules(content_type: str):
+async def apply_metadata_rules(content_type: str, force: bool = False):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    return vod_db.apply_metadata_rules_to_pool(content_type)
+    # Same event-loop-blocking shape as scan_duplicates/merge_confirmed_duplicates
+    # (2026-07-31) -- measured 1.3s+ against this instance's real 247K-movie
+    # pool even with zero changes to write; a real run with thousands of
+    # writes would be worse. Small next to the other two, but the same
+    # anti-pattern, so offloaded the same way rather than left as a known gap.
+    return await asyncio.to_thread(vod_db.apply_metadata_rules_to_pool, content_type, force)

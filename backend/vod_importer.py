@@ -180,7 +180,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
     movie_items = []
     for s in streams:
-        name, year = parse_name_year(s.get("name", ""))
+        name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
         category_name = category_names.get(str(s.get("category_id")))
         movie_items.append({
@@ -197,7 +197,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # can never differentiate between two sources' quality on its
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
-            "raw_name": s.get("name", ""),
+            "raw_name": s.get("name") or "",
             "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
@@ -210,7 +210,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
     series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
     series_items = []
     for s in series_list:
-        name, year = parse_name_year(s.get("name", ""))
+        name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         category_name = series_category_names.get(str(s.get("category_id")))
         series_items.append({
@@ -218,6 +218,10 @@ async def import_provider_catalog(provider_id: int) -> dict:
             "year": year or _coerce_year(s.get("year")),
             "provider_series_id": str(s["series_id"]),
             "provider_category_name": category_name,
+            # See movie_items' identical raw_name field above -- the
+            # provider's own unstripped name, before parse_name_year and
+            # Title & Metadata Rules clean it up.
+            "raw_name": s.get("name") or "",
             "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
         })
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)

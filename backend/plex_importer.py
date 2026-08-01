@@ -108,6 +108,8 @@ async def import_plex_library(provider_id: int) -> dict:
                         "cast_list": fields["cast_list"],
                         "poster_url": _poster_url(provider, item.get("thumb")),
                         "tmdb_id": fields["tmdb_id"],
+                        "rating": fields["rating"],
+                        "release_date": fields["release_date"],
                         "last_enriched_at": now,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
@@ -139,6 +141,8 @@ async def import_plex_library(provider_id: int) -> dict:
                         "cast_list": fields["cast_list"],
                         "poster_url": _poster_url(provider, show.get("thumb")),
                         "tmdb_id": fields["tmdb_id"],
+                        "rating": fields["rating"],
+                        "release_date": fields["release_date"],
                         "last_enriched_at": now,
                         "episodes": episodes,
                     })

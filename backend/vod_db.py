@@ -482,6 +482,27 @@ def init_db() -> None:
             UNIQUE(provider_id, dispatcharr_user_id)
         );
 
+        -- Real user request 2026-07-31: a failed playback attempt (every
+        -- source exhausted, or a mid-stream relay crash) only ever showed up
+        -- in the raw application log -- no way to notice "this user's
+        -- stream just failed" without tailing logs. attempts is a JSON list
+        -- of {provider, error} for every source tried, not just the last
+        -- one, so an admin can tell "every provider is down" from "only
+        -- this one flaky provider keeps failing." Deliberately no FK to
+        -- movies/series -- a failure for something since renamed/deleted
+        -- should still show what it was at the time, not vanish or point at
+        -- the wrong row. Pruned to the most recent 500 rows on insert (see
+        -- log_stream_failure) -- diagnostic history, not permanent record.
+        CREATE TABLE IF NOT EXISTS vod_stream_failures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            username TEXT,
+            attempts TEXT NOT NULL,
+            final_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -502,6 +523,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(dispatcharr_user_id);
         CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_vod_stream_failures_created_at ON vod_stream_failures(created_at);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_user_id ON movie_source_owners(dispatcharr_user_id);
         CREATE INDEX IF NOT EXISTS idx_episode_source_owners_source_id ON episode_source_owners(episode_source_id);
@@ -876,6 +898,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "dvr_delete_after_copy", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "last_movie_provider_total", "INTEGER"),
         ("providers", "last_series_provider_total", "INTEGER"),
+        ("series", "raw_name", "TEXT"),
+        # DEFAULT 1 (regex) only matters for rows that already exist -- those
+        # are genuine hand-written regex from before this column existed.
+        # New rules created after this migration get is_regex=0 (literal)
+        # explicitly from create_metadata_rule's own default -- literal
+        # matching is the safer default for the common case (e.g. stripping
+        # a literal "EN| " prefix), since a missing regex escape (an
+        # unescaped "|" turning that into "match EN OR a bare space") can't
+        # happen if the pattern was never treated as regex in the first
+        # place. Real bug found live 2026-07-31.
+        ("metadata_rules", "is_regex", "INTEGER NOT NULL DEFAULT 1"),
+        ("movie_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("movie_sources", "last_failed_at", "TEXT"),
+        ("episode_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("episode_sources", "last_failed_at", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1644,20 +1681,29 @@ END"""
 # "UHD" hits the tier-3 branch and never reaches the plain-HD check.
 
 
+# A source that has failed this many times in a row (and hasn't succeeded
+# since) is real dead weight -- still tried (a provider can come back), but
+# last, after every source without that track record, so playback doesn't
+# eat a slow doomed connect attempt first on every request. See
+# _source_order_by, record_source_failure/record_source_success.
+_FAILING_SOURCE_THRESHOLD = 3
+
+
 def _source_order_by(source_alias: str, provider_alias: str) -> str:
     """Builds the ORDER BY clause for a multi-source query. source_alias is
     the movie_sources/episode_sources table alias (has raw_name,
-    provider_category_name, last_seen_at); provider_alias is the joined
-    providers table alias (has priority)."""
+    provider_category_name, last_seen_at, consecutive_failures);
+    provider_alias is the joined providers table alias (has priority)."""
     quality = _QUALITY_TIER_SQL_TEMPLATE.format(a=source_alias)
+    failing = f"(CASE WHEN {source_alias}.consecutive_failures >= {_FAILING_SOURCE_THRESHOLD} THEN 1 ELSE 0 END) ASC"
     mode = get_stream_priority_mode()
     if mode == "quality":
-        return f"{quality} DESC, {source_alias}.last_seen_at DESC"
+        return f"{failing}, {quality} DESC, {source_alias}.last_seen_at DESC"
     if mode == "quality_then_provider":
-        return f"{quality} DESC, {provider_alias}.priority DESC, {source_alias}.last_seen_at DESC"
+        return f"{failing}, {quality} DESC, {provider_alias}.priority DESC, {source_alias}.last_seen_at DESC"
     if mode == "provider_then_quality":
-        return f"{provider_alias}.priority DESC, {quality} DESC, {source_alias}.last_seen_at DESC"
-    return f"{provider_alias}.priority DESC, {source_alias}.last_seen_at DESC"
+        return f"{failing}, {provider_alias}.priority DESC, {quality} DESC, {source_alias}.last_seen_at DESC"
+    return f"{failing}, {provider_alias}.priority DESC, {source_alias}.last_seen_at DESC"
 
 
 def find_pool_backfill_match(title: str, program: dict) -> dict | None:
@@ -1837,6 +1883,96 @@ def get_recording_failure(provider_id: int, dispatcharr_recording_id: int) -> di
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+# ── Failed VOD stream playback attempts ─────────────────────────────────────
+# See vod_stream_failures' CREATE TABLE comment above and
+# xc_server._proxy_vod_stream, the only writer.
+
+_MAX_STORED_STREAM_FAILURES = 500
+
+
+def log_stream_failure(kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str) -> None:
+    import json
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at) VALUES (?,?,?,?,?,?)",
+        (kind, title, username, json.dumps(attempts), final_reason, _now()),
+    )
+    conn.execute(
+        "DELETE FROM vod_stream_failures WHERE id NOT IN "
+        "(SELECT id FROM vod_stream_failures ORDER BY created_at DESC, id DESC LIMIT ?)",
+        (_MAX_STORED_STREAM_FAILURES,),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def record_source_failure(kind: str, source_id: int) -> None:
+    """Bumps one specific source's own failure streak -- called on every
+    per-source failure in xc_server._proxy_vod_stream's failover loop, not
+    just when every source is exhausted. Real motivating case (2026-08-01):
+    a series airing fine overall because one good provider (e.g. 4KLive)
+    covers most episodes masks a second provider (e.g. Mega-OTT) whose
+    copies are almost entirely broken -- vod_stream_failures alone would
+    never surface that, since fallback to the good provider means no
+    request ever actually failed outright. See _source_order_by, which
+    reads this to try a source with a live failure streak last instead of
+    first, and record_source_success, which clears it."""
+    table = "movie_sources" if kind == "movie" else "episode_sources"
+    conn = _connect()
+    conn.execute(
+        f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
+        (_now(), source_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def record_source_success(kind: str, source_id: int) -> None:
+    """Clears a source's failure streak the moment it actually works again --
+    a provider that was down can come back, and a source that's currently
+    serving successfully shouldn't stay deprioritized on its past record."""
+    table = "movie_sources" if kind == "movie" else "episode_sources"
+    conn = _connect()
+    conn.execute(
+        f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
+        (source_id,),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_stream_failures(limit: int = 200) -> list[dict]:
+    import json
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM vod_stream_failures ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["attempts"] = json.loads(d["attempts"])
+        except (TypeError, ValueError):
+            d["attempts"] = []
+        out.append(d)
+    return out
+
+
+def delete_stream_failure(failure_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM vod_stream_failures WHERE id=?", (failure_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def clear_stream_failures() -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM vod_stream_failures")
+    _commit_with_retry(conn)
+    conn.close()
 
 
 # ── DVR per-person resource limits ──────────────────────────────────────────
@@ -2370,7 +2506,7 @@ def set_provider_max_streams(provider_id: int, max_streams: int) -> None:
 def set_provider_shared_limit(provider_id: int, shared_connection_limit: int | None) -> None:
     """The real provider's true total connection cap, shared across every
     live-TV account on any Dispatcharr instance plus our own VOD streaming
-    -- see xc_server.py's _has_capacity(). Which specific live-TV accounts
+    -- see xc_server.py's _try_reserve_capacity(). Which specific live-TV accounts
     count toward it is managed separately (provider_live_accounts, since a
     provider can have one on more than one Dispatcharr instance)."""
     conn = _connect()
@@ -3121,7 +3257,7 @@ def record_xc_client_seen(client_id: int, ip: str) -> None:
 #   1. vod_sync.py pushes each provider's max_streams into a Dispatcharr
 #      account's connection-limit profiles (vod_relay_account_id: which
 #      account on this connection is the one pointing back at VOD Manager).
-#   2. xc_server.py's shared-connection-limit coordination (_has_capacity)
+#   2. xc_server.py's shared-connection-limit coordination (_try_reserve_capacity)
 #      checks live-TV viewer counts against a real provider's total cap --
 #      see provider_live_accounts below, since a single real provider can
 #      have its own separate native live-TV account on more than one
@@ -3188,6 +3324,22 @@ def delete_dispatcharr_connection(connection_id: int) -> None:
 
 # ── Provider live-TV accounts (for shared connection-limit coordination) ────
 
+def list_provider_live_accounts_for_connection(connection_id: int) -> list[dict]:
+    """Every provider already linked to ANY Dispatcharr account on this one
+    connection -- one query instead of an admin-side N+1 over every
+    provider, used by vod_sync's discovery flow to know which real
+    Dispatcharr accounts are already imported (and by whom) before offering
+    them again."""
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("""
+        SELECT pla.*, p.name AS provider_name FROM provider_live_accounts pla
+        JOIN providers p ON p.id = pla.provider_id
+        WHERE pla.dispatcharr_connection_id=?
+    """, (connection_id,)).fetchall()]
+    conn.close()
+    return rows
+
+
 def list_provider_live_accounts(provider_id: int) -> list[dict]:
     conn = _connect()
     rows = [dict(r) for r in conn.execute("""
@@ -3204,7 +3356,7 @@ def set_provider_live_account(provider_id: int, connection_id: int, account_id: 
     """Upsert -- one row per (provider, connection) pair; setting it again
     for the same connection just updates the account id.
 
-    profile_id optionally scopes capacity coordination (xc_server._has_capacity)
+    profile_id optionally scopes capacity coordination (xc_server._try_reserve_capacity)
     to ONE Dispatcharr M3U profile within that account instead of the whole
     account -- needed when a single Dispatcharr M3U source actually represents
     several separate real upstream logins (e.g. a provider selling "5x1"
@@ -3711,7 +3863,15 @@ def _movie_filter_clause(
     where = ["m.review_excluded = ?"]
     params: list = [1 if archived else 0]
     if search:
-        where.append("m.name LIKE ?")
+        # Also matches each source's own raw_name -- the provider's
+        # unmodified original title, captured before parse_name_year and
+        # Title & Metadata Rules ran (see vod_importer.import_provider_
+        # catalog). Real user request 2026-07-31: a rule that strips e.g. a
+        # "EN|" prefix means the original text no longer appears in m.name
+        # at all, so searching for it would otherwise find nothing even
+        # though the movie is right there.
+        where.append("(m.name LIKE ? OR m.id IN (SELECT movie_id FROM movie_sources WHERE raw_name LIKE ?))")
+        params.append(f"%{search}%")
         params.append(f"%{search}%")
     if category_id is not None:
         where.append("m.id IN (SELECT movie_id FROM movie_category_placements WHERE category_id=?)")
@@ -4045,6 +4205,25 @@ def delete_movie_source(movie_id: int, source_id: int) -> None:
     _delete_file_if_present(file_path)
 
 
+def move_movie_source(source_id: int, movie_id: int, target_movie_id: int) -> None:
+    """Re-points one mismatched source at the movie it actually belongs to,
+    instead of deleting and losing it -- for when a provider's own listing
+    (typo, wrong year, a title collision) got matched to the wrong movie on
+    import. Keeps the source's own history (priority, raw_name,
+    consecutive_failures) intact; only movie_id changes. The
+    (provider_id, provider_stream_id) UNIQUE constraint doesn't involve
+    movie_id, so this can't collide. If that was the old movie's last
+    source, it gets purged same as a plain delete would."""
+    conn = _connect()
+    if not conn.execute("SELECT 1 FROM movies WHERE id=?", (target_movie_id,)).fetchone():
+        conn.close()
+        raise ValueError(f"target movie {target_movie_id} not found")
+    conn.execute("UPDATE movie_sources SET movie_id=? WHERE id=? AND movie_id=?", (target_movie_id, source_id, movie_id))
+    _purge_if_sourceless_movie(conn, movie_id)
+    _commit_with_retry(conn)
+    conn.close()
+
+
 def remove_movie_from_category(movie_id: int, category_id: int) -> None:
     conn = _connect()
     conn.execute(
@@ -4242,7 +4421,8 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
     so the proxy can try them in order."""
     conn = _connect()
     rows = conn.execute(f"""
-        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path
+        SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension,
+               ms.plex_rating_key, ms.local_file_path
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
         WHERE ms.movie_id = ? AND p.is_active = 1
@@ -4321,7 +4501,12 @@ def _series_filter_clause(
     where = ["s.review_excluded = ?"]
     params: list = [1 if archived else 0]
     if search:
-        where.append("s.name LIKE ?")
+        # Also matches s.raw_name -- see _movie_filter_clause's identical
+        # comment. Series (unlike movies) have exactly one raw_name, not
+        # one per source, since XC series don't carry a per-source stream_id
+        # the way movies do (see bulk_import_series's docstring).
+        where.append("(s.name LIKE ? OR s.raw_name LIKE ?)")
+        params.append(f"%{search}%")
         params.append(f"%{search}%")
     if category_id is not None:
         where.append("s.id IN (SELECT series_id FROM series_category_placements WHERE category_id=?)")
@@ -4624,6 +4809,73 @@ def delete_episode_source(episode_id: int, source_id: int) -> None:
     _delete_file_if_present(file_path)
 
 
+def move_episode_source(source_id: int, episode_id: int, target_series_id: int, season_number: int, episode_number: int, name: str) -> int:
+    """Re-points one mismatched source at the episode it actually belongs to
+    -- movie_sources' move_movie_source, episode edition. The target episode
+    is found-or-created on target_series_id via add_episode (a title
+    collision can just as easily land on a season/episode slot the correct
+    series hasn't been given a row for yet, e.g. if this was the only
+    source anyone had imported for it). Returns the target episode's id."""
+    conn = _connect()
+    if not conn.execute("SELECT 1 FROM series WHERE id=?", (target_series_id,)).fetchone():
+        conn.close()
+        raise ValueError(f"target series {target_series_id} not found")
+    conn.close()
+    target_episode_id = add_episode(target_series_id, season_number, episode_number, name)
+
+    conn = _connect()
+    old_episode_row = conn.execute("SELECT series_id FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    conn.execute("UPDATE episode_sources SET episode_id=? WHERE id=? AND episode_id=?", (target_episode_id, source_id, episode_id))
+    _purge_if_sourceless_episode(conn, episode_id)
+    if old_episode_row:
+        _purge_if_sourceless_series(conn, old_episode_row["series_id"])
+    _commit_with_retry(conn)
+    conn.close()
+    return target_episode_id
+
+
+def list_failing_episode_sources_for_series(series_id: int, min_failures: int = 1) -> list[dict]:
+    """Surfaces the exact pattern a healthy-looking series can hide: one
+    provider whose copies are almost all broken never shows up as an
+    outright failure if a second, healthier provider covers the same
+    episodes -- fallback succeeds, so vod_stream_failures never sees it (see
+    record_source_failure). Grouping by provider here is what lets an admin
+    spot "Mega-OTT's copies of this show are all dead" at a glance instead
+    of noticing it one broken episode at a time."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT es.id AS source_id, es.provider_id, p.name AS provider_name,
+               es.episode_id, e.season_number, e.episode_number,
+               es.consecutive_failures, es.last_failed_at
+        FROM episode_sources es
+        JOIN episodes e ON e.id = es.episode_id
+        JOIN providers p ON p.id = es.provider_id
+        WHERE e.series_id = ? AND es.consecutive_failures >= ?
+        ORDER BY p.name, e.season_number, e.episode_number
+    """, (series_id, min_failures)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def remove_provider_sources_from_series(series_id: int, provider_id: int) -> int:
+    """Bulk version of delete_episode_source for the fix list_failing_episode_sources_for_series
+    exists to enable: once a provider's copies of a series are confirmed
+    dead, removing them one episode at a time is real toil for a 20+
+    episode season. Same file-cleanup and sourceless-purge behavior as the
+    single-source delete, just looped. Returns the number of sources
+    removed."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT es.id AS source_id, es.episode_id, es.local_file_path
+        FROM episode_sources es JOIN episodes e ON e.id = es.episode_id
+        WHERE e.series_id = ? AND es.provider_id = ?
+    """, (series_id, provider_id)).fetchall()
+    conn.close()
+    for row in rows:
+        delete_episode_source(row["episode_id"], row["source_id"])
+    return len(rows)
+
+
 def remove_series_from_category(series_id: int, category_id: int) -> None:
     conn = _connect()
     conn.execute(
@@ -4808,7 +5060,8 @@ def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
     """Episode equivalent of list_movie_sources_for_streaming — see there."""
     conn = _connect()
     rows = conn.execute(f"""
-        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path
+        SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension,
+               es.plex_rating_key, es.local_file_path
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
         WHERE es.episode_id = ? AND p.is_active = 1
@@ -5130,6 +5383,16 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                 # skip this check entirely for that item's index.
                 if (i + 1) % batch_size == 0:
                     _commit_with_retry(conn)
+                    # Release+reacquire between batches -- holding the lock for the
+                    # WHOLE function (a large catalog can take many minutes) blocked
+                    # every other writer with no timeout, which could exhaust the
+                    # async thread pool if enough piled up waiting -- confirmed live
+                    # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
+                    # requests hanging/500ing during a large concurrent import, fixed
+                    # by matching the lock's hold window to one batch's real SQLite
+                    # write-transaction span instead of the whole import.
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
         _commit_with_retry(conn)
         conn.close()
     finally:
@@ -5210,7 +5473,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # back and stamp it onto each episode as episodes are
                         # discovered (episodes aren't known yet at this cheap
                         # bulk-list stage, only lazily via get_series_info).
-                        conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), existing["id"]))
+                        conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), existing["id"]))
                         if category_looks_adult and not existing["is_adult"] and not existing["is_adult_manual"]:
                             conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (existing["id"],))
                         if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
@@ -5233,8 +5496,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # is a genuinely new item.
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
                         conn.execute(
-                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                         )
                         did_create = True
                         did_flag = True
@@ -5248,7 +5511,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             did_match = True
                             # See the identical comment on the existing-identity
                             # match branch above -- same fix, same reasoning.
-                            conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), row["id"]))
+                            conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), row["id"]))
                             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                                 conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
@@ -5278,7 +5541,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             ).fetchall()
                             if len(candidates) == 1:
                                 did_match = True
-                                conn.execute("UPDATE series SET provider_category_name=? WHERE id=?", (item.get("provider_category_name"), candidates[0]["id"]))
+                                conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), candidates[0]["id"]))
                                 if candidates[0]["import_provider_id"] is None:
                                     conn.execute(
                                         "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
@@ -5296,8 +5559,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_unarchive = True
                             else:
                                 conn.execute(
-                                    "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
+                                    "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                                 )
                                 did_create = True
                                 did_archive = should_archive
@@ -5305,8 +5568,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_flag = True
                         else:
                             conn.execute(
-                                "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), now),
+                                "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                             )
                             did_create = True
                             did_archive = should_archive
@@ -5334,6 +5597,16 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                 # so the blank-name branch's `continue` doesn't skip it.
                 if (i + 1) % batch_size == 0:
                     _commit_with_retry(conn)
+                    # Release+reacquire between batches -- holding the lock for the
+                    # WHOLE function (a large catalog can take many minutes) blocked
+                    # every other writer with no timeout, which could exhaust the
+                    # async thread pool if enough piled up waiting -- confirmed live
+                    # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
+                    # requests hanging/500ing during a large concurrent import, fixed
+                    # by matching the lock's hold window to one batch's real SQLite
+                    # write-transaction span instead of the whole import.
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
         _commit_with_retry(conn)
         conn.close()
     finally:
@@ -5354,7 +5627,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
     return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
-_PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at")
+_PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at", "rating", "release_date")
 
 
 def _plex_detail_update_sql(detail: dict, tmdb_id: str | None) -> tuple[str, list]:
@@ -5510,6 +5783,16 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                                 item.get("name"), item.get("provider_stream_id"), exc)
             if (i + 1) % batch_size == 0:
                 _commit_with_retry(conn)
+                # Release+reacquire between batches -- holding the lock for the
+                # WHOLE function (a large catalog can take many minutes) blocked
+                # every other writer with no timeout, which could exhaust the
+                # async thread pool if enough piled up waiting -- confirmed live
+                # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
+                # requests hanging/500ing during a large concurrent import, fixed
+                # by matching the lock's hold window to one batch's real SQLite
+                # write-transaction span instead of the whole import.
+                _WRITE_LOCK.release()
+                _WRITE_LOCK.acquire()
         _commit_with_retry(conn)
         conn.close()
     finally:
@@ -5666,6 +5949,16 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                 item.get("name"), item.get("provider_series_id"), exc)
             if (i + 1) % batch_size == 0:
                 _commit_with_retry(conn)
+                # Release+reacquire between batches -- holding the lock for the
+                # WHOLE function (a large catalog can take many minutes) blocked
+                # every other writer with no timeout, which could exhaust the
+                # async thread pool if enough piled up waiting -- confirmed live
+                # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
+                # requests hanging/500ing during a large concurrent import, fixed
+                # by matching the lock's hold window to one batch's real SQLite
+                # write-transaction span instead of the whole import.
+                _WRITE_LOCK.release()
+                _WRITE_LOCK.acquire()
         _commit_with_retry(conn)
         conn.close()
     finally:
@@ -5684,11 +5977,15 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
 REWRITABLE_FIELDS = ("name", "genre", "description", "director", "cast_list", "country")
 
 
-def create_metadata_rule(content_type: str, field: str, pattern: str, replacement: str = "", sort_order: int = 0) -> int:
+def create_metadata_rule(
+    content_type: str, field: str, pattern: str, replacement: str = "", sort_order: int = 0, is_regex: bool = False,
+) -> int:
+    """is_regex defaults to False (literal-text matching) -- see this
+    column's migration comment for why literal is the safer default."""
     conn = _connect()
     cur = conn.execute(
-        "INSERT INTO metadata_rules (content_type, field, pattern, replacement, sort_order, created_at) VALUES (?,?,?,?,?,?)",
-        (content_type, field, pattern, replacement, sort_order, _now()),
+        "INSERT INTO metadata_rules (content_type, field, pattern, replacement, sort_order, is_regex, created_at) VALUES (?,?,?,?,?,?,?)",
+        (content_type, field, pattern, replacement, sort_order, int(is_regex), _now()),
     )
     rule_id = cur.lastrowid
     _commit_with_retry(conn)
@@ -5733,23 +6030,82 @@ def get_active_rules_for_field(content_type: str, field: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _effective_pattern(rule: dict) -> str:
+    """A literal-text rule (the default -- see is_regex's migration
+    comment) matches its pattern as plain text, escaped so no character in
+    it is ever treated as regex syntax. Only a rule explicitly marked
+    is_regex=1 gets its pattern used as raw regex."""
+    return rule["pattern"] if rule.get("is_regex") else re.escape(rule["pattern"])
+
+
 def apply_rules_to_value(value: str | None, rules: list[dict]) -> str | None:
     if not value or not rules:
         return value
-    import re
     for r in rules:
         try:
-            value = re.sub(r["pattern"], r["replacement"], value)
+            value = re.sub(_effective_pattern(r), r["replacement"], value)
         except re.error as exc:
-            logger.warning("[vod_db] bad metadata rule pattern id=%s: %s", r["id"], exc)
+            logger.warning("[vod_db] bad metadata rule pattern id=%s: %s", r.get("id"), exc)
     return value
 
 
-def apply_metadata_rules_to_pool(content_type: str) -> dict:
+def preview_metadata_rule(content_type: str, field: str, pattern: str, replacement: str, is_regex: bool, limit: int = 10) -> dict:
+    """Ad-hoc preview of one candidate rule against the current pool --
+    doesn't need to be saved as a real rule first. `field` is caller-
+    controlled and gets interpolated into the SELECT below, so it's
+    validated against REWRITABLE_FIELDS here rather than trusting the
+    route layer alone -- this function has to be safe to call on its own.
+    Real user request 2026-07-31, alongside is_regex/apply_metadata_rules_
+    to_pool's blast-radius guard: a rule meant to strip a literal string
+    had no way to check what it would actually match before committing it
+    against the whole pool."""
+    if field not in REWRITABLE_FIELDS:
+        raise ValueError(f"field must be one of {REWRITABLE_FIELDS}")
+    table = "movies" if content_type == "movie" else "series"
+    fake_rule = {"pattern": pattern, "replacement": replacement, "is_regex": is_regex}
+
+    conn = _connect()
+    rows = conn.execute(f"SELECT id, {field} FROM {table}").fetchall()
+    conn.close()
+
+    samples = []
+    match_count = 0
+    for row in rows:
+        old = row[field]
+        new = apply_rules_to_value(old, [fake_rule])
+        if new != old:
+            match_count += 1
+            if len(samples) < limit:
+                samples.append({"id": row["id"], "before": old, "after": new})
+    return {"total_pool": len(rows), "match_count": match_count, "samples": samples}
+
+
+# A real "strip this prefix" rule should only ever touch a small slice of
+# the pool -- anything past this fraction (floor'd so a small pool isn't
+# blocked by a handful of legitimate matches) is disproportionate enough to
+# warrant a second look before committing, not an automatic pass-through.
+_POOL_APPLY_BLAST_RADIUS_FRACTION = 0.05
+_POOL_APPLY_BLAST_RADIUS_FLOOR = 50
+
+
+def apply_metadata_rules_to_pool(content_type: str, force: bool = False) -> dict:
     """Re-applies all active rules for this content_type against the whole
     already-imported pool — same 'fix what's already there' pattern as the
     year-dedup and enrichment bulk-runs. Movies/series only (episodes don't
-    carry independently rewritable text beyond what their parent set)."""
+    carry independently rewritable text beyond what their parent set).
+
+    Real bug found live 2026-07-31: this used to commit unconditionally,
+    with no preview and no confirmation of scale -- a rule meant to strip a
+    literal string (e.g. "EN| ") but written with an unescaped regex
+    metacharacter (a bare "|" meaning "EN" OR an empty string, not the
+    literal text "EN|") would silently rewrite far more of the pool than
+    intended, with the first sign of trouble being the result count after
+    the fact. force=False (the default) blocks and returns samples instead
+    of committing whenever the change set is disproportionately large;
+    the caller re-calls with force=True to proceed anyway once they've seen
+    the samples. See preview_metadata_rule for checking a rule BEFORE
+    saving it in the first place, which is the safer path for anything
+    correcting the earlier fix's own damage."""
     table = "movies" if content_type == "movie" else "series"
     rules_by_field: dict[str, list[dict]] = {}
     for field in REWRITABLE_FIELDS:
@@ -5757,13 +6113,25 @@ def apply_metadata_rules_to_pool(content_type: str) -> dict:
         if rules:
             rules_by_field[field] = rules
     if not rules_by_field:
-        return {"checked": 0, "changed": 0}
+        return {"blocked": False, "checked": 0, "changed": 0}
 
     conn = _connect()
+    # Real bug found live 2026-07-31: a pool-wide rule apply overwrote name
+    # with no record of what it replaced whenever raw_name hadn't already
+    # been captured at import -- true for basically any pre-existing
+    # catalog, since raw_name tracking is new. That's the exact case the
+    # raw_name revert feature (built the same night) exists to protect
+    # against, so this fetches raw_name (series only -- see below) to
+    # backfill it from the about-to-be-overwritten name, and never touches
+    # a raw_name that's already set.
+    backfill_name = content_type == "series" and "name" in rules_by_field
     cols = ["id", *rules_by_field.keys()]
+    if backfill_name and "raw_name" not in cols:
+        cols.append("raw_name")
     rows = [dict(r) for r in conn.execute(f"SELECT {', '.join(cols)} FROM {table}").fetchall()]
 
-    changed = 0
+    pending: dict[int, dict] = {}
+    samples = []
     for row in rows:
         updates = {}
         for field, rules in rules_by_field.items():
@@ -5771,12 +6139,38 @@ def apply_metadata_rules_to_pool(content_type: str) -> dict:
             if new_val != row[field]:
                 updates[field] = new_val
         if updates:
-            sets = ", ".join(f"{f}=?" for f in updates)
-            conn.execute(f"UPDATE {table} SET {sets} WHERE id=?", (*updates.values(), row["id"]))
-            changed += 1
+            if backfill_name and "name" in updates and not row.get("raw_name"):
+                updates["raw_name"] = row["name"]
+            pending[row["id"]] = updates
+            if len(samples) < 10:
+                samples.append({"id": row["id"], "changes": updates})
+
+    threshold = max(_POOL_APPLY_BLAST_RADIUS_FLOOR, round(len(rows) * _POOL_APPLY_BLAST_RADIUS_FRACTION))
+    if not force and len(pending) > threshold:
+        conn.close()
+        return {"blocked": True, "checked": len(rows), "changed": len(pending), "threshold": threshold, "samples": samples}
+
+    # Movies have no single raw_name of their own -- it's captured per
+    # SOURCE (a movie can have arrived from more than one provider under
+    # different raw names), so the equivalent backfill for a movie whose
+    # name is about to change is onto each of its sources that doesn't
+    # already have its own raw_name, using the movie's current (pre-rule)
+    # name as the best available record of what it was.
+    if content_type == "movie" and "name" in rules_by_field:
+        old_name_by_id = {row["id"]: row["name"] for row in rows}
+        for row_id, updates in pending.items():
+            if "name" in updates:
+                conn.execute(
+                    "UPDATE movie_sources SET raw_name=? WHERE movie_id=? AND raw_name IS NULL",
+                    (old_name_by_id[row_id], row_id),
+                )
+
+    for row_id, updates in pending.items():
+        sets = ", ".join(f"{f}=?" for f in updates)
+        conn.execute(f"UPDATE {table} SET {sets} WHERE id=?", (*updates.values(), row_id))
     _commit_with_retry(conn)
     conn.close()
-    return {"checked": len(rows), "changed": changed}
+    return {"blocked": False, "checked": len(rows), "changed": len(pending)}
 
 
 # ── Merging duplicate pool entries ──────────────────────────────────────────
@@ -6446,6 +6840,23 @@ def resolve_missing_artwork(
     _commit_with_retry(conn)
     conn.close()
     return {"resolved_id": item_id}
+
+
+def backfill_tmdb_id_if_missing(content_type: str, item_id: int, tmdb_id: str) -> None:
+    """Real bug found live 2026-07-31: apply_tmdb_title_movie/series calls
+    rename_item with TMDB's own title, which can trigger rename_item's
+    merge-on-collision (an existing row already has that exact name+year) --
+    merge_movie/merge_series move sources/episodes/categories but never
+    touch tmdb_id, so the confirmed match just fetched from TMDB was
+    silently lost on the surviving row. Only backfills when the survivor
+    has no tmdb_id of its own -- never overwrites an existing (possibly
+    different) confirmed match."""
+    table = "movies" if content_type == "movie" else "series"
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(f"UPDATE {table} SET tmdb_id=? WHERE id=? AND tmdb_id IS NULL", (tmdb_id, item_id))
+        _commit_with_retry(conn)
+        conn.close()
 
 
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:

@@ -14,6 +14,7 @@ organizes what's already there according to an external list.
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -25,6 +26,16 @@ logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
 _YEAR_LOOKUP_CONCURRENCY = 6
+
+_API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
+
+
+def _redact(exc: Exception) -> str:
+    """str(exc) on an httpx.HTTPStatusError embeds the full request URL,
+    api_key included -- this must wrap every logged/returned exception from
+    a TMDB call, or a real API key ends up in plaintext in container logs
+    (and, via sync_all's error dict, in an API response body)."""
+    return _API_KEY_RE.sub(r"\1***", str(exc))
 
 
 async def fetch_list_items(list_id: str) -> list[dict]:
@@ -110,7 +121,7 @@ async def search_title(query: str, content_type: str) -> list[dict]:
                     out["episode_count"] = dd.get("number_of_episodes")
                 out["cast"] = [c["name"] for c in dd.get("credits", {}).get("cast", [])[:4]]
             except Exception as exc:
-                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], exc)
+                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], _redact(exc))
             return out
 
         results = data.get("results", [])
@@ -159,7 +170,7 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
                     for ep in sr.json().get("episodes", [])
                 ]
             except Exception as exc:
-                logger.warning("[tmdb_sync] failed to fetch season %d for tmdb_id=%s: %s", season_number, tmdb_id, exc)
+                logger.warning("[tmdb_sync] failed to fetch season %d for tmdb_id=%s: %s", season_number, tmdb_id, _redact(exc))
                 return []
 
         results = await asyncio.gather(*[_season(n) for n in seasons])
@@ -217,7 +228,7 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
                 title = data.get("title") if content_type == "movie" else data.get("name")
                 return tmdb_id, {"year": year, "title": title or None}
             except Exception as exc:
-                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", tmdb_id, exc)
+                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
                 return tmdb_id, {"year": None, "title": None}
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
@@ -293,6 +304,6 @@ async def sync_all() -> dict:
         try:
             results[category["name"]] = await sync_category(category["id"])
         except Exception as exc:
-            logger.warning("[tmdb_sync] sync failed for category=%s: %s", category["name"], exc)
-            results[category["name"]] = {"error": str(exc)}
+            logger.warning("[tmdb_sync] sync failed for category=%s: %s", category["name"], _redact(exc))
+            results[category["name"]] = {"error": _redact(exc)}
     return results

@@ -18,6 +18,7 @@ provider_type.
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -25,6 +26,15 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 20.0
+
+_API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _redact(exc: Exception) -> str:
+    """str(exc) on an httpx.HTTPStatusError embeds the full request URL,
+    api_key included -- this must wrap every logged Emby/Jellyfin exception
+    or a real API key ends up in plaintext in container logs."""
+    return _API_KEY_RE.sub(r"\1***", str(exc))
 
 # Identifies VOD-Manager-relayed sessions to Emby's Now Playing / dashboard —
 # the /Videos/{id}/stream direct-play endpoint never registers a session on
@@ -95,7 +105,7 @@ class EmbyVodClient:
                 json=body, headers=_SESSION_HEADERS,
             )
         except Exception as exc:
-            logger.warning("[emby_vod_client] POST %s failed: %s", path, exc)
+            logger.warning("[emby_vod_client] POST %s failed: %s", path, _redact(exc))
         finally:
             if owns_client:
                 await client.aclose()
@@ -132,7 +142,13 @@ class EmbyVodClient:
             "ParentId": library_id,
             "IncludeItemTypes": "Movie",
             "Recursive": "true",
-            "Fields": "Overview,Genres,ProductionYear,People,MediaSources,ProviderIds",
+            # CommunityRating added 2026-07-31 -- real bug found live: it was
+            # never requested at all, so every Emby-sourced movie showed 0.0
+            # regardless of enrichment, no matter what Emby itself had.
+            # PremiereDate added same day, same bug (release date was always
+            # blank for Emby-sourced content, found doing a completeness
+            # pass after the rating fix).
+            "Fields": "Overview,Genres,ProductionYear,People,MediaSources,ProviderIds,CommunityRating,PremiereDate",
         })
         return (data or {}).get("Items", []) or []
 
@@ -141,7 +157,7 @@ class EmbyVodClient:
             "ParentId": library_id,
             "IncludeItemTypes": "Series",
             "Recursive": "true",
-            "Fields": "Overview,Genres,ProductionYear,People,ProviderIds",
+            "Fields": "Overview,Genres,ProductionYear,People,ProviderIds,CommunityRating,PremiereDate",
         })
         return (data or {}).get("Items", []) or []
 
@@ -177,12 +193,22 @@ def extract_common_fields(item: dict) -> dict:
     directors = [p["Name"] for p in people if p.get("Type") == "Director" and p.get("Name")]
     cast = [p["Name"] for p in people if p.get("Type") == "Actor" and p.get("Name")]
     tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
+    # See list_movies/list_series -- CommunityRating has to be explicitly
+    # requested via Fields= or Emby omits it entirely from the response.
+    community_rating = item.get("CommunityRating")
+    # PremiereDate is a full ISO datetime ("2020-05-15T00:00:00.0000000Z") --
+    # trimmed to just the date portion to match XC's own releasedate shape
+    # (plain "YYYY-MM-DD") and Plex's originallyAvailableAt, which is
+    # already date-only.
+    premiere_date = item.get("PremiereDate")
     return {
         "genre": ", ".join(genres) or None,
         "description": item.get("Overview") or None,
         "director": ", ".join(directors) or None,
         "cast_list": ", ".join(cast) or None,
         "tmdb_id": str(tmdb_raw) if tmdb_raw and str(tmdb_raw).isdigit() else None,
+        "rating": str(community_rating) if community_rating is not None else None,
+        "release_date": premiere_date.split("T")[0] if premiere_date else None,
     }
 
 

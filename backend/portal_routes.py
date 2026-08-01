@@ -28,7 +28,7 @@ import vod_db
 from portal_auth import require_portal_auth
 from secrets_util import decrypt_value, verify_password
 from vod_routes import _parse_epg_datetime, _predict_stream_conflict, _require_dvr_connection
-from xc_server import _proxy_vod_stream
+from xc_server import _proxy_vod_stream, fetch_proxied_image
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/portal", tags=["dvr-portal"])
@@ -1016,3 +1016,16 @@ async def portal_library_stream(kind: str, item_id: int, request: Request, token
     # (used for its log-line labels only) -- map our "episode" to "series".
     proxy_kind = "series" if kind == "episode" else "movie"
     return await _proxy_vod_stream(proxy_kind, account["username"], sources, request, title=title)
+
+
+@router.get("/image-proxy")
+async def portal_image_proxy(url: str, token: str):
+    """Portal counterpart to vod_routes.image_proxy -- same reasoning (see
+    xc_server.fetch_proxied_image's docstring), using the portal's own
+    token system since portal users aren't admins. Takes the session token
+    as a `?token=` query param rather than the usual X-Portal-Session-Token
+    header for the same reason as portal_library_stream above -- a plain
+    <img src> can't attach a custom header."""
+    if portal_auth.resolve_portal_account_from_token(token) is None:
+        raise HTTPException(401, detail="unauthorized")
+    return await fetch_proxied_image(url)

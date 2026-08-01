@@ -12,6 +12,7 @@ separate Dispatcharr databases.
 import logging
 
 from dispatcharr_client import DispatcharrClient
+import dispatcharr_dvr_client
 import vod_db
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,168 @@ async def _sync_provider_to_connection(provider: dict, connection: dict) -> dict
     logger.info("[vod_sync] connection=%s: created profile %s for provider %s max_streams=%s",
                 connection["label"], profile["id"], provider["name"], provider["max_streams"])
     return profile
+
+
+# ── Discovering real upstream accounts already configured in Dispatcharr ────
+# Real user request 2026-07-31: the admin already told Dispatcharr about
+# every real XC login when they set up live TV there -- no reason to make
+# them retype the same username/password/base_url into a VOD Manager
+# provider row by hand, or keep the two in sync manually if a login's
+# password ever changes. Confirmed live 2026-07-31 against a real
+# Dispatcharr instance: GET /api/m3u/accounts/ returns full plaintext
+# username/password (not write-only), so this reads real credentials
+# straight from Dispatcharr's own API using the same connection token
+# already used everywhere else in this file.
+#
+# Real gap found live the same day, testing against real multi-login
+# providers: an M3U "account" is not always one real login. Dispatcharr
+# lets an admin represent several separate real upstream logins as
+# distinct "profiles" under one account object, each with its own
+# max_streams -- confirmed live, summing real profiles' max_streams
+# reproduced the admin's actual known per-provider connection totals
+# exactly. Each profile's search_pattern/replace_pattern is a plain
+# "username/password" -> "username/password" regex swap applied to the
+# account's own base credentials (confirmed live: a profile's
+# replace_pattern tokens never equal the account's own base username/
+# password when it's rewriting to a different login) -- except the
+# always-present "Default" profile, whose pattern is the literal
+# passthrough "^(.*)$" -> "$1" (no rewrite at all), meaning Default uses
+# the account's own base credentials unchanged. So discovery has to work
+# at the PROFILE level, not the account level: each profile (Default
+# included) is its own real, independently-capped login candidate.
+
+def _extract_profile_credentials(account: dict, profile: dict) -> tuple[str, str] | None:
+    """The real username/password this one profile actually streams with.
+    Default profile (or any pattern that's a no-op passthrough) uses the
+    account's own base credentials unchanged. A real rewrite profile's
+    replace_pattern is "username/password" -- split on the one slash. Any
+    other shape is unparseable (some other, non-credential rewrite use of
+    profiles this app hasn't seen) and this returns None rather than
+    guessing wrong credentials that could break real streaming."""
+    search_pattern = (profile.get("search_pattern") or "").strip()
+    replace_pattern = (profile.get("replace_pattern") or "").strip()
+    if search_pattern in ("^(.*)$", "") or replace_pattern in ("$1", ""):
+        return (account.get("username") or "", account.get("password") or "")
+    parts = replace_pattern.split("/")
+    if len(parts) == 2 and all(parts):
+        return (parts[0], parts[1])
+    return None
+
+
+async def list_discoverable_profiles(connection: dict) -> list[dict]:
+    """Every real upstream XC login Dispatcharr already knows about on this
+    connection, one entry per PROFILE (see module docstring above for why
+    profile, not account) -- excluding the one Dispatcharr account this
+    same connection's own vod_relay_account_id points at (that one is
+    Dispatcharr pointing BACK at us, not a real upstream source) and any
+    non-XC placeholder account (Dispatcharr's own "custom account" type has
+    no real credentials -- confirmed live, username/password both empty).
+    Each result carries whether it's already linked to a VOD Manager
+    provider on this connection, so the picker can show that state without
+    a second round trip. A profile whose rewrite pattern couldn't be parsed
+    into credentials is still listed (so the admin can see it exists) but
+    with credentials_unparseable=True and no username/password -- never
+    silently guessed."""
+    client = DispatcharrClient(connection["url"], connection["token"])
+    data = await client.get("/api/m3u/accounts/")
+    accounts = data if isinstance(data, list) else data.get("results", [])
+
+    relay_account_id = connection.get("vod_relay_account_id")
+    linked = {
+        (link["dispatcharr_account_id"], link["dispatcharr_profile_id"])
+        for link in vod_db.list_provider_live_accounts_for_connection(connection["id"])
+    }
+
+    candidates = []
+    for a in accounts:
+        if a["id"] == relay_account_id:
+            continue
+        if a.get("account_type") != "XC" or not a.get("username"):
+            continue
+        profiles = await dispatcharr_dvr_client.list_m3u_account_profiles(connection, a["id"])
+        for p in profiles:
+            if not p.get("is_active", True):
+                continue
+            creds = _extract_profile_credentials(a, p)
+            candidates.append({
+                "dispatcharr_account_id": a["id"],
+                "dispatcharr_profile_id": p["id"],
+                "name": f"{a['name']} ({p['name']})" if p["name"] != f"{a['name']} Default" else a["name"],
+                "username": creds[0] if creds else None,
+                "password": creds[1] if creds else None,
+                "credentials_unparseable": creds is None,
+                "server_url": a["server_url"],
+                "max_streams": p.get("max_streams") or 0,
+                "already_linked": (a["id"], p["id"]) in linked,
+            })
+    return candidates
+
+
+def _find_provider_linked_to_profile(connection_id: int, account_id: int, profile_id: int) -> dict | None:
+    for link in vod_db.list_provider_live_accounts_for_connection(connection_id):
+        if link["dispatcharr_account_id"] == account_id and link["dispatcharr_profile_id"] == profile_id:
+            return vod_db.get_provider(link["provider_id"])
+    return None
+
+
+def import_discovered_profile(connection_id: int, profile: dict) -> dict:
+    """Creates (or refreshes, if this Dispatcharr profile was already
+    imported before) one VOD Manager provider row from a discovered
+    Dispatcharr profile. upsert_provider matches by name, so re-running
+    this for a profile whose name hasn't changed on the Dispatcharr side
+    just refreshes its credentials rather than creating a duplicate row.
+    Preserves an already-imported provider's own priority rather than
+    resetting it to the default -- an admin's manual adjustment there
+    shouldn't get silently clobbered by a re-import. Refuses to import a
+    profile whose credentials couldn't be parsed (see
+    _extract_profile_credentials) rather than creating a provider with no
+    real login."""
+    if profile.get("credentials_unparseable") or not profile.get("username"):
+        raise ValueError(f"couldn't determine real credentials for profile {profile['name']!r} -- not imported")
+    existing = _find_provider_linked_to_profile(connection_id, profile["dispatcharr_account_id"], profile["dispatcharr_profile_id"])
+    priority = existing["priority"] if existing else 0
+    provider_id = vod_db.upsert_provider(
+        name=profile["name"], base_url=profile["server_url"],
+        username=profile["username"], password=profile["password"],
+        max_streams=profile["max_streams"], priority=priority, provider_type="xc",
+    )
+    if profile["max_streams"]:
+        vod_db.set_provider_shared_limit(provider_id, profile["max_streams"])
+    vod_db.set_provider_live_account(provider_id, connection_id, profile["dispatcharr_account_id"], profile["dispatcharr_profile_id"])
+    return vod_db.get_provider(provider_id)
+
+
+async def recheck_discovered_credentials(connection: dict) -> dict:
+    """Re-fetches every already-imported profile on this connection and
+    updates VOD Manager's stored username/password if Dispatcharr's own
+    values have since changed -- the actual "credentials rotate in
+    Dispatcharr, VOD Manager picks it up" half of discovery, not just the
+    one-time import. Only ever touches credentials (and base_url, which
+    comes from the same Dispatcharr account); leaves every other admin-set
+    field (priority, shared limit override, custom user-agent, category
+    exclusions, max_streams, etc.) alone -- max_streams drift on the
+    Dispatcharr side is a separate, deliberate re-import, not picked up
+    silently by a credentials-only recheck."""
+    profiles = await list_discoverable_profiles(connection)
+    changed = []
+    unchanged = 0
+    for profile in profiles:
+        if profile.get("credentials_unparseable"):
+            continue
+        provider = _find_provider_linked_to_profile(connection["id"], profile["dispatcharr_account_id"], profile["dispatcharr_profile_id"])
+        if not provider:
+            continue
+        if provider["username"] != profile["username"] or provider["password"] != profile["password"]:
+            vod_db.upsert_provider(
+                name=provider["name"], base_url=profile["server_url"],
+                username=profile["username"], password=profile["password"],
+                max_streams=provider["max_streams"], priority=provider["priority"],
+                provider_type=provider["provider_type"],
+            )
+            changed.append(provider["name"])
+        else:
+            unchanged += 1
+    return {"changed": changed, "unchanged_count": unchanged}
 
 
 async def sync_provider(provider_id: int) -> dict:
