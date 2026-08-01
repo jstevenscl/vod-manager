@@ -185,7 +185,9 @@ Each provider row also has:
   feeds a *live TV* account somewhere in Dispatcharr, link them here so VOD
   usage and live-TV usage draw from one accurately-tracked pool instead of
   silently exceeding your real connection limit. See your provider's actual
-  plan for its real concurrent-stream cap.
+  plan for its real concurrent-stream cap. If your subscription is split
+  into several Dispatcharr profiles, see *Multiple profiles on one
+  subscription* below before setting this up.
 - **User-Agent override** — some providers (a real example: one popular XC
   reseller) silently drop any request that doesn't look like it's coming
   from a browser. Leave this blank unless a specific provider needs it;
@@ -247,6 +249,64 @@ just set, not just how many providers finished.
 Import exclusion currently applies to Xtream-Codes (XC) providers only —
 Plex/Emby/Jellyfin libraries are typically your own personal media, so this
 isn't wired into those import paths yet.
+
+### Multiple profiles on one subscription
+
+Some XC resellers split a subscription into several Dispatcharr "profiles"
+so more than one connection can be open at once. This trips people up, so
+here is the **one rule that decides everything else** — or skip the manual
+counting below entirely and let VOD Manager read your real setup straight
+from Dispatcharr; see *Discovering providers automatically* in §6:
+
+> **Add exactly one provider row per distinct login (username+password
+> pair) — never one row per Dispatcharr profile, and never one row per
+> concurrent connection.** How many connections that one login is good for
+> is a *setting* on its single provider row (Shared Limit + Live Accounts),
+> not a reason to create more rows.
+
+This is because VOD Manager's connection-limit pooling mirrors Dispatcharr's
+own connection-fingerprint pooling exactly: it only pools two provider rows
+together when their username **and** password match **exactly**. Rows with
+different credentials are never pooled with each other, no matter how they're
+labeled or grouped in Dispatcharr.
+
+**Step 1 — count your distinct logins, not your profiles or connections.**
+Ask your provider (or check what you were actually given): how many
+different username/password pairs do you have? That number is exactly how
+many provider rows you need. Ignore how many Dispatcharr profiles or total
+concurrent connections you have — those numbers are irrelevant to this step.
+
+**Step 2 — for each distinct login, set up its one provider row correctly:**
+
+1. Add **one** provider row using that login's username/password.
+2. Set **Max streams** and **Shared Limit** to that login's real connection
+   cap (how many connections *this one login* — not your whole
+   subscription — is allowed to have open at once; see your provider's
+   plan).
+3. Under **Live Accounts**, link this row to *every* Dispatcharr profile
+   that was created using this same login. If this login only has one
+   Dispatcharr profile, link that one; if it was split into several profiles
+   for connection-management purposes, link all of them to this same single
+   row.
+4. Click **Import catalog** on this row.
+
+**Step 3 — repeat Step 2 for every other distinct login**, but skip the
+**Import catalog** click if that login serves the identical catalog as one
+you already imported (the common case for multiple logins from the same
+reseller). Importing the same catalog more than once creates real duplicate
+rows in your pool — see *Duplicate Finder*, §11.
+
+**Worked examples:**
+
+| Situation | Distinct logins | Provider rows needed | Import catalog on |
+|---|---|---|---|
+| One login, split into 5 Dispatcharr profiles for 5 connections ("5x1") | 1 | **1**, Shared Limit = 5, linked to all 5 profiles | that 1 row |
+| 5 logins, each with its own username/password, 1 connection each | 5 | **5**, each Max streams = 1, nothing linked between them | just 1 of the 5 |
+| 5 logins, each *also* split into 5 Dispatcharr profiles ("5x5" = 25 connections total) | 5 | **5** (not 25 — one per login), each Shared Limit = 5, each linked to its own 5 profiles | just 1 of the 5 |
+
+The number of Dispatcharr profiles or the total connection count never
+determines the number of provider rows by itself — only the number of
+distinct logins does.
 
 ---
 
@@ -347,6 +407,32 @@ categories instead of leaving it at "— all —". This is enforced everywhere
 that credential is used (catalog listing, detail lookups, and the actual
 stream), not just hidden from a browse UI — a restricted client can't reach
 disallowed content even with a raw copied stream URL.
+
+### Discovering providers automatically
+
+Once a **Dispatcharr Connection** exists (above), you don't have to type in
+provider credentials by hand at all — click **Discover** on that
+connection's row instead. This reads every real XC login Dispatcharr
+already has configured on it — one entry per Dispatcharr "profile", since a
+single Dispatcharr account can represent several separate real logins that
+way (see *Multiple profiles on one subscription*, §5) — and shows you
+exactly what it found: real base URL, username, and max streams, straight
+from Dispatcharr, nothing to retype.
+
+![Discover Providers modal, usernames masked](docs/screenshots/discover-providers.png)
+
+Check the ones you want and click **Import selected**, or **Select all
+valid logins** to grab everything in one click. A profile whose credential
+rewrite pattern couldn't be cleanly parsed is listed but greyed out with an
+explanation rather than guessed at — configure that one manually instead.
+This is deliberately a review-and-import step, not a silent background
+sync: nothing gets added as a provider until you choose it here.
+
+**Re-check credentials** re-runs the same read against Dispatcharr and
+updates any provider whose real password has since rotated on Dispatcharr's
+side, without touching anything else you've set on that provider (priority,
+category exclusions, shared limit, etc.). Already-imported profiles show as
+"already imported" rather than being offered again.
 
 ---
 
@@ -638,8 +724,25 @@ it's reachable from the public internet at all — do these:
 
 ## 9. Browsing and managing your catalog
 
-The **Movies** and **TV Shows** tabs are the main catalog views, each with a
-**list** or **grid** (poster wall) mode.
+Above the catalog itself, the dashboard always shows two live cards:
+
+- **Activity** — what's playing right now, across every viewer, refreshed
+  continuously. Empties out the moment playback stops; nothing here
+  persists.
+- **Failed Streams** — the opposite: a *persisted* log of playback attempts
+  that failed outright (every source for that title was tried and none
+  worked) or broke mid-stream after starting, surviving restarts unlike
+  Activity above. Each row lists every provider that was actually tried and
+  its own specific error — not just the last one — so you can tell "every
+  source for this title is genuinely down" apart from "one specific
+  provider keeps failing while the others are fine." Dismiss individual
+  rows or **Clear all**; the log itself is capped at the most recent 500
+  entries and prunes automatically.
+
+![Failed Streams, showing a mid-stream crash and an every-source-exhausted failure](docs/screenshots/failed-streams.png)
+
+The **Movies** and **TV Shows** tabs below that are the main catalog views,
+each with a **list** or **grid** (poster wall) mode.
 
 ![Movies tab, grid view](docs/screenshots/movies-grid.png)
 
@@ -663,6 +766,23 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
 
 ![Renaming a movie](docs/screenshots/rename-movie.png)
 
+- **Use TMDB title** — appears next to *Rename / fix year* whenever the item
+  already has a confirmed TMDB match. One click renames it to TMDB's own
+  canonical title and year — useful after *Use TMDB title* or a Title &
+  Metadata Rule has left the display name slightly different from what TMDB
+  itself calls it. If the corrected title collides with an existing pool
+  entry, the two merge (same as a manual rename above), and the confirmed
+  TMDB id carries over to whichever row survives.
+- **Revert to this** — every source records the provider's *original* name
+  at import time even after a Title & Metadata Rule cleans it up for
+  display. If a source's captured original name differs from the item's
+  current name, a **"Provider's original name: ..."** line appears under
+  that source with a one-click **Revert to this** button. Search also
+  matches this original name, so a title is still findable by what the
+  provider called it even after a rule has rewritten the display name.
+
+![Use TMDB title and Revert to this, on a source whose display name was rewritten by a Title & Metadata Rule](docs/screenshots/revert-and-tmdb-title.png)
+
 - **Archive** (the archive-box icon on each row) is a true archive: an
   archived item is immediately removed from every category placement (so
   Dispatcharr stops seeing it right away, not just eventually) and hidden
@@ -675,6 +795,51 @@ The **Movies** and **TV Shows** tabs are the main catalog views, each with a
   the next sync no matter how many times you delete it locally, so Archive is
   the only way to durably hide something that's still provider-backed. Use
   the **Orphan Checker** (§11) to find and clean up genuine orphans in bulk.
+
+### Fixing a wrong match, and removing dead sources
+
+Every movie or episode can have more than one **source** — one entry per
+provider currently serving it. Expand any item to see its full source list;
+each source line has two actions beyond the usual **Play** and **Copy
+playable stream URL**:
+
+- **Move to a different movie/episode** (the ↔ icon) — for when a
+  provider's own listing was matched to the wrong title on import (a typo,
+  a title collision, a garbled name). Search for the correct movie, or for
+  an episode, search for the correct series and give it the right
+  season/episode number — that episode is created if it doesn't exist yet —
+  and the source moves there with its history intact, instead of you having
+  to delete and re-add it. If the source you moved was the old item's only
+  source, that now-empty item is cleaned up automatically.
+- **Remove source** (the × icon) — deletes just that one source. If it's
+  the item's only source, this deletes the item itself, since nothing would
+  be left to serve it; if other sources remain, the item stays available
+  from them.
+
+![A movie's Sources list: a failing source, a source whose provider name doesn't match the movie ("Cinderella" under "The Crew"), and the Move/Remove actions](docs/screenshots/move-and-remove-source.png)
+
+A source that keeps failing shows a warning right on its own line —
+**"Failed Nx in a row, last &lt;time&gt; — likely dead, consider
+removing"** — updated on every real playback attempt, not just when every
+source for that title fails outright (see *Failed Streams* above). This
+catches what Failed Streams alone can't: a title that *looks* healthy
+because one provider covers it, while a second provider's copies are almost
+all actually broken and simply never get tried because the first one
+already succeeded. A source with a live failure streak is automatically
+tried *last* during playback, behind every source without one, so it stops
+being everyone's slow first (and doomed) attempt.
+
+On a TV show, if more than one episode from the *same* provider is
+currently failing, a **Failing sources** box appears at the top of that
+show's Episodes list, grouped by provider — with a one-click **Remove all**
+to strip every one of that provider's sources from the whole show at once,
+instead of clearing them episode by episode.
+
+![Failing sources box on a TV show, grouped by provider, with Remove all](docs/screenshots/failing-sources.png)
+
+As with any source removal, **Remove all** can delete an episode (or, if
+that provider was the only one covering it, the whole show) if nothing else
+was serving it — the confirmation prompt warns before you commit.
 
 ---
 
@@ -704,6 +869,18 @@ you still review and confirm yourself:
   correct match among the real TMDB search candidates already shown, with
   its reasoning and a confidence level. You still click a candidate
   yourself to apply it.
+
+**Ask AI stays greyed out until at least one TMDB candidate is shown to
+choose among** — it picks from that list, it doesn't search TMDB itself.
+That candidate list depends on your **TMDB API key** (Configuration → API
+Keys), which is a *separate* key from the AI provider key above — having an
+AI provider configured isn't enough on its own if the TMDB key is missing
+or the search for that title's stored name genuinely returns nothing. If
+you see "No TMDB matches found for this name" under an item, that's why
+the button is disabled for it: try a cleaned-up search term in the "search
+TMDB as" box first, or set the year manually.
+
+![Ask AI disabled on an item with zero TMDB candidates — the "No TMDB matches found" message is why](docs/screenshots/ask-ai-disabled.png)
 
 Each provider has a model dropdown (Configuration → API Keys) with a
 curated set of options, from cheapest/fastest to most capable — defaults to
