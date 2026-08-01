@@ -109,6 +109,14 @@ export default function App() {
     retry: false,
   })
 
+  const hideDvrTabQuery = useQuery<{ hidden: boolean }>({
+    queryKey: ['hide-dvr-tab'],
+    queryFn:  () => api.get('/vod/hide-dvr-tab/').then((r) => r.data),
+    enabled: authState === 'ready',
+    staleTime: 30_000,
+  })
+  const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
+
   useEffect(() => {
     if (isLoading) return
     if (!settings?.has_credentials) {
@@ -121,6 +129,15 @@ export default function App() {
       .then((r) => setAuthState(r.data.valid ? 'ready' : 'login'))
       .catch(() => setAuthState('login'))
   }, [isLoading, settings?.has_credentials])
+
+  useEffect(() => {
+    // If DVR was hidden (by this admin or another) while it was the active
+    // tab -- including on load, from a stale localStorage value -- land
+    // somewhere that's still actually in the nav instead of an empty pane.
+    if (hideDvrTabQuery.data?.hidden && activeTab === 'dvr') {
+      setActiveTab('movies')
+    }
+  }, [hideDvrTabQuery.data?.hidden, activeTab])
 
   function handleSkipFirstRun() {
     localStorage.setItem('vodmanager-firstrun-dismissed', '1')
@@ -185,7 +202,7 @@ export default function App() {
           </div>
         </div>
         <nav className="flex-1 space-y-3.5">
-          {NAV_GROUPS.map((group) => (
+          {navGroups.map((group) => (
             <div key={group.label}>
               <div className="px-2 pb-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">{group.label}</div>
               {group.items.map((item) => {

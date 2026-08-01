@@ -13,6 +13,7 @@ from config import (
     get_anthropic_api_key,
     get_default_categories_prompt_dismissed,
     get_gemini_api_key,
+    get_hide_dvr_tab,
     get_import_language_exclusion,
     get_lockout_settings,
     get_openai_api_key,
@@ -32,6 +33,7 @@ from config import (
     save_stream_priority_mode,
     save_tmdb_api_key,
     set_default_categories_prompt_dismissed,
+    set_hide_dvr_tab,
 )
 from routes import require_auth
 from secrets_util import hash_password, looks_like_fernet_token
@@ -85,6 +87,10 @@ class AiApiKeyRequest(BaseModel):
 
 class DefaultCategoriesAdultRequest(BaseModel):
     include_adult: bool
+
+
+class HideDvrTabRequest(BaseModel):
+    hidden: bool
 
 
 class ImportLanguageExclusionRequest(BaseModel):
@@ -734,6 +740,17 @@ async def get_default_categories_prompt():
         return {"show": False}
     has_catchall = bool(await asyncio.to_thread(vod_db.list_catchall_category_ids))
     return {"show": has_catchall}
+
+
+@router.get("/hide-dvr-tab/", dependencies=_GUARDS)
+async def get_hide_dvr_tab_setting():
+    return {"hidden": get_hide_dvr_tab()}
+
+
+@router.post("/hide-dvr-tab/", dependencies=_GUARDS)
+async def set_hide_dvr_tab_setting(body: HideDvrTabRequest):
+    set_hide_dvr_tab(body.hidden)
+    return {"ok": True}
 
 
 @router.post("/default-categories-prompt/", dependencies=_GUARDS)
