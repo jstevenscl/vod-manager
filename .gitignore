@@ -47,8 +47,7 @@ Thumbs.db
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
-# internal audit-trail log (bd close/create reasons can reference real
-# catalog/account details) -- not something a repo visitor needs, and this
-# keeps future entries from landing in a public commit automatically
-.beads/interactions.jsonl
+# entire beads tracker lives in the private dev repo now, not here --
+# see C:\Tools\scripts\Release-ToPublic.ps1 / EDM CURRENT.md for the
+# private->public release workflow this repo is paired with
+.beads/
