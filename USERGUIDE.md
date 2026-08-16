@@ -236,6 +236,21 @@ visible/shift-click pattern as the language picker.
 
 ![Exclude Categories picker for a provider](docs/screenshots/exclude-categories-modal.png)
 
+If a provider's own category list has drifted since you last set exclusions
+(a category renamed or removed on their end), the picker calls those out
+separately — "N saved exclusions no longer reported by this provider" — with
+a one-click **Remove stale** action, instead of silently folding them into
+the selected count where they'd make the numbers look wrong.
+
+**Archive new categories** (checkbox next to each provider, alongside
+*Auto-create categories*) goes a step further: instead of a category you
+have to notice and exclude by hand, any category a provider reports for the
+first time gets auto-archived the moment it's discovered, same as
+Dispatcharr's own "auto-archive new VOD categories" behavior. Off by
+default, and turning it on never retroactively archives categories the
+provider was already reporting before you enabled it — only ones that show
+up for the first time on a later import.
+
 Turning either of these on only affects **future** imports by default. If
 you already have a large catalog and want the new rules applied
 retroactively, click **Apply rules to existing catalog now** — this
@@ -783,6 +798,14 @@ each with a **list** or **grid** (poster wall) mode.
 
 ![Use TMDB title and Revert to this, on a source whose display name was rewritten by a Title & Metadata Rule](docs/screenshots/revert-and-tmdb-title.png)
 
+- **Apply TMDB Titles** (Movies/TV Shows toolbar) is the bulk version of
+  *Use TMDB title* above — renames every item in the library that already
+  has a confirmed TMDB match to TMDB's own title/year, wherever it currently
+  differs, instead of clicking through one at a time. Still only ever
+  touches items with an already-confirmed match; it doesn't go looking for
+  new matches itself. Large libraries process in bounded batches, so this
+  can take a little while — the button's label updates with a running "N
+  renamed" count as it works.
 - **Archive** (the archive-box icon on each row) is a true archive: an
   archived item is immediately removed from every category placement (so
   Dispatcharr stops seeing it right away, not just eventually) and hidden
@@ -996,7 +1019,12 @@ main player) lets you play more than one candidate side by side before
 deciding. Pick which candidate to keep — the rest merge into it (sources,
 categories, and episodes all move over automatically, nothing is lost) — or
 **Ignore** a group that isn't actually a duplicate so it stops resurfacing on
-future scans.
+future scans. The pre-selected candidate favors TMDB confirmation over raw
+source count — a candidate with a confirmed, cross-checked TMDB match is
+picked by default even if another candidate happens to have more sources,
+since an unconfirmed candidate outranking a confirmed one by source count
+alone was more often wrong than right. Still just a starting point — pick a
+different one any time before merging.
 
 **Check TMDB-confirmed matches** goes a step further: it checks every group in
 the current scan against TMDB in the background (a real API call per
@@ -1036,12 +1064,20 @@ under Configuration → API Keys unlocks:
 
 - Real TMDB search for the Needs Review and Missing Artwork flows above
 - **TMDB Lists** (Curation & Maintenance) — link a public TMDB List (a
-  personal watchlist, for example) to auto-populate a category. A list can
-  contain both movies and shows, so linking one creates a paired movie
-  category and series category — kept separate since Dispatcharr's movie
-  and TV catalogs are different endpoints. Only items already present in
-  your pool ever get placed; this organizes existing content, it doesn't
-  pull in anything new.
+  personal watchlist, or a well-known curated list like IMDB's Top 250, for
+  example) to auto-populate a category. A list can contain both movies and
+  shows, so linking one creates a paired movie category and series category
+  — kept separate since Dispatcharr's movie and TV catalogs are different
+  endpoints. Only items already present in your pool ever get placed; this
+  organizes existing content, it doesn't pull in anything new. Matching
+  first tries each list entry's own TMDB id against your pool directly, then
+  falls back to a forgiving title+year match (tolerating a provider
+  mislabeling a release year by one) for pool items that don't have a
+  confirmed TMDB id yet — a real hit backfills the id, so the match is
+  instant on the next sync. Without this fallback, a list only ever matched
+  the handful of items a provider happened to tag with their own TMDB id at
+  import time, which is why a large curated list used to place almost
+  nothing.
 
 ---
 

@@ -267,12 +267,33 @@ async def sync_category(category_id: int) -> dict:
 
         if media_type == "movie" and category["content_type"] == "movie":
             movie = vod_db.get_movie_by_tmdb_id(tmdb_id)
+            if not movie:
+                # Most pool movies never get a tmdb_id at import time (only
+                # set when the provider's own metadata happens to include
+                # one) -- fall back to a normalized title+year match against
+                # the list's own title/date fields (GH issue #3: curated
+                # lists like IMDB Top 250 were matching "very few items"
+                # because this fallback didn't exist). A hit backfills the
+                # tmdb_id so future syncs take the fast id-only path.
+                title = item.get("title") or item.get("original_title")
+                release_date = item.get("release_date") or ""
+                year = int(release_date[:4]) if release_date[:4].isdigit() else None
+                movie = title and vod_db.find_movie_by_title_year(title, year)
+                if movie:
+                    vod_db.backfill_tmdb_id_if_missing("movie", movie["id"], str(tmdb_id))
             if movie:
                 matched_movie_ids.append(movie["id"])
             else:
                 unmatched += 1
         elif media_type == "tv" and category["content_type"] == "series":
             series = vod_db.get_series_by_tmdb_id(tmdb_id)
+            if not series:
+                title = item.get("name") or item.get("original_name")
+                first_air_date = item.get("first_air_date") or ""
+                year = int(first_air_date[:4]) if first_air_date[:4].isdigit() else None
+                series = title and vod_db.find_series_by_title_year(title, year)
+                if series:
+                    vod_db.backfill_tmdb_id_if_missing("series", series["id"], str(tmdb_id))
             if series:
                 matched_series_ids.append(series["id"])
             else:

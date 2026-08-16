@@ -16,6 +16,8 @@ __pycache__/
 *.pyo
 *.egg-info/
 .venv/
+venv/
+backend/venv/
 
 # frontend
 node_modules/
@@ -27,6 +29,7 @@ backend/static/
 # runtime data (config.json, sessions.json, sqlite DBs — never commit real credentials/data)
 /data/
 backend/data/
+backend/devdata/
 *.sqlite
 *.sqlite3
 *.sqlite-wal
