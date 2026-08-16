@@ -54,7 +54,7 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
         <div className="text-center space-y-2">
           <div className="flex items-center justify-center gap-2">
             <Clapperboard size={28} className="text-primary" />
-            <h1 className="text-2xl font-semibold">VOD Manager</h1>
+            <h1 className="text-2xl font-semibold">VOD & DVR Manager</h1>
           </div>
           <p className="text-sm text-muted-foreground">
             {firstRun ? 'Set up an admin login to get started.' : 'Account settings'}
@@ -71,7 +71,7 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
               <p className="text-xs text-muted-foreground mt-0.5">
                 {hasCredentials
                   ? 'Update the username and password used to sign in.'
-                  : 'Protect VOD Manager with a username and password, or skip to run without a login.'}
+                  : 'Protect VOD & DVR Manager with a username and password, or skip to run without a login.'}
               </p>
             </div>
 
@@ -149,7 +149,7 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
             <div className="flex items-start gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-md px-3 py-2">
               <AlertCircle size={14} className="shrink-0 mt-0.5" />
               <span>
-                Skipping means VOD Manager runs with <strong>no login at all</strong> — anyone who can reach this
+                Skipping means VOD & DVR Manager runs with <strong>no login at all</strong> — anyone who can reach this
                 app (e.g. if the port is exposed to the internet, not just your local network) has full access:
                 your streaming credentials, provider logins, API keys, and the database backup download. Only skip
                 if this instance is only reachable from a network you trust.
@@ -159,7 +159,7 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
               <button
                 className="text-sm text-muted-foreground hover:text-foreground transition-colors mx-auto"
                 onClick={() => {
-                  if (confirm('Run VOD Manager with no login? Anyone who can reach this app will have full access. Only continue if you\'re sure this instance is not exposed to the internet.')) {
+                  if (confirm('Run VOD & DVR Manager with no login? Anyone who can reach this app will have full access. Only continue if you\'re sure this instance is not exposed to the internet.')) {
                     onSkip()
                   }
                 }}

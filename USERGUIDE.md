@@ -1,4 +1,4 @@
-# VOD Manager — User Guide
+# VOD & DVR Manager — User Guide
 
 A complete walkthrough: install it, connect your real sources, wire it into
 Dispatcharr (one instance or several), lock it down, and use the curation
@@ -12,7 +12,7 @@ walkthrough, see [README.md](README.md).
 
 ## Table of contents
 
-1. [What VOD Manager does](#1-what-vod-manager-does)
+1. [What VOD & DVR Manager does](#1-what-vod-manager-does)
 2. [Prerequisites](#2-prerequisites)
 3. [Installation](#3-installation)
 4. [First-run setup](#4-first-run-setup)
@@ -29,9 +29,9 @@ walkthrough, see [README.md](README.md).
 
 ---
 
-## 1. What VOD Manager does
+## 1. What VOD & DVR Manager does
 
-VOD Manager pulls movies and TV shows from whatever real sources you have —
+VOD & DVR Manager pulls movies and TV shows from whatever real sources you have —
 one or more Xtream-Codes (XC) IPTV providers, a Plex server, an Emby or
 Jellyfin server — and merges them into a single deduplicated catalog (the
 *pool*). It then re-exposes that pool as its own XC-compatible server, so
@@ -47,7 +47,7 @@ flowchart LR
         EMBY["Emby / Jellyfin"]
     end
 
-    subgraph VM["VOD Manager"]
+    subgraph VM["VOD & DVR Manager"]
         POOL["Import → Pool<br/>(dedupe, curate)"]
         XCS["Own XC server"]
     end
@@ -145,7 +145,7 @@ normally you'll just set a login through the UI on first run instead):
 
 ## 4. First-run setup
 
-On first visit, VOD Manager asks you to set an admin username and password.
+On first visit, VOD & DVR Manager asks you to set an admin username and password.
 
 ![Login / account settings screen](docs/screenshots/login-settings.png)
 
@@ -177,9 +177,9 @@ click **Add**.
 Each provider row also has:
 
 - **Priority** — lower numbers are preferred when the same title is
-  available from more than one source; VOD Manager tries them in order and
+  available from more than one source; VOD & DVR Manager tries them in order and
   fails over automatically.
-- **Max streams** — a hard cap on concurrent connections VOD Manager itself
+- **Max streams** — a hard cap on concurrent connections VOD & DVR Manager itself
   will open against this provider (`0` = unlimited).
 - **Shared Limit / Live Accounts** — if this same real subscription also
   feeds a *live TV* account somewhere in Dispatcharr, link them here so VOD
@@ -191,7 +191,7 @@ Each provider row also has:
 - **User-Agent override** — some providers (a real example: one popular XC
   reseller) silently drop any request that doesn't look like it's coming
   from a browser. Leave this blank unless a specific provider needs it;
-  VOD Manager already sends a normal desktop-browser User-Agent by default.
+  VOD & DVR Manager already sends a normal desktop-browser User-Agent by default.
 
 Once a provider is added, click **Import catalog** to pull its listing in
 for the first time. This is a metadata-only pass (name/year/category/stream
@@ -270,7 +270,7 @@ isn't wired into those import paths yet.
 Some XC resellers split a subscription into several Dispatcharr "profiles"
 so more than one connection can be open at once. This trips people up, so
 here is the **one rule that decides everything else** — or skip the manual
-counting below entirely and let VOD Manager read your real setup straight
+counting below entirely and let VOD & DVR Manager read your real setup straight
 from Dispatcharr; see *Discovering providers automatically* in §6:
 
 > **Add exactly one provider row per distinct login (username+password
@@ -279,7 +279,7 @@ from Dispatcharr; see *Discovering providers automatically* in §6:
 > is a *setting* on its single provider row (Shared Limit + Live Accounts),
 > not a reason to create more rows.
 
-This is because VOD Manager's connection-limit pooling mirrors Dispatcharr's
+This is because VOD & DVR Manager's connection-limit pooling mirrors Dispatcharr's
 own connection-fingerprint pooling exactly: it only pools two provider rows
 together when their username **and** password match **exactly**. Rows with
 different credentials are never pooled with each other, no matter how they're
@@ -327,11 +327,11 @@ distinct logins does.
 
 ## 6. Connecting Dispatcharr
 
-VOD Manager distinguishes two separate relationships with Dispatcharr, both
+VOD & DVR Manager distinguishes two separate relationships with Dispatcharr, both
 configured under **Configuration**:
 
-- **Connected Instances** — *who's allowed to pull from VOD Manager.*
-- **Dispatcharr Connections** — *who VOD Manager itself reaches out to*, to
+- **Connected Instances** — *who's allowed to pull from VOD & DVR Manager.*
+- **Dispatcharr Connections** — *who VOD & DVR Manager itself reaches out to*, to
   push connection-limit data and check live-TV viewer counts for the
   shared-limit coordination mentioned above.
 
@@ -357,7 +357,7 @@ categories (Manage Categories) on top of, or instead of, these two.
 If any of your providers are already connected directly in Dispatcharr with
 VOD enabled, turn that off first. Otherwise you end up with the same movies
 and series pulled in twice — once straight from the provider, once again
-through VOD Manager's own pool — competing for the same groups.
+through VOD & DVR Manager's own pool — competing for the same groups.
 
 Do this **one provider at a time**, not all at once — running it across
 every provider simultaneously can cause database issues.
@@ -376,7 +376,7 @@ For each provider:
 
 Once every provider is done, open the **VODs** modal in Dispatcharr and
 confirm both Movies and Series are empty. Only then are you ready to attach
-VOD Manager as the new source.
+VOD & DVR Manager as the new source.
 
 ### Connecting a single instance (the easy way)
 
@@ -384,12 +384,12 @@ Under *Dispatcharr Connections → Connect a new instance*, give it:
 
 - A label of your choosing
 - That Dispatcharr instance's own URL and an **admin API token** from it
-- VOD Manager's own URL, **as reachable from that Dispatcharr instance** —
-  this is not always the same URL you're viewing VOD Manager at yourself. A
+- VOD & DVR Manager's own URL, **as reachable from that Dispatcharr instance** —
+  this is not always the same URL you're viewing VOD & DVR Manager at yourself. A
   co-located instance (same Docker network/host) might use an internal
   hostname; a remote one needs your real public/VPN-reachable URL.
 
-Click **Connect**. VOD Manager automatically:
+Click **Connect**. VOD & DVR Manager automatically:
 
 1. Creates its own high-entropy client credentials
 2. Creates the Dispatcharr-side XC M3U account for you, capped at 50
@@ -415,7 +415,7 @@ others.
 **Per-instance category access control**: Dispatcharr has no per-user VOD
 split of its own — everyone on a given Dispatcharr instance sees whatever
 that instance's M3U account can see. To give one instance (or one end-user
-IPTV app pointed straight at VOD Manager, bypassing Dispatcharr entirely) a
+IPTV app pointed straight at VOD & DVR Manager, bypassing Dispatcharr entirely) a
 *restricted* catalog — a kids-only view, for example — set that instance's
 *Category access* under *Connected Instances* to a specific set of
 categories instead of leaving it at "— all —". This is enforced everywhere
@@ -455,7 +455,7 @@ category exclusions, shared limit, etc.). Already-imported profiles show as
 
 DVR isn't a provider you add — it's a capability you turn on for a
 Dispatcharr connection you already have (§6). There's no separate catalog to
-set up: enabling it just tells VOD Manager "also pull finished recordings
+set up: enabling it just tells VOD & DVR Manager "also pull finished recordings
 from this instance," and they show up in your pool alongside everything else.
 
 Under **Configuration → Dispatcharr Connections**, each row has a DVR
@@ -468,10 +468,10 @@ same settings modal.
 
 The **Local/NFS path** field is not a path on your host machine, and not a
 path inside Dispatcharr's own container. It's a path **as seen from inside
-the VOD Manager container itself**. That distinction is the single most
+the VOD & DVR Manager container itself**. That distinction is the single most
 common way to misconfigure this.
 
-**Leave it blank** and VOD Manager downloads each recording's file once,
+**Leave it blank** and VOD & DVR Manager downloads each recording's file once,
 over Dispatcharr's own API, into its own storage — no shared filesystem
 needed at all. This always works, regardless of where either instance runs,
 and is the right choice for a Dispatcharr instance on a different machine
@@ -479,9 +479,9 @@ with no shared/NFS mount. It costs one extra copy of each recording's bytes
 and is a little slower to import than reading the file directly, but nothing
 about setup or ongoing use requires touching Docker volumes at all.
 
-**Set a path** only when VOD Manager's own container can read that
+**Set a path** only when VOD & DVR Manager's own container can read that
 Dispatcharr instance's recordings directory directly off disk — which means
-that directory has to be *mounted into VOD Manager's container*, not just
+that directory has to be *mounted into VOD & DVR Manager's container*, not just
 present somewhere on the host. Two ways to get there:
 
 - **Same host, Dispatcharr also running in Docker** (the common case): mount
@@ -493,7 +493,7 @@ present somewhere on the host. Two ways to get there:
   real values in a `docker-compose.override.yml` (gitignored) rather than
   editing the tracked file, so a `git pull` never clobbers your local setup.
 - **Different host, reachable over NFS**: mount the NFS share at the host
-  level first (plain Docker/OS NFS client config — VOD Manager itself never
+  level first (plain Docker/OS NFS client config — VOD & DVR Manager itself never
   talks NFS), then bind-mount that host path into the container, same
   syntax as any other bind mount.
 
@@ -502,7 +502,7 @@ in the field — e.g. `/mnt/dvr/dispatch-test/recordings`, not
 `/var/lib/docker/volumes/.../_data/recordings` and not Dispatcharr's own
 internal `/data/recordings`. Point it at the `recordings` subfolder
 specifically — Dispatcharr reports each file's path with a `/data/recordings`
-prefix, and VOD Manager strips that prefix and re-joins the remainder onto
+prefix, and VOD & DVR Manager strips that prefix and re-joins the remainder onto
 whatever you put here, so mounting one level too high or low silently
 produces file-not-found on every recording.
 
@@ -538,7 +538,7 @@ back to this one — see **Users** below for why.
 
 Neither ingestion mode ever cleaned up the original recording on
 Dispatcharr's own side — Dispatcharr has no automatic retention of its own,
-so left alone, its disk just fills up forever with content VOD Manager has
+so left alone, its disk just fills up forever with content VOD & DVR Manager has
 already absorbed. **Delete from Dispatcharr once safely copied**, on the
 same DVR settings modal, fixes this — off by default, so it's always a
 deliberate choice, never a surprise the moment you update.
@@ -547,10 +547,10 @@ What it actually does depends on which mode you're using:
 
 - **Local/NFS path (shared-volume) mode** — normally just references
   Dispatcharr's own file directly, no bytes ever copied. With this on,
-  a completed recording gets copied into VOD Manager's own storage first
+  a completed recording gets copied into VOD & DVR Manager's own storage first
   (independent of Dispatcharr's file), verified against the exact byte size
   Dispatcharr itself reports for that recording, and only *after* that
-  verified copy exists does VOD Manager ask Dispatcharr to delete the
+  verified copy exists does VOD & DVR Manager ask Dispatcharr to delete the
   original — which removes the underlying file too, not just Dispatcharr's
   own database record.
 - **Download mode** — already makes an independent copy of every recording;
@@ -579,7 +579,7 @@ A couple of things worth knowing:
 A **Recording Rule** (renamed from "Recording Profiles" — you may see the
 old name in older screenshots) watches one EPG channel for anything matching
 a title, and keeps discovering and scheduling new airings as Dispatcharr's
-guide data updates — this is VOD Manager's own replacement for Dispatcharr's
+guide data updates — this is VOD & DVR Manager's own replacement for Dispatcharr's
 built-in Series Rules, which have a channel-matching bug of their own for
 this kind of setup. Create one from the DVR tab's **Scheduled Recordings**
 page or the EPG search.
@@ -596,7 +596,7 @@ Each rule can set:
   - **Pointer** — no extra disk cost; just references the existing source's
     stream. The file stays wherever it already lived.
   - **Download-and-store** — makes a real local copy of the existing
-    source's bytes under VOD Manager's own storage, same as a normal
+    source's bytes under VOD & DVR Manager's own storage, same as a normal
     recording, but without needing Dispatcharr to record it again.
   - Either mode still counts the matched item toward the rule owner's disk
     quota (as virtual usage for pointer mode, real usage for download mode)
@@ -660,7 +660,7 @@ DVR is split into five subpages once you're actually using it day to day:
 ### The self-service Portal
 
 DVR also ships a separate, lightweight web app for end users — not admins —
-to manage their own recordings without touching the main VOD Manager UI at
+to manage their own recordings without touching the main VOD & DVR Manager UI at
 all. It has its own login (a **Portal account**, created per-person under
 the Users page — separate from both the admin login and their Dispatcharr
 credentials) and its own URL.
@@ -704,7 +704,7 @@ If this is reachable beyond a network you fully trust — and especially if
 it's reachable from the public internet at all — do these:
 
 1. **Set a real login** (§4) and don't use the Skip option.
-2. **Put TLS in front of it.** VOD Manager doesn't terminate TLS itself —
+2. **Put TLS in front of it.** VOD & DVR Manager doesn't terminate TLS itself —
    use a reverse proxy (nginx, Caddy, Traefik) or a tunnel (Cloudflare
    Tunnel, Tailscale, WireGuard) if it's reachable from outside your LAN.
    This matters more than usual here: the XC protocol itself has no session
@@ -1113,12 +1113,12 @@ restart — this overrides the stored login while set, letting you sign in
 and set a new one from the UI. Remove the environment variables afterward.
 
 **Dispatcharr says "Provider returned no VOD categories... aborting VOD
-refresh."** This means VOD Manager currently has zero categories — normally
+refresh."** This means VOD & DVR Manager currently has zero categories — normally
 impossible since a fresh install auto-seeds "All Movies"/"All TV Shows"
 (§6), but it can happen if every category was manually deleted. Create at
 least one category (Manage Categories) and re-run the Dispatcharr sync.
 
-**A Dispatcharr instance can't reach VOD Manager.** Double check the URL
+**A Dispatcharr instance can't reach VOD & DVR Manager.** Double check the URL
 you gave it during "Connect a new instance" is reachable *from that
 instance's own network position*, not just from your browser — a
 Docker-internal hostname won't resolve from a remote instance, and vice

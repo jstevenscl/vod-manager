@@ -193,7 +193,7 @@ export default function App() {
         <div className="flex items-center gap-2 px-1.5 pb-4">
           <img src="/favicon.svg" width={26} height={26} alt="" className="rounded-md flex-shrink-0" />
           <div className="min-w-0">
-            <div className="text-sm font-bold tracking-tight leading-tight">VOD Manager</div>
+            <div className="text-sm font-bold tracking-tight leading-tight">VOD & DVR Manager</div>
             {versionQuery.data && (
               <div className="text-[10px] text-muted-foreground font-mono truncate" title={`ref: ${versionQuery.data.ref}`}>
                 v{versionQuery.data.version} · {versionQuery.data.commit}

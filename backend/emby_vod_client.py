@@ -43,8 +43,8 @@ def _redact(exc: Exception) -> str:
 # heartbeat + X-Plex-Client-Identifier).
 _DEVICE_ID = "vod-manager-relay-4d8f2b17"
 _SESSION_HEADERS = {
-    "X-Emby-Client": "VOD Manager",
-    "X-Emby-Device-Name": "VOD Manager",
+    "X-Emby-Client": "VOD & DVR Manager",
+    "X-Emby-Device-Name": "VOD & DVR Manager",
     "X-Emby-Device-Id": _DEVICE_ID,
     "X-Emby-Client-Version": "1.0.0",
 }

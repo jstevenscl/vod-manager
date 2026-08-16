@@ -59,10 +59,10 @@ def notify_quota_threshold(
         to.append(user_email)
     if not to:
         return
-    subject = f"[VOD Manager] {username} reached {pct}% of their DVR quota"
+    subject = f"[VOD & DVR Manager] {username} reached {pct}% of their DVR quota"
     body = (
         f"{username}'s DVR recordings on {provider_name} are now using "
         f"{usage_bytes / 1e9:.1f} GB of their {quota_bytes / 1e9:.1f} GB quota ({pct}%).\n\n"
-        "This is an automated notice from VOD Manager."
+        "This is an automated notice from VOD & DVR Manager."
     )
     send_email(to, subject, body)

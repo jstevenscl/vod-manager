@@ -37,7 +37,7 @@ export default function Login({ onLogin }: Props) {
         <div className="flex items-center justify-center gap-3">
           <img src="/favicon.svg" width={84} height={84} alt="" className="rounded-lg" />
           <div className="text-left">
-            <h1 className="text-2xl font-semibold">VOD Manager</h1>
+            <h1 className="text-2xl font-semibold">VOD & DVR Manager</h1>
             <p className="text-sm text-muted-foreground flex items-center gap-1.5">
               <Lock size={12} /> Sign in to continue
             </p>
