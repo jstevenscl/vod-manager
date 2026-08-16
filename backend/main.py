@@ -424,7 +424,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="VOD Manager", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="VOD & DVR Manager", version=APP_VERSION, lifespan=lifespan)
 app.include_router(router)
 app.include_router(vod_router)
 app.include_router(portal_router)

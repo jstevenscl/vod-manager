@@ -1,4 +1,4 @@
-# VOD Manager
+# VOD & DVR Manager
 
 Curates movies and TV shows from multiple real sources — Xtream-Codes (XC)
 IPTV providers, Plex, and Emby/Jellyfin — into one deduplicated pool, then
@@ -7,7 +7,7 @@ Dispatcharr instances can pull it like any other provider.
 
 Same real content is often available from several sources at once (a movie
 on both an XC reseller and your own Plex library, or the same title from two
-different resellers). VOD Manager treats those as multiple *sources* for one
+different resellers). VOD & DVR Manager treats those as multiple *sources* for one
 pool entry rather than duplicate entries, and automatically fails over
 between them if one goes down or hits its connection limit.
 
@@ -46,7 +46,7 @@ docker build -t vod-manager:local .
 ```
 
 The app listens on port `8282`. First run asks you to set an admin
-username/password (VOD Manager's own login, separate from Dispatcharr's) —
+username/password (VOD & DVR Manager's own login, separate from Dispatcharr's) —
 see [USERGUIDE.md](USERGUIDE.md#4-first-run-setup) for why you should set
 one rather than skip it.
 
@@ -56,29 +56,29 @@ walkthrough with screenshots in [USERGUIDE.md](USERGUIDE.md).
 
 ## Connecting Dispatcharr instances
 
-VOD Manager distinguishes two separate relationships with Dispatcharr:
+VOD & DVR Manager distinguishes two separate relationships with Dispatcharr:
 
-- **Connected Instances** — *who's allowed to pull from VOD Manager.* Each
+- **Connected Instances** — *who's allowed to pull from VOD & DVR Manager.* Each
   Dispatcharr instance gets its own auto-generated, high-entropy
-  username/password pair. Use VOD Manager's own URL as the `server_url` on
+  username/password pair. Use VOD & DVR Manager's own URL as the `server_url` on
   an XC-type M3U account in that Dispatcharr instance, with the generated
   credentials.
-- **Dispatcharr Connections** — *who VOD Manager itself reaches out to.*
+- **Dispatcharr Connections** — *who VOD & DVR Manager itself reaches out to.*
   Used to push each provider's connection limit into Dispatcharr's own
   admission control, and to check real-time live-TV viewer counts for
   shared-connection-limit coordination (see below).
 
 A single Dispatcharr instance is usually both at once (it pulls from VOD
-Manager *and* VOD Manager pushes profile data back to it), but they don't
+Manager *and* VOD & DVR Manager pushes profile data back to it), but they don't
 have to match — you can have Dispatcharr instances that only pull, and
-connections VOD Manager only reaches out to for coordination.
+connections VOD & DVR Manager only reaches out to for coordination.
 
 **Adding a new instance** (Configuration → Dispatcharr Connections →
 "Connect a new instance"): give it that instance's own admin API token and VOD
 Manager's own URL as reachable *from that instance* — this isn't always the
-same URL you're viewing VOD Manager at yourself (a co-located instance
+same URL you're viewing VOD & DVR Manager at yourself (a co-located instance
 might use a Docker-internal hostname; a remote one needs your real public
-URL). VOD Manager then automatically creates the client credentials and the
+URL). VOD & DVR Manager then automatically creates the client credentials and the
 Dispatcharr-side M3U account for you (with a 50-concurrent-stream account-
 level cap — generous on purpose, since the real per-provider limits are
 enforced separately; see below). The only thing left is on Dispatcharr's
@@ -160,7 +160,7 @@ Review, Orphan Checker) with screenshots.
 DVR isn't a separate provider you add — it's a capability you turn on for a
 Dispatcharr connection you already have, so a connection's finished
 recordings flow into the same pool as everything else. Beyond ingestion, it
-covers EPG-driven Recording Rules (VOD Manager's own replacement for
+covers EPG-driven Recording Rules (VOD & DVR Manager's own replacement for
 Dispatcharr's own Series Rules, which have a channel-matching bug), backfill
 (reuse existing pooled content instead of re-recording), per-person disk
 quotas/stream limits/retention, a Missing Episodes view, Metrics, and a
@@ -170,7 +170,7 @@ account records into their own explicitly-assigned DVR category — there's
 no silent shared default, by design (see
 [USERGUIDE.md](USERGUIDE.md#7-dvr-recordings) for why). An opt-in **delete
 from Dispatcharr once safely copied** setting keeps Dispatcharr's own
-storage from filling up forever with content VOD Manager has already
+storage from filling up forever with content VOD & DVR Manager has already
 absorbed — off by default, and only ever deletes after a byte-verified
 independent copy exists. Full setup
 (including the local-path-vs-download-mode decision, which is easy to get
@@ -180,7 +180,7 @@ wrong) and screenshots in [USERGUIDE.md](USERGUIDE.md#7-dvr-recordings).
 
 If a real provider also has its own native live-TV account somewhere in
 Dispatcharr (common — the same IPTV subscription usually serves both live
-channels and VOD), live TV and VOD Manager's own usage draw from the same
+channels and VOD), live TV and VOD & DVR Manager's own usage draw from the same
 real connection pool without either side knowing about the other by
 default. Configure it under Providers → *Shared Limit / Live Accounts*:
 
@@ -192,7 +192,7 @@ default. Configure it under Providers → *Shared Limit / Live Accounts*:
   provider can have a different live-TV account on more than one
   Dispatcharr instance; all of them count toward the same real limit.
 
-VOD Manager checks the current combined usage (its own active streams +
+VOD & DVR Manager checks the current combined usage (its own active streams +
 every linked live account's viewer count) before opening a new stream
 against that provider, and fails over to the next available source instead
 of exceeding the real limit.
@@ -267,7 +267,7 @@ Configuration → Refresh Schedule controls how often background work runs:
 ## Backup and restore
 
 Configuration → Backup & Restore lets you download, restore, or reset each
-piece of VOD Manager's state independently (config, sessions, the catalog
+piece of VOD & DVR Manager's state independently (config, sessions, the catalog
 database) — e.g. reset a corrupted database without touching saved
 credentials, or roll back just the config. Database downloads use SQLite's
 `VACUUM INTO` for a consistent snapshot even while the app is actively
@@ -297,9 +297,9 @@ every already-confirmed TMDB match at once, instead of one item at a time.
 **Auto-create categories** (per provider, Providers → *Auto-create
 categories*) creates a Smart Category for every distinct category name a
 provider reports on import, matched via that item's own provider-category
-tag — so your VOD Manager categories mirror the provider's own grouping
+tag — so your VOD & DVR Manager categories mirror the provider's own grouping
 without hand-building a rule for each one. Two providers that both have a
-category literally named "Comedy" share one VOD Manager "Comedy" category
+category literally named "Comedy" share one VOD & DVR Manager "Comedy" category
 rather than creating a duplicate. Never overwrites a category you've already
 built by hand with the same name — it only ever fills in what's missing.
 

@@ -268,12 +268,12 @@ _LIVE_PLACEHOLDER_CATEGORY_ID = "999999"
 _LIVE_PLACEHOLDER_STREAM_ID = 999_000_000
 _LIVE_PLACEHOLDER_CATEGORY = {
     "category_id": _LIVE_PLACEHOLDER_CATEGORY_ID,
-    "category_name": "VOD Manager (no live TV)",
+    "category_name": "VOD & DVR Manager (no live TV)",
     "parent_id": 0,
 }
 _LIVE_PLACEHOLDER_STREAM = {
     "num": 1,
-    "name": "VOD Manager does not provide live TV",
+    "name": "VOD & DVR Manager does not provide live TV",
     "stream_type": "live",
     "stream_id": _LIVE_PLACEHOLDER_STREAM_ID,
     "stream_icon": "",

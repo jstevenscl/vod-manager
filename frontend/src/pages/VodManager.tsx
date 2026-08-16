@@ -5016,7 +5016,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <div className="p-5 space-y-3">
             <h2 className="text-base font-semibold">Include 18+ content in the default categories?</h2>
             <p className="text-sm text-muted-foreground">
-              VOD Manager keeps two catch-all categories — "All Movies" and "All TV Shows" — so Dispatcharr always has
+              VOD & DVR Manager keeps two catch-all categories — "All Movies" and "All TV Shows" — so Dispatcharr always has
               something to sync against. By default they exclude 18+ titles. You can change this later, per category,
               in Manage Categories.
             </p>
@@ -5580,7 +5580,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Who VOD Manager itself reaches out to — the other side of Connected Instances above (who's allowed to
+          Who VOD & DVR Manager itself reaches out to — the other side of Connected Instances above (who's allowed to
           reach in). Used to push each provider's stream limit into Dispatcharr's own connection accounting, and
           to check real-time live-TV viewer counts for the shared-connection-limit coordination below.
         </p>
@@ -5588,7 +5588,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         <div className="border border-border rounded p-2 space-y-1.5">
           <p className="text-xs font-medium">Connect a new instance (automated)</p>
           <p className="text-xs text-muted-foreground">
-            Give it that instance's own admin API token — VOD Manager creates its client credentials and the
+            Give it that instance's own admin API token — VOD & DVR Manager creates its client credentials and the
             Dispatcharr-side M3U account for you. All that's left afterward is on Dispatcharr's own side: enable
             VOD on the new account and pick which groups to turn on, same as any other source.
           </p>
@@ -5597,7 +5597,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <input className={inputCls('w-36')} placeholder="http://host:port" value={connectUrl} onChange={(e) => setConnectUrl(e.target.value)} />
             <input className={inputCls('w-36')} placeholder="Admin API token" value={connectToken} onChange={(e) => setConnectToken(e.target.value)} />
             <input
-              className={inputCls('w-44')} placeholder="VOD Manager's URL, as reachable from that instance"
+              className={inputCls('w-44')} placeholder="VOD & DVR Manager's URL, as reachable from that instance"
               value={connectPublicUrl} onChange={(e) => setConnectPublicUrl(e.target.value)}
               title="e.g. host.docker.internal:8282 for a co-located instance, or the public tunnel URL for a remote one — not always the same as what you're viewing this page at"
             />
@@ -5781,7 +5781,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               </div>
               <label
                 className="flex items-center gap-1.5 text-sm cursor-pointer"
-                title="Off by default. Once a recording has an independently verified copy in VOD Manager's own storage (an actual local copy either way -- Local/NFS path recordings get copied out of the shared mount first, download-mode recordings already are one), deletes the original from Dispatcharr to free its disk space. Verified by comparing file size against what Dispatcharr itself reports before anything is deleted -- never deletes without a confirmed independent copy. Turning this on also gradually cleans up recordings already imported before this setting existed, a few per import pass, not all at once."
+                title="Off by default. Once a recording has an independently verified copy in VOD & DVR Manager's own storage (an actual local copy either way -- Local/NFS path recordings get copied out of the shared mount first, download-mode recordings already are one), deletes the original from Dispatcharr to free its disk space. Verified by comparing file size against what Dispatcharr itself reports before anything is deleted -- never deletes without a confirmed independent copy. Turning this on also gradually cleans up recordings already imported before this setting existed, a few per import pass, not all at once."
               >
                 <input
                   type="checkbox"
@@ -7113,7 +7113,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                               <Button
                                 size="sm" className="text-destructive"
                                 disabled={applyRetention.isPending || !retentionCandidatesQuery.data || (!retentionCandidatesQuery.data.movies.length && !retentionCandidatesQuery.data.episodes.length)}
-                                onClick={() => { if (confirm('Delete these items from the VOD Manager pool? This cannot be undone.')) applyRetention.mutate() }}
+                                onClick={() => { if (confirm('Delete these items from the VOD & DVR Manager pool? This cannot be undone.')) applyRetention.mutate() }}
                               >
                                 {applyRetention.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Trash2 size={12} className="mr-1" /> Delete listed items</>}
                               </Button>
@@ -7604,7 +7604,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 <SectionCard title="Failed Recording Replacements" icon={<CalendarClock size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     Recordings Dispatcharr scheduled and attempted but that genuinely failed -- Dispatcharr never
-                    retries these on its own. VOD Manager looks for the same episode's next airing on any channel in
+                    retries these on its own. VOD & DVR Manager looks for the same episode's next airing on any channel in
                     that person's own lineup and reschedules it there automatically; "unresolved" is retried every
                     poll cycle rather than given up on.
                   </p>

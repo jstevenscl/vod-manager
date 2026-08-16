@@ -726,7 +726,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
             <img src="/favicon.svg" width={18} height={18} alt="" className="brightness-0 invert opacity-90" />
           </div>
           <div className="hidden sm:block">
-            <div className="text-base font-bold leading-tight tracking-tight">VOD Manager</div>
+            <div className="text-base font-bold leading-tight tracking-tight">VOD & DVR Manager</div>
             {meQuery.data && (
               <div className="text-xs text-muted-foreground leading-tight">
                 {meQuery.data.provider_name ?? 'DVR portal'}

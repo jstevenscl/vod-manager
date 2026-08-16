@@ -196,7 +196,7 @@ async def portal_enroll_mfa(body: PortalPendingTokenRequest):
         raise HTTPException(400, detail="MFA is already enrolled for this account")
     secret = pyotp.random_base32()
     vod_db.set_portal_account_totp(account_id, secret, totp_enabled=False)
-    otpauth_uri = pyotp.totp.TOTP(secret).provisioning_uri(name=account["username"], issuer_name="VOD Manager Portal")
+    otpauth_uri = pyotp.totp.TOTP(secret).provisioning_uri(name=account["username"], issuer_name="VOD & DVR Manager Portal")
     return {"secret": secret, "otpauth_uri": otpauth_uri}
 
 

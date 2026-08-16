@@ -129,8 +129,8 @@ class PlexClient:
                 "time": max(int(time_ms), 0),
                 "duration": max(int(duration_ms), 0),
                 "X-Plex-Client-Identifier": CLIENT_IDENTIFIER,
-                "X-Plex-Device-Name": "VOD Manager",
-                "X-Plex-Product": "VOD Manager",
+                "X-Plex-Device-Name": "VOD & DVR Manager",
+                "X-Plex-Product": "VOD & DVR Manager",
             })
         except Exception as exc:
             logger.warning("[plex_client] timeline report failed: %s", _redact(exc))
