@@ -33,6 +33,7 @@ interface Provider {
   dvr_series_category_id: number | null
   dvr_delete_after_copy: number
   auto_create_categories: number
+  archive_new_categories: number
 }
 
 interface RecordingProfile {
@@ -1457,9 +1458,36 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
   isIgnorePending: boolean
   tmdbDetails?: Record<string, { year: number | null; title: string | null }>
 }) {
-  // Backend already sorts most-sourced/most-placed first -- the obvious
-  // default "keep" pick, but still a human decision the reviewer can override.
-  const [keepId, setKeepId] = useState(group.items[0].id)
+  // Backend sorts most-sourced/most-placed first, but that ignores TMDB
+  // confirmation entirely -- an unconfirmed candidate with more sources used
+  // to beat a TMDB-confirmed one for the default "keep" pick. Rank by TMDB
+  // signal first (corroborated match > uncorroborated match > no signal
+  // either way > year mismatch > confirmed-wrong while a sibling matches),
+  // falling back to the backend's source/category order within a tier.
+  const rankTmdbTier = (item: DuplicateGroup['items'][number]) => {
+    const trueYear = item.tmdb_id ? tmdbDetails?.[item.tmdb_id]?.year : undefined
+    const corroborated = item.tmdb_id != null && (tmdbIdCounts.get(item.tmdb_id) ?? 0) > 1
+    const yearMatch = trueYear != null && item.year === trueYear
+    const yearMismatch = trueYear != null && item.year !== trueYear
+    const noMatchWhileSiblingHas = !item.tmdb_id && group.items.some((o) => o.id !== item.id && o.tmdb_id != null)
+    if (yearMatch && corroborated) return 3
+    if (yearMatch && !corroborated) return 2
+    if (yearMismatch) return 0
+    if (noMatchWhileSiblingHas) return -1
+    return 1 // no tmdb signal either way -- neutral, defer to source/category order
+  }
+  const bestDefaultId = group.items.reduce(
+    (best, item) => (rankTmdbTier(item) > rankTmdbTier(best) ? item : best),
+    group.items[0],
+  ).id
+  const [keepId, setKeepId] = useState(bestDefaultId)
+  const [userPickedKeep, setUserPickedKeep] = useState(false)
+  useEffect(() => {
+    // tmdbDetails resolves asynchronously after this group first renders;
+    // re-rank once it lands, but never override a reviewer's manual pick.
+    if (!userPickedKeep) setKeepId(bestDefaultId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bestDefaultId, userPickedKeep])
   const [previewIds, setPreviewIds] = useState<Set<number>>(new Set())
   const togglePreview = (id: number) => setPreviewIds((prev) => {
     const next = new Set(prev)
@@ -1531,7 +1559,7 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
             <PosterThumb url={item.poster_url} className="w-12 h-[72px] object-cover rounded shrink-0" fallback={null} />
             <div className="flex-1 min-w-0">
               <label className="flex items-center gap-2 cursor-pointer">
-                <input type="radio" checked={keepId === item.id} onChange={() => setKeepId(item.id)} />
+                <input type="radio" checked={keepId === item.id} onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }} />
                 <span className={keepId === item.id ? 'font-medium' : ''}>{item.name} ({item.year})</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
@@ -4091,6 +4119,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       api.post(`/vod/providers/${id}/auto-create-categories/`, null, { params: { enabled } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
   })
+  const setProviderArchiveNewCategories = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.post(`/vod/providers/${id}/archive-new-categories/`, null, { params: { enabled } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
   const [excludeCategoriesProviderId, setExcludeCategoriesProviderId] = useState<number | null>(null)
   const [excludeCategoriesDraft, setExcludeCategoriesDraft] = useState<Set<string>>(new Set())
   const [excludeCategoriesSearch, setExcludeCategoriesSearch] = useState('')
@@ -4793,6 +4826,35 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/duplicates/tmdb-details/', { params: { content_type: duplicatesContentType, tmdb_ids: duplicatesTmdbIdsKey } }).then((r) => r.data),
     enabled:  !!duplicatesTmdbIdsKey,
   })
+
+  // ── Bulk "apply TMDB title" (GH issue #1) ──
+  // Catches the whole library up to TMDB's own titles in one action instead
+  // of the existing per-item button being the only way. Still only ever
+  // touches items with an already-confirmed tmdb_id -- same manual-only,
+  // opt-in-per-run philosophy as the single-item version, just looped
+  // client-side against the cursor-paginated bulk-apply endpoint so one
+  // huge library doesn't have to fit in a single request.
+  const [tmdbBulkApply, setTmdbBulkApply] = useState<Record<'movie' | 'series', { running: boolean; checked: number; renamed: number; error?: string } | null>>({ movie: null, series: null })
+  async function runBulkApplyTmdbTitles(contentType: 'movie' | 'series') {
+    setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: 0, renamed: 0 } }))
+    let afterId = 0
+    let totalChecked = 0
+    let totalRenamed = 0
+    try {
+      for (;;) {
+        const r = await api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/tmdb-title/bulk-apply/`, null, { params: { after_id: afterId, limit: 100 } })
+        totalChecked += r.data.checked
+        totalRenamed += r.data.renamed
+        afterId = r.data.last_id
+        setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: totalChecked, renamed: totalRenamed } }))
+        if (!r.data.has_more) break
+      }
+      qc.invalidateQueries({ queryKey: [contentType === 'movie' ? 'vod-movies' : 'vod-series'] })
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed } }))
+    } catch (e: any) {
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, error: e?.response?.data?.detail ?? e.message ?? 'Failed' } }))
+    }
+  }
 
   // ── Movies ──
   const [movieSearch, setMovieSearch] = useState('')
@@ -6277,6 +6339,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     />
                     Auto-create categories
                   </label>
+                  <label
+                    className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer"
+                    title="A category this provider reports for the first time on a future import gets auto-archived immediately, same as Exclude Categories -- catches new categories before they land in your library instead of after. Categories already known as of today are unaffected."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!p.archive_new_categories}
+                      disabled={setProviderArchiveNewCategories.isPending}
+                      onChange={(e) => setProviderArchiveNewCategories.mutate({ id: p.id, enabled: e.target.checked })}
+                    />
+                    Archive new categories
+                  </label>
                   <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
@@ -6342,6 +6416,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {excludeCategoriesProviderId != null && (() => {
         const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
+        const allNamesSet = new Set(allNames)
+        // Saved exclusions can outlive the provider's own category list (renamed,
+        // removed, or a transient partial fetch) -- those names are invisible in
+        // `visible` below but were still being counted into the selected total,
+        // which is what made "Select visible (296)" saving as "314 selected"
+        // look like a persistence bug when it was really stale/invisible entries.
+        const staleNames = providerAvailableCategoriesQuery.data
+          ? Array.from(excludeCategoriesDraft).filter((n) => !allNamesSet.has(n))
+          : []
         const visible = allNames.filter((name) => {
           if (excludeCategoriesSearch && !name.toLowerCase().includes(excludeCategoriesSearch.toLowerCase())) return false
           if (excludeCategoriesShowFilter === 'selected' && !excludeCategoriesDraft.has(name)) return false
@@ -6396,8 +6479,25 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   >
                     Deselect visible ({visible.filter((n) => excludeCategoriesDraft.has(n)).length})
                   </button>
-                  <span className="text-muted-foreground ml-auto">{excludeCategoriesDraft.size} selected total · shift-click to select a range</span>
+                  <span className="text-muted-foreground ml-auto">{excludeCategoriesDraft.size - staleNames.length} selected total · shift-click to select a range</span>
                 </div>
+                {staleNames.length > 0 && (
+                  <div className="flex items-center gap-1.5 text-xs text-warning">
+                    <span>
+                      {staleNames.length} saved exclusion{staleNames.length === 1 ? '' : 's'} no longer reported by this provider (kept, hidden from the list above)
+                    </span>
+                    <button
+                      className="underline decoration-dotted hover:text-foreground"
+                      onClick={() => {
+                        const next = new Set(excludeCategoriesDraft)
+                        staleNames.forEach((n) => next.delete(n))
+                        setExcludeCategoriesDraft(next)
+                      }}
+                    >
+                      Remove stale
+                    </button>
+                  </div>
+                )}
               </>
             )}
             <div className="max-h-64 overflow-y-auto space-y-1 border border-border rounded p-2">
@@ -7921,6 +8021,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('movie')}>
             Language Filter
           </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!!tmdbBulkApply.movie?.running}
+            title="Renames every movie with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-movie TMDB-title button, just for the whole library at once"
+            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('movie') }}
+          >
+            {tmdbBulkApply.movie?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
+            Apply TMDB Titles{tmdbBulkApply.movie && !tmdbBulkApply.movie.running ? ` (${tmdbBulkApply.movie.renamed} renamed)` : ''}
+          </Button>
+          {tmdbBulkApply.movie?.error && <span className="text-xs text-destructive">{tmdbBulkApply.movie.error}</span>}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -8071,6 +8181,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('series')}>
             Language Filter
           </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!!tmdbBulkApply.series?.running}
+            title="Renames every series with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-series TMDB-title button, just for the whole library at once"
+            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('series') }}
+          >
+            {tmdbBulkApply.series?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
+            Apply TMDB Titles{tmdbBulkApply.series && !tmdbBulkApply.series.running ? ` (${tmdbBulkApply.series.renamed} renamed)` : ''}
+          </Button>
+          {tmdbBulkApply.series?.error && <span className="text-xs text-destructive">{tmdbBulkApply.series.error}</span>}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"

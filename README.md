@@ -291,7 +291,8 @@ leave behind — a series whose only source provider no longer exists, or
 movies/episodes with zero sources at all). Every movie/series can also be
 manually renamed or have its year corrected from its own detail view, for
 whatever a provider's own catalog data got wrong with no other way to fix
-it.
+it. **Apply TMDB Titles** (Movies/TV Shows toolbar) does this in bulk for
+every already-confirmed TMDB match at once, instead of one item at a time.
 
 **Auto-create categories** (per provider, Providers → *Auto-create
 categories*) creates a Smart Category for every distinct category name a
@@ -303,6 +304,12 @@ rather than creating a duplicate. Never overwrites a category you've already
 built by hand with the same name — it only ever fills in what's missing.
 
 ![Auto-create categories checkbox on a provider](docs/screenshots/provider-auto-create-categories.png)
+
+**Archive new categories** (per provider, next to *Auto-create categories*)
+auto-archives any category a provider reports for the first time, catching
+it before it lands in your library instead of after — off by default, and
+never retroactively archives a category the provider was already reporting
+before you turned it on.
 
 **Stream priority** (Curation & Maintenance → *Stream Priority*) controls
 which of a pool item's multiple real sources gets used first when more than

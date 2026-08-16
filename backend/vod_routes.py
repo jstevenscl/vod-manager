@@ -1161,6 +1161,14 @@ async def set_provider_auto_create_categories(provider_id: int, enabled: bool):
     return {"ok": True}
 
 
+@router.post("/providers/{provider_id}/archive-new-categories/", dependencies=_GUARDS)
+async def set_provider_archive_new_categories(provider_id: int, enabled: bool):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    vod_db.set_provider_archive_new_categories(provider_id, enabled)
+    return {"ok": True}
+
+
 @router.get("/providers/{provider_id}/available-categories/", dependencies=_GUARDS)
 async def get_provider_available_categories(provider_id: int):
     """Live category names from the provider itself (both movie and series
@@ -2679,6 +2687,39 @@ async def apply_tmdb_title_movie(movie_id: int):
     return result
 
 
+@router.post("/movies/tmdb-title/bulk-apply/", dependencies=_GUARDS)
+async def bulk_apply_tmdb_title_movies(after_id: int = 0, limit: int = 100):
+    """Batch counterpart to apply_tmdb_title_movie (GH issue #1: catch the
+    whole library up in one pass instead of one click per movie). Same
+    manual-only, already-confirmed-tmdb_id-only philosophy as the single-item
+    version -- still never runs automatically on import/enrichment. Cursor
+    paginated (after_id) and bounded per call (default 100) so one request
+    can't fan out into an unbounded number of TMDB lookups; the frontend
+    loops, passing back the highest id seen, until has_more is false."""
+    candidates = await asyncio.to_thread(vod_db.list_movies_with_tmdb_id, after_id, limit)
+    if not candidates:
+        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+    try:
+        details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "movie")
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    renamed = 0
+    for c in candidates:
+        detail = details.get(c["tmdb_id"], {})
+        title = detail.get("title")
+        year = detail.get("year") or c["year"]
+        if not title or (title == c["name"] and year == c["year"]):
+            continue
+        try:
+            result = vod_db.rename_item("movie", c["id"], title, year)
+        except ValueError:
+            continue
+        if "merged_into" in result:
+            vod_db.backfill_tmdb_id_if_missing("movie", result["merged_into"], c["tmdb_id"])
+        renamed += 1
+    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
+
+
 @router.delete("/movies/{movie_id}/", dependencies=_GUARDS)
 async def delete_movie(movie_id: int):
     if not vod_db.get_movie(movie_id):
@@ -2862,6 +2903,33 @@ async def apply_tmdb_title_series(series_id: int):
     if "merged_into" in result:
         vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], series["tmdb_id"])
     return result
+
+
+@router.post("/series/tmdb-title/bulk-apply/", dependencies=_GUARDS)
+async def bulk_apply_tmdb_title_series(after_id: int = 0, limit: int = 100):
+    """See bulk_apply_tmdb_title_movies' identical docstring -- same reasoning."""
+    candidates = await asyncio.to_thread(vod_db.list_series_with_tmdb_id, after_id, limit)
+    if not candidates:
+        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+    try:
+        details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "series")
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    renamed = 0
+    for c in candidates:
+        detail = details.get(c["tmdb_id"], {})
+        title = detail.get("title")
+        year = detail.get("year") or c["year"]
+        if not title or (title == c["name"] and year == c["year"]):
+            continue
+        try:
+            result = vod_db.rename_item("series", c["id"], title, year)
+        except ValueError:
+            continue
+        if "merged_into" in result:
+            vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], c["tmdb_id"])
+        renamed += 1
+    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
 
 
 @router.delete("/series/{series_id}/", dependencies=_GUARDS)

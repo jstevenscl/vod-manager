@@ -176,6 +176,29 @@ async def import_provider_catalog(provider_id: int) -> dict:
     categories = await client.get_vod_categories()
     category_names = {str(c["category_id"]): c["category_name"] for c in categories}
 
+    series_categories = await client.get_series_categories()
+    series_category_names = {str(c["category_id"]): c["category_name"] for c in series_categories}
+
+    # GH issue #5: archive a category the moment it's first seen on this
+    # provider, same as Dispatcharr's own "auto-archive newly discovered VOD
+    # provider categories" behavior, instead of it landing in the library
+    # fully visible until an admin notices and hand-adds it to
+    # import_exclude_categories. known_import_categories is always
+    # refreshed below regardless of the setting, so turning this on later
+    # never retroactively archives the whole existing category list.
+    seen_category_names = {n for n in category_names.values() if n} | {n for n in series_category_names.values() if n}
+    if provider.get("archive_new_categories"):
+        known_categories = set(provider.get("known_import_categories") or [])
+        new_categories = seen_category_names - known_categories
+        if new_categories:
+            exclude_categories = list(exclude_categories) + list(new_categories)
+            logger.info("[vod_importer] provider=%s auto-archiving %d newly discovered categor(y/ies): %s",
+                        provider["name"], len(new_categories), ", ".join(sorted(new_categories)))
+    await asyncio.to_thread(
+        vod_db.set_provider_known_import_categories, provider_id,
+        sorted(seen_category_names | set(provider.get("known_import_categories") or [])),
+    )
+
     streams = await client.get_vod_streams()
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
     movie_items = []
@@ -202,9 +225,6 @@ async def import_provider_catalog(provider_id: int) -> dict:
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
     logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
-
-    series_categories = await client.get_series_categories()
-    series_category_names = {str(c["category_id"]): c["category_name"] for c in series_categories}
 
     series_list = await client.get_series()
     series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")

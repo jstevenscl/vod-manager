@@ -913,6 +913,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "last_failed_at", "TEXT"),
         ("episode_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("episode_sources", "last_failed_at", "TEXT"),
+        ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
+        ("providers", "known_import_categories", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -2562,6 +2564,38 @@ def set_provider_import_exclude_categories(provider_id: int, category_names: lis
     conn.close()
 
 
+def set_provider_archive_new_categories(provider_id: int, enabled: bool) -> None:
+    """Opt-in per provider (default off, mirrors auto_create_categories): a
+    category name never seen before on this provider's own last-known set
+    (providers.known_import_categories) gets auto-archived on the import
+    that discovers it, same as Dispatcharr's own VOD provider category
+    behavior (GH issue #5). See vod_importer.import_provider_catalog."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE providers SET archive_new_categories=?, updated_at=? WHERE id=?",
+        (int(enabled), _now(), provider_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_provider_known_import_categories(provider_id: int, category_names: list[str]) -> None:
+    """Bookkeeping for archive_new_categories -- the full set of category
+    names this provider has ever reported, so the next import can tell
+    which ones are genuinely new. Written unconditionally every import
+    (whether or not archive_new_categories is on) so turning the setting on
+    later doesn't retroactively treat the entire existing category list as
+    'new' and archive everything."""
+    import json
+    conn = _connect()
+    conn.execute(
+        "UPDATE providers SET known_import_categories=?, updated_at=? WHERE id=?",
+        (json.dumps(sorted({c.strip() for c in category_names if c.strip()})), _now(), provider_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
 def set_provider_dispatcharr_profile(provider_id: int, profile_id: int) -> None:
     conn = _connect()
     conn.execute("UPDATE providers SET dispatcharr_profile_id=?, updated_at=? WHERE id=?", (profile_id, _now(), provider_id))
@@ -2589,6 +2623,7 @@ def get_provider(provider_id: int) -> dict | None:
     d = dict(row)
     d["password"] = decrypt_value(d["password"])
     d["import_exclude_categories"] = _parse_json_list(d.get("import_exclude_categories"))
+    d["known_import_categories"] = _parse_json_list(d.get("known_import_categories"))
     return d
 
 
@@ -3562,6 +3597,74 @@ def get_series_by_tmdb_id(tmdb_id: str) -> dict | None:
     row = conn.execute("SELECT * FROM series WHERE tmdb_id=?", (str(tmdb_id),)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def list_movies_with_tmdb_id(after_id: int, limit: int) -> list[dict]:
+    """Cursor-paginated (by id, not OFFSET) so bulk_apply_tmdb_title_movies
+    can keep calling this across a whole library in bounded batches without
+    ever re-fetching a batch it already processed -- OFFSET would have kept
+    returning the exact same first `limit` rows forever, since renaming a
+    movie to already match TMDB's title doesn't remove it from a WHERE
+    tmdb_id IS NOT NULL filter."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, year, tmdb_id FROM movies WHERE tmdb_id IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+        (after_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_series_with_tmdb_id(after_id: int, limit: int) -> list[dict]:
+    """See list_movies_with_tmdb_id's identical docstring."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, year, tmdb_id FROM series WHERE tmdb_id IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+        (after_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def find_movie_by_title_year(title: str, year: int | None) -> dict | None:
+    """Fallback for tmdb_sync's list matching: a pool movie only ever gets a
+    tmdb_id at import time if the provider's own metadata happened to carry
+    one (see vod_importer.py), so plenty of real pool items TMDB-list
+    matching should hit sit there with tmdb_id NULL. Rather than reporting
+    those as "not in pool" (the real complaint behind GH issue #3 -- a
+    curated list like IMDB Top 250 matching "very few items"), fall back to
+    the same normalized-title comparison find_pool_backfill_match already
+    trusts, with a +/-1 year tolerance matching the Duplicate Finder's own
+    (_split_by_year_proximity) since a provider-mislabeled release year is
+    common and shouldn't sink an otherwise-exact title match."""
+    normalized = _normalize_title_for_dedup(title)
+    conn = _connect()
+    rows = conn.execute("SELECT id, name, year FROM movies WHERE tmdb_id IS NULL").fetchall()
+    conn.close()
+    candidates = [r for r in rows if _normalize_title_for_dedup(r["name"]) == normalized]
+    if not candidates:
+        return None
+    if year is not None:
+        in_range = [r for r in candidates if r["year"] is not None and abs(r["year"] - year) <= 1]
+        if in_range:
+            candidates = in_range
+    return dict(candidates[0])
+
+
+def find_series_by_title_year(title: str, year: int | None) -> dict | None:
+    """Series counterpart to find_movie_by_title_year -- see its docstring."""
+    normalized = _normalize_title_for_dedup(title)
+    conn = _connect()
+    rows = conn.execute("SELECT id, name, year FROM series WHERE tmdb_id IS NULL").fetchall()
+    conn.close()
+    candidates = [r for r in rows if _normalize_title_for_dedup(r["name"]) == normalized]
+    if not candidates:
+        return None
+    if year is not None:
+        in_range = [r for r in candidates if r["year"] is not None and abs(r["year"] - year) <= 1]
+        if in_range:
+            candidates = in_range
+    return dict(candidates[0])
 
 
 def list_categories(content_type: str | None = None, active_only: bool = False) -> list[dict]:
