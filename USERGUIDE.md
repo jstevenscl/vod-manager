@@ -1077,7 +1077,9 @@ under Configuration → API Keys unlocks:
   instant on the next sync. Without this fallback, a list only ever matched
   the handful of items a provider happened to tag with their own TMDB id at
   import time, which is why a large curated list used to place almost
-  nothing.
+  nothing. The full list is fetched regardless of size — a list with
+  hundreds of entries (e.g. IMDB's Top 250) is no longer capped at the
+  first page TMDB returns.
 
 ---
 
