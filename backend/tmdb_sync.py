@@ -297,6 +297,15 @@ async def sync_category(category_id: int) -> dict:
                 year = int(release_date[:4]) if release_date[:4].isdigit() else None
                 movie = title and vod_db.find_movie_by_title_year(title, year)
                 if movie:
+                    # Only source of truth for a wrong-match investigation
+                    # (GH issue #6) -- backfill_tmdb_id_if_missing's own log
+                    # doesn't have the list item's title, and this fallback
+                    # match is the one place a title/year mismatch could
+                    # silently attach the wrong id to a pool movie.
+                    logger.info(
+                        "[tmdb_sync] fallback match: pool movie id=%s (%r, year=%s) <- list title=%r year=%s tmdb_id=%s",
+                        movie["id"], movie["name"], movie["year"], title, year, tmdb_id,
+                    )
                     vod_db.backfill_tmdb_id_if_missing("movie", movie["id"], str(tmdb_id))
             if movie:
                 matched_movie_ids.append(movie["id"])
@@ -310,6 +319,10 @@ async def sync_category(category_id: int) -> dict:
                 year = int(first_air_date[:4]) if first_air_date[:4].isdigit() else None
                 series = title and vod_db.find_series_by_title_year(title, year)
                 if series:
+                    logger.info(
+                        "[tmdb_sync] fallback match: pool series id=%s (%r, year=%s) <- list title=%r year=%s tmdb_id=%s",
+                        series["id"], series["name"], series["year"], title, year, tmdb_id,
+                    )
                     vod_db.backfill_tmdb_id_if_missing("series", series["id"], str(tmdb_id))
             if series:
                 matched_series_ids.append(series["id"])

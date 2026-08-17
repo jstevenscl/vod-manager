@@ -2652,6 +2652,18 @@ async def rename_movie(movie_id: int, body: RenameRequest):
         raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
 
 
+@router.post("/movies/{movie_id}/tmdb-id/clear/", dependencies=_GUARDS)
+async def clear_movie_tmdb_id(movie_id: int):
+    """Manual undo for a wrong tmdb_id (GH issue #6) -- name/year/sources/
+    poster untouched, just breaks the bad match so it stops being trusted
+    as confirmed. See vod_db.clear_tmdb_id's docstring for what this can't
+    fix (an already-executed merge)."""
+    try:
+        return vod_db.clear_tmdb_id("movie", movie_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
 @router.post("/movies/{movie_id}/tmdb-title/", dependencies=_GUARDS)
 async def apply_tmdb_title_movie(movie_id: int):
     """Manual, one-click 'use TMDB's own title' -- real user request
@@ -2879,6 +2891,15 @@ async def rename_series(series_id: int, body: RenameRequest):
         return vod_db.rename_item("series", series_id, body.name, body.year)
     except ValueError as exc:
         raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
+
+
+@router.post("/series/{series_id}/tmdb-id/clear/", dependencies=_GUARDS)
+async def clear_series_tmdb_id(series_id: int):
+    """See clear_movie_tmdb_id's identical docstring -- same reasoning."""
+    try:
+        return vod_db.clear_tmdb_id("series", series_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
 
 
 @router.post("/series/{series_id}/tmdb-title/", dependencies=_GUARDS)
