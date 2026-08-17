@@ -1770,6 +1770,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
 
+  // Manual undo for a wrong tmdb_id (GH issue #6: TMDB Lists sync's
+  // title/year fallback match attached the wrong id, with no way in the UI
+  // to see or break it short of Needs Review/Missing Artwork). Only clears
+  // the id -- name/year/sources/poster untouched -- so the item drops back
+  // to unmatched and can pick up a correct id on the next enrichment pass.
+  const clearTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/movies/${movie.id}/tmdb-id/clear/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+  })
+
   const addSource = useMutation({
     mutationFn: () => api.post(`/vod/movies/${movie.id}/sources/`, {
       provider_id: Number(sourceForm.provider_id), provider_stream_id: sourceForm.provider_stream_id,
@@ -1850,19 +1860,33 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               Rename / fix year
             </button>
             {movie.tmdb_id && (
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
-                title="Fetch TMDB's own canonical title (and release year) for this movie's confirmed TMDB match and rename to it"
-                disabled={useTmdbTitle.isPending}
-                onClick={() => useTmdbTitle.mutate()}
-              >
-                {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
-              </button>
+              <>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${movie.tmdb_id}`}>
+                  TMDB #{movie.tmdb_id}
+                </span>
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+                  title="Fetch TMDB's own canonical title (and release year) for this movie's confirmed TMDB match and rename to it"
+                  disabled={useTmdbTitle.isPending}
+                  onClick={() => useTmdbTitle.mutate()}
+                >
+                  {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
+                </button>
+                <button
+                  className="text-muted-foreground hover:text-destructive underline decoration-dotted disabled:opacity-50"
+                  title="Clear this movie's TMDB match if it's wrong -- leaves name/year/sources/poster untouched"
+                  disabled={clearTmdbId.isPending}
+                  onClick={() => { if (confirm(`Clear the TMDB match (#${movie.tmdb_id}) for "${movie.name}"? This only removes the match itself.`)) clearTmdbId.mutate() }}
+                >
+                  {clearTmdbId.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Clear TMDB match'}
+                </button>
+              </>
             )}
           </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
+        {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
       </div>
       {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
 
@@ -2135,6 +2159,12 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
 
+  // See Movie's identical clearTmdbId -- same reasoning (GH issue #6).
+  const clearTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/series/${series.id}/tmdb-id/clear/`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
   const addPlacement = useMutation({
     mutationFn: () => api.post(`/vod/series/${series.id}/categories/`, { category_id: Number(categoryPick) }),
     onSuccess: () => {
@@ -2228,19 +2258,33 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
               Rename / fix year
             </button>
             {series.tmdb_id && (
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
-                title="Fetch TMDB's own canonical title (and release year) for this series' confirmed TMDB match and rename to it"
-                disabled={useTmdbTitle.isPending}
-                onClick={() => useTmdbTitle.mutate()}
-              >
-                {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
-              </button>
+              <>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${series.tmdb_id}`}>
+                  TMDB #{series.tmdb_id}
+                </span>
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+                  title="Fetch TMDB's own canonical title (and release year) for this series' confirmed TMDB match and rename to it"
+                  disabled={useTmdbTitle.isPending}
+                  onClick={() => useTmdbTitle.mutate()}
+                >
+                  {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
+                </button>
+                <button
+                  className="text-muted-foreground hover:text-destructive underline decoration-dotted disabled:opacity-50"
+                  title="Clear this series' TMDB match if it's wrong -- leaves name/year/episodes/poster untouched"
+                  disabled={clearTmdbId.isPending}
+                  onClick={() => { if (confirm(`Clear the TMDB match (#${series.tmdb_id}) for "${series.name}"? This only removes the match itself.`)) clearTmdbId.mutate() }}
+                >
+                  {clearTmdbId.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Clear TMDB match'}
+                </button>
+              </>
             )}
           </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
+        {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
         {series.raw_name && series.raw_name !== series.name && (
           <div className="text-[11px] text-muted-foreground flex items-center gap-1.5">
             <span>Provider's original name: "{series.raw_name}"</span>

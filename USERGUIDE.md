@@ -788,6 +788,15 @@ each with a **list** or **grid** (poster wall) mode.
   itself calls it. If the corrected title collides with an existing pool
   entry, the two merge (same as a manual rename above), and the confirmed
   TMDB id carries over to whichever row survives.
+- **Clear TMDB match** — appears next to *Use TMDB title* whenever the item
+  has a confirmed TMDB match (its id is also shown, e.g. "TMDB #623"). If a
+  match turns out to be wrong (whether from the automatic matching TMDB
+  Lists sync does or anything else), this breaks it — only the TMDB id is
+  removed, name/year/sources/poster are untouched — so the item goes back
+  to unmatched and can pick up a correct id on the next enrichment pass
+  instead of staying confirmed-wrong. Note this can't undo a merge that
+  already happened from a bad match (see *Use TMDB title* above) — that
+  needs a Backup & Restore snapshot taken before the merge.
 - **Revert to this** — every source records the provider's *original* name
   at import time even after a Title & Metadata Rule cleans it up for
   display. If a source's captured original name differs from the item's

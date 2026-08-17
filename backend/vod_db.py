@@ -6287,6 +6287,19 @@ def merge_movie(from_id: int, into_id: int) -> None:
     if from_id == into_id:
         return
     conn = _connect()
+    from_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (from_id,)).fetchone()
+    into_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (into_id,)).fetchone()
+    # This permanently deletes `from_id` below (its sources/placements move
+    # to `into_id` first) -- irreversible outside a DB backup, so a merge
+    # triggered by a bad tmdb_id match (GH issue #6) leaves no trace to
+    # diagnose without this. Logged as a warning, not info, since a merge
+    # between two rows that don't actually share a tmdb_id is exactly the
+    # signature of a false match, not a routine dedup.
+    logger.warning(
+        "[merge_movie] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
+        from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
+        into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
+    )
     # movie_sources has no per-movie uniqueness (UNIQUE is (provider_id,
     # provider_stream_id) only) -- a plain reassignment can never collide.
     conn.execute("UPDATE movie_sources SET movie_id=? WHERE movie_id=?", (into_id, from_id))
@@ -6319,6 +6332,14 @@ def merge_series(from_id: int, into_id: int) -> None:
     if from_id == into_id:
         return
     conn = _connect()
+    from_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (from_id,)).fetchone()
+    into_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (into_id,)).fetchone()
+    # See merge_movie's identical logging comment -- same irreversible-delete risk.
+    logger.warning(
+        "[merge_series] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
+        from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
+        into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
+    )
 
     from_episodes = conn.execute(
         "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (from_id,)
@@ -6960,6 +6981,28 @@ def backfill_tmdb_id_if_missing(content_type: str, item_id: int, tmdb_id: str) -
         conn.execute(f"UPDATE {table} SET tmdb_id=? WHERE id=? AND tmdb_id IS NULL", (tmdb_id, item_id))
         _commit_with_retry(conn)
         conn.close()
+
+
+def clear_tmdb_id(content_type: str, item_id: int) -> dict:
+    """Manual escape hatch (GH issue #6): a wrong tmdb_id -- however it got
+    attached -- has no UI-visible undo today. Clearing it breaks the bad
+    match (name/year/sources/poster untouched) so the item falls back to
+    being unmatched instead of confirmed-wrong, and can pick up a correct
+    id on the next enrichment pass or TMDB List sync. Does NOT touch
+    anything a merge already did -- if the item was already merged into
+    another row (see merge_movie/merge_series), the pre-merge row is gone
+    and this can't bring it back; that needs a backup restore."""
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    row = conn.execute(f"SELECT id, name, tmdb_id FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+    conn.execute(f"UPDATE {table} SET tmdb_id=NULL, updated_at=? WHERE id=?", (_now(), item_id))
+    _commit_with_retry(conn)
+    conn.close()
+    logger.info("[clear_tmdb_id] %s id=%s (%r) tmdb_id %s -> NULL", content_type, item_id, row["name"], row["tmdb_id"])
+    return {"cleared_id": item_id}
 
 
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
