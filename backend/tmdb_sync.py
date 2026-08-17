@@ -39,16 +39,33 @@ def _redact(exc: Exception) -> str:
 
 
 async def fetch_list_items(list_id: str) -> list[dict]:
+    """GET /list/{id} paginates its "items" array (20/page) behind a "page"
+    param, separate from the "item_count" total it reports up front -- a
+    single unpaged call silently truncated any list over 20 items to its
+    first page (GH issue #3's second half: v0.1.14's title/year fallback fixed
+    matching, but a 250-item list still only ever placed 20, because that's
+    all fetch_list_items ever saw)."""
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
 
+    items: list[dict] = []
+    item_count: int | None = None
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        r = await client.get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key})
-        r.raise_for_status()
-        data = r.json()
+        page = 1
+        while True:
+            r = await client.get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key, "page": page})
+            r.raise_for_status()
+            data = r.json()
+            page_items = data.get("items", [])
+            items.extend(page_items)
+            if item_count is None:
+                item_count = data.get("item_count")
+            if not page_items or (item_count is not None and len(items) >= item_count):
+                break
+            page += 1
 
-    return data.get("items", [])
+    return items
 
 
 async def search_title(query: str, content_type: str) -> list[dict]:
