@@ -70,20 +70,36 @@ logger = logging.getLogger(__name__)
 
 
 def _file_matches_size(path: str, expected_size: int | None) -> bool:
-    """Verification gate for dvr_delete_after_copy -- expected_size is
-    Dispatcharr's own custom_properties.bytes_written for this recording
-    (the authoritative source, not something VOD Manager measured), so a
-    match here is real confirmation the local copy is byte-complete before
-    anything asks Dispatcharr to delete its original. expected_size=None
-    (Dispatcharr didn't report a size) or a missing file both return False
-    -- never treated as "good enough," since a false positive here means
-    deleting the only remaining copy of someone's real recording."""
+    """Verification gate for dvr_delete_after_copy. expected_size must be a
+    freshly-observed real size -- the actual bytes downloaded (Phase 1b,
+    see download_recording_file's return value) or the shared-mount
+    source file's current size at copy time (Phase 1a) -- NOT Dispatcharr's
+    custom_properties.bytes_written, which is stamped from the raw
+    recording write and confirmed live (dispatch-test v0.29.0, 2026-08-18)
+    to go stale/wrong the moment Dispatcharr remuxes the recording
+    (custom_properties.remux_success), the common case. Comparing against
+    that stale field meant this check could never pass -- and therefore
+    dvr_delete_after_copy could never actually delete anything -- for any
+    remuxed recording. expected_size=None or a missing file both return
+    False -- never treated as "good enough," since a false positive here
+    means deleting the only remaining copy of someone's real recording."""
     if expected_size is None or not os.path.isfile(path):
         return False
     try:
         return os.path.getsize(path) == expected_size
     except OSError:
         return False
+
+
+def _safe_getsize(path: str) -> int | None:
+    """Fresh ground-truth size of a file that's supposed to already exist
+    (a shared-mount source, or a download this function's caller already
+    confirmed completed) -- see _file_matches_size's docstring for why this
+    replaces Dispatcharr's own bytes_written as the comparison target."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def _copy_local_file(source_path: str, dest_path: str) -> None:
@@ -383,9 +399,15 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 )
                 continue
 
+        # Freshly-observed byte count for this download, when we actually
+        # download this pass -- see _file_matches_size's docstring for why
+        # this can't come from Dispatcharr's own bytes_written field.
+        just_downloaded_size: int | None = None
         if download_mode and not os.path.isfile(target_path):
             try:
-                await dispatcharr_dvr_client.download_recording_file(connection, recording["id"], target_path)
+                just_downloaded_size = await dispatcharr_dvr_client.download_recording_file(
+                    connection, recording["id"], target_path,
+                )
                 downloaded += 1
             except Exception as exc:
                 download_errors += 1
@@ -396,11 +418,18 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 continue
 
         if delete_after_copy:
-            expected_size = file_info.get("bytes_written")
             verified_own_copy = False
             if download_mode:
                 # Phase 1b already downloads straight into our own storage --
                 # target_path here already IS our own independent copy.
+                # download_recording_file's atomic write-then-rename pattern
+                # already guarantees target_path is complete (never
+                # truncated) the moment it exists, whether that happened
+                # just now or on an earlier pass -- so the file's own
+                # current size, freshly stat'd, is always valid ground
+                # truth to verify against (trivially, for a just-completed
+                # download; equally validly for one that already existed).
+                expected_size = just_downloaded_size if just_downloaded_size is not None else _safe_getsize(target_path)
                 verified_own_copy = _file_matches_size(target_path, expected_size)
             else:
                 # Phase 1a: target_path currently points at Dispatcharr's own
@@ -410,8 +439,12 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 # discovered ones, so turning this setting on naturally
                 # backfills every recording imported under the old
                 # reference-only behavior too, one pass at a time, without
-                # any separate migration step.
+                # any separate migration step. expected_size is the shared
+                # file's own real current size (fresh stat, same reasoning
+                # as download_mode above), not Dispatcharr's stale
+                # bytes_written field.
                 shared_path = target_path
+                expected_size = _safe_getsize(shared_path)
                 hashed_name = hashlib.sha256(f"{provider_id}:{recording_id}".encode()).hexdigest() + (os.path.splitext(file_path)[1] or ".mkv")
                 own_path = os.path.join(own_storage_dir, hashed_name)
                 if not _file_matches_size(own_path, expected_size):
@@ -432,6 +465,16 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                     "copy yet -- not deleting the Dispatcharr original this pass", recording_id)
 
         local_paths_by_stream_id[recording_id] = target_path
+        # Best real size we know for this recording, for display only
+        # (movies/episodes.file_size_bytes below) -- a real stat of
+        # whatever local file we actually have beats Dispatcharr's stale
+        # bytes_written (see _file_matches_size's docstring), falling back
+        # to it only when no local file is accessible yet (e.g.
+        # delete_after_copy is off and this is a shared-mount reference
+        # this container can't itself see).
+        known_size = _safe_getsize(target_path)
+        if known_size is None:
+            known_size = file_info.get("bytes_written")
 
         program = dispatcharr_dvr_client.recording_program_info(recording)
         title = _guess_title(recording, program, file_path)
@@ -463,7 +506,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 "name": program.get("sub_title") or f"Episode {episode_number}",
                 "description": program.get("description"), "duration_secs": None,
                 "provider_stream_id": recording_id, "container_extension": container_extension,
-                "file_size_bytes": file_info.get("bytes_written"),
+                "file_size_bytes": known_size,
             })
         elif recording_id in known_episode_stream_ids:
             # This exact recording already lives correctly as an episode --
@@ -478,7 +521,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
                 "container_extension": container_extension,
                 "description": program.get("description"),
                 "genre": None, "director": None, "cast_list": None, "poster_url": program.get("poster_url"),
-                "last_enriched_at": None, "file_size_bytes": file_info.get("bytes_written"),
+                "last_enriched_at": None, "file_size_bytes": known_size,
             })
 
     # TMDB enrichment pass -- one search per distinct title, not per

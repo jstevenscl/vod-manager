@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import api from '@/lib/api'
+import { askConfirm, ConfirmDialogHost } from '@/lib/confirm'
 
 interface Props {
   firstRun:       boolean
@@ -158,11 +159,10 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
             <div className="text-center">
               <button
                 className="text-sm text-muted-foreground hover:text-foreground transition-colors mx-auto"
-                onClick={() => {
-                  if (confirm('Run VOD & DVR Manager with no login? Anyone who can reach this app will have full access. Only continue if you\'re sure this instance is not exposed to the internet.')) {
-                    onSkip()
-                  }
-                }}
+                onClick={() => askConfirm(
+                  'Run VOD & DVR Manager with no login? Anyone who can reach this app will have full access. Only continue if you\'re sure this instance is not exposed to the internet.',
+                  onSkip
+                )}
               >
                 Skip for now — run without a login
               </button>
@@ -171,6 +171,7 @@ export default function Settings({ firstRun, hasCredentials, onSaved, onBack, on
         )}
 
       </div>
+      <ConfirmDialogHost />
     </div>
   )
 }

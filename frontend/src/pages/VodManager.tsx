@@ -6,6 +6,7 @@ import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, Ca
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
+import { askConfirm, ConfirmDialogHost } from '@/lib/confirm'
 
 interface Provider {
   id: number
@@ -26,6 +27,7 @@ interface Provider {
   last_series_provider_total: number | null
   synced_connection_count: number
   live_account_count: number
+  sub_account_count: number
   import_exclude_categories: string[]
   import_exclude_uncategorized: number
   dispatcharr_connection_id: number | null
@@ -180,6 +182,17 @@ interface ProviderLiveAccount {
   dispatcharr_account_id: number
   dispatcharr_profile_id: number | null
   connection_label: string
+}
+
+interface ProviderSubAccount {
+  id: number
+  provider_id: number
+  label: string
+  username: string
+  password: string
+  max_streams: number
+  is_active: number
+  sort_order: number
 }
 
 interface DispatcharrAccountProfile {
@@ -1885,7 +1898,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                   className="text-muted-foreground hover:text-destructive underline decoration-dotted disabled:opacity-50"
                   title="Clear this movie's TMDB match if it's wrong -- leaves name/year/sources/poster untouched"
                   disabled={clearTmdbId.isPending}
-                  onClick={() => { if (confirm(`Clear the TMDB match (#${movie.tmdb_id}) for "${movie.name}"? This only removes the match itself.`)) clearTmdbId.mutate() }}
+                  onClick={() => { askConfirm(`Clear the TMDB match (#${movie.tmdb_id}) for "${movie.name}"? This only removes the match itself.`, () => clearTmdbId.mutate()) }}
                 >
                   {clearTmdbId.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Clear TMDB match'}
                 </button>
@@ -1927,7 +1940,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                     const msg = movie.sources.length === 1
                       ? `Remove the only source (${s.provider_name}) from "${movie.name}"? This deletes the movie itself (and its file, if local) -- it has no other source to fall back on. Can't be undone.`
                       : `Remove the ${s.provider_name} source from "${movie.name}"? The movie stays available from its other source(s). Can't be undone.`
-                    if (confirm(msg)) deleteSource.mutate(s.id)
+                    askConfirm(msg, () => deleteSource.mutate(s.id))
                   }}
                 >
                   <X size={12} />
@@ -2102,7 +2115,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               : 'Delete movie (sourceless orphan)'}
             className={movie.sources.length > 0 ? 'text-muted-foreground/40 cursor-not-allowed' : 'text-muted-foreground hover:text-destructive'}
             disabled={movie.sources.length > 0}
-            onClick={() => { if (confirm(`Delete "${movie.name}"? This removes all its category placements. It has no sources, so nothing will bring it back on the next sync.`)) deleteMovie.mutate() }}
+            onClick={() => { askConfirm(`Delete "${movie.name}"? This removes all its category placements. It has no sources, so nothing will bring it back on the next sync.`, () => deleteMovie.mutate()) }}
           >
             <Trash2 size={12} />
           </button>
@@ -2283,7 +2296,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   className="text-muted-foreground hover:text-destructive underline decoration-dotted disabled:opacity-50"
                   title="Clear this series' TMDB match if it's wrong -- leaves name/year/episodes/poster untouched"
                   disabled={clearTmdbId.isPending}
-                  onClick={() => { if (confirm(`Clear the TMDB match (#${series.tmdb_id}) for "${series.name}"? This only removes the match itself.`)) clearTmdbId.mutate() }}
+                  onClick={() => { askConfirm(`Clear the TMDB match (#${series.tmdb_id}) for "${series.name}"? This only removes the match itself.`, () => clearTmdbId.mutate()) }}
                 >
                   {clearTmdbId.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Clear TMDB match'}
                 </button>
@@ -2325,7 +2338,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                 <Button
                   size="sm" variant="outline"
                   disabled={removeProviderSources.isPending}
-                  onClick={() => { if (confirm(`Remove all ${info.count} failing ${info.name} source(s) from "${series.name}"? Can't be undone.`)) removeProviderSources.mutate(providerId) }}
+                  onClick={() => { askConfirm(`Remove all ${info.count} failing ${info.name} source(s) from "${series.name}"? Can't be undone.`, () => removeProviderSources.mutate(providerId)) }}
                 >
                   Remove all
                 </Button>
@@ -2379,7 +2392,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                       const msg = e.sources.length === 1
                         ? `Remove the only source (${s.provider_name}) from S${e.season_number}E${e.episode_number}? This deletes the episode itself -- it has no other source to fall back on. Can't be undone.`
                         : `Remove the ${s.provider_name} source from S${e.season_number}E${e.episode_number}? The episode stays available from its other source(s). Can't be undone.`
-                      if (confirm(msg)) deleteEpisodeSource.mutate({ episodeId: e.id, sourceId: s.id })
+                      askConfirm(msg, () => deleteEpisodeSource.mutate({ episodeId: e.id, sourceId: s.id }))
                     }}
                   >
                     <X size={11} />
@@ -2512,7 +2525,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   : 'Delete series (sourceless orphan)'}
                 className={seriesSourceCount > 0 ? 'text-muted-foreground/40 cursor-not-allowed' : 'text-muted-foreground hover:text-destructive'}
                 disabled={seriesSourceCount > 0}
-                onClick={() => { if (confirm(`Delete "${series.name}"? This removes all its episodes and category placements. It has no sources, so nothing will bring it back on the next sync.`)) deleteSeries.mutate() }}
+                onClick={() => { askConfirm(`Delete "${series.name}"? This removes all its episodes and category placements. It has no sources, so nothing will bring it back on the next sync.`, () => deleteSeries.mutate()) }}
               >
                 <Trash2 size={12} />
               </button>
@@ -2803,7 +2816,7 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
               size="sm"
               variant="outline"
               disabled={bulkDeleteCategories.isPending}
-              onClick={() => { if (confirm(`Delete ${selectedCategoryIds.size} categor${selectedCategoryIds.size === 1 ? 'y' : 'ies'}? Items stay in the pool, just unplaced from these categories.`)) bulkDeleteCategories.mutate() }}
+              onClick={() => { askConfirm(`Delete ${selectedCategoryIds.size} categor${selectedCategoryIds.size === 1 ? 'y' : 'ies'}? Items stay in the pool, just unplaced from these categories.`, () => bulkDeleteCategories.mutate()) }}
             >
               <Trash2 size={12} className="mr-1" /> Delete selected
             </Button>
@@ -2909,7 +2922,7 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 >
                   <CalendarClock size={12} />
                 </button>
-                <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
+                <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { askConfirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`, () => deleteCategory.mutate(c.id)) }}>
                   <Trash2 size={12} />
                 </button>
               </span>
@@ -4098,11 +4111,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       api.post('/vod/metadata-rules/apply/', null, { params: { content_type: contentType, force } }).then((r) => r.data),
     onSuccess: (data, { contentType }) => {
       if (data.blocked) {
-        const ok = confirm(
+        askConfirm(
           `This would change ${data.changed} of ${data.checked} ${contentType === 'movie' ? 'movies' : 'series'} -- `
-          + `above the normal threshold (${data.threshold}). Proceed anyway?`
+          + `above the normal threshold (${data.threshold}). Proceed anyway?`,
+          () => applyRules.mutate({ contentType, force: true })
         )
-        if (ok) applyRules.mutate({ contentType, force: true })
         return
       }
       setApplyRulesResult(`${contentType}: checked ${data.checked}, changed ${data.changed}.`)
@@ -4606,6 +4619,60 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: ({ id, active }: { id: number; active: boolean }) =>
       api.post(`/vod/providers/${id}/${active ? 'activate' : 'deactivate'}/`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
+  // ── Provider sub-accounts (vod_manager-4dh) -- multiple real logins nested
+  // under one provider entry, Dispatcharr M3U-profile parity. No aggregate
+  // limit shown/edited anywhere here -- see providers_sub_accounts' CREATE
+  // TABLE comment in vod_db.py for why: Dispatcharr itself tracks capacity
+  // independently per profile with automatic failover, never a summed total.
+  const [expandedSubAccountsProviderId, setExpandedSubAccountsProviderId] = useState<number | null>(null)
+  const providerSubAccountsQuery = useQuery<ProviderSubAccount[]>({
+    queryKey: ['vod-provider-sub-accounts', expandedSubAccountsProviderId],
+    queryFn:  () => api.get(`/vod/providers/${expandedSubAccountsProviderId}/sub-accounts/`).then((r) => r.data),
+    enabled:  expandedSubAccountsProviderId != null,
+  })
+  const [newSubAccountLabel, setNewSubAccountLabel] = useState('')
+  const [newSubAccountUsername, setNewSubAccountUsername] = useState('')
+  const [newSubAccountPassword, setNewSubAccountPassword] = useState('')
+  const [newSubAccountMaxStreams, setNewSubAccountMaxStreams] = useState('')
+  const createProviderSubAccount = useMutation({
+    mutationFn: ({ providerId, label, username, password, maxStreams }: { providerId: number; label: string; username: string; password: string; maxStreams: number }) =>
+      api.post(`/vod/providers/${providerId}/sub-accounts/`, { label, username, password, max_streams: maxStreams }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-provider-sub-accounts'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setNewSubAccountLabel(''); setNewSubAccountUsername(''); setNewSubAccountPassword(''); setNewSubAccountMaxStreams('')
+    },
+  })
+  const updateProviderSubAccount = useMutation({
+    mutationFn: ({ id, ...body }: { id: number; is_active?: boolean; max_streams?: number }) =>
+      api.patch(`/vod/providers/sub-accounts/${id}/`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-provider-sub-accounts'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
+  })
+  const deleteProviderSubAccount = useMutation({
+    mutationFn: (id: number) => api.delete(`/vod/providers/sub-accounts/${id}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-provider-sub-accounts'] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+    },
+  })
+  // vod_manager-q78: consolidate old manually-split provider rows (the
+  // pre-4dh workaround) into one provider's sub-accounts.
+  const [mergeModalOpen, setMergeModalOpen] = useState(false)
+  const [mergePrimaryId, setMergePrimaryId] = useState('')
+  const [mergeOtherIds, setMergeOtherIds] = useState<Set<number>>(new Set())
+  const [mergeResult, setMergeResult] = useState<any>(null)
+  const mergeProviders = useMutation({
+    mutationFn: () => api.post(`/vod/providers/${mergePrimaryId}/merge-into-subaccounts/`, { other_provider_ids: Array.from(mergeOtherIds) }),
+    onSuccess: (r) => {
+      setMergeResult(r.data)
+      setMergeOtherIds(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      qc.invalidateQueries({ queryKey: ['vod-provider-sub-accounts'] })
+    },
   })
   const deleteProvider = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/providers/${id}/`),
@@ -5620,14 +5687,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     <button
                       title="Regenerate secret (invalidates the old one immediately)"
                       className="text-muted-foreground hover:text-foreground"
-                      onClick={() => { if (confirm(`Regenerate the credential for "${c.label}"? The old one stops working immediately.`)) regenerateXcClient.mutate(c.id) }}
+                      onClick={() => { askConfirm(`Regenerate the credential for "${c.label}"? The old one stops working immediately.`, () => regenerateXcClient.mutate(c.id)) }}
                     >
                       <RotateCcw size={12} />
                     </button>
                     <button
                       title="Delete"
                       className="text-muted-foreground hover:text-destructive"
-                      onClick={() => { if (confirm(`Delete instance "${c.label}"? It will stop being able to authenticate immediately.`)) deleteXcClient.mutate(c.id) }}
+                      onClick={() => { askConfirm(`Delete instance "${c.label}"? It will stop being able to authenticate immediately.`, () => deleteXcClient.mutate(c.id)) }}
                     >
                       <Trash2 size={12} />
                     </button>
@@ -5781,7 +5848,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   <button
                     title="Delete connection"
                     className="text-muted-foreground hover:text-destructive"
-                    onClick={() => { if (confirm(`Delete Dispatcharr connection "${c.label}"? Provider sync/coordination against it will stop.`)) deleteDispatcharrConnection.mutate(c.id) }}
+                    onClick={() => { askConfirm(`Delete Dispatcharr connection "${c.label}"? Provider sync/coordination against it will stop.`, () => deleteDispatcharrConnection.mutate(c.id)) }}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -5864,11 +5931,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               {dvrProvider ? (
                 <button
                   className="text-xs text-destructive hover:underline flex items-center gap-1"
-                  onClick={() => {
-                    if (confirm(`Disable DVR for "${connection?.label}"? Its recording rules, upcoming recordings, per-person limits, and portal accounts will all be removed.`)) {
-                      disableDvrForConnection.mutate(dvrModalConnectionId)
-                    }
-                  }}
+                  onClick={() => askConfirm(
+                    `Disable DVR for "${connection?.label}"? Its recording rules, upcoming recordings, per-person limits, and portal accounts will all be removed.`,
+                    () => disableDvrForConnection.mutate(dvrModalConnectionId)
+                  )}
                 >
                   <Trash2 size={12} /> Disable DVR
                 </button>
@@ -6031,11 +6097,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   <Button
                     size="sm" variant="outline" className="gap-1 text-destructive"
                     disabled={resetBackup.isPending}
-                    onClick={() => {
-                      if (confirm(`Reset "${c.label}" to a fresh empty state? The current file is moved to a timestamped backup on disk first, not deleted.`)) {
-                        resetBackup.mutate(c.id)
-                      }
-                    }}
+                    onClick={() => askConfirm(
+                      `Reset "${c.label}" to a fresh empty state? The current file is moved to a timestamped backup on disk first, not deleted.`,
+                      () => resetBackup.mutate(c.id)
+                    )}
                   >
                     <RotateCcw size={12} /> Reset
                   </Button>
@@ -6074,7 +6139,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm" variant="outline" disabled={!!enrichProgress?.running || startBulkEnrich.isPending}
             title="Re-fetches every movie/series from its provider even if it was already enriched -- use this once after an update adds new captured fields (e.g. rating, release date, bitrate), so existing items backfill them right away instead of waiting out the normal freshness window."
-            onClick={() => { if (confirm('Re-enrich the ENTIRE pool from scratch, ignoring the normal freshness window? This re-fetches every movie/series from its provider, not just what changed.')) startBulkEnrich.mutate(true) }}
+            onClick={() => askConfirm('Re-enrich the ENTIRE pool from scratch, ignoring the normal freshness window? This re-fetches every movie/series from its provider, not just what changed.', () => startBulkEnrich.mutate(true))}
           >
             <RefreshCw size={12} className="mr-1" /> Force Re-Enrich All
           </Button>
@@ -6218,6 +6283,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <th className="py-2 px-2 font-semibold">Max Streams</th>
               <th className="py-2 px-2 font-semibold" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
               <th className="py-2 px-2 font-semibold" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it. If another provider entry has the exact same username/password (e.g. a '5x1' account split into separate rows, one per real login), their usage is pooled together automatically, mirroring how Dispatcharr itself treats a shared login.">Shared Limit / Live Accounts</th>
+              <th className="py-2 px-2 font-semibold" title="Multiple real logins nested under this one provider entry (Dispatcharr M3U-profile parity) — each with its own connection limit, no combined total. Playback tries each in order, failing over to the next when one's full, same as Dispatcharr itself.">Sub-accounts</th>
               <th className="py-2 px-2 font-semibold" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
               <th className="py-2 px-2 font-semibold"></th>
             </tr>
@@ -6361,6 +6427,56 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     </div>
                   )}
                 </td>
+                <td className="py-1 pr-2 align-top">
+                  <button
+                    className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                    onClick={() => setExpandedSubAccountsProviderId(expandedSubAccountsProviderId === p.id ? null : p.id)}
+                  >
+                    {p.sub_account_count} sub-acct{p.sub_account_count === 1 ? '' : 's'}
+                  </button>
+                  {expandedSubAccountsProviderId === p.id && (
+                    <div className="mt-1 p-1.5 border border-border rounded space-y-1 w-64">
+                      {providerSubAccountsQuery.data?.map((sa) => (
+                        <div key={sa.id} className="flex items-center gap-1 text-xs">
+                          <span className="flex-1 truncate" title={`${sa.username}`}>
+                            {sa.label} ({sa.username}) · {sa.max_streams || '∞'}
+                          </span>
+                          <button
+                            className={sa.is_active ? 'text-muted-foreground hover:text-foreground' : 'text-destructive'}
+                            title={sa.is_active ? 'Active -- click to disable' : 'Disabled -- click to enable'}
+                            onClick={() => updateProviderSubAccount.mutate({ id: sa.id, is_active: !sa.is_active })}
+                          >
+                            {sa.is_active ? 'on' : 'off'}
+                          </button>
+                          <button className="text-muted-foreground hover:text-destructive" onClick={() => deleteProviderSubAccount.mutate(sa.id)}>
+                            <X size={10} />
+                          </button>
+                        </div>
+                      ))}
+                      <div className="space-y-1">
+                        <input className={inputCls('w-full')} placeholder="Label" value={newSubAccountLabel} onChange={(e) => setNewSubAccountLabel(e.target.value)} />
+                        <input className={inputCls('w-full')} placeholder="Username" value={newSubAccountUsername} onChange={(e) => setNewSubAccountUsername(e.target.value)} />
+                        <input className={inputCls('w-full')} placeholder="Password" type="password" value={newSubAccountPassword} onChange={(e) => setNewSubAccountPassword(e.target.value)} />
+                        <div className="flex items-center gap-1">
+                          <input
+                            className={inputCls('flex-1')} type="number" placeholder="max streams (0=∞)"
+                            value={newSubAccountMaxStreams} onChange={(e) => setNewSubAccountMaxStreams(e.target.value)}
+                          />
+                          <Button
+                            size="sm"
+                            disabled={!newSubAccountLabel || !newSubAccountUsername || !newSubAccountPassword || createProviderSubAccount.isPending}
+                            onClick={() => createProviderSubAccount.mutate({
+                              providerId: p.id, label: newSubAccountLabel, username: newSubAccountUsername,
+                              password: newSubAccountPassword, maxStreams: Number(newSubAccountMaxStreams) || 0,
+                            })}
+                          >
+                            Add
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </td>
                 <td className="py-1 pr-2">
                   <input
                     className={inputCls('w-32')}
@@ -6430,7 +6546,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   <button
                     title="Delete provider"
                     className="text-muted-foreground hover:text-destructive p-1"
-                    onClick={() => { if (confirm(`Delete provider "${p.name}"? Its sources for existing movies/episodes will be removed.`)) deleteProvider.mutate(p.id) }}
+                    onClick={() => { askConfirm(`Delete provider "${p.name}"? Its sources for existing movies/episodes will be removed.`, () => deleteProvider.mutate(p.id)) }}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -6481,8 +6597,86 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Plus size={12} className="mr-1" /> Add
           </Button>
+          <Button
+            size="sm" variant="outline"
+            title="Consolidate old manually-split provider rows (one per real login, from before native sub-account support) into one provider's sub-accounts"
+            onClick={() => { setMergeModalOpen(true); setMergePrimaryId(''); setMergeOtherIds(new Set()); setMergeResult(null) }}
+          >
+            Merge Providers
+          </Button>
         </div>
       </SectionCard>
+
+      {mergeModalOpen && (
+        <Modal onClose={() => setMergeModalOpen(false)} maxWidth="max-w-lg">
+          <div className="p-5 space-y-3">
+            <h2 className="text-base font-semibold">Merge providers into sub-accounts</h2>
+            <p className="text-sm text-muted-foreground">
+              Consolidates other provider rows into one primary provider's sub-accounts -- their content moves to the
+              primary (never deleted), their real credentials become sub-accounts with their own connection limits,
+              and the old rows are removed once fully merged. A source whose id happens to collide with one already
+              on the primary is left in place on the old row rather than dropped -- reported below, that row won't
+              be removed until you resolve it.
+            </p>
+            <div>
+              <label className="text-xs text-muted-foreground">Primary provider (keeps this identity, gains sub-accounts)</label>
+              <select className={inputCls('w-full')} value={mergePrimaryId} onChange={(e) => { setMergePrimaryId(e.target.value); setMergeOtherIds(new Set()) }}>
+                <option value="">Select…</option>
+                {providersQuery.data?.filter((p) => p.provider_type === 'xc').map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+            {mergePrimaryId && (
+              <div>
+                <label className="text-xs text-muted-foreground">Other providers to merge in</label>
+                <div className="max-h-48 overflow-y-auto space-y-1 border border-border rounded p-2 mt-1">
+                  {providersQuery.data?.filter((p) => p.provider_type === 'xc' && String(p.id) !== mergePrimaryId).map((p) => (
+                    <label key={p.id} className="flex items-center gap-1.5 text-xs select-none">
+                      <input
+                        type="checkbox"
+                        checked={mergeOtherIds.has(p.id)}
+                        onChange={() => {
+                          const next = new Set(mergeOtherIds)
+                          if (next.has(p.id)) next.delete(p.id); else next.add(p.id)
+                          setMergeOtherIds(next)
+                        }}
+                      />
+                      {p.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            {mergeResult && (
+              <div className="text-xs space-y-1 border border-border rounded p-2">
+                <p>{mergeResult.sub_accounts_created} sub-account(s) created · {mergeResult.movie_sources_moved} movie source(s) + {mergeResult.episode_sources_moved} episode source(s) moved · {mergeResult.providers_removed} old provider row(s) removed</p>
+                {!!(mergeResult.movie_source_collisions || mergeResult.episode_source_collisions) && (
+                  <p className="text-warning">
+                    {mergeResult.movie_source_collisions} movie / {mergeResult.episode_source_collisions} episode source(s) collided and stayed on the old row -- see providers_partially_merged below.
+                  </p>
+                )}
+                {!!mergeResult.providers_partially_merged?.length && (
+                  <ul className="list-disc list-inside">
+                    {mergeResult.providers_partially_merged.map((p: any) => (
+                      <li key={p.provider_id}>{p.name}: {p.movie_collisions} movie / {p.episode_collisions} episode collision(s) left, row not removed</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <Button size="sm" variant="outline" onClick={() => setMergeModalOpen(false)}>Close</Button>
+              <Button
+                size="sm"
+                disabled={!mergePrimaryId || !mergeOtherIds.size || mergeProviders.isPending}
+                onClick={() => { askConfirm(`Merge ${mergeOtherIds.size} provider(s) into this one? Their content moves over and the old rows are removed once fully merged.`, () => mergeProviders.mutate()) }}
+              >
+                {mergeProviders.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                Merge
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {excludeCategoriesProviderId != null && (() => {
         const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
@@ -6715,7 +6909,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm" variant="outline"
             disabled={applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running'}
-            onClick={() => { if (confirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.')) applyImportExclusionsNow.mutate() }}
+            onClick={() => askConfirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.', () => applyImportExclusionsNow.mutate())}
           >
             {applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running' ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
             Apply rules to existing catalog now
@@ -6817,7 +7011,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         <button
                           title="Delete this recording rule (also cancels its future recordings on Dispatcharr)"
                           className="text-muted-foreground hover:text-destructive p-1"
-                          onClick={() => { if (confirm(`Delete recording rule "${rp.label}"? This also cancels its future recordings on Dispatcharr.`)) deleteRecordingProfile.mutate(rp.id) }}
+                          onClick={() => { askConfirm(`Delete recording rule "${rp.label}"? This also cancels its future recordings on Dispatcharr.`, () => deleteRecordingProfile.mutate(rp.id)) }}
                         >
                           <Trash2 size={12} />
                         </button>
@@ -7054,7 +7248,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           <button
                             title="Remove this person's DVR limits (their existing recording rules are unaffected, just unconstrained again)"
                             className="text-muted-foreground hover:text-destructive p-1"
-                            onClick={() => { if (confirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`)) deleteDvrUserLimit.mutate(lim.id) }}
+                            onClick={() => { askConfirm(`Remove DVR limits for "${lim.dispatcharr_username}"?`, () => deleteDvrUserLimit.mutate(lim.id)) }}
                           >
                             <Trash2 size={12} />
                           </button>
@@ -7191,7 +7385,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                               <Button
                                 size="sm" className="text-destructive"
                                 disabled={applyRetention.isPending || !retentionCandidatesQuery.data || (!retentionCandidatesQuery.data.movies.length && !retentionCandidatesQuery.data.episodes.length)}
-                                onClick={() => { if (confirm('Delete these items from the VOD & DVR Manager pool? This cannot be undone.')) applyRetention.mutate() }}
+                                onClick={() => askConfirm('Delete these items from the VOD & DVR Manager pool? This cannot be undone.', () => applyRetention.mutate())}
                               >
                                 {applyRetention.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Trash2 size={12} className="mr-1" /> Delete listed items</>}
                               </Button>
@@ -7350,7 +7544,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         {!!acct.totp_enabled && (
                           <Button
                             size="sm" variant="outline"
-                            onClick={() => { if (confirm(`Reset MFA for "${acct.username}"? They'll need to re-enroll on their next login.`)) resetPortalAccountMfa.mutate(acct.id) }}
+                            onClick={() => { askConfirm(`Reset MFA for "${acct.username}"? They'll need to re-enroll on their next login.`, () => resetPortalAccountMfa.mutate(acct.id)) }}
                           >
                             Reset MFA
                           </Button>
@@ -7358,7 +7552,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         <button
                           title="Delete this portal account"
                           className="text-muted-foreground hover:text-destructive p-1"
-                          onClick={() => { if (confirm(`Delete portal account "${acct.username}"?`)) deletePortalAccount.mutate(acct.id) }}
+                          onClick={() => { askConfirm(`Delete portal account "${acct.username}"?`, () => deletePortalAccount.mutate(acct.id)) }}
                         >
                           <Trash2 size={12} />
                         </button>
@@ -7462,7 +7656,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                             title="Remove this provider's copy from the pool"
                             className="text-muted-foreground hover:text-destructive p-1"
                             disabled={!src || deleteDvrMovieSource.isPending}
-                            onClick={() => { if (src && confirm(`Remove "${m.name}" from the DVR pool? This can't be undone.`)) deleteDvrMovieSource.mutate({ movieId: m.id, sourceId: src.id }) }}
+                            onClick={() => { if (src) askConfirm(`Remove "${m.name}" from the DVR pool? This can't be undone.`, () => deleteDvrMovieSource.mutate({ movieId: m.id, sourceId: src.id })) }}
                           >
                             <Trash2 size={12} />
                           </button>
@@ -7507,7 +7701,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                                   title="Remove this provider's copy from the pool"
                                   className="text-muted-foreground hover:text-destructive p-1"
                                   disabled={deleteDvrEpisodeSource.isPending}
-                                  onClick={() => { if (confirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`)) deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id }) }}
+                                  onClick={() => { askConfirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`, () => deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id })) }}
                                 >
                                   <Trash2 size={12} />
                                 </button>
@@ -7738,7 +7932,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   : (
                     <Button
                       size="sm" variant="outline" className="text-destructive" disabled={purgeOrphans.isPending}
-                      onClick={() => { if (confirm(`Delete ${total} orphaned/sourceless row(s)? This can't be undone.`)) purgeOrphans.mutate() }}
+                      onClick={() => { askConfirm(`Delete ${total} orphaned/sourceless row(s)? This can't be undone.`, () => purgeOrphans.mutate()) }}
                     >
                       {purgeOrphans.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Trash2 size={12} className="mr-1" />}
                       Delete {total} orphan{total === 1 ? '' : 's'}
@@ -8014,7 +8208,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     >
                       <CalendarClock size={12} />
                     </button>
-                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { if (confirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`)) deleteCategory.mutate(c.id) }}>
+                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { askConfirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`, () => deleteCategory.mutate(c.id)) }}>
                       <Trash2 size={12} />
                     </button>
                   </span>
@@ -8103,7 +8297,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             size="sm" variant="outline"
             disabled={!!tmdbBulkApply.movie?.running}
             title="Renames every movie with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-movie TMDB-title button, just for the whole library at once"
-            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('movie') }}
+            onClick={() => askConfirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.', () => runBulkApplyTmdbTitles('movie'))}
           >
             {tmdbBulkApply.movie?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
             Apply TMDB Titles{tmdbBulkApply.movie && !tmdbBulkApply.movie.running ? ` (${tmdbBulkApply.movie.renamed} renamed)` : ''}
@@ -8263,7 +8457,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             size="sm" variant="outline"
             disabled={!!tmdbBulkApply.series?.running}
             title="Renames every series with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-series TMDB-title button, just for the whole library at once"
-            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('series') }}
+            onClick={() => askConfirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.', () => runBulkApplyTmdbTitles('series'))}
           >
             {tmdbBulkApply.series?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
             Apply TMDB Titles{tmdbBulkApply.series && !tmdbBulkApply.series.running ? ` (${tmdbBulkApply.series.renamed} renamed)` : ''}
@@ -8406,6 +8600,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           onClose={() => setLibraryLanguageModalOpen(null)}
         />
       )}
+
+      <ConfirmDialogHost />
     </div>
   )
 }
