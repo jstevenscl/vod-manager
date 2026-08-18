@@ -211,6 +211,39 @@ real login count against one shared limit rather than each getting their
 own — since they *are* the same underlying subscription regardless of how
 many separate provider rows you've set up for it.
 
+## Multi-account providers (sub-accounts)
+
+Some subscriptions aren't one login — they're several separate logins sold
+as a bundle (e.g. a "5x1" package: five independent single-connection
+accounts). Dispatcharr represents this with M3U *profiles* under one
+source; VOD & DVR Manager now has the same concept natively: a provider can
+hold multiple **sub-accounts**, each with its own real username, password,
+and connection limit.
+
+Configure it under Providers → *Sub-accounts* (expand a provider row):
+
+- Add each real login as a sub-account, with its own `max_streams` (0 =
+  unlimited).
+- VOD & DVR Manager tries active sub-accounts in order and picks the first
+  one with a free slot when opening a stream — matching Dispatcharr's own
+  default-then-next-profile failover exactly, not a summed/aggregate limit.
+- Sub-accounts can be individually deactivated (e.g. a login temporarily
+  suspended) without touching the rest of the provider.
+- Providers without any sub-accounts configured behave exactly as before —
+  this is purely additive.
+
+**Already split into separate provider rows?** If you previously worked
+around this by manually creating one VOD & DVR Manager provider per login
+(the only option before sub-accounts existed), use **Merge Providers**
+(Providers page → *Merge Providers*) to consolidate them: pick a primary
+provider and one or more others to fold in as its sub-accounts. Content is
+never deleted — every source re-points to the primary provider, and any
+Dispatcharr live-account links move over too. If a merge finds the same
+piece of content already present on both providers (a genuine collision,
+not just a duplicate), that item is left on the old row and reported back
+so you can resolve it by hand; the old row is only removed once it's fully
+empty.
+
 ## Security and deployment
 
 - **Set an admin login and don't skip it.** Until a login is configured,
