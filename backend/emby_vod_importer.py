@@ -16,6 +16,7 @@ import time
 
 import emby_vod_client
 import vod_db
+import vod_importer
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         "rating": fields["rating"],
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
+                        "auto_archive": vod_importer._should_auto_archive(item.get("Name", "")),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
                 for k in movie_result:
@@ -128,6 +130,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         "rating": fields["rating"],
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
+                        "auto_archive": vod_importer._should_auto_archive(show.get("Name", "")),
                         "episodes": episodes,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_series, provider_id, series_items)

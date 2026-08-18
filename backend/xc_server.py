@@ -328,6 +328,14 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "container_extension": row["container_extension"] or "mp4",
             "custom_sid": "",
             "direct_source": "",
+            # Dispatcharr v0.29.0+ reads this exact key off each item in this
+            # bulk list (apps/vod/tasks.py: `if 'is_adult' in movie_data`) to
+            # gate content per-profile ("Hide Mature Content"). Sent as a
+            # string, matching the real XC providers' own convention -- its
+            # parser (parse_is_adult) accepts int or string "1" either way.
+            # Mirrors movies.is_adult/is_adult_manual (see
+            # vod_importer._looks_adult and the manual override toggle).
+            "is_adult": "1" if row.get("is_adult") else "0",
         } for i, row in enumerate(rows)]
 
     if action == "get_vod_info":
@@ -352,6 +360,11 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "rating": row.get("rating") or "0",
                 "bitrate": row.get("bitrate") or 0,
                 "duration_secs": row["duration_secs"] or 0,
+                # See get_vod_streams' identical field -- included here too
+                # since a real XC provider's own get_vod_info typically
+                # repeats it, but get_vod_streams' bulk list is Dispatcharr's
+                # actual confirmed read path (apps/vod/tasks.py) as of v0.29.0.
+                "is_adult": "1" if row.get("is_adult") else "0",
             },
             "movie_data": {
                 "stream_id": row["export_stream_id"],
@@ -1120,6 +1133,7 @@ async def hls_segment(username: str, password: str, hls_id: str, segment_name: s
 async def _proxy_vod_stream(
     kind: str, username: str, sources: list[dict], request: Request,
     title: str = "?", duration_secs: int | None = None,
+    movie_id: int | None = None, episode_id: int | None = None,
 ) -> Response:
     """Tries each source (provider carrying this movie/episode) in order,
     most-recently-imported first, falling over to the next one if a provider
@@ -1130,7 +1144,7 @@ async def _proxy_vod_stream(
 
     if not sources:
         logger.warning("[xc_server] %s stream 404 id=%s (no active source)", kind, conn_id)
-        vod_db.log_stream_failure(kind, title, username, [], "no active source")
+        vod_db.log_stream_failure(kind, title, username, [], "no active source", movie_id=movie_id, episode_id=episode_id)
         return Response(status_code=404, content="not found")
 
     forward_headers = {}
@@ -1280,7 +1294,7 @@ async def _proxy_vod_stream(
                 vod_db.log_stream_failure(
                     kind, title, username,
                     [{"provider": provider["name"], "error": f"started OK, broke mid-stream after {bytes_sent} bytes"}],
-                    outcome,
+                    outcome, movie_id=movie_id, episode_id=episode_id,
                 )
                 vod_db.record_source_failure(kind, source["source_id"])
                 raise
@@ -1331,7 +1345,7 @@ async def _proxy_vod_stream(
 
     logger.warning("[xc_server] %s stream id=%s exhausted %d source(s), last error: %s",
                     kind, conn_id, len(sources), last_error)
-    vod_db.log_stream_failure(kind, title, username, attempts, last_error or "all sources failed")
+    vod_db.log_stream_failure(kind, title, username, attempts, last_error or "all sources failed", movie_id=movie_id, episode_id=episode_id)
     return Response(status_code=502, content="all sources failed")
 
 
@@ -1350,7 +1364,7 @@ async def movie_stream(username: str, password: str, stream_id_ext: str, request
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(row["movie_id"])
     title = f"{row['name']} ({row['year']})" if row.get("year") else row["name"]
-    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=row.get("duration_secs"))
+    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=row.get("duration_secs"), movie_id=row["movie_id"])
 
 
 @router.get("/series/{username}/{password}/{episode_id_ext}")
@@ -1369,7 +1383,7 @@ async def series_stream(username: str, password: str, episode_id_ext: str, reque
     series = vod_db.get_series(row["series_id"])
     series_name = series["name"] if series else "?"
     title = f"{series_name} S{row['season_number']}E{row['episode_number']} — {row['name']}"
-    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=row.get("duration_secs"))
+    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=row.get("duration_secs"), episode_id=row["episode_id"])
 
 
 # ── Preview streaming ────────────────────────────────────────────────────────
@@ -1395,7 +1409,7 @@ async def preview_movie_stream(username: str, password: str, movie_id_ext: str, 
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(movie_id)
     title = f"{movie['name']} ({movie['year']})" if movie.get("year") else movie["name"]
-    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=movie.get("duration_secs"))
+    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=movie.get("duration_secs"), movie_id=movie_id)
 
 
 @router.get("/preview/series/{username}/{password}/{episode_id_ext}")
@@ -1415,7 +1429,7 @@ async def preview_episode_stream(username: str, password: str, episode_id_ext: s
         title = f"{series_name} S{episode['season_number']}E{episode['episode_number']} — {episode['name']}"
     else:
         title = "?"
-    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=episode.get("duration_secs") if episode else None)
+    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=episode.get("duration_secs") if episode else None, episode_id=episode_id)
 
 
 # Per-source preview — forces exactly one specific provider's copy rather
@@ -1436,7 +1450,7 @@ async def preview_movie_source_stream(username: str, password: str, source_id_ex
     if not source or not _movie_allowed(client, source["movie_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
-    return await _proxy_vod_stream("movie", username, [source], request, title=title, duration_secs=source.get("duration_secs"))
+    return await _proxy_vod_stream("movie", username, [source], request, title=title, duration_secs=source.get("duration_secs"), movie_id=source["movie_id"])
 
 
 @router.get("/preview/series-source/{username}/{password}/{source_id_ext}")
@@ -1450,7 +1464,7 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
     if not source or not _series_allowed(client, source["series_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
-    return await _proxy_vod_stream("series", username, [source], request, title=title, duration_secs=source.get("duration_secs"))
+    return await _proxy_vod_stream("series", username, [source], request, title=title, duration_secs=source.get("duration_secs"), episode_id=source["episode_id"])
 
 
 # Transcoded variants — same auth/lookup, but re-encode to browser-compatible

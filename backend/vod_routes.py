@@ -100,6 +100,7 @@ class ImportLanguageExclusionRequest(BaseModel):
 
 class ProviderImportExcludeCategoriesRequest(BaseModel):
     category_names: list[str] = []
+    exclude_uncategorized: bool = False
 
 
 class SuggestCategoryRuleRequest(BaseModel):
@@ -1191,7 +1192,7 @@ async def get_provider_available_categories(provider_id: int):
 async def set_provider_import_exclude_categories(provider_id: int, body: ProviderImportExcludeCategoriesRequest):
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
-    vod_db.set_provider_import_exclude_categories(provider_id, body.category_names)
+    vod_db.set_provider_import_exclude_categories(provider_id, body.category_names, body.exclude_uncategorized)
     return {"ok": True}
 
 

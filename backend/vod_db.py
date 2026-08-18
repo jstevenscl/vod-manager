@@ -915,6 +915,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("episode_sources", "last_failed_at", "TEXT"),
         ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "known_import_categories", "TEXT"),
+        # Nullable, ON DELETE SET NULL -- foreign_keys=ON is enforced (see
+        # _connect), so a plain REFERENCES without an ON DELETE action would
+        # block deleting a movie/episode that still has an old failure row
+        # pointing at it. See vod_stream_failures' CREATE TABLE comment: only
+        # used to look up *live* "playing from" state while the row still
+        # resolves; the stamped title/kind/attempts text is always the
+        # source of truth for what a since-deleted item was.
+        ("vod_stream_failures", "movie_id", "INTEGER REFERENCES movies(id) ON DELETE SET NULL"),
+        ("vod_stream_failures", "episode_id", "INTEGER REFERENCES episodes(id) ON DELETE SET NULL"),
+        # GH issue #7: some providers ship movies/series with no category at
+        # all -- import_exclude_categories can never match those (it only
+        # ever compares an actual category NAME against the exclude list),
+        # so this is a separate on/off switch, not another entry in that
+        # list. See vod_importer._should_auto_archive.
+        ("providers", "import_exclude_uncategorized", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1894,12 +1909,16 @@ def get_recording_failure(provider_id: int, dispatcharr_recording_id: int) -> di
 _MAX_STORED_STREAM_FAILURES = 500
 
 
-def log_stream_failure(kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str) -> None:
+def log_stream_failure(
+    kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str,
+    movie_id: int | None = None, episode_id: int | None = None,
+) -> None:
     import json
     conn = _connect()
     conn.execute(
-        "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at) VALUES (?,?,?,?,?,?)",
-        (kind, title, username, json.dumps(attempts), final_reason, _now()),
+        "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at, movie_id, episode_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (kind, title, username, json.dumps(attempts), final_reason, _now(), movie_id, episode_id),
     )
     conn.execute(
         "DELETE FROM vod_stream_failures WHERE id NOT IN "
@@ -1945,6 +1964,47 @@ def record_source_success(kind: str, source_id: int) -> None:
     conn.close()
 
 
+def _current_best_source(kind: str, movie_id: int | None, episode_id: int | None) -> dict | None:
+    """The source that would actually be tried first right now for this
+    specific movie/episode -- reuses list_movie/episode_sources_for_streaming,
+    the exact same ordering xc_server._proxy_vod_stream's failover loop uses
+    to pick source order, so this can never drift from what actually plays.
+    Returns None if the row was since deleted (movie_id/episode_id NULL) or
+    has no active-provider source at all."""
+    if movie_id:
+        sources = list_movie_sources_for_streaming(movie_id)
+    elif episode_id:
+        sources = list_episode_sources_for_streaming(episode_id)
+    else:
+        return None
+    if not sources:
+        return None
+    top = sources[0]
+    return {
+        "provider_name": top["provider_name"],
+        "is_failing": top["consecutive_failures"] >= _FAILING_SOURCE_THRESHOLD,
+        "consecutive_failures": top["consecutive_failures"],
+    }
+
+
+def _series_providers(series_id: int) -> list[str]:
+    """Distinct providers with ANY source across the whole series -- not just
+    the one episode a given failure happened on. Providers only ever attach
+    at the episode level, so without this an admin has no way to see the
+    full picture without opening every episode individually."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT DISTINCT p.name AS provider_name
+        FROM episode_sources es
+        JOIN episodes e ON e.id = es.episode_id
+        JOIN providers p ON p.id = es.provider_id
+        WHERE e.series_id = ?
+        ORDER BY p.name
+    """, (series_id,)).fetchall()
+    conn.close()
+    return [r["provider_name"] for r in rows]
+
+
 def list_stream_failures(limit: int = 200) -> list[dict]:
     import json
     conn = _connect()
@@ -1959,6 +2019,12 @@ def list_stream_failures(limit: int = 200) -> list[dict]:
             d["attempts"] = json.loads(d["attempts"])
         except (TypeError, ValueError):
             d["attempts"] = []
+        d["current_source"] = _current_best_source(d["kind"], d.get("movie_id"), d.get("episode_id"))
+        d["series_providers"] = None
+        if d["kind"] == "series" and d.get("episode_id"):
+            episode = get_episode(d["episode_id"])
+            if episode:
+                d["series_providers"] = _series_providers(episode["series_id"])
         out.append(d)
     return out
 
@@ -2548,17 +2614,22 @@ def set_provider_auto_create_categories(provider_id: int, enabled: bool) -> None
     conn.close()
 
 
-def set_provider_import_exclude_categories(provider_id: int, category_names: list[str]) -> None:
+def set_provider_import_exclude_categories(provider_id: int, category_names: list[str], exclude_uncategorized: bool = False) -> None:
     """Provider category names (as this provider itself names them, e.g.
     "Movies - Spanish") to auto-archive on import -- unlike the language
     exclusion rules (config.get/save_import_language_exclusion), this is
     per-provider since available categories genuinely differ provider to
-    provider. See vod_importer._should_auto_archive."""
+    provider. See vod_importer._should_auto_archive.
+
+    exclude_uncategorized (GH issue #7) is a separate switch, not another
+    category name -- some providers ship items with no category attached at
+    all, which can never appear in category_names since there's no name to
+    add."""
     import json
     conn = _connect()
     conn.execute(
-        "UPDATE providers SET import_exclude_categories=?, updated_at=? WHERE id=?",
-        (json.dumps([c.strip() for c in category_names if c.strip()]), _now(), provider_id),
+        "UPDATE providers SET import_exclude_categories=?, import_exclude_uncategorized=?, updated_at=? WHERE id=?",
+        (json.dumps([c.strip() for c in category_names if c.strip()]), int(exclude_uncategorized), _now(), provider_id),
     )
     _commit_with_retry(conn)
     conn.close()
@@ -4405,24 +4476,45 @@ def _next_placement_seq(conn: sqlite3.Connection) -> int:
     return row["m"] - _EXPORT_STREAM_ID_BASE + 1
 
 
+def _chunked(ids: list[int], size: int = 900) -> list[list[int]]:
+    """Split an id list into SQLite-safe IN(...) chunks. 900 stays well under
+    even the historically low SQLITE_MAX_VARIABLE_NUMBER default of 999 seen
+    on some builds (this build's is 32766, but the smart-category catch-all
+    path can match tens of thousands of rows in one call -- see
+    bulk_place_movies_in_category -- so a fixed safe chunk size beats
+    querying the runtime limit)."""
+    return [ids[i:i + size] for i in range(0, len(ids), size)]
+
+
 def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int:
     """Batch equivalent of place_movie_in_category — one connection/transaction
     for the whole list instead of one round-trip per movie. Needed because
     smart-category evaluation (e.g. a catch-all rule matching the entire
     pool) can place tens of thousands of rows at once; the one-at-a-time
     version times out at that scale. Returns the count newly placed
-    (already-placed movies are skipped, same semantics as the single version)."""
+    (already-placed movies are skipped, same semantics as the single version).
+
+    IN (...) clauses are chunked (see _chunked) rather than binding the
+    whole id list as one statement -- a catalog-wide catch-all category can
+    match tens of thousands of movies, which exceeds SQLite's bound-parameter
+    limit (32766 on this build; historically as low as 999 on some) in a
+    single query."""
     if not movie_ids:
         return 0
     conn = _connect()
-    placeholders = ",".join("?" for _ in movie_ids)
-    already = {r["movie_id"] for r in conn.execute(
-        f"SELECT movie_id FROM movie_category_placements WHERE category_id=? AND movie_id IN ({placeholders})",
-        (category_id, *movie_ids),
-    ).fetchall()}
-    flagged = {r["id"] for r in conn.execute(
-        f"SELECT id FROM movies WHERE needs_year_review=1 AND id IN ({placeholders})", movie_ids,
-    ).fetchall()}
+    already: set[int] = set()
+    for chunk in _chunked(movie_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        already.update(r["movie_id"] for r in conn.execute(
+            f"SELECT movie_id FROM movie_category_placements WHERE category_id=? AND movie_id IN ({placeholders})",
+            (category_id, *chunk),
+        ).fetchall())
+    flagged: set[int] = set()
+    for chunk in _chunked(movie_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        flagged.update(r["id"] for r in conn.execute(
+            f"SELECT id FROM movies WHERE needs_year_review=1 AND id IN ({placeholders})", chunk,
+        ).fetchall())
     if flagged:
         logger.info("[vod_db] skipping %d movie(s) still needing year review for category=%s", len(flagged), category_id)
     to_place = [mid for mid in movie_ids if mid not in already and mid not in flagged]
@@ -4431,11 +4523,13 @@ def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int
         return 0
 
     counts: dict[int, int] = {}
-    for r in conn.execute(
-        f"SELECT movie_id, COUNT(*) c FROM movie_category_placements WHERE movie_id IN ({','.join('?' for _ in to_place)}) GROUP BY movie_id",
-        to_place,
-    ).fetchall():
-        counts[r["movie_id"]] = r["c"]
+    for chunk in _chunked(to_place):
+        placeholders = ",".join("?" for _ in chunk)
+        for r in conn.execute(
+            f"SELECT movie_id, COUNT(*) c FROM movie_category_placements WHERE movie_id IN ({placeholders}) GROUP BY movie_id",
+            chunk,
+        ).fetchall():
+            counts[r["movie_id"]] = r["c"]
 
     next_seq = _next_placement_seq(conn)
     rows = []
@@ -4482,7 +4576,7 @@ def get_movie_export_rows() -> list[dict]:
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
-            m.rating AS rating, m.release_date AS release_date,
+            m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -4525,7 +4619,8 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
     conn = _connect()
     rows = conn.execute(f"""
         SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension,
-               ms.plex_rating_key, ms.local_file_path
+               ms.plex_rating_key, ms.local_file_path, ms.consecutive_failures AS consecutive_failures,
+               p.name AS provider_name
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
         WHERE ms.movie_id = ? AND p.is_active = 1
@@ -4542,7 +4637,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
-            m.rating AS rating, m.release_date AS release_date,
+            m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -5041,18 +5136,24 @@ def place_series_in_category(series_id: int, category_id: int) -> int:
 
 
 def bulk_place_series_in_category(series_ids: list[int], category_id: int) -> int:
-    """Batch equivalent of place_series_in_category — see bulk_place_movies_in_category."""
+    """Batch equivalent of place_series_in_category — see bulk_place_movies_in_category
+    (including the _chunked rationale)."""
     if not series_ids:
         return 0
     conn = _connect()
-    placeholders = ",".join("?" for _ in series_ids)
-    already = {r["series_id"] for r in conn.execute(
-        f"SELECT series_id FROM series_category_placements WHERE category_id=? AND series_id IN ({placeholders})",
-        (category_id, *series_ids),
-    ).fetchall()}
-    flagged = {r["id"] for r in conn.execute(
-        f"SELECT id FROM series WHERE needs_year_review=1 AND id IN ({placeholders})", series_ids,
-    ).fetchall()}
+    already: set[int] = set()
+    for chunk in _chunked(series_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        already.update(r["series_id"] for r in conn.execute(
+            f"SELECT series_id FROM series_category_placements WHERE category_id=? AND series_id IN ({placeholders})",
+            (category_id, *chunk),
+        ).fetchall())
+    flagged: set[int] = set()
+    for chunk in _chunked(series_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        flagged.update(r["id"] for r in conn.execute(
+            f"SELECT id FROM series WHERE needs_year_review=1 AND id IN ({placeholders})", chunk,
+        ).fetchall())
     if flagged:
         logger.info("[vod_db] skipping %d series still needing year review for category=%s", len(flagged), category_id)
     to_place = [sid for sid in series_ids if sid not in already and sid not in flagged]
@@ -5061,11 +5162,13 @@ def bulk_place_series_in_category(series_ids: list[int], category_id: int) -> in
         return 0
 
     counts: dict[int, int] = {}
-    for r in conn.execute(
-        f"SELECT series_id, COUNT(*) c FROM series_category_placements WHERE series_id IN ({','.join('?' for _ in to_place)}) GROUP BY series_id",
-        to_place,
-    ).fetchall():
-        counts[r["series_id"]] = r["c"]
+    for chunk in _chunked(to_place):
+        placeholders = ",".join("?" for _ in chunk)
+        for r in conn.execute(
+            f"SELECT series_id, COUNT(*) c FROM series_category_placements WHERE series_id IN ({placeholders}) GROUP BY series_id",
+            chunk,
+        ).fetchall():
+            counts[r["series_id"]] = r["c"]
 
     row = conn.execute(
         "SELECT COALESCE(MAX(export_series_id), ?) m FROM series_category_placements",
@@ -5147,7 +5250,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("""
         SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path,
-               e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
+               e.id AS episode_id, e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
                e.duration_secs AS duration_secs, s.id AS series_id, s.name AS series_name
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
@@ -5164,7 +5267,8 @@ def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
     conn = _connect()
     rows = conn.execute(f"""
         SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension,
-               es.plex_rating_key, es.local_file_path
+               es.plex_rating_key, es.local_file_path, es.consecutive_failures AS consecutive_failures,
+               p.name AS provider_name
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
         WHERE es.episode_id = ? AND p.is_active = 1
@@ -5777,7 +5881,14 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
     Plex hands back full detail up front, so this also writes genre/
     description/etc. in the same pass rather than needing a later enrichment
     step. items: [{name, year, provider_stream_id, container_extension, genre,
-    description, director, cast_list, poster_url, last_enriched_at}, ...]"""
+    description, director, cast_list, poster_url, last_enriched_at,
+    auto_archive}, ...]
+
+    auto_archive (see vod_importer._should_auto_archive, called with no
+    category args -- Plex/Emby have no XC-style flat category list to filter
+    on, only language rules apply here, see vod_manager-i4i) mirrors
+    bulk_import_movies' upgrade-only-both-directions archive/unarchive
+    semantics exactly -- see that function's docstring."""
     _WRITE_LOCK.acquire()
     try:
         conn = _connect()
@@ -5786,6 +5897,8 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
         matched = 0
         flagged = 0
         errors = 0
+        archived = 0
+        unarchived = 0
         # See bulk_import_movies's identical comment -- same fix, same reason.
         batch_size = 25
         for i, item in enumerate(items):
@@ -5793,11 +5906,12 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                 with _item_savepoint(conn):
                     name = item["name"]
                     year = item.get("year")
+                    should_archive = bool(item.get("auto_archive"))
                     detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
                     # See bulk_import_movies's identical did_create/did_match/did_flag
                     # comment -- folded into the real counters only after this item's
                     # last statement has actually succeeded.
-                    did_create = did_match = did_flag = False
+                    did_create = did_match = did_flag = did_archive = did_unarchive = False
                     # Primary match: this exact provider+stream_id was already imported
                     # before -- reuse its established movie_id directly, UNCONDITIONALLY
                     # (checked before any name-based matching, not just for a blank
@@ -5817,6 +5931,17 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                         did_match = True
                         sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                         conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
+                        existing = conn.execute(
+                            "SELECT review_excluded, review_excluded_manual FROM movies WHERE id=?", (movie_id,)
+                        ).fetchone()
+                        if existing:
+                            if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
+                                conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
+                                conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                did_archive = True
+                            elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
+                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                did_unarchive = True
                     elif not name.strip():
                         # Same guard as bulk_import_movies -- a blank name has no real
                         # identity to match on, so never match it against anything,
@@ -5825,31 +5950,51 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                         # established identity for this stream, so this is genuinely new.
                         placeholder = f"[Untitled] Plex · stream {item['provider_stream_id']}"
                         cur = conn.execute(
-                            "INSERT INTO movies (name, year, needs_year_review, created_at) VALUES (?,?,?,?)",
-                            (placeholder, year, 1, now),
+                            "INSERT INTO movies (name, year, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?)",
+                            (placeholder, year, 1, int(should_archive), now),
                         )
                         movie_id = cur.lastrowid
                         did_create = True
                         did_flag = True
+                        did_archive = should_archive
                     else:
-                        row = conn.execute("SELECT id FROM movies WHERE name=? AND year IS ?", (name, year)).fetchone()
+                        row = conn.execute(
+                            "SELECT id, review_excluded, review_excluded_manual FROM movies WHERE name=? AND year IS ?",
+                            (name, year),
+                        ).fetchone()
                         if row:
                             movie_id = row["id"]
                             did_match = True
                             sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                             conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
+                            if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
+                                conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
+                                conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                did_archive = True
+                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
+                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                did_unarchive = True
                         elif year is None:
                             # Same reasoning as bulk_import_movies. Still writes full detail
                             # even when flagged -- more info for whoever reviews it later.
-                            candidates = conn.execute("SELECT id FROM movies WHERE name=?", (name,)).fetchall()
+                            candidates = conn.execute(
+                                "SELECT id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
+                            ).fetchall()
                             if len(candidates) == 1:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
                                 sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                                 conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
+                                if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
+                                    conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                    did_archive = True
+                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                    did_unarchive = True
                             else:
-                                cols = ["name", "year", "needs_year_review", *detail.keys()]
-                                vals = [name, year, 1 if candidates else 0, *detail.values()]
+                                cols = ["name", "year", "needs_year_review", "review_excluded", *detail.keys()]
+                                vals = [name, year, 1 if candidates else 0, int(should_archive), *detail.values()]
                                 if item.get("tmdb_id"):
                                     cols.append("tmdb_id")
                                     vals.append(item["tmdb_id"])
@@ -5857,11 +6002,12 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                                 cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
                                 movie_id = cur.lastrowid
                                 did_create = True
+                                did_archive = should_archive
                                 if candidates:
                                     did_flag = True
                         else:
-                            cols = ["name", "year", *detail.keys()]
-                            vals = [name, year, *detail.values()]
+                            cols = ["name", "year", "review_excluded", *detail.keys()]
+                            vals = [name, year, int(should_archive), *detail.values()]
                             if item.get("tmdb_id"):
                                 cols.append("tmdb_id")
                                 vals.append(item["tmdb_id"])
@@ -5869,6 +6015,7 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                             cur = conn.execute(f"INSERT INTO movies ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
                             movie_id = cur.lastrowid
                             did_create = True
+                            did_archive = should_archive
                     conn.execute(
                         """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
                            VALUES (?,?,?,?,?,?,?,?)
@@ -5880,6 +6027,8 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                     created += did_create
                     matched += did_match
                     flagged += did_flag
+                    archived += did_archive
+                    unarchived += did_unarchive
             except Exception as exc:
                 errors += 1
                 logger.warning("[vod_db] bulk_import_plex_movies: skipped item name=%r stream_id=%r: %s",
@@ -5900,7 +6049,8 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
         conn.close()
     finally:
         _WRITE_LOCK.release()
-    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"movies_created": created, "movies_matched": matched, "total": len(items), "flagged_for_review": flagged,
+            "archived": archived, "unarchived": unarchived, "errors": errors}
 
 
 def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
@@ -5908,9 +6058,11 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
     and also writes every episode (Plex's allLeaves gives us all of them up
     front, unlike XC's lazy per-series fetch) in the same pass. items:
     [{name, year, provider_series_id, genre, description, director,
-    cast_list, poster_url, last_enriched_at, episodes: [{season_number,
+    cast_list, poster_url, last_enriched_at, auto_archive, episodes: [{season_number,
     episode_number, name, description, duration_secs, provider_stream_id,
-    container_extension}, ...]}, ...]"""
+    container_extension}, ...]}, ...]
+
+    auto_archive -- see bulk_import_plex_movies' identical docstring note."""
     _WRITE_LOCK.acquire()
     try:
         conn = _connect()
@@ -5920,17 +6072,20 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
         episodes_total = 0
         errors = 0
         episode_errors = 0
+        archived = 0
+        unarchived = 0
         batch_size = 20
         for i, item in enumerate(items):
             try:
                 with _item_savepoint(conn):
                     name = item["name"]
                     year = item.get("year")
+                    should_archive = bool(item.get("auto_archive"))
                     detail = {k: item.get(k) for k in _PLEX_DETAIL_FIELDS}
                     # See bulk_import_movies's identical did_create/did_match comment --
                     # folded into the real counters only once the series-level
                     # statement that follows has actually succeeded.
-                    did_create = did_match = False
+                    did_create = did_match = did_archive = did_unarchive = False
                     # Primary match: this exact provider+series_id was already imported
                     # before -- reuse its established series_id directly, UNCONDITIONALLY
                     # (checked before any name-based matching, not just for a blank
@@ -5941,7 +6096,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                     # changing between Plex syncs could silently duplicate a series on
                     # the very next import instead of recognizing it via its stable id.
                     existing = conn.execute(
-                        "SELECT id FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                        "SELECT id, review_excluded, review_excluded_manual FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
                         (provider_id, item.get("provider_series_id")),
                     ).fetchone()
                     if existing:
@@ -5949,6 +6104,13 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                         sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                         conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                         did_match = True
+                        if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
+                            conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id,))
+                            conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id,))
+                            did_archive = True
+                        elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
+                            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id,))
+                            did_unarchive = True
                     elif not name.strip():
                         # Same guard as bulk_import_series -- a blank name has no real
                         # identity to match on, so never match it against anything,
@@ -5956,8 +6118,8 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                         # already means the existing check above found no established
                         # identity for this series, so this is genuinely new.
                         placeholder = f"[Untitled] Plex · series {item.get('provider_series_id')}"
-                        cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
-                        vals = [placeholder, year, 1, provider_id, item.get("provider_series_id"), *detail.values()]
+                        cols = ["name", "year", "needs_year_review", "review_excluded", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                        vals = [placeholder, year, 1, int(should_archive), provider_id, item.get("provider_series_id"), *detail.values()]
                         if item.get("tmdb_id"):
                             cols.append("tmdb_id")
                             vals.append(item["tmdb_id"])
@@ -5965,13 +6127,23 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                         cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders_sql}, ?)", (*vals, now))
                         series_id = cur.lastrowid
                         did_create = True
+                        did_archive = should_archive
                     else:
-                        row = conn.execute("SELECT id FROM series WHERE name=? AND year IS ?", (name, year)).fetchone()
+                        row = conn.execute(
+                            "SELECT id, review_excluded, review_excluded_manual FROM series WHERE name=? AND year IS ?", (name, year),
+                        ).fetchone()
                         if row:
                             series_id = row["id"]
                             sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                             conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                             did_match = True
+                            if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
+                                conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id,))
+                                conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id,))
+                                did_archive = True
+                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
+                                conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id,))
+                                did_unarchive = True
                         elif year is None:
                             # Same reasoning as bulk_import_plex_movies's identical
                             # branch -- a null year (rare for Plex/Emby, which
@@ -5982,15 +6154,24 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                             # falling straight through to a plain insert with no
                             # disambiguation at all, unlike every other null-year
                             # match path in this codebase.
-                            candidates = conn.execute("SELECT id FROM series WHERE name=?", (name,)).fetchall()
+                            candidates = conn.execute(
+                                "SELECT id, review_excluded, review_excluded_manual FROM series WHERE name=?", (name,)
+                            ).fetchall()
                             if len(candidates) == 1:
                                 series_id = candidates[0]["id"]
                                 sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
                                 conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                                 did_match = True
+                                if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id,))
+                                    conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id,))
+                                    did_archive = True
+                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id,))
+                                    did_unarchive = True
                             else:
-                                cols = ["name", "year", "needs_year_review", "import_provider_id", "import_provider_series_id", *detail.keys()]
-                                vals = [name, year, 1 if candidates else 0, provider_id, item.get("provider_series_id"), *detail.values()]
+                                cols = ["name", "year", "needs_year_review", "review_excluded", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                                vals = [name, year, 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), *detail.values()]
                                 if item.get("tmdb_id"):
                                     cols.append("tmdb_id")
                                     vals.append(item["tmdb_id"])
@@ -5998,9 +6179,10 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                 cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
                                 series_id = cur.lastrowid
                                 did_create = True
+                                did_archive = should_archive
                         else:
-                            cols = ["name", "year", "import_provider_id", "import_provider_series_id", *detail.keys()]
-                            vals = [name, year, provider_id, item.get("provider_series_id"), *detail.values()]
+                            cols = ["name", "year", "review_excluded", "import_provider_id", "import_provider_series_id", *detail.keys()]
+                            vals = [name, year, int(should_archive), provider_id, item.get("provider_series_id"), *detail.values()]
                             if item.get("tmdb_id"):
                                 cols.append("tmdb_id")
                                 vals.append(item["tmdb_id"])
@@ -6008,8 +6190,11 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                             cur = conn.execute(f"INSERT INTO series ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)", (*vals, now))
                             series_id = cur.lastrowid
                             did_create = True
+                            did_archive = should_archive
                     series_created += did_create
                     series_matched += did_match
+                    archived += did_archive
+                    unarchived += did_unarchive
 
                     for ep in item.get("episodes", []):
                         # A separate inner savepoint -- one malformed episode
@@ -6067,7 +6252,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
     finally:
         _WRITE_LOCK.release()
     return {"series_created": series_created, "series_matched": series_matched, "episodes_imported": episodes_total,
-            "errors": errors, "episode_errors": episode_errors}
+            "archived": archived, "unarchived": unarchived, "errors": errors, "episode_errors": episode_errors}
 
 
 # ── Metadata rewrite rules ───────────────────────────────────────────────────

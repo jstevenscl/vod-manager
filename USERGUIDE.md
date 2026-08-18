@@ -232,7 +232,11 @@ its name.
 per-provider, since available categories genuinely differ from one provider
 to the next — the picker shows exactly what that provider itself calls its
 categories, fetched live, not a guessed or fixed list. Same search/select-
-visible/shift-click pattern as the language picker.
+visible/shift-click pattern as the language picker. A standalone
+**Uncategorized** checkbox above the category list catches the case some
+providers hit where an item is reported with no category at all — since
+that has no name to match against, it can't be caught by picking specific
+categories and needs its own switch.
 
 ![Exclude Categories picker for a provider](docs/screenshots/exclude-categories-modal.png)
 
@@ -261,9 +265,11 @@ while (the same cost as a normal full catalog import). Progress shows live
 per-provider counts: how many titles were newly archived by the rules you
 just set, not just how many providers finished.
 
-Import exclusion currently applies to Xtream-Codes (XC) providers only —
-Plex/Emby/Jellyfin libraries are typically your own personal media, so this
-isn't wired into those import paths yet.
+**Language** exclusion applies to Plex/Emby/Jellyfin imports too, not just
+Xtream-Codes (XC) providers. **Category** exclusion (including the
+Uncategorized checkbox above) is XC-only for now — Plex/Emby have their own
+library/collection concepts rather than an XC-style flat category list, so
+that side needs its own design pass.
 
 ### Multiple profiles on one subscription
 
@@ -351,6 +357,17 @@ from the start. The first time you see the app, you'll be asked once
 whether 18+ content should be included in those two categories — it's
 excluded by default until you answer. You can still build your own
 categories (Manage Categories) on top of, or instead of, these two.
+
+Separately from category placement, every movie's 18+ status (from the
+Language Filter's category-name detection, or a manual toggle on the movie
+itself) is also passed straight through to Dispatcharr on every VOD sync,
+via the same field Dispatcharr (v0.29.0+) uses for its own per-profile
+"Hide Mature Content" setting. This means a Dispatcharr profile with mature
+content hidden won't see a flagged movie regardless of which category it's
+placed in on the VOD & DVR Manager side — the two controls are independent,
+and this one requires no setup here, it's automatic. Note this currently
+covers **movies only**: Dispatcharr itself has no equivalent flag for
+series yet.
 
 ### Before you start: remove existing provider VOD from Dispatcharr
 
@@ -752,7 +769,13 @@ Above the catalog itself, the dashboard always shows two live cards:
   source for this title is genuinely down" apart from "one specific
   provider keeps failing while the others are fine." Dismiss individual
   rows or **Clear all**; the log itself is capped at the most recent 500
-  entries and prunes automatically.
+  entries and prunes automatically. Where the failure's still resolvable to
+  a real movie/episode, each row also shows **"Playing from"** — the source
+  that would actually be tried first right now, using the same
+  priority/failover ordering real playback uses, flagged if that source is
+  itself currently failing — and, for a series, **"All series providers"**,
+  every provider with a source anywhere in that series, not just the one
+  episode that happened to fail.
 
 ![Failed Streams, showing a mid-stream crash and an every-source-exhausted failure](docs/screenshots/failed-streams.png)
 
@@ -1062,7 +1085,10 @@ Finds dead rows a provider deletion (or a bug) can leave behind — a series
 whose only source provider no longer exists, or movies/episodes with zero
 sources at all. Run it periodically, especially after removing a provider.
 It won't flag a series with no episodes yet — that's normal for anything
-not yet lazily enriched, not broken.
+not yet lazily enriched, not broken. Once a scan finds anything, a **Delete
+N orphans** button purges everything the scan found in one action — useful
+when a provider's fully abandoned and its dead rows just need to go, rather
+than investigating one at a time.
 
 ---
 
