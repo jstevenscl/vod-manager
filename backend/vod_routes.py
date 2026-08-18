@@ -1274,7 +1274,14 @@ async def get_provider_available_categories(provider_id: int):
     """Live category names from the provider itself (both movie and series
     categories, combined/deduped) -- powers the exclude-categories picker
     with what this specific provider actually calls things, not a guessed
-    or stale list. XC-only: Plex/Emby don't have this category concept."""
+    or stale list. XC-only: Plex/Emby don't have this category concept.
+
+    Stripped the same way set_provider_import_exclude_categories strips on
+    save (GH#4 reopened): a provider whose category names carry stray
+    leading/trailing whitespace was saving a trimmed name but this endpoint
+    returned the untrimmed one, so the saved exclusion could never match its
+    own live category again -- looked stale every single time, forever, for
+    exactly the categories with whitespace on that one provider."""
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise HTTPException(404, detail="provider not found")
@@ -1283,7 +1290,10 @@ async def get_provider_available_categories(provider_id: int):
     client = vod_importer.XCProviderClient(provider)
     movie_categories = await client.get_vod_categories()
     series_categories = await client.get_series_categories()
-    names = sorted({c["category_name"] for c in movie_categories} | {c["category_name"] for c in series_categories})
+    names = sorted({
+        n for c in movie_categories + series_categories
+        if (n := (c.get("category_name") or "").strip())
+    })
     return {"categories": names}
 
 
