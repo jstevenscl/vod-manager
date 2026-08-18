@@ -22,7 +22,10 @@ import config
 import vod_db
 
 
-def _should_auto_archive(name: str, provider_category_name: str | None, provider_exclude_categories: list[str]) -> bool:
+def _should_auto_archive(
+    name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
+    exclude_uncategorized: bool = False,
+) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
     for that tool's "don't archive the only copy" behavior): an explicit
@@ -30,7 +33,19 @@ def _should_auto_archive(name: str, provider_category_name: str | None, provider
     not "prefer another language's copy if one exists". Language rules are
     global (config.get_import_language_exclusion); category rules are
     per-provider (providers.import_exclude_categories), since available
-    categories genuinely differ provider to provider."""
+    categories genuinely differ provider to provider.
+
+    provider_category_name/provider_exclude_categories default to no-ops so
+    plex_importer.py/emby_vod_importer.py can call this for language rules
+    only -- Plex/Emby have their own library/collection concepts, not
+    XC-style flat category lists, so category-rule support there needs its
+    own design pass (see vod_manager-i4i).
+
+    exclude_uncategorized (GH issue #7): a real provider was found shipping
+    movies with no category attached at all -- the category-name check below
+    can never catch that (there's no name to compare), so this is a
+    dedicated switch, checked only when the item truly has no category,
+    never as a substitute for an actual category-name match."""
     lang = config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
         code = vod_db._name_prefix_code(name)
@@ -38,7 +53,10 @@ def _should_auto_archive(name: str, provider_category_name: str | None, provider
             return True
     if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
         return True
-    if provider_category_name and provider_category_name in provider_exclude_categories:
+    if provider_category_name:
+        if provider_category_name in provider_exclude_categories:
+            return True
+    elif exclude_uncategorized:
         return True
     return False
 
@@ -172,6 +190,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
     client = XCProviderClient(provider)
 
     exclude_categories = provider.get("import_exclude_categories") or []
+    exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
 
     categories = await client.get_vod_categories()
     category_names = {str(c["category_id"]): c["category_name"] for c in categories}
@@ -221,7 +240,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
     logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
@@ -242,7 +261,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
         })
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)

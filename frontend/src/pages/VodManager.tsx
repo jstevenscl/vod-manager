@@ -27,6 +27,7 @@ interface Provider {
   synced_connection_count: number
   live_account_count: number
   import_exclude_categories: string[]
+  import_exclude_uncategorized: number
   dispatcharr_connection_id: number | null
   dvr_local_path: string | null
   dvr_movie_category_id: number | null
@@ -227,6 +228,12 @@ interface ActivitySession {
   range_start_byte: number
 }
 
+interface CurrentBestSource {
+  provider_name: string
+  is_failing: boolean
+  consecutive_failures: number
+}
+
 interface StreamFailure {
   id: number
   kind: string
@@ -235,6 +242,8 @@ interface StreamFailure {
   attempts: { provider: string; error: string }[]
   final_reason: string
   created_at: string
+  current_source: CurrentBestSource | null
+  series_providers: string[] | null
 }
 
 interface NeedsReviewItem {
@@ -4170,6 +4179,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [excludeCategoriesProviderId, setExcludeCategoriesProviderId] = useState<number | null>(null)
   const [excludeCategoriesDraft, setExcludeCategoriesDraft] = useState<Set<string>>(new Set())
+  const [excludeUncategorizedDraft, setExcludeUncategorizedDraft] = useState(false)
   const [excludeCategoriesSearch, setExcludeCategoriesSearch] = useState('')
   const [excludeCategoriesShowFilter, setExcludeCategoriesShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
   const [excludeCategoriesLastClickedIndex, setExcludeCategoriesLastClickedIndex] = useState<number | null>(null)
@@ -4180,8 +4190,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     enabled:  excludeCategoriesProviderId != null,
   })
   const setProviderImportExcludeCategories = useMutation({
-    mutationFn: ({ id, category_names }: { id: number; category_names: string[] }) =>
-      api.post(`/vod/providers/${id}/import-exclude-categories/`, { category_names }),
+    mutationFn: ({ id, category_names, exclude_uncategorized }: { id: number; category_names: string[]; exclude_uncategorized: boolean }) =>
+      api.post(`/vod/providers/${id}/import-exclude-categories/`, { category_names, exclude_uncategorized }),
     onSuccess: async () => {
       // Awaited, not fire-and-forget -- closing the dialog before this
       // resolves let a reopen race the refetch and show stale (pre-save)
@@ -5151,7 +5161,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     <td className="py-1 pr-2 text-muted-foreground whitespace-nowrap">
                       {new Date(Number(f.created_at) * 1000).toLocaleString()}
                     </td>
-                    <td className="py-1 pr-2">{f.title} <span className="text-muted-foreground">({f.kind})</span></td>
+                    <td className="py-1 pr-2">
+                      {f.title} <span className="text-muted-foreground">({f.kind})</span>
+                      {f.current_source && (
+                        <p className="text-muted-foreground/80 truncate">
+                          Playing from: <span className={f.current_source.is_failing ? 'text-destructive' : 'text-foreground/80'}>
+                            {f.current_source.provider_name}
+                          </span>
+                          {f.current_source.is_failing && ' — also currently failing'}
+                        </p>
+                      )}
+                      {f.kind === 'series' && !!f.series_providers?.length && (
+                        <p className="text-muted-foreground/70 truncate" title={f.series_providers.join(', ')}>
+                          All series providers: {f.series_providers.join(', ')}
+                        </p>
+                      )}
+                    </td>
                     <td
                       className="py-1 pr-2 text-muted-foreground max-w-[16rem] truncate"
                       title={f.attempts.map((a) => `${a.provider}: ${a.error}`).join('\n') || '(no sources to try)'}
@@ -6363,13 +6388,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     onClick={() => {
                       setExcludeCategoriesProviderId(p.id)
                       setExcludeCategoriesDraft(new Set(p.import_exclude_categories))
+                      setExcludeUncategorizedDraft(!!p.import_exclude_uncategorized)
                       setExcludeCategoriesSearch('')
                       setExcludeCategoriesShowFilter('all')
                       setExcludeCategoriesLastClickedIndex(null)
                       setExcludeCategoriesError(null)
                     }}
                   >
-                    Exclude Categories{p.import_exclude_categories.length ? ` (${p.import_exclude_categories.length})` : ''}
+                    Exclude Categories{p.import_exclude_categories.length + (p.import_exclude_uncategorized ? 1 : 0) ? ` (${p.import_exclude_categories.length + (p.import_exclude_uncategorized ? 1 : 0)})` : ''}
                   </Button>
                   <label
                     className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer"
@@ -6485,6 +6511,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               Movies/series in a checked category get auto-archived on import, using this provider's own category
               names. Archived, not deleted — still browsable if you change your mind.
             </p>
+            <label className="flex items-center gap-1.5 text-xs select-none border border-border rounded p-2">
+              <input
+                type="checkbox"
+                checked={excludeUncategorizedDraft}
+                onChange={(e) => setExcludeUncategorizedDraft(e.target.checked)}
+              />
+              Uncategorized — auto-archive movies/series this provider reports with no category at all
+            </label>
             {providerAvailableCategoriesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading this provider's categories…</p>}
             {providerAvailableCategoriesQuery.data && !providerAvailableCategoriesQuery.data.categories.length && (
               <p className="text-xs text-muted-foreground">No categories reported by this provider.</p>
@@ -6577,7 +6611,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <Button
                 size="sm"
                 disabled={setProviderImportExcludeCategories.isPending}
-                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft) })}
+                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft), exclude_uncategorized: excludeUncategorizedDraft })}
               >
                 {setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
               </Button>

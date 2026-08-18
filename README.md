@@ -86,6 +86,12 @@ own side: enable VOD on the new account and pick which groups/categories to
 turn on — normal setup for any source, regardless of how the account got
 created.
 
+On Dispatcharr v0.29.0+, every movie's 18+ status also syncs automatically
+as part of the normal VOD refresh, so Dispatcharr's own per-profile "Hide
+Mature Content" setting works against VOD & DVR Manager's catalog with no
+extra setup. Movies only for now — Dispatcharr has no equivalent flag for
+series yet.
+
 ## Per-instance category access control
 
 Dispatcharr has no per-user/per-profile VOD split of its own — once content
