@@ -231,6 +231,50 @@ def init_db() -> None:
             UNIQUE(provider_id, dispatcharr_connection_id)
         );
 
+        -- Native multi-account-per-provider support (vod_manager-4dh): one
+        -- provider entry can hold several separate real upstream logins
+        -- (Dispatcharr calls these M3U "profiles" under one account -- a
+        -- provider selling "5x1" single-connection accounts, for example),
+        -- shown/managed as one thing instead of the old workaround of
+        -- manually splitting into N separate provider rows. XC-only --
+        -- Plex/Emby/Jellyfin have no equivalent multi-login concept.
+        -- Deliberately NO aggregate/summed limit anywhere in this table or
+        -- providers.shared_connection_limit when sub-accounts exist --
+        -- confirmed live by reading Dispatcharr's own source
+        -- (apps/channels/models.py Channel.get_stream(),
+        -- apps/m3u/connection_pool.py) that IT tracks capacity
+        -- independently per profile with automatic failover to the next
+        -- profile when one is full, and never has an account-level total.
+        -- xc_server's capacity/credential-selection logic mirrors that
+        -- exactly: try each active sub-account in sort_order, first one
+        -- with a free max_streams slot wins.
+        CREATE TABLE IF NOT EXISTS provider_sub_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            max_streams INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        -- Sub-account equivalent of provider_live_accounts -- a separate
+        -- table rather than adding a nullable sub_account_id column to
+        -- provider_live_accounts and reworking its UNIQUE constraint,
+        -- since SQLite can't alter an existing constraint in place without
+        -- a full table rebuild (see _migrate_category_name_uniqueness for
+        -- what that costs) and this table is already in real use.
+        CREATE TABLE IF NOT EXISTS provider_sub_account_live_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sub_account_id INTEGER NOT NULL REFERENCES provider_sub_accounts(id) ON DELETE CASCADE,
+            dispatcharr_connection_id INTEGER NOT NULL REFERENCES dispatcharr_connections(id) ON DELETE CASCADE,
+            dispatcharr_account_id INTEGER NOT NULL,
+            dispatcharr_profile_id INTEGER,
+            UNIQUE(sub_account_id, dispatcharr_connection_id)
+        );
+
         CREATE TABLE IF NOT EXISTS provider_sync_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -524,6 +568,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
         CREATE INDEX IF NOT EXISTS idx_vod_stream_failures_created_at ON vod_stream_failures(created_at);
+        CREATE INDEX IF NOT EXISTS idx_provider_sub_accounts_provider_id ON provider_sub_accounts(provider_id);
+        CREATE INDEX IF NOT EXISTS idx_provider_sub_account_live_accounts_sub_account_id ON provider_sub_account_live_accounts(sub_account_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_user_id ON movie_source_owners(dispatcharr_user_id);
         CREATE INDEX IF NOT EXISTS idx_episode_source_owners_source_id ON episode_source_owners(episode_source_id);
@@ -2772,6 +2818,9 @@ def list_providers() -> list[dict]:
     live_account_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM provider_live_accounts GROUP BY provider_id"
     ).fetchall()}
+    sub_account_counts = {r["provider_id"]: r["c"] for r in conn.execute(
+        "SELECT provider_id, COUNT(*) c FROM provider_sub_accounts GROUP BY provider_id"
+    ).fetchall()}
     conn.close()
     for p in rows:
         p["movie_count"] = movie_counts.get(p["id"], 0)
@@ -2779,6 +2828,7 @@ def list_providers() -> list[dict]:
         p["episode_count"] = episode_counts.get(p["id"], 0)
         p["synced_connection_count"] = synced_counts.get(p["id"], 0)
         p["live_account_count"] = live_account_counts.get(p["id"], 0)
+        p["sub_account_count"] = sub_account_counts.get(p["id"], 0)
     return rows
 
 
@@ -3493,6 +3543,232 @@ def remove_provider_live_account(link_id: int) -> None:
     conn.execute("DELETE FROM provider_live_accounts WHERE id=?", (link_id,))
     _commit_with_retry(conn)
     conn.close()
+
+
+# ── Provider sub-accounts (vod_manager-4dh) ──────────────────────────────────
+# Multiple real logins under one provider entry, matching Dispatcharr's own
+# M3U-account-with-profiles model. See provider_sub_accounts' CREATE TABLE
+# comment for why capacity is tracked per sub-account with no aggregate --
+# xc_server._select_upstream_credentials is where that's actually enforced.
+
+def list_provider_sub_accounts(provider_id: int) -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM provider_sub_accounts WHERE provider_id=? ORDER BY sort_order, id", (provider_id,)
+    ).fetchall()]
+    conn.close()
+    for r in rows:
+        r["password"] = decrypt_value(r["password"])
+    return rows
+
+
+def get_provider_sub_account(sub_account_id: int) -> dict | None:
+    conn = _connect()
+    row = conn.execute("SELECT * FROM provider_sub_accounts WHERE id=?", (sub_account_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    d["password"] = decrypt_value(d["password"])
+    return d
+
+
+def create_provider_sub_account(
+    provider_id: int, label: str, username: str, password: str,
+    max_streams: int = 0, sort_order: int = 0,
+) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        """INSERT INTO provider_sub_accounts (provider_id, label, username, password, max_streams, sort_order, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (provider_id, label, username, encrypt_value(password), max_streams, sort_order, _now()),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+    return cur.lastrowid
+
+
+def update_provider_sub_account(
+    sub_account_id: int, label: str | None = None, username: str | None = None, password: str | None = None,
+    max_streams: int | None = None, is_active: bool | None = None, sort_order: int | None = None,
+) -> None:
+    sets, params = [], []
+    if label is not None:
+        sets.append("label=?"); params.append(label)
+    if username is not None:
+        sets.append("username=?"); params.append(username)
+    if password is not None:
+        sets.append("password=?"); params.append(encrypt_value(password))
+    if max_streams is not None:
+        sets.append("max_streams=?"); params.append(max_streams)
+    if is_active is not None:
+        sets.append("is_active=?"); params.append(int(is_active))
+    if sort_order is not None:
+        sets.append("sort_order=?"); params.append(sort_order)
+    if not sets:
+        return
+    conn = _connect()
+    conn.execute(f"UPDATE provider_sub_accounts SET {', '.join(sets)} WHERE id=?", (*params, sub_account_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def delete_provider_sub_account(sub_account_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM provider_sub_accounts WHERE id=?", (sub_account_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_provider_sub_account_live_accounts(sub_account_id: int) -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("""
+        SELECT psla.*, dc.label AS connection_label FROM provider_sub_account_live_accounts psla
+        JOIN dispatcharr_connections dc ON dc.id = psla.dispatcharr_connection_id
+        WHERE psla.sub_account_id=?
+        ORDER BY dc.label
+    """, (sub_account_id,)).fetchall()]
+    conn.close()
+    return rows
+
+
+def set_provider_sub_account_live_account(sub_account_id: int, connection_id: int, account_id: int, profile_id: int | None = None) -> int:
+    """Sub-account equivalent of set_provider_live_account -- see there for
+    the upsert-by-(sub_account, connection) shape."""
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO provider_sub_account_live_accounts (sub_account_id, dispatcharr_connection_id, dispatcharr_account_id, dispatcharr_profile_id)
+           VALUES (?,?,?,?)
+           ON CONFLICT(sub_account_id, dispatcharr_connection_id) DO UPDATE SET
+               dispatcharr_account_id=excluded.dispatcharr_account_id,
+               dispatcharr_profile_id=excluded.dispatcharr_profile_id""",
+        (sub_account_id, connection_id, account_id, profile_id),
+    )
+    _commit_with_retry(conn)
+    row_id = conn.execute(
+        "SELECT id FROM provider_sub_account_live_accounts WHERE sub_account_id=? AND dispatcharr_connection_id=?",
+        (sub_account_id, connection_id),
+    ).fetchone()["id"]
+    conn.close()
+    return row_id
+
+
+def remove_provider_sub_account_live_account(link_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM provider_sub_account_live_accounts WHERE id=?", (link_id,))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def merge_providers_into_subaccounts(primary_provider_id: int, other_provider_ids: list[int]) -> dict:
+    """vod_manager-q78: migrates N pre-existing separately-created provider
+    rows (the old manual workaround for a split "5x1"-style subscription --
+    one row per real login, each independently profile-scoped -- from before
+    vod_manager-4dh's native sub-accounts existed) into sub-accounts of one
+    primary provider. Each other provider becomes one new sub-account under
+    primary (label = its own name, its own username/password/
+    shared_connection_limit as max_streams, same relative priority as
+    sort_order). Its content (movie_sources/episode_sources) is RE-POINTED
+    to primary_provider_id, never deleted -- this is a consolidation, not a
+    purge, unlike delete_provider. Its provider_live_accounts links become
+    provider_sub_account_live_accounts links on the new sub-account, so
+    Dispatcharr live-viewer-count capacity coordination isn't lost in the
+    move. The now-empty other provider row is then removed via the existing
+    delete_provider -- safe to call at that point since everything it would
+    otherwise cascade-affect has already been moved off it.
+
+    A source whose provider_stream_id happens to collide with one already on
+    the primary provider (astronomically unlikely across two genuinely
+    different real logins on two different real subscriptions, but not
+    provably impossible) is left in place on the OLD provider rather than
+    silently dropped -- reported back in providers_partially_merged so an
+    admin can look at what's left before deciding what to do with it. An
+    other-provider with any leftover collided sources is NOT deleted."""
+    conn = _connect()
+    primary = conn.execute("SELECT id, name FROM providers WHERE id=?", (primary_provider_id,)).fetchone()
+    if not primary:
+        conn.close()
+        raise ValueError(f"primary provider {primary_provider_id} not found")
+
+    movie_sources_moved = 0
+    episode_sources_moved = 0
+    movie_source_collisions = 0
+    episode_source_collisions = 0
+    live_accounts_migrated = 0
+    sub_accounts_created = 0
+    providers_removed: list[int] = []
+    providers_partially_merged: list[dict] = []
+
+    for other_id in other_provider_ids:
+        if other_id == primary_provider_id:
+            continue
+        other = conn.execute("SELECT * FROM providers WHERE id=?", (other_id,)).fetchone()
+        if not other:
+            continue
+        other = dict(other)
+
+        sub_account_id = create_provider_sub_account(
+            primary_provider_id, other["name"], other["username"], decrypt_value(other["password"]),
+            max_streams=other.get("shared_connection_limit") or 0, sort_order=other.get("priority") or 0,
+        )
+        sub_accounts_created += 1
+
+        # Re-pointed one row at a time (not a bulk UPDATE) so a collision on
+        # one row doesn't block every other row on this same provider from
+        # moving -- see this function's own docstring for the collision path.
+        collided_movie_ids = []
+        for row in conn.execute("SELECT id FROM movie_sources WHERE provider_id=?", (other_id,)).fetchall():
+            try:
+                conn.execute("UPDATE movie_sources SET provider_id=? WHERE id=?", (primary_provider_id, row["id"]))
+                movie_sources_moved += 1
+            except sqlite3.IntegrityError:
+                movie_source_collisions += 1
+                collided_movie_ids.append(row["id"])
+        collided_episode_ids = []
+        for row in conn.execute("SELECT id FROM episode_sources WHERE provider_id=?", (other_id,)).fetchall():
+            try:
+                conn.execute("UPDATE episode_sources SET provider_id=? WHERE id=?", (primary_provider_id, row["id"]))
+                episode_sources_moved += 1
+            except sqlite3.IntegrityError:
+                episode_source_collisions += 1
+                collided_episode_ids.append(row["id"])
+
+        for link in conn.execute("SELECT * FROM provider_live_accounts WHERE provider_id=?", (other_id,)).fetchall():
+            conn.execute(
+                """INSERT INTO provider_sub_account_live_accounts (sub_account_id, dispatcharr_connection_id, dispatcharr_account_id, dispatcharr_profile_id)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(sub_account_id, dispatcharr_connection_id) DO UPDATE SET
+                       dispatcharr_account_id=excluded.dispatcharr_account_id,
+                       dispatcharr_profile_id=excluded.dispatcharr_profile_id""",
+                (sub_account_id, link["dispatcharr_connection_id"], link["dispatcharr_account_id"], link["dispatcharr_profile_id"]),
+            )
+            live_accounts_migrated += 1
+
+        _commit_with_retry(conn)
+
+        if collided_movie_ids or collided_episode_ids:
+            providers_partially_merged.append({
+                "provider_id": other_id, "name": other["name"],
+                "movie_collisions": len(collided_movie_ids), "episode_collisions": len(collided_episode_ids),
+            })
+        else:
+            providers_removed.append(other_id)
+
+    conn.close()
+
+    for pid in providers_removed:
+        delete_provider(pid)
+
+    return {
+        "sub_accounts_created": sub_accounts_created,
+        "movie_sources_moved": movie_sources_moved,
+        "episode_sources_moved": episode_sources_moved,
+        "movie_source_collisions": movie_source_collisions,
+        "episode_source_collisions": episode_source_collisions,
+        "live_accounts_migrated": live_accounts_migrated,
+        "providers_removed": len(providers_removed),
+        "providers_partially_merged": providers_partially_merged,
+    }
 
 
 # ── Provider sync profiles (per-connection Dispatcharr profile id) ──────────

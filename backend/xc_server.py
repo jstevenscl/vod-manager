@@ -498,6 +498,7 @@ async def player_api(request: Request):
 
 
 _active_vod_streams: dict[int, int] = {}  # provider_id -> count of VOD streams we're currently relaying
+_active_sub_account_streams: dict[int, int] = {}  # sub_account_id -> same, for vod_manager-4dh
 _live_viewer_cache: dict[int, tuple[int, float]] = {}  # dispatcharr_account_id -> (viewer_count, monotonic_at)
 _LIVE_VIEWER_CACHE_TTL = 5.0  # seconds — short, since range-seek requests can fire many proxy calls in quick succession
 
@@ -649,15 +650,65 @@ async def _try_reserve_capacity(provider: dict) -> bool:
         return True
 
 
-def _release_capacity(provider: dict) -> None:
-    """Undo a _try_reserve_capacity reservation that didn't lead to an open
-    stream (connect failed, or upstream returned an error status) -- without
-    this the slot leaks forever, since the only other release path is
-    relay()'s finally block, which never runs for a source that never
-    actually opened."""
+def _release_capacity(provider: dict, sub_account_id: int | None = None) -> None:
+    """Undo a _try_reserve_capacity/_select_upstream_credentials reservation
+    that didn't lead to an open stream (connect failed, or upstream returned
+    an error status) -- without this the slot leaks forever, since the only
+    other release path is relay()'s finally block, which never runs for a
+    source that never actually opened. sub_account_id, when given, releases
+    that sub-account's own counter instead of the provider-level one --
+    see _select_upstream_credentials."""
+    if sub_account_id is not None:
+        if sub_account_id in _active_sub_account_streams:
+            _active_sub_account_streams[sub_account_id] = max(0, _active_sub_account_streams[sub_account_id] - 1)
+        return
     pid = provider["id"]
     if pid in _active_vod_streams:
         _active_vod_streams[pid] = max(0, _active_vod_streams[pid] - 1)
+
+
+async def _select_upstream_credentials(provider: dict) -> dict | None:
+    """vod_manager-4dh: if this provider has sub-accounts (multiple real
+    logins nested under one provider entry, Dispatcharr M3U-profile parity),
+    picks which one to actually use for this request and reserves its
+    capacity slot -- mirrors Dispatcharr's own Channel.get_stream(): try
+    each active sub-account in sort_order, first one with a free max_streams
+    slot wins, no aggregate/summed limit anywhere (confirmed live by reading
+    Dispatcharr's actual source, see provider_sub_accounts' CREATE TABLE
+    comment). A provider with no sub-accounts is unaffected -- falls
+    straight through to the existing provider-level _try_reserve_capacity,
+    unchanged.
+
+    Returns None if no capacity is available anywhere (provider-level or
+    every sub-account), else a dict describing what was reserved and which
+    credentials to actually use: {"username", "password", "sub_account_id"}
+    (sub_account_id is None for the plain provider-level case)."""
+    sub_accounts = await asyncio.to_thread(vod_db.list_provider_sub_accounts, provider["id"])
+    if not sub_accounts:
+        if await _try_reserve_capacity(provider):
+            return {"username": provider.get("username"), "password": provider.get("password"), "sub_account_id": None}
+        return None
+
+    for sub in sub_accounts:
+        if not sub.get("is_active", True):
+            continue
+        limit = sub.get("max_streams") or 0  # 0 = unlimited, same convention as Dispatcharr profiles
+        live_count = 0
+        if limit:
+            links = await asyncio.to_thread(vod_db.list_provider_sub_account_live_accounts, sub["id"])
+            for link in links:
+                connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
+                if not connection:
+                    continue
+                live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"], link.get("dispatcharr_profile_id"))
+        async with _capacity_lock:
+            our_count = _active_sub_account_streams.get(sub["id"], 0)
+            if limit and live_count + our_count >= limit:
+                continue
+            _active_sub_account_streams[sub["id"]] = our_count + 1
+        return {"username": sub["username"], "password": sub["password"], "sub_account_id": sub["id"]}
+
+    return None
 
 
 _PLEX_PROBE_GRACE_SECONDS = 3.0  # short connections under this are treated as
@@ -739,7 +790,7 @@ def _redact_upstream_url(url: str) -> str:
     return url
 
 
-def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
+def _build_upstream_url(kind: str, provider: dict, source: dict, credentials: dict | None = None) -> str:
     if provider.get("provider_type") == "dispatcharr_dvr":
         # A plain local disk path, not a URL -- correct for ffmpeg's -i
         # (transcode/HLS paths, which accept a local path untouched, no
@@ -767,7 +818,12 @@ def _build_upstream_url(kind: str, provider: dict, source: dict) -> str:
         return (f"{provider['base_url'].rstrip('/')}/emby/Videos/{item_id}/stream.{ext}"
                 f"?Static=true&api_key={provider['password']}")
     ext = source["container_extension"] or "mp4"
-    return f"{provider['base_url'].rstrip('/')}/{kind}/{provider['username']}/{provider['password']}/{source['provider_stream_id']}.{ext}"
+    # credentials, when given, is the specific sub-account _select_upstream_
+    # credentials picked (vod_manager-4dh) -- falls back to the provider's
+    # own single login otherwise, unchanged from before sub-accounts existed.
+    username = credentials["username"] if credentials else provider["username"]
+    password = credentials["password"] if credentials else provider["password"]
+    return f"{provider['base_url'].rstrip('/')}/{kind}/{username}/{password}/{source['provider_stream_id']}.{ext}"
 
 
 def _is_safe_proxy_target(url: str) -> bool:
@@ -1182,14 +1238,16 @@ async def _proxy_vod_stream(
             vod_db.record_source_success(kind, source["source_id"])
             return FileResponse(local_path, media_type=media_type)
 
-        if not await _try_reserve_capacity(provider):
+        reservation = await _select_upstream_credentials(provider)
+        if reservation is None:
             last_error = "at shared connection capacity"
             attempts.append({"provider": provider["name"], "error": last_error})
             logger.warning("[xc_server] %s stream source %d/%d (%s) at shared capacity id=%s, trying next",
                             kind, idx + 1, len(sources), provider["name"], conn_id)
             continue
+        sub_account_id = reservation["sub_account_id"]
 
-        upstream_url = _build_upstream_url(kind, provider, source)
+        upstream_url = _build_upstream_url(kind, provider, source, reservation)
 
         # follow_redirects=True: real providers commonly 302 movie/series
         # requests off to a CDN edge host rather than serving the file
@@ -1206,7 +1264,7 @@ async def _proxy_vod_stream(
             upstream_resp = await client.send(upstream_req, stream=True)
         except Exception as exc:
             await client.aclose()
-            _release_capacity(provider)
+            _release_capacity(provider, sub_account_id)
             vod_db.record_source_failure(kind, source["source_id"])
             last_error = f"{type(exc).__name__}: {_redact_upstream_url(str(exc))}"
             attempts.append({"provider": provider["name"], "error": last_error})
@@ -1222,7 +1280,7 @@ async def _proxy_vod_stream(
                             kind, idx + 1, len(sources), provider["name"], last_error, conn_id)
             await upstream_resp.aclose()
             await client.aclose()
-            _release_capacity(provider)
+            _release_capacity(provider, sub_account_id)
             vod_db.record_source_failure(kind, source["source_id"])
             continue
 
@@ -1302,7 +1360,10 @@ async def _proxy_vod_stream(
                 _kill_requested.discard(conn_id)
                 await upstream_resp.aclose()
                 await client.aclose()
-                _active_vod_streams[provider["id"]] = max(0, _active_vod_streams.get(provider["id"], 1) - 1)
+                if sub_account_id is not None:
+                    _active_sub_account_streams[sub_account_id] = max(0, _active_sub_account_streams.get(sub_account_id, 1) - 1)
+                else:
+                    _active_vod_streams[provider["id"]] = max(0, _active_vod_streams.get(provider["id"], 1) - 1)
                 closed_session = _active_sessions.pop(conn_id, None)
                 if heartbeat_task:
                     heartbeat_task.cancel()

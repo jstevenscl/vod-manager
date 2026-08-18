@@ -111,7 +111,7 @@ def recording_file_info(recording: dict) -> dict:
     }
 
 
-async def download_recording_file(connection: dict, recording_id: int, dest_path: str) -> None:
+async def download_recording_file(connection: dict, recording_id: int, dest_path: str) -> int:
     """Phase 1b: streams a completed recording's bytes to a local path for
     a cross-host deployment (no shared bind-mount available) -- confirmed
     live that GET /api/channels/recordings/{id}/file/ takes the same
@@ -127,18 +127,30 @@ async def download_recording_file(connection: dict, recording_id: int, dest_path
     isfile() check, or xc_server serving playback) can never observe a
     truncated file at the final path -- a real risk unique to Phase 1b that
     Phase 1a's same-host reference never had (nothing there is ever
-    partially written from VOD Manager's point of view)."""
+    partially written from VOD Manager's point of view).
+
+    Returns the real number of bytes actually written -- confirmed live
+    (dispatch-test v0.29.0, 2026-08-18) that custom_properties.bytes_written
+    is stamped from the raw recording write and is NOT updated after a
+    remux (custom_properties.remux_success), so it's stale/wrong for any
+    recording that gets remuxed -- which is the common case, not an edge
+    case. dvr_delete_after_copy's verification must compare against what
+    was actually downloaded, not that stale field, or it would never
+    successfully verify (and therefore never delete) a remuxed recording."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     tmp_path = dest_path + ".part"
     url = f"{connection['url'].rstrip('/')}/api/channels/recordings/{recording_id}/file/"
     headers = {"X-API-Key": connection["token"]}
+    written = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as client:
         async with client.stream("GET", url, headers=headers) as resp:
             resp.raise_for_status()
             with open(tmp_path, "wb") as f:
                 async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                     f.write(chunk)
+                    written += len(chunk)
     os.replace(tmp_path, dest_path)
+    return written
 
 
 async def search_epg_programs(

@@ -289,6 +289,33 @@ class ProviderLiveAccountRequest(BaseModel):
     dispatcharr_profile_id: Optional[int] = None
 
 
+class ProviderSubAccountRequest(BaseModel):
+    label: str
+    username: str
+    password: str
+    max_streams: int = 0
+    sort_order: int = 0
+
+
+class ProviderSubAccountUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    max_streams: Optional[int] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class ProviderSubAccountLiveAccountRequest(BaseModel):
+    dispatcharr_connection_id: int
+    dispatcharr_account_id: int
+    dispatcharr_profile_id: Optional[int] = None
+
+
+class MergeProvidersRequest(BaseModel):
+    other_provider_ids: list[int]
+
+
 class DiscoveredProfileKey(BaseModel):
     dispatcharr_account_id: int
     dispatcharr_profile_id: int
@@ -1081,6 +1108,78 @@ async def remove_provider_live_account(link_id: int):
     return {"ok": True}
 
 
+# ── Provider sub-accounts (vod_manager-4dh) ──────────────────────────────────
+# Multiple real logins nested under one provider entry, Dispatcharr M3U-
+# profile parity -- see provider_sub_accounts' CREATE TABLE comment in
+# vod_db.py for why there's no aggregate/summed limit anywhere here.
+
+@router.get("/providers/{provider_id}/sub-accounts/", dependencies=_GUARDS)
+async def list_provider_sub_accounts(provider_id: int):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    accounts = vod_db.list_provider_sub_accounts(provider_id)
+    for a in accounts:
+        a["password"] = "•" * 8  # never echo a real password back to the client
+    return accounts
+
+
+@router.post("/providers/{provider_id}/sub-accounts/", dependencies=_GUARDS)
+async def create_provider_sub_account(provider_id: int, body: ProviderSubAccountRequest):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    sub_account_id = vod_db.create_provider_sub_account(
+        provider_id, body.label.strip(), body.username.strip(), body.password,
+        body.max_streams, body.sort_order,
+    )
+    return {"id": sub_account_id}
+
+
+@router.patch("/providers/sub-accounts/{sub_account_id}/", dependencies=_GUARDS)
+async def update_provider_sub_account(sub_account_id: int, body: ProviderSubAccountUpdateRequest):
+    if not vod_db.get_provider_sub_account(sub_account_id):
+        raise HTTPException(404, detail="sub-account not found")
+    vod_db.update_provider_sub_account(
+        sub_account_id,
+        label=body.label.strip() if body.label is not None else None,
+        username=body.username.strip() if body.username is not None else None,
+        password=body.password if body.password is not None else None,
+        max_streams=body.max_streams, is_active=body.is_active, sort_order=body.sort_order,
+    )
+    return {"ok": True}
+
+
+@router.delete("/providers/sub-accounts/{sub_account_id}/", dependencies=_GUARDS)
+async def delete_provider_sub_account(sub_account_id: int):
+    vod_db.delete_provider_sub_account(sub_account_id)
+    return {"ok": True}
+
+
+@router.get("/providers/sub-accounts/{sub_account_id}/live-accounts/", dependencies=_GUARDS)
+async def list_provider_sub_account_live_accounts(sub_account_id: int):
+    if not vod_db.get_provider_sub_account(sub_account_id):
+        raise HTTPException(404, detail="sub-account not found")
+    return vod_db.list_provider_sub_account_live_accounts(sub_account_id)
+
+
+@router.post("/providers/sub-accounts/{sub_account_id}/live-accounts/", dependencies=_GUARDS)
+async def set_provider_sub_account_live_account(sub_account_id: int, body: ProviderSubAccountLiveAccountRequest):
+    if not vod_db.get_provider_sub_account(sub_account_id):
+        raise HTTPException(404, detail="sub-account not found")
+    connection = vod_db.get_dispatcharr_connection(body.dispatcharr_connection_id)
+    if not connection:
+        raise HTTPException(404, detail="dispatcharr connection not found")
+    link_id = vod_db.set_provider_sub_account_live_account(
+        sub_account_id, body.dispatcharr_connection_id, body.dispatcharr_account_id, body.dispatcharr_profile_id,
+    )
+    return {"id": link_id}
+
+
+@router.delete("/providers/sub-accounts/live-accounts/{link_id}/", dependencies=_GUARDS)
+async def remove_provider_sub_account_live_account(link_id: int):
+    vod_db.remove_provider_sub_account_live_account(link_id)
+    return {"ok": True}
+
+
 @router.get("/dispatcharr-connections/{connection_id}/accounts/{account_id}/profiles/", dependencies=_GUARDS)
 async def list_dispatcharr_account_profiles(connection_id: int, account_id: int):
     """Real Dispatcharr M3U profiles under this account -- lets a provider's
@@ -1222,6 +1321,22 @@ async def delete_provider(provider_id: int):
     # (including the Activity poll) while it runs.
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
     return {"ok": True}
+
+
+@router.post("/providers/{provider_id}/merge-into-subaccounts/", dependencies=_GUARDS)
+async def merge_providers_into_subaccounts(provider_id: int, body: MergeProvidersRequest):
+    """vod_manager-q78: consolidates one or more existing provider rows
+    (the old manual multi-account workaround) into this provider's
+    sub-accounts. See vod_db.merge_providers_into_subaccounts's docstring
+    for exactly what moves and what the collision-safety guarantee is."""
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="primary provider not found")
+    if provider_id in body.other_provider_ids:
+        raise HTTPException(400, detail="a provider can't be merged into itself")
+    # Same reasoning as delete_provider's route -- real content-repointing
+    # work, off the event loop.
+    result = await asyncio.to_thread(vod_db.merge_providers_into_subaccounts, provider_id, body.other_provider_ids)
+    return result
 
 
 @router.post("/providers/{provider_id}/sync/", dependencies=_GUARDS)

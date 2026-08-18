@@ -4,6 +4,7 @@ import { CalendarDays, Clock, Film, HardDriveDownload, ListVideo, Loader2, LogOu
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import portalApi from '@/lib/portalApi'
+import { askConfirm, ConfirmDialogHost } from '@/lib/confirm'
 
 type PortalTab = 'scheduler' | 'recordings' | 'upcoming' | 'usage' | 'library' | 'account'
 
@@ -348,7 +349,7 @@ function EpisodeRows({
               </button>
               <button
                 title="Remove from my library" className="text-muted-foreground hover:text-destructive p-1 shrink-0"
-                onClick={() => { if (confirm(`Remove "${e.name}" from your library?`)) onRemove({ kind: 'episode', id: e.libraryId! }) }}
+                onClick={() => askConfirm(`Remove "${e.name}" from your library?`, () => onRemove({ kind: 'episode', id: e.libraryId! }))}
               >
                 <Trash2 size={12} />
               </button>
@@ -357,7 +358,7 @@ function EpisodeRows({
           {e.kind === 'upcoming' && (
             <button
               title="Cancel this recording" className="text-muted-foreground hover:text-destructive p-1 shrink-0"
-              onClick={() => { if (confirm('Cancel this upcoming recording?')) onCancelUpcoming(e.recordingId!) }}
+              onClick={() => askConfirm('Cancel this upcoming recording?', () => onCancelUpcoming(e.recordingId!))}
             >
               <X size={13} />
             </button>
@@ -874,7 +875,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
                     <button
                       title="Delete this recording rule"
                       className="text-muted-foreground hover:text-destructive p-1"
-                      onClick={() => { if (confirm(`Delete "${rule.label}"? This also cancels its future recordings.`)) deleteRule.mutate(rule.id) }}
+                      onClick={() => askConfirm(`Delete "${rule.label}"? This also cancels its future recordings.`, () => deleteRule.mutate(rule.id))}
                     >
                       <Trash2 size={12} />
                     </button>
@@ -899,7 +900,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
                     <button
                       title="Delete this recording"
                       className="text-muted-foreground hover:text-destructive p-1"
-                      onClick={() => { if (confirm(`Delete "${rec.title}"?`)) cancelUpcoming.mutate(rec.id) }}
+                      onClick={() => askConfirm(`Delete "${rec.title}"?`, () => cancelUpcoming.mutate(rec.id))}
                     >
                       <Trash2 size={12} />
                     </button>
@@ -949,9 +950,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
                           <button
                             title="Cancel this recording"
                             className="text-muted-foreground hover:text-destructive p-1"
-                            onClick={() => {
-                              if (confirm(`Cancel "${r.custom_properties?.program?.title ?? 'this recording'}"?`)) cancelUpcoming.mutate(r.id)
-                            }}
+                            onClick={() => askConfirm(`Cancel "${r.custom_properties?.program?.title ?? 'this recording'}"?`, () => cancelUpcoming.mutate(r.id))}
                           >
                             <Trash2 size={12} />
                           </button>
@@ -1099,7 +1098,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
                     <button
                       title="Remove from my library"
                       className="text-muted-foreground hover:text-destructive p-2"
-                      onClick={() => { if (confirm(`Remove "${m.name}" from your library?`)) { removeFromLibrary.mutate({ kind: 'movie', id: m.id }); setLibraryDetail(null) } }}
+                      onClick={() => askConfirm(`Remove "${m.name}" from your library?`, () => { removeFromLibrary.mutate({ kind: 'movie', id: m.id }); setLibraryDetail(null) })}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -1283,6 +1282,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
           </div>
         </div>
       )}
+      <ConfirmDialogHost />
     </div>
   )
 }
