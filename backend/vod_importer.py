@@ -192,11 +192,17 @@ async def import_provider_catalog(provider_id: int) -> dict:
     exclude_categories = provider.get("import_exclude_categories") or []
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
 
+    # Stripped for the same reason vod_routes.get_provider_available_categories
+    # strips (GH#4 reopened): provider_exclude_categories is saved trimmed
+    # (vod_db.set_provider_import_exclude_categories), so an untrimmed name
+    # here would never match its own saved exclusion below -- a category
+    # with stray whitespace in its provider-reported name could never
+    # actually be excluded, no matter how many times it was re-selected.
     categories = await client.get_vod_categories()
-    category_names = {str(c["category_id"]): c["category_name"] for c in categories}
+    category_names = {str(c["category_id"]): (c.get("category_name") or "").strip() for c in categories}
 
     series_categories = await client.get_series_categories()
-    series_category_names = {str(c["category_id"]): c["category_name"] for c in series_categories}
+    series_category_names = {str(c["category_id"]): (c.get("category_name") or "").strip() for c in series_categories}
 
     # GH issue #5: archive a category the moment it's first seen on this
     # provider, same as Dispatcharr's own "auto-archive newly discovered VOD
