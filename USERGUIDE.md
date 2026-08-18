@@ -329,6 +329,43 @@ The number of Dispatcharr profiles or the total connection count never
 determines the number of provider rows by itself — only the number of
 distinct logins does.
 
+### Native sub-accounts — one provider row per subscription, not per login
+
+Everything above still works and is the safest description of the
+underlying model, but if your logins all serve the **same catalog** (the
+common case — multiple logins from the same reseller), you no longer need
+a separate provider row for each one. A single provider can hold multiple
+**sub-accounts**, each with its own real username, password, and
+connection limit — the same idea as Dispatcharr's own M3U profiles, built
+natively into VOD & DVR Manager.
+
+Expand a provider row on the Providers page and use the **Sub-accounts**
+panel:
+
+1. Add each distinct login as a sub-account under the one provider, with
+   its own **Max streams** (0 = unlimited).
+2. Only import the catalog once, on the parent provider — sub-accounts
+   share its content pool, they don't get their own.
+3. VOD & DVR Manager tries active sub-accounts in order and uses the first
+   one with a free slot when opening a stream, then fails over to the
+   next — matching Dispatcharr's own default-then-next-profile behavior.
+   Deactivate a sub-account (e.g. a login that's temporarily suspended)
+   without touching the rest of the provider.
+
+This replaces the "5 logins → 5 provider rows" pattern in the worked
+examples above with "5 logins → 1 provider row, 5 sub-accounts" — fewer
+rows to manage, one place to import/curate the catalog, same connection
+accounting underneath.
+
+**Already set up the old way?** Use **Merge Providers** (Providers page →
+*Merge Providers* button) to fold your existing separate provider rows
+into one. Pick a primary provider and the other rows to merge in as its
+sub-accounts — content is never deleted, every source re-points to the
+primary, and Dispatcharr live-account links move over automatically. If
+the same piece of content genuinely exists on both providers (a real
+collision, not a duplicate), it's left on the old row and reported back so
+you can resolve it by hand; the old row is only removed once fully empty.
+
 ---
 
 ## 6. Connecting Dispatcharr
