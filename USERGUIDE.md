@@ -660,6 +660,8 @@ Each rule can set:
   episodes (e.g. a show you've finished collecting) without deleting its
   history or already-scheduled recordings.
 
+![Scheduled Recordings — an existing Recording Rule and the "Add a rule" creation form](docs/screenshots/dvr-scheduled-recordings.png)
+
 ### The DVR tab's subpages
 
 DVR is split into five subpages once you're actually using it day to day:
@@ -700,16 +702,27 @@ DVR is split into five subpages once you're actually using it day to day:
   something that says whose it is and what it's for — e.g. **"Steven DVR
   Movies"** / **"Steven DVR TV Shows"** — the quick-create button here
   pre-fills exactly that suggestion.
+
+  ![DVR Users card with categories assigned, plus Portal Access below it](docs/screenshots/dvr-users-configured.png)
+
 - **DVR Library** — browse, preview, and delete recordings directly
   (admin view of everything, not scoped to one person).
+
+  ![DVR Library subpage](docs/screenshots/dvr-library.png)
+
 - **Missing Episodes** — a Sonarr/Radarr-style view per show: episodes a
   monitored Recording Rule hasn't captured yet, with a find/record cascade
   (checks the show's own known channel first, falls back to a cross-channel
   EPG search).
+
+  ![Missing Episodes subpage](docs/screenshots/dvr-missing-episodes.png)
+
 - **Metrics** — rule health (is each rule's channel/title still matching
   anything real) and disk usage, split into actual bytes (real files this
   connection owns) vs. virtual bytes (pointer-backfilled content that lives
   elsewhere but still counts toward someone's quota).
+
+  ![Metrics subpage — per-person usage, recording load by channel, rule health, and unresolved missing episodes](docs/screenshots/dvr-metrics.png)
 
 ### The self-service Portal
 
@@ -717,18 +730,41 @@ DVR also ships a separate, lightweight web app for end users — not admins —
 to manage their own recordings without touching the main VOD & DVR Manager UI at
 all. It has its own login (a **Portal account**, created per-person under
 the Users page — separate from both the admin login and their Dispatcharr
-credentials) and its own URL.
+credentials) and its own URL. Its first login always requires setting up an
+authenticator app (Google Authenticator, Authy, 1Password, etc.) — mandatory,
+not optional — before the account can sign in at all.
+
+![Portal two-factor setup on first login — scan the QR/enter the key, then confirm a code](docs/screenshots/portal-mfa-setup.png)
 
 From the Portal, a person can:
 
 - Browse the EPG and schedule a single episode or a recurring series rule
   for anything on a channel visible to their Dispatcharr user
+
+  ![Portal Scheduler tab — everything airing in the next 24 hours, tap anything to schedule it](docs/screenshots/portal-scheduler.png)
+
 - See their own upcoming/in-progress recordings
+
+  ![Portal Upcoming tab](docs/screenshots/portal-upcoming.png)
+
 - Browse their own Library — everything they've recorded or been attached to
   (see below), grouped by their own assigned DVR category — and play, or
   remove, anything in it
+
+  ![Portal Library tab](docs/screenshots/portal-library.png)
+
 - See their own disk usage against their quota, and their stream-limit
   budget
+
+  ![Portal Usage tab](docs/screenshots/portal-usage.png)
+
+The landing tab (**My Recordings**) is the person's own dashboard —
+upcoming count, active rules, storage used, and stream budget at a glance,
+plus their own Recording Rules — and **Account** lets them set a
+notification email.
+
+![Portal landing tab — My Recordings, with the at-a-glance stat tiles every tab shares](docs/screenshots/portal-my-recordings.png)
+![Portal Account tab](docs/screenshots/portal-account.png)
 
 **Shared recordings, not duplicated ones.** If two people's rules both match
 the same airing, or someone schedules something another person already has,
