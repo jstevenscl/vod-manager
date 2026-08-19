@@ -19,6 +19,47 @@ export function askConfirm(message: string, onConfirm: () => void) {
   _setConfirmDialog?.({ message, onConfirm })
 }
 
+// Same rationale as askConfirm, for the OTHER native dialog that blocks
+// automation and page rendering the identical way: window.alert(), used
+// for a pure FYI with nothing to confirm/cancel. One "OK" button instead
+// of confirm's two, since there's no real choice being made.
+let _setNotifyDialog: ((message: string | null) => void) | null = null
+
+export function notify(message: string) {
+  _setNotifyDialog?.(message)
+}
+
+export function NotifyDialogHost() {
+  const [message, setMessage] = useState<string | null>(null)
+  useEffect(() => {
+    _setNotifyDialog = setMessage
+    return () => { _setNotifyDialog = null }
+  }, [])
+  if (!message) return null
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 p-4" onClick={() => setMessage(null)}>
+      <div
+        className="relative bg-card border border-border rounded-xl overflow-hidden w-full max-w-sm shadow-2xl flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          className="absolute top-2 right-2 text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-accent z-10"
+          onClick={() => setMessage(null)}
+        >
+          <X size={16} />
+        </button>
+        <div className="p-5 space-y-4">
+          <p className="text-sm whitespace-pre-wrap pr-4">{message}</p>
+          <div className="flex justify-end">
+            <Button size="sm" onClick={() => setMessage(null)}>OK</Button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
 export function ConfirmDialogHost() {
   const [confirmDialog, setConfirmDialog] = useState<ConfirmState>(null)
   useEffect(() => {

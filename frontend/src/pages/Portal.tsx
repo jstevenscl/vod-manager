@@ -4,7 +4,7 @@ import { CalendarDays, Clock, Film, HardDriveDownload, ListVideo, Loader2, LogOu
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import portalApi from '@/lib/portalApi'
-import { askConfirm, ConfirmDialogHost } from '@/lib/confirm'
+import { askConfirm, ConfirmDialogHost, notify, NotifyDialogHost } from '@/lib/confirm'
 
 type PortalTab = 'scheduler' | 'recordings' | 'upcoming' | 'usage' | 'library' | 'account'
 
@@ -549,6 +549,12 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
   const [scheduleMode, setScheduleMode] = useState<'new' | 'all'>('new')
   const [scheduleLabel, setScheduleLabel] = useState('')
   const [scheduleError, setScheduleError] = useState<string | null>(null)
+  // vod_manager-8p1.2: opt-in bulk backfill of already-aired episodes for a
+  // brand-new series rule -- reuses whatever's already in the pool from a
+  // regular provider, or this show's own known channel's EPG, same
+  // conservative two-tier cascade the admin's own Missing Episodes resolve
+  // already uses (never guesses a channel for an ambiguous match).
+  const [scheduleBackfillPastSeasons, setScheduleBackfillPastSeasons] = useState(false)
 
   function openScheduling(channel: GuideChannel['channel'], program: GuideProgram) {
     setSchedulingItem({ channel, program })
@@ -556,6 +562,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
     setScheduleMode('new')
     setScheduleLabel('')
     setScheduleError(null)
+    setScheduleBackfillPastSeasons(false)
   }
   function closeScheduling() { setSchedulingItem(null) }
 
@@ -582,11 +589,13 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
       return portalApi.post('/recording-rules/', {
         label: scheduleLabel.trim() || program.title, title: program.title,
         tvg_id: program.tvg_id || null, mode: scheduleMode, channel_id: channel.id,
+        backfill_past_seasons: scheduleBackfillPastSeasons,
       })
     },
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ['portal-my-recordings'] })
       qc.invalidateQueries({ queryKey: ['portal-upcoming'] })
+      qc.invalidateQueries({ queryKey: ['portal-library'] })
       closeScheduling()
       // A rule with 0 matches right now is a legitimate, common outcome
       // (nothing in the 7-day EPG window yet -- it'll pick up the next
@@ -594,7 +603,19 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
       // indistinguishable from the rule having failed or vanished. Real
       // confusion reported live, 2026-07-28.
       if (res.data?.scheduled_now === 0) {
-        alert(`Saved "${res.data.label}" as a recording rule, but nothing matches it in the guide right now -- it'll start recording automatically the next time a matching episode airs (within the next 7 days).`)
+        notify(`Saved "${res.data.label}" as a recording rule, but nothing matches it in the guide right now -- it'll start recording automatically the next time a matching episode airs (within the next 7 days).`)
+      }
+      const backfill = res.data?.past_seasons_backfill
+      if (backfill?.available) {
+        const already = backfill.episodes.filter((e: { status: string }) => e.status === 'already_in_pool').length
+        const scheduled = backfill.episodes.filter((e: { status: string }) => e.status === 'scheduled').length
+        const notFound = backfill.episodes.filter((e: { status: string }) => e.status === 'not_found').length
+        notify(
+          `Past seasons: ${already} already in your library, ${scheduled} newly scheduled` +
+          (notFound ? `, ${notFound} not found yet (still watching for them)` : '') + '.'
+        )
+      } else if (backfill && !backfill.available && scheduleBackfillPastSeasons) {
+        notify("Past seasons: not available for this show yet (it hasn't been catalogued with full episode info).")
       }
     },
     onError: (e: any) => setScheduleError(e?.response?.data?.detail ?? e.message ?? 'Failed to schedule.'),
@@ -617,7 +638,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
       qc.invalidateQueries({ queryKey: ['portal-upcoming'] })
       qc.invalidateQueries({ queryKey: ['portal-my-recordings'] })
     },
-    onError: (e: any) => alert(e?.response?.data?.detail ?? 'Failed to cancel.'),
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Failed to cancel.'),
   })
   // Removes only from THIS person's own Library -- if someone else also has
   // the same recording (e.g. two people's profiles matched the same
@@ -629,7 +650,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
     mutationFn: ({ kind, id }: { kind: 'movie' | 'episode'; id: number }) =>
       portalApi.delete(`/library/${kind === 'movie' ? 'movies' : 'episodes'}/${id}/`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-library'] }),
-    onError: (e: any) => alert(e?.response?.data?.detail ?? 'Failed to remove.'),
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Failed to remove.'),
   })
 
   // Self-service email -- where THIS person's own DVR quota warnings go
@@ -641,7 +662,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
   const updateEmail = useMutation({
     mutationFn: (email: string | null) => portalApi.put('/me/email/', { email }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['portal-me'] }),
-    onError: (e: any) => alert(e?.response?.data?.detail ?? 'Failed to save.'),
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Failed to save.'),
   })
 
   // Convert single<->series -- opened from a small "Make this a series" /
@@ -1245,6 +1266,19 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
                   value={scheduleLabel}
                   onChange={(e) => setScheduleLabel(e.target.value)}
                 />
+                <label className="flex items-center gap-2 text-sm pt-1 border-t border-border/50 mt-1.5">
+                  <input
+                    type="checkbox" checked={scheduleBackfillPastSeasons}
+                    onChange={(e) => setScheduleBackfillPastSeasons(e.target.checked)}
+                  />
+                  Also grab past seasons
+                </label>
+                {scheduleBackfillPastSeasons && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Uses whatever's already in the library, or this show's usual channel's guide -- won't guess a
+                    different channel for you. Anything it can't find stays on the watch list for later.
+                  </p>
+                )}
               </div>
             )}
 
@@ -1283,6 +1317,7 @@ export default function Portal({ onLogout }: { onLogout: () => void }) {
         </div>
       )}
       <ConfirmDialogHost />
+      <NotifyDialogHost />
     </div>
   )
 }

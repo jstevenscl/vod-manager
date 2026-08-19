@@ -1837,6 +1837,23 @@ def find_pool_backfill_match(title: str, program: dict) -> dict | None:
     return {"type": "movie", "movie_id": movie_id, "source": dict(source)} if source else None
 
 
+def find_series_by_title(title: str) -> dict | None:
+    """Same normalized-title match find_pool_backfill_match already trusts,
+    factored out as its own lookup for vod_manager-8p1.2's Portal past-
+    seasons backfill: needs the full series row (specifically tmdb_id) up
+    front to know whether a canonical episode list is even available to
+    diff against, before doing any per-episode work."""
+    normalized = _normalize_title_for_dedup(title)
+    conn = _connect()
+    row = next(
+        (r for r in conn.execute("SELECT id, name FROM series").fetchall()
+         if _normalize_title_for_dedup(r["name"]) == normalized),
+        None,
+    )
+    conn.close()
+    return get_series(row["id"]) if row else None
+
+
 def find_recording_profile_for_title(provider_id: int, title: str) -> dict | None:
     """Missing-episode resolve's own backfill_mode/target-category source
     when there's no per-episode rule to ask -- an existing Recording Rule
