@@ -1219,6 +1219,34 @@ async def _proxy_vod_stream(
         forward_headers["range"] = request.headers["range"]
     logger.info("[xc_server] %s stream request id=%s range=%s", kind, conn_id, forward_headers.get("range", "(none)"))
 
+    # GH#8: a real player seeking doesn't close its old Range request before
+    # opening the new one for the target position -- confirmed live,
+    # 2026-08-19, against a real single-connection account: the old
+    # connection was still open 73-195ms *after* the new request had already
+    # been rejected "at shared connection capacity". Not a leak, not a stale
+    # Dispatcharr viewer count -- a deterministic collision between normal
+    # player behavior and a provider with zero spare capacity for the
+    # overlap. Since the old connection is for this exact same client
+    # watching this exact same title, it's safe to treat the new request as
+    # superseding it: kill the old one and give it a brief moment to
+    # actually release before reserving capacity for the new one, instead of
+    # letting the new request simply lose the race every single time.
+    superseded = [
+        sid for sid, sess in _active_sessions.items()
+        if sess.get("username") == username and sess.get("kind") == kind
+        and sess.get("movie_id") == movie_id and sess.get("episode_id") == episode_id
+        and (movie_id is not None or episode_id is not None)
+    ]
+    if superseded:
+        for sid in superseded:
+            kill_session(sid)
+        logger.info("[xc_server] %s stream id=%s superseding %d earlier connection(s) for the same client+title: %s",
+                    kind, conn_id, len(superseded), superseded)
+        for _ in range(50):  # up to ~5s, 100ms steps -- covers slow upstream connects (observed 2.18s live)
+            if not any(sid in _active_sessions for sid in superseded):
+                break
+            await asyncio.sleep(0.1)
+
     last_error = None
     attempts: list[dict] = []
     for idx, source in enumerate(sources):
@@ -1258,6 +1286,17 @@ async def _proxy_vod_stream(
             continue
         sub_account_id = reservation["sub_account_id"]
 
+        # Registered as soon as capacity is actually reserved, not once the
+        # (potentially slow -- seen 2+s live) upstream connect finishes: the
+        # GH#8 supersede check above only has something to find and kill if
+        # a held reservation is visible immediately, not just once its
+        # connection is fully established. Popped in both failure paths
+        # below if this source doesn't pan out; overwritten with the full
+        # session record once the connect actually succeeds.
+        _active_sessions[conn_id] = {
+            "conn_id": conn_id, "kind": kind, "username": username, "movie_id": movie_id, "episode_id": episode_id,
+        }
+
         upstream_url = _build_upstream_url(kind, provider, source, reservation)
 
         # follow_redirects=True: real providers commonly 302 movie/series
@@ -1276,6 +1315,7 @@ async def _proxy_vod_stream(
         except Exception as exc:
             await client.aclose()
             _release_capacity(provider, sub_account_id)
+            _active_sessions.pop(conn_id, None)
             vod_db.record_source_failure(kind, source["source_id"])
             last_error = f"{type(exc).__name__}: {_redact_upstream_url(str(exc))}"
             attempts.append({"provider": provider["name"], "error": last_error})
@@ -1292,6 +1332,7 @@ async def _proxy_vod_stream(
             await upstream_resp.aclose()
             await client.aclose()
             _release_capacity(provider, sub_account_id)
+            _active_sessions.pop(conn_id, None)
             vod_db.record_source_failure(kind, source["source_id"])
             continue
 
@@ -1324,6 +1365,7 @@ async def _proxy_vod_stream(
             "provider_type": provider.get("provider_type", "xc"), "started_at": time.time(),
             "bytes_sent": 0, "total_bytes": total_bytes, "duration_secs": duration_secs,
             "range_start_byte": range_start_byte, "plex_reported": False, "emby_reported": False,
+            "username": username, "movie_id": movie_id, "episode_id": episode_id,
         }
 
         heartbeat_task = None
