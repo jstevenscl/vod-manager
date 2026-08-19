@@ -1027,6 +1027,30 @@ All of these live under the **Movies**/**TV Shows** toolbars or the
 automatically against your whole library without you seeing what it found
 first.
 
+### Rich Metadata (enrichment)
+
+Fetches detail — genre, poster, description, cast — from each item's own
+source provider for every movie and series in the pool (**Curation &
+Maintenance** tab). Runs in the background; safe to navigate away while it
+works.
+
+- **Bulk Enrich All** — enriches everything that hasn't been enriched yet,
+  or has aged past the **Enrichment TTL** (Configuration → Refresh
+  Schedule), skipping anything still fresh.
+- **Force Re-Enrich All** — re-fetches every movie/series from its provider
+  regardless of freshness, ignoring the TTL entirely. Use this once after
+  an update adds a new field it captures (e.g. rating, release date,
+  bitrate), so existing items backfill it right away instead of waiting
+  out the normal freshness window.
+- Progress tracks movies and series separately, each with its own running
+  error count — a nonzero count usually means a source's own API rejected
+  or timed out on some items, not that the whole run failed.
+- Enrichment also happens lazily, per item, the moment it's actually
+  needed (e.g. a movie/series detail modal's own **Fetch full detail**
+  button) — so a freshly-imported series showing no episodes yet just
+  hasn't been enriched yet, not necessarily broken (see Orphan Checker
+  below).
+
 ### Managing categories
 
 **Manage Categories** (Movies/TV Shows toolbar) is where you rename, reorder,
