@@ -491,7 +491,7 @@ function DvrLibrarySeriesCard({ series, rows, providerId, qc, xcCredentials, del
       </div>
       {open && (
         <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
-          <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-primary/25 via-card to-card overflow-hidden">
+          <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-brand2/25 via-card to-card overflow-hidden">
             <div aria-hidden className="absolute -right-3 -bottom-6 text-[90px] font-extrabold opacity-[0.08] leading-none select-none">
               {series.name.slice(0, 1).toUpperCase()}
             </div>
@@ -2226,7 +2226,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
         </div>
         {open && (
           <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
-            <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-brand2/25 via-card to-card overflow-hidden">
+            <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-brand3/25 via-card to-card overflow-hidden">
               <div aria-hidden className="absolute -right-3 -bottom-6 text-[90px] font-extrabold opacity-[0.08] leading-none select-none">
                 {movie.name.slice(0, 1).toUpperCase()}
               </div>
@@ -2654,7 +2654,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         </div>
         {open && (
           <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
-            <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-primary/25 via-card to-card overflow-hidden">
+            <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-brand2/25 via-card to-card overflow-hidden">
               <div aria-hidden className="absolute -right-3 -bottom-6 text-[90px] font-extrabold opacity-[0.08] leading-none select-none">
                 {series.name.slice(0, 1).toUpperCase()}
               </div>

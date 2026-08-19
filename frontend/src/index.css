@@ -103,6 +103,8 @@
     --radius:                 0.5rem;
     --brand2:                 140 12% 58%;
     --brand2-foreground:      0 0% 7%;
+    --brand3:                 45 18% 62%;
+    --brand3-foreground:      0 0% 7%;
   }
 
   /* "Warm" theme -- the Sonarr/Radarr-style poster-grid redesign mockup's
@@ -113,6 +115,15 @@
      from --primary's series/orange actions) -- added to every theme, not
      just this one, so shared components (poster cards, detail modals)
      read correctly no matter which theme is active. */
+  /* --brand3 (orange) -- vod_manager-8fi's Movies-specific accent (distinct
+     from --brand2/teal's TV Shows accent), requested for every theme, not
+     just Warm. On Warm it's literally --primary (already the mockup's
+     orange), matching the original design intent that Movies use --primary
+     there. The 3 pre-existing non-mono themes reuse their own --warning
+     color (already amber/orange-family in each) for the same reason
+     --brand2 reuses --success -- coherent with the rest of that theme's
+     palette instead of an arbitrary new hue. mono reuses its own --warning
+     too, set inline in its own block below since brand2 already is. */
   [data-theme="warm"] {
     --background:             223 24% 6%;
     --foreground:             220 19% 94%;
@@ -138,6 +149,8 @@
     --radius:                 0.625rem;
     --brand2:                 169 36% 54%;
     --brand2-foreground:      169 51% 8%;
+    --brand3:                 27 79% 57%;
+    --brand3-foreground:      24 69% 10%;
   }
 }
 
@@ -146,9 +159,9 @@
    poster-card/modal components coherent under any theme without inventing
    an unrelated new hue per theme. mono's --brand2 is set inline above
    since it lives in the same rule block as its other tokens. */
-:root, [data-theme="dark"] { --brand2: 160 70% 45%; --brand2-foreground: 224 71% 7%; }
-[data-theme="mid"]         { --brand2: 160 65% 42%; --brand2-foreground: 215 28% 10%; }
-[data-theme="light"]       { --brand2: 160 75% 28%; --brand2-foreground: 0 0% 100%; }
+:root, [data-theme="dark"] { --brand2: 160 70% 45%; --brand2-foreground: 224 71% 7%; --brand3: 40 90% 55%; --brand3-foreground: 224 71% 7%; }
+[data-theme="mid"]         { --brand2: 160 65% 42%; --brand2-foreground: 215 28% 10%; --brand3: 38 85% 52%; --brand3-foreground: 215 28% 10%; }
+[data-theme="light"]       { --brand2: 160 75% 28%; --brand2-foreground: 0 0% 100%;   --brand3: 38 90% 34%; --brand3-foreground: 0 0% 100%; }
 
 @layer base {
   * { @apply border-border; }
