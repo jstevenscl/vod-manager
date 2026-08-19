@@ -325,6 +325,12 @@ class ImportDiscoveredProfilesRequest(BaseModel):
     profiles: list[DiscoveredProfileKey]
 
 
+class ImportDiscoveredProfilesAsSubAccountsRequest(BaseModel):
+    profiles: list[DiscoveredProfileKey]
+    provider_id: Optional[int] = None
+    new_provider_name: Optional[str] = None
+
+
 class CategoryRequest(BaseModel):
     name: str
     content_type: str  # 'movie' or 'series'
@@ -1232,6 +1238,31 @@ async def import_discovered_dispatcharr_accounts(connection_id: int, body: Impor
         except ValueError as exc:
             skipped.append({"name": profile["name"], "reason": str(exc)})
     return {"imported": imported, "skipped": skipped}
+
+
+@router.post("/dispatcharr-connections/{connection_id}/discover-accounts/import-as-subaccounts/", dependencies=_GUARDS)
+async def import_discovered_dispatcharr_accounts_as_subaccounts(
+    connection_id: int, body: ImportDiscoveredProfilesAsSubAccountsRequest,
+):
+    """vod_manager-gd5: group the selected discovered profiles into one
+    provider's sub-accounts instead of one separate provider row each."""
+    connection = vod_db.get_dispatcharr_connection(connection_id)
+    if not connection:
+        raise HTTPException(404, detail="connection not found")
+    if (body.provider_id is None) == (body.new_provider_name is None):
+        raise HTTPException(400, detail="give exactly one of provider_id or new_provider_name")
+    try:
+        candidates = await vod_sync.list_discoverable_profiles(connection)
+    except Exception as exc:
+        raise HTTPException(502, detail=str(exc))
+    by_key = {(c["dispatcharr_account_id"], c["dispatcharr_profile_id"]): c for c in candidates}
+    profiles = [by_key[(k.dispatcharr_account_id, k.dispatcharr_profile_id)] for k in body.profiles if (k.dispatcharr_account_id, k.dispatcharr_profile_id) in by_key]
+    try:
+        return vod_sync.import_discovered_profiles_as_subaccounts(
+            connection_id, profiles, provider_id=body.provider_id, new_provider_name=body.new_provider_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
 
 
 @router.post("/dispatcharr-connections/{connection_id}/discover-accounts/recheck/", dependencies=_GUARDS)

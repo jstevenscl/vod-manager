@@ -256,6 +256,70 @@ def import_discovered_profile(connection_id: int, profile: dict) -> dict:
     return vod_db.get_provider(provider_id)
 
 
+def import_discovered_profiles_as_subaccounts(
+    connection_id: int, profiles: list[dict], provider_id: int | None = None, new_provider_name: str | None = None,
+) -> dict:
+    """vod_manager-gd5: group N discovered Dispatcharr profiles into one
+    provider's sub-accounts, instead of import_discovered_profile's one-row-
+    per-profile default -- the Discover-flow equivalent of
+    merge_providers_into_subaccounts (vod_manager-q78), but for profiles
+    that were never separately imported as providers at all.
+
+    Give exactly one of:
+    - provider_id: an existing provider. Every usable profile becomes a new
+      sub-account under it (its own top-level credentials are untouched).
+    - new_provider_name: creates a new provider. The FIRST usable profile
+      becomes that provider's own top-level login + live-account link
+      (same as import_discovered_profile for a single profile); every
+      remaining profile becomes a sub-account.
+
+    Skips (not raises) any profile whose credentials couldn't be parsed,
+    same as import_discovered_profile -- reported back in "skipped" rather
+    than aborting the whole group."""
+    if (provider_id is None) == (new_provider_name is None):
+        raise ValueError("give exactly one of provider_id or new_provider_name")
+
+    usable, skipped = [], []
+    for profile in profiles:
+        if profile.get("credentials_unparseable") or not profile.get("username"):
+            skipped.append({"name": profile["name"], "reason": "couldn't determine real credentials"})
+        else:
+            usable.append(profile)
+    if not usable:
+        return {"provider": None, "sub_accounts_created": 0, "skipped": skipped}
+
+    sub_account_profiles = usable
+    if provider_id is not None:
+        provider = vod_db.get_provider(provider_id)
+        if not provider:
+            raise ValueError(f"provider {provider_id} not found")
+    else:
+        first = usable[0]
+        pid = vod_db.upsert_provider(
+            name=new_provider_name, base_url=first["server_url"],
+            username=first["username"], password=first["password"],
+            max_streams=first["max_streams"], provider_type="xc",
+        )
+        if first["max_streams"]:
+            vod_db.set_provider_shared_limit(pid, first["max_streams"])
+        vod_db.set_provider_live_account(pid, connection_id, first["dispatcharr_account_id"], first["dispatcharr_profile_id"])
+        provider = vod_db.get_provider(pid)
+        sub_account_profiles = usable[1:]
+
+    sub_accounts_created = 0
+    for i, profile in enumerate(sub_account_profiles):
+        sub_id = vod_db.create_provider_sub_account(
+            provider["id"], profile["name"], profile["username"], profile["password"],
+            max_streams=profile["max_streams"], sort_order=i,
+        )
+        vod_db.set_provider_sub_account_live_account(
+            sub_id, connection_id, profile["dispatcharr_account_id"], profile.get("dispatcharr_profile_id"),
+        )
+        sub_accounts_created += 1
+
+    return {"provider": vod_db.get_provider(provider["id"]), "sub_accounts_created": sub_accounts_created, "skipped": skipped}
+
+
 async def recheck_discovered_credentials(connection: dict) -> dict:
     """Re-fetches every already-imported profile on this connection and
     updates VOD Manager's stored username/password if Dispatcharr's own

@@ -3697,6 +3697,35 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       }
     },
   })
+  // vod_manager-gd5: group selected discovered profiles into one provider's
+  // sub-accounts instead of one separate provider row each -- the
+  // Discover-flow equivalent of the Merge Providers tool, but for profiles
+  // that were never separately imported as providers at all.
+  const [groupSubAccountsOpen, setGroupSubAccountsOpen] = useState(false)
+  const [groupTargetProviderId, setGroupTargetProviderId] = useState<number | ''>('')
+  const [groupNewProviderName, setGroupNewProviderName] = useState('')
+  const groupIntoSubAccounts = useMutation({
+    mutationFn: () => api.post(`/vod/dispatcharr-connections/${discoverModalConnectionId}/discover-accounts/import-as-subaccounts/`, {
+      profiles: Array.from(discoverSelectedIds).map((key) => {
+        const [dispatcharr_account_id, dispatcharr_profile_id] = key.split(':').map(Number)
+        return { dispatcharr_account_id, dispatcharr_profile_id }
+      }),
+      provider_id: groupTargetProviderId === '' ? null : groupTargetProviderId,
+      new_provider_name: groupTargetProviderId === '' ? groupNewProviderName : null,
+    }).then((r) => r.data),
+    onSuccess: (data: { provider: { name: string } | null; sub_accounts_created: number; skipped: { name: string; reason: string }[] }) => {
+      const createdNewProvider = groupTargetProviderId === ''
+      const skippedMsg = data.skipped.length ? ` Skipped: ${data.skipped.map((s) => `${s.name} (${s.reason})`).join('; ')}` : ''
+      const totalGrouped = data.sub_accounts_created + (createdNewProvider && data.provider ? 1 : 0)
+      qc.invalidateQueries({ queryKey: ['vod-dispatcharr-discover-accounts', discoverModalConnectionId] })
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setDiscoverSelectedIds(new Set())
+      setGroupSubAccountsOpen(false)
+      setGroupTargetProviderId('')
+      setGroupNewProviderName('')
+      setRecheckResult(`Grouped ${totalGrouped} profile(s) into "${data.provider?.name}".${skippedMsg}`)
+    },
+  })
   const [recheckResult, setRecheckResult] = useState<string | null>(null)
   const recheckDiscoveredCredentials = useMutation({
     mutationFn: () => api.post(`/vod/dispatcharr-connections/${discoverModalConnectionId}/discover-accounts/recheck/`).then((r) => r.data),
@@ -6052,7 +6081,68 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 {importDiscoveredAccounts.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
                 Import selected ({discoverSelectedIds.size})
               </Button>
+              <Button
+                size="sm" variant="outline"
+                disabled={discoverSelectedIds.size < 2}
+                onClick={() => setGroupSubAccountsOpen((v) => !v)}
+              >
+                Group into sub-accounts ({discoverSelectedIds.size})
+              </Button>
             </div>
+            {groupSubAccountsOpen && (
+              <div className="border border-border rounded p-3 space-y-2">
+                <p className="text-xs text-muted-foreground">
+                  Group the {discoverSelectedIds.size} selected profiles into one provider's sub-accounts instead of{' '}
+                  {discoverSelectedIds.size} separate provider rows — matching credential limits/failover, one place
+                  to import/curate the catalog.
+                </p>
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="radio" name="group-target" checked={groupTargetProviderId === ''}
+                    onChange={() => setGroupTargetProviderId('')}
+                  />
+                  New provider named
+                  <input
+                    type="text"
+                    className="h-7 text-sm flex-1 bg-background border border-border rounded px-1.5" placeholder="e.g. Infinity"
+                    value={groupNewProviderName}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => { setGroupNewProviderName(e.target.value); setGroupTargetProviderId('') }}
+                  />
+                </label>
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="radio" name="group-target" checked={groupTargetProviderId !== ''}
+                    onChange={() => setGroupTargetProviderId(providersQuery.data?.[0]?.id ?? '')}
+                  />
+                  Existing provider
+                  <select
+                    className="h-7 text-sm flex-1 bg-background border border-border rounded px-1.5"
+                    value={groupTargetProviderId}
+                    onChange={(e) => setGroupTargetProviderId(e.target.value ? Number(e.target.value) : '')}
+                  >
+                    <option value="">Select…</option>
+                    {providersQuery.data?.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <div className="flex justify-end gap-1.5">
+                  <Button size="sm" variant="outline" onClick={() => setGroupSubAccountsOpen(false)}>Cancel</Button>
+                  <Button
+                    size="sm"
+                    disabled={
+                      groupIntoSubAccounts.isPending ||
+                      (groupTargetProviderId === '' && !groupNewProviderName.trim()) ||
+                      (groupTargetProviderId !== '' && !groupTargetProviderId)
+                    }
+                    onClick={() => groupIntoSubAccounts.mutate()}
+                  >
+                    {groupIntoSubAccounts.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                    Group
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </Modal>
         )
