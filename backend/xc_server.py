@@ -1441,7 +1441,20 @@ async def _proxy_vod_stream(
                 )
 
         passthrough_headers = {}
-        for h in ("content-range", "content-length"):
+        # GH#8 follow-up: content-length used to be forwarded here too, but
+        # any relay can now be cut short mid-stream by design (supersede-kill
+        # on a seek, or an ordinary client disconnect) -- uvicorn's own ASGI
+        # transport strictly enforces that a declared Content-Length gets
+        # fully delivered, and raises "Response content shorter than
+        # Content-Length" as an unhandled exception the instant it doesn't
+        # (confirmed live: happens on every seek now that supersede-kill
+        # exists, harmless to actual playback but noisy/alarming in logs).
+        # Dropping it lets the response fall back to chunked transfer
+        # encoding, which has no such fixed-length contract -- a stream
+        # ending early there is just an ordinary short read, not a protocol
+        # violation. content-range (which is what a player actually needs to
+        # know the seek target and total resource size) is unaffected.
+        for h in ("content-range",):
             if h in upstream_resp.headers:
                 passthrough_headers[h] = upstream_resp.headers[h]
         # Some real providers send a malformed Accept-Ranges value (e.g. a
