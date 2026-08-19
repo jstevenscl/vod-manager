@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -386,6 +386,168 @@ function PosterThumb({ url, className, fallback }: { url: string | null; classNa
     return <img src={posterSrc(url)} alt="" className={className} loading="lazy" onError={() => setFailed(true)} />
   }
   return <>{fallback !== undefined ? fallback : <div className={`${className} bg-muted`} />}</>
+}
+
+function formatFileSize(n: number): string {
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(0)} MB`
+  return `${(n / 1024 ** 3).toFixed(2)} GB`
+}
+
+// Poster-less fallback for DVR-recorded content (vod_manager-8fi) -- fresh
+// recordings often haven't been through TMDB enrichment yet, so no real
+// poster exists. A deterministic gradient (hashed off the row's own id, so
+// it's stable across re-renders/re-fetches, not random each time) plus the
+// title's first letter, matching the approved redesign mockup's own
+// "glyph" placeholder treatment instead of a generic blank box.
+const LIBRARY_GLYPH_GRADIENTS = [
+  'from-amber-900 to-stone-950', 'from-teal-900 to-emerald-950',
+  'from-violet-900 to-indigo-950', 'from-orange-900 to-red-950',
+  'from-cyan-900 to-slate-950', 'from-rose-900 to-pink-950',
+]
+function LibraryGlyph({ seed, name }: { seed: number; name: string }) {
+  const gradient = LIBRARY_GLYPH_GRADIENTS[seed % LIBRARY_GLYPH_GRADIENTS.length]
+  return (
+    <div className={`w-full aspect-[2/3] bg-gradient-to-br ${gradient} flex items-center justify-center`}>
+      <span className="text-white/25 text-5xl font-extrabold">{(name || '?').slice(0, 1).toUpperCase()}</span>
+    </div>
+  )
+}
+
+// DVR Library's series card (vod_manager-8fi) -- poster + season-collapsed
+// episode modal, matching the approved redesign mockup's own show-detail
+// interaction exactly (latest season open by default, a toggle to reveal
+// earlier ones). rows is already pre-filtered to this provider's own
+// sources by the caller (DVR Library only ever shows what THIS provider
+// recorded, same scoping the old flat list had).
+function DvrLibrarySeriesCard({ series, rows, providerId, qc, xcCredentials, deleteDvrEpisodeSource }: {
+  series: Series
+  rows: { episode: Episode; source: EpisodeSource }[]
+  providerId: number
+  qc: ReturnType<typeof useQueryClient>
+  xcCredentials?: XcCredentials
+  deleteDvrEpisodeSource: { isPending: boolean; mutate: (v: { episodeId: number; sourceId: number }) => void }
+}) {
+  const [open, setOpen] = useState(false)
+  const [showEarlier, setShowEarlier] = useState(false)
+  const [showMissing, setShowMissing] = useState(false)
+
+  const bySeason = new Map<number, { episode: Episode; source: EpisodeSource }[]>()
+  for (const row of rows) {
+    if (!bySeason.has(row.episode.season_number)) bySeason.set(row.episode.season_number, [])
+    bySeason.get(row.episode.season_number)!.push(row)
+  }
+  const seasons = Array.from(bySeason.entries())
+    .map(([season_number, seasonRows]) => ({ season_number, rows: seasonRows.sort((a, b) => a.episode.episode_number - b.episode.episode_number) }))
+    .sort((a, b) => b.season_number - a.season_number)
+  const [latest, ...earlier] = seasons
+
+  function seasonBlock(block: { season_number: number; rows: { episode: Episode; source: EpisodeSource }[] }, defaultOpen: boolean) {
+    return (
+      <SeasonBlock key={block.season_number} label={`Season ${block.season_number}`} defaultOpen={defaultOpen}>
+        {block.rows.map(({ episode, source }) => {
+          const ext = source.container_extension || 'mp4'
+          return (
+            <div key={`${episode.id}-${source.id}`} className="flex items-center gap-2 text-xs px-1 py-1.5 border-t border-border/60 first:border-t-0">
+              <PlayButton
+                url={buildPreviewSourceUrl('series', source.id, ext, xcCredentials)}
+                transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentials)}
+                hlsUrl={buildHlsPreviewSourceUrl('series', source.id, xcCredentials)}
+                title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
+              />
+              <span className="font-mono text-[10.5px] font-bold text-primary bg-primary/10 rounded px-1.5 py-0.5 shrink-0">E{episode.episode_number}</span>
+              <span className="flex-1 truncate">{episode.name}</span>
+              <span className="text-muted-foreground text-[10.5px] shrink-0">
+                {ext.toUpperCase()}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}
+              </span>
+              {episode.sources.length > 1 && <Chip>+{episode.sources.length - 1}</Chip>}
+              <button
+                title="Remove this provider's copy from the pool"
+                className="text-muted-foreground hover:text-destructive p-1 shrink-0"
+                disabled={deleteDvrEpisodeSource.isPending}
+                onClick={() => askConfirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`, () => deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id }))}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          )
+        })}
+      </SeasonBlock>
+    )
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-card overflow-hidden shadow-sm hover:shadow-lg hover:-translate-y-0.5 hover:border-primary/40 transition-all relative">
+      <button className="block w-full text-left relative" onClick={() => setOpen(true)}>
+        <PosterThumb url={series.poster_url} className="w-full aspect-[2/3] object-cover" fallback={<LibraryGlyph seed={series.id} name={series.name} />} />
+        <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
+        <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
+          <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{series.name}</p>
+          <p className="text-[11px] text-white/70 mt-0.5">{seasons.length} season{seasons.length === 1 ? '' : 's'}</p>
+        </div>
+      </button>
+      <div className="px-2.5 py-1.5 text-[10.5px] text-muted-foreground border-t border-border/60">
+        {rows.length} episode{rows.length === 1 ? '' : 's'} from this provider
+      </div>
+      {open && (
+        <Modal onClose={() => setOpen(false)} maxWidth="max-w-lg">
+          <div className="relative px-4 py-3.5 border-b border-border bg-gradient-to-br from-primary/25 via-card to-card overflow-hidden">
+            <div aria-hidden className="absolute -right-3 -bottom-6 text-[90px] font-extrabold opacity-[0.08] leading-none select-none">
+              {series.name.slice(0, 1).toUpperCase()}
+            </div>
+            <span className="relative text-sm font-bold truncate pr-6 block">{series.name}</span>
+            <span className="relative text-[11px] text-muted-foreground mt-0.5 block">
+              {seasons.length} season{seasons.length === 1 ? '' : 's'} · {rows.length} episode{rows.length === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="p-4 text-xs space-y-2 overflow-y-auto">
+            {latest && seasonBlock(latest, true)}
+            {earlier.length > 0 && (
+              <>
+                <label className="flex items-center justify-between gap-2 text-xs py-1.5 border-t border-border/60 mt-1 cursor-pointer select-none">
+                  <span className="text-muted-foreground">
+                    {earlier.length} earlier season{earlier.length === 1 ? '' : 's'} ({earlier.reduce((n, s) => n + s.rows.length, 0)} episodes) hidden
+                  </span>
+                  <input type="checkbox" checked={showEarlier} onChange={(e) => setShowEarlier(e.target.checked)} />
+                </label>
+                {showEarlier && earlier.map((block) => seasonBlock(block, false))}
+              </>
+            )}
+            {series.tmdb_id && (
+              <button
+                className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1 pt-2"
+                onClick={() => setShowMissing((v) => !v)}
+              >
+                {showMissing ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                Missing episodes
+              </button>
+            )}
+            {showMissing && <MissingEpisodesPanel series={series} providerId={providerId} qc={qc} />}
+          </div>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// Collapsible season group (vod_manager-8fi), matching the approved
+// redesign mockup's season-block chevron treatment.
+function SeasonBlock({ label, defaultOpen, children }: { label: string; defaultOpen: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="border border-border/60 rounded-lg overflow-hidden">
+      <button
+        className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 bg-secondary/50 hover:bg-secondary text-xs font-bold text-left"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="flex items-center gap-1.5">
+          <ChevronRight size={12} className={`text-muted-foreground transition-transform ${open ? 'rotate-90' : ''}`} />
+          {label}
+        </span>
+      </button>
+      {open && <div className="px-2">{children}</div>}
+    </div>
+  )
 }
 
 // Forces one specific provider's copy — belongs on each Sources row (testing
@@ -4458,12 +4620,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // retention's apply step already uses), not a blanket row delete -- a
   // movie/episode also sourced elsewhere stays, just no longer via DVR.
   const [dvrLibraryTab, setDvrLibraryTab] = useState<'movies' | 'series'>('movies')
-  const [expandedMissingSeriesId, setExpandedMissingSeriesId] = useState<number | null>(null)
-  function formatFileSize(n: number): string {
-    if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
-    if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(0)} MB`
-    return `${(n / 1024 ** 3).toFixed(2)} GB`
-  }
   const dvrLibraryMoviesQuery = useQuery<{ items: Movie[]; total: number }>({
     queryKey: ['vod-dvr-library-movies', recordingProfilesProviderId],
     queryFn: () => api.get('/vod/movies/', { params: { provider_id: recordingProfilesProviderId, limit: 200, archived: false } }).then((r) => r.data),
@@ -7740,7 +7896,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 </div>
 
                 {dvrLibraryTab === 'movies' ? (
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                     {dvrLibraryMoviesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
                     {dvrLibraryMoviesQuery.data && !dvrLibraryMoviesQuery.data.items.length && (
                       <p className="text-xs text-muted-foreground">No movies from this provider yet.</p>
@@ -7748,36 +7904,50 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     {dvrLibraryMoviesQuery.data?.total != null && dvrLibraryMoviesQuery.data.total > dvrLibraryMoviesQuery.data.items.length && (
                       <p className="text-[11px] text-muted-foreground">Showing {dvrLibraryMoviesQuery.data.items.length} of {dvrLibraryMoviesQuery.data.total}.</p>
                     )}
-                    {dvrLibraryMoviesQuery.data?.items.map((m) => {
-                      const src = m.sources.find((s) => s.provider_id === recordingProfilesProviderId)
-                      const ext = src?.container_extension || 'mp4'
-                      return (
-                        <div key={m.id} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
-                          {src && (
-                            <PlayButton
-                              url={buildPreviewSourceUrl('movie', src.id, ext, xcCredentialsQuery.data)}
-                              transcodedUrl={buildTranscodedPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
-                              hlsUrl={buildHlsPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
-                              title={m.name}
-                            />
-                          )}
-                          <span className="flex-1 truncate">
-                            <span className="font-semibold">{m.name}</span>{' '}
-                            <span className="text-muted-foreground">{m.year ? `(${m.year})` : ''}</span>
-                          </span>
-                          {src && <Chip>{ext.toUpperCase()}{src.file_size_bytes != null && ` · ${formatFileSize(src.file_size_bytes)}`}</Chip>}
-                          {m.sources.length > 1 && <Chip>+{m.sources.length - 1} other source{m.sources.length > 2 ? 's' : ''}</Chip>}
-                          <button
-                            title="Remove this provider's copy from the pool"
-                            className="text-muted-foreground hover:text-destructive p-1"
-                            disabled={!src || deleteDvrMovieSource.isPending}
-                            onClick={() => { if (src) askConfirm(`Remove "${m.name}" from the DVR pool? This can't be undone.`, () => deleteDvrMovieSource.mutate({ movieId: m.id, sourceId: src.id })) }}
-                          >
-                            <Trash2 size={12} />
-                          </button>
-                        </div>
-                      )
-                    })}
+                    <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}>
+                      {dvrLibraryMoviesQuery.data?.items.map((m) => {
+                        const src = m.sources.find((s) => s.provider_id === recordingProfilesProviderId)
+                        const ext = src?.container_extension || 'mp4'
+                        return (
+                          <div key={m.id} className="rounded-xl border border-border bg-card overflow-hidden shadow-sm hover:shadow-lg hover:-translate-y-0.5 hover:border-primary/40 transition-all relative group">
+                            <div className="relative">
+                              <PosterThumb
+                                url={m.poster_url}
+                                className="w-full aspect-[2/3] object-cover"
+                                fallback={<LibraryGlyph seed={m.id} name={m.name} />}
+                              />
+                              <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
+                              <div className="absolute inset-x-0 bottom-0 p-2.5 text-white pointer-events-none">
+                                <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{m.name}</p>
+                                <p className="text-[11px] text-white/70 mt-0.5">{m.year ?? ''}</p>
+                              </div>
+                              {src && (
+                                <div className="absolute bottom-14 right-1.5 z-10 opacity-0 group-hover:opacity-100 transition-opacity bg-background/85 rounded">
+                                  <PlayButton
+                                    url={buildPreviewSourceUrl('movie', src.id, ext, xcCredentialsQuery.data)}
+                                    transcodedUrl={buildTranscodedPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
+                                    hlsUrl={buildHlsPreviewSourceUrl('movie', src.id, xcCredentialsQuery.data)}
+                                    title={m.name}
+                                  />
+                                </div>
+                              )}
+                              <button
+                                title="Remove this provider's copy from the pool"
+                                className="absolute top-1.5 right-1.5 z-10 bg-background/85 rounded p-1 text-muted-foreground hover:text-destructive"
+                                disabled={!src || deleteDvrMovieSource.isPending}
+                                onClick={() => { if (src) askConfirm(`Remove "${m.name}" from the DVR pool? This can't be undone.`, () => deleteDvrMovieSource.mutate({ movieId: m.id, sourceId: src.id })) }}
+                              >
+                                <Trash2 size={12} />
+                              </button>
+                            </div>
+                            <div className="px-2.5 py-1.5 flex items-center gap-1 flex-wrap text-[10.5px] text-muted-foreground border-t border-border/60">
+                              {src && <span>{ext.toUpperCase()}{src.file_size_bytes != null && ` · ${formatFileSize(src.file_size_bytes)}`}</span>}
+                              {m.sources.length > 1 && <span>+{m.sources.length - 1} other</span>}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -7792,51 +7962,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       if (dvrLibrarySeriesQuery.data && !groups.length) {
                         return <p className="text-xs text-muted-foreground">No episodes from this provider yet.</p>
                       }
-                      return groups.map(({ series, rows }) => (
-                        <div key={series.id} className="space-y-1">
-                          {rows.map(({ episode, source }) => {
-                            const ext = source.container_extension || 'mp4'
-                            return (
-                              <div key={`${episode.id}-${source.id}`} className="flex items-center gap-2 text-xs rounded-lg border border-border bg-card px-3 py-2 shadow-sm">
-                                <PlayButton
-                                  url={buildPreviewSourceUrl('series', source.id, ext, xcCredentialsQuery.data)}
-                                  transcodedUrl={buildTranscodedPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
-                                  hlsUrl={buildHlsPreviewSourceUrl('series', source.id, xcCredentialsQuery.data)}
-                                  title={`${series.name} S${episode.season_number}E${episode.episode_number}`}
-                                />
-                                <span className="flex-1 truncate">
-                                  <span className="font-semibold">{series.name}</span>{' '}
-                                  <span className="text-muted-foreground">
-                                    S{episode.season_number}E{episode.episode_number} — {episode.name}
-                                  </span>
-                                </span>
-                                <Chip>{ext.toUpperCase()}{source.file_size_bytes != null && ` · ${formatFileSize(source.file_size_bytes)}`}</Chip>
-                                {episode.sources.length > 1 && <Chip>+{episode.sources.length - 1} other source{episode.sources.length > 2 ? 's' : ''}</Chip>}
-                                <button
-                                  title="Remove this provider's copy from the pool"
-                                  className="text-muted-foreground hover:text-destructive p-1"
-                                  disabled={deleteDvrEpisodeSource.isPending}
-                                  onClick={() => { askConfirm(`Remove "${series.name}" S${episode.season_number}E${episode.episode_number} from the DVR pool? This can't be undone.`, () => deleteDvrEpisodeSource.mutate({ episodeId: episode.id, sourceId: source.id })) }}
-                                >
-                                  <Trash2 size={12} />
-                                </button>
-                              </div>
-                            )
-                          })}
-                          {series.tmdb_id && (
-                            <button
-                              className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1 pl-1"
-                              onClick={() => setExpandedMissingSeriesId(expandedMissingSeriesId === series.id ? null : series.id)}
-                            >
-                              {expandedMissingSeriesId === series.id ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-                              Missing episodes
-                            </button>
-                          )}
-                          {expandedMissingSeriesId === series.id && recordingProfilesProviderId != null && (
-                            <MissingEpisodesPanel series={series} providerId={recordingProfilesProviderId} qc={qc} />
-                          )}
+                      return (
+                        <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}>
+                          {groups.map(({ series, rows }) => (
+                            <DvrLibrarySeriesCard
+                              key={series.id} series={series} rows={rows}
+                              providerId={recordingProfilesProviderId!} qc={qc} xcCredentials={xcCredentialsQuery.data}
+                              deleteDvrEpisodeSource={deleteDvrEpisodeSource}
+                            />
+                          ))}
                         </div>
-                      ))
+                      )
                     })()}
                   </div>
                 )}
