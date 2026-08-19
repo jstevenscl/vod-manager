@@ -682,11 +682,22 @@ async def _select_upstream_credentials(provider: dict) -> dict | None:
     Returns None if no capacity is available anywhere (provider-level or
     every sub-account), else a dict describing what was reserved and which
     credentials to actually use: {"username", "password", "sub_account_id"}
-    (sub_account_id is None for the plain provider-level case)."""
+    (sub_account_id is None for the plain provider-level case).
+
+    Real bug fixed here: the provider's OWN top-level credentials used to
+    stop being tried entirely the moment any sub-account existed (only the
+    `if not sub_accounts:` branch ever called _try_reserve_capacity) --
+    meaning a provider's own original login became permanently dead weight
+    the instant merge_providers_into_subaccounts (vod_manager-q78) gave it
+    its first sub-account, silently losing that real subscription's whole
+    capacity with no error anywhere. The provider's own login is real
+    capacity too, so it's now tried first (matching Dispatcharr's own
+    convention of an account's Default profile coming before its other
+    profiles), then every sub-account in sort_order, same as before."""
     sub_accounts = await asyncio.to_thread(vod_db.list_provider_sub_accounts, provider["id"])
+    if await _try_reserve_capacity(provider):
+        return {"username": provider.get("username"), "password": provider.get("password"), "sub_account_id": None}
     if not sub_accounts:
-        if await _try_reserve_capacity(provider):
-            return {"username": provider.get("username"), "password": provider.get("password"), "sub_account_id": None}
         return None
 
     for sub in sub_accounts:
