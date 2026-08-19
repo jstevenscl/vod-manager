@@ -46,6 +46,10 @@ export default {
           DEFAULT:    'hsl(var(--brand2))',
           foreground: 'hsl(var(--brand2-foreground))',
         },
+        brand3: {
+          DEFAULT:    'hsl(var(--brand3))',
+          foreground: 'hsl(var(--brand3-foreground))',
+        },
       },
       borderRadius: {
         lg: 'var(--radius)',
