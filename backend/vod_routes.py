@@ -1961,6 +1961,102 @@ async def list_dvr_unresolved_missing_episodes(series_id: Optional[int] = None):
     return vod_db.list_unresolved_missing_episodes(series_id)
 
 
+async def backfill_series_past_seasons(series_id: int, provider_id: int, scheduled_by: dict | None = None) -> dict:
+    """vod_manager-8p1.2: bulk equivalent of resolve_missing_episode for a
+    Portal user checking "also grab past seasons" when starting a series
+    recording rule. For every canonical (TMDB) episode not already in the
+    pool, tries the same first two tiers of resolve_missing_episode's
+    cascade -- pool backfill, then a match on this show's own known channel
+    (the rule just created for it, or an existing one) within the guide
+    horizon -- and auto-applies whichever hits.
+
+    Deliberately skips resolve_missing_episode's third tier (an unscoped
+    cross-channel search returning candidates for a human to pick from):
+    there's no synchronous human reviewing a whole season's worth of
+    candidates one by one, and guessing a channel here risks the exact
+    per-affiliate duplicate-recording problem create_recording's own
+    docstring warns about. Anything that doesn't resolve in the first two
+    tiers is flagged the same way resolve_missing_episode's own dead-end
+    case is (dvr_unresolved_missing_episodes) -- surfaces on the admin's
+    existing Missing Episodes review, and gets picked up automatically by
+    any later schedule_channel_recordings rescan, same as any other missing
+    episode always has, rather than silently going nowhere.
+
+    Returns {"available": False} if this series has no TMDB id yet (nothing
+    canonical to diff against -- same precondition list_missing_episodes
+    enforces for the admin view). Otherwise {"available": True, "episodes":
+    [...]} with each canonical episode's own {season_number, episode_number,
+    name, status}, status one of already_in_pool / scheduled / not_found."""
+    series = vod_db.get_series(series_id)
+    if not series or not series.get("tmdb_id"):
+        return {"available": False, "episodes": []}
+    try:
+        canonical = await tmdb_sync.get_series_episode_list(series["tmdb_id"])
+    except Exception as exc:
+        logger.warning("[vod_routes] backfill_series_past_seasons: TMDB lookup failed for series=%s: %s", series_id, exc)
+        return {"available": False, "episodes": []}
+
+    have = {
+        (e["season_number"], e["episode_number"])
+        for e in vod_db.list_episodes_for_series_ids([series_id]).get(series_id, [])
+    }
+    _, connection = _require_dvr_connection(provider_id)
+    rule = vod_db.find_recording_profile_for_title(provider_id, series["name"])
+
+    results = []
+    for ep in canonical:
+        season, episode, name = ep["season_number"], ep["episode_number"], ep.get("name")
+        if (season, episode) in have:
+            results.append({"season_number": season, "episode_number": episode, "name": name, "status": "already_in_pool"})
+            continue
+
+        program = {"title": series["name"], "custom_properties": {"season": season, "episode": episode}}
+        match = vod_db.find_pool_backfill_match(series["name"], program)
+        if match:
+            mode = (rule or {}).get("backfill_mode") or "pointer"
+            try:
+                if mode == "download":
+                    await dispatcharr_dvr_importer._apply_download_backfill(match, provider_id)
+                else:
+                    await dispatcharr_dvr_importer._apply_pointer_backfill(match)
+                target_category_id = (rule or {}).get("target_series_category_id")
+                if target_category_id:
+                    vod_db.place_series_in_category(match["series_id"], target_category_id)
+                vod_db.clear_unresolved_missing_episode(series_id, season, episode)
+                results.append({"season_number": season, "episode_number": episode, "name": name, "status": "already_in_pool"})
+                continue
+            except Exception as exc:
+                logger.warning("[vod_routes] backfill_series_past_seasons: pool backfill failed for %r S%sE%s: %s",
+                                series["name"], season, episode, exc)
+                # falls through to the known-channel EPG check below
+
+        scheduled = False
+        if rule and rule.get("channel_id"):
+            try:
+                scoped_matches = await dispatcharr_dvr_client.search_epg_programs(
+                    connection, series["name"], channel_id=rule["channel_id"],
+                )
+                scoped_candidates = [m for m in scoped_matches if _matches_episode(m, season, episode)]
+                if scoped_candidates:
+                    if await dispatcharr_dvr_client.is_already_scheduled(connection, rule["channel_id"], scoped_candidates[0]):
+                        scheduled = True
+                    else:
+                        await dispatcharr_dvr_client.create_recording(connection, rule["channel_id"], scoped_candidates[0], scheduled_by)
+                        scheduled = True
+            except Exception as exc:
+                logger.warning("[vod_routes] backfill_series_past_seasons: channel EPG check failed for %r S%sE%s: %s",
+                                series["name"], season, episode, exc)
+
+        if scheduled:
+            vod_db.clear_unresolved_missing_episode(series_id, season, episode)
+            results.append({"season_number": season, "episode_number": episode, "name": name, "status": "scheduled"})
+        else:
+            vod_db.record_unresolved_missing_episode(series_id, season, episode, name)
+            results.append({"season_number": season, "episode_number": episode, "name": name, "status": "not_found"})
+
+    return {"available": True, "episodes": results}
+
+
 @router.get("/dvr-recording-failures/", dependencies=_GUARDS)
 async def list_dvr_recording_failures(provider_id: Optional[int] = None):
     """Admin-visible log of every recording dispatcharr_dvr_importer.

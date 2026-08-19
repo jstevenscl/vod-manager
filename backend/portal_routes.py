@@ -27,7 +27,7 @@ import tmdb_sync
 import vod_db
 from portal_auth import require_portal_auth
 from secrets_util import decrypt_value, verify_password
-from vod_routes import _parse_epg_datetime, _predict_stream_conflict, _require_dvr_connection
+from vod_routes import _parse_epg_datetime, _predict_stream_conflict, _require_dvr_connection, backfill_series_past_seasons
 from xc_server import _proxy_vod_stream, fetch_proxied_image
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,7 @@ class PortalRecordingRuleRequest(BaseModel):
     title_mode: str = "exact"
     mode: str = "all"
     channel_id: int
+    backfill_past_seasons: bool = False
 
 
 class PortalScheduleSingleRequest(BaseModel):
@@ -758,6 +759,17 @@ async def portal_create_recording_rule(body: PortalRecordingRuleRequest, account
     profile = vod_db.get_recording_profile(profile_id)
     profile["scheduled_now"] = schedule_result.get("scheduled", 0)
     profile["total_matches"] = schedule_result.get("total_matches", 0)
+    if body.backfill_past_seasons:
+        # After profile creation, not before -- backfill_series_past_seasons
+        # looks up this exact rule (by title) for its channel_id, so the
+        # rule just created above has to exist first.
+        series = vod_db.find_series_by_title(body.title)
+        if series:
+            profile["past_seasons_backfill"] = await backfill_series_past_seasons(
+                series["id"], provider_id, scheduled_by,
+            )
+        else:
+            profile["past_seasons_backfill"] = {"available": False, "episodes": []}
     return profile
 
 

@@ -6,7 +6,7 @@ import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, Ca
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
-import { askConfirm, ConfirmDialogHost } from '@/lib/confirm'
+import { askConfirm, ConfirmDialogHost, notify, NotifyDialogHost } from '@/lib/confirm'
 
 interface Provider {
   id: number
@@ -498,7 +498,7 @@ function MissingEpisodesPanel({ series, providerId, qc }: {
       qc.invalidateQueries({ queryKey: ['vod-missing-episodes', series.id] })
       qc.invalidateQueries({ queryKey: ['vod-dvr-upcoming', providerId] })
     } catch (e: any) {
-      alert(e?.response?.data?.detail ?? e.message ?? 'Failed to schedule.')
+      notify(e?.response?.data?.detail ?? e.message ?? 'Failed to schedule.')
     } finally {
       setResolving(null)
     }
@@ -1826,7 +1826,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   const deleteMovie = useMutation({
     mutationFn: () => api.delete(`/vod/movies/${movie.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const toggleAdult = useMutation({
     mutationFn: (is_adult: boolean) => api.post(`/vod/movies/${movie.id}/adult/`, null, { params: { is_adult } }),
@@ -1835,14 +1835,14 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   const deleteSource = useMutation({
     mutationFn: (sourceId: number) => api.delete(`/vod/movies/${movie.id}/sources/${sourceId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const [movingSourceId, setMovingSourceId] = useState<number | null>(null)
   const moveSource = useMutation({
     mutationFn: (v: { sourceId: number; target_movie_id: number }) =>
       api.post(`/vod/movies/${movie.id}/sources/${v.sourceId}/move/`, { target_movie_id: v.target_movie_id }),
     onSuccess:  () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); setMovingSourceId(null) },
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Move failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Move failed.'),
   })
   const removePlacement = useMutation({
     mutationFn: (categoryId: number) => api.delete(`/vod/movies/${movie.id}/categories/${categoryId}/`),
@@ -2201,7 +2201,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   const deleteSeries = useMutation({
     mutationFn: () => api.delete(`/vod/series/${series.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const toggleAdult = useMutation({
     mutationFn: (is_adult: boolean) => api.post(`/vod/series/${series.id}/adult/`, null, { params: { is_adult } }),
@@ -2214,7 +2214,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   const deleteEpisodeSource = useMutation({
     mutationFn: (v: { episodeId: number; sourceId: number }) => api.delete(`/vod/episodes/${v.episodeId}/sources/${v.sourceId}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   const [movingEpisodeSourceId, setMovingEpisodeSourceId] = useState<number | null>(null)
   const moveEpisodeSource = useMutation({
@@ -2223,7 +2223,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         target_series_id: v.targetSeriesId, season_number: v.seasonNumber, episode_number: v.episodeNumber, name: v.name,
       }),
     onSuccess:  () => { qc.invalidateQueries({ queryKey: ['vod-series'] }); setMovingEpisodeSourceId(null) },
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Move failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Move failed.'),
   })
   // Grouped by provider so a provider whose copies of this series are
   // almost entirely broken shows up as one obvious pattern, not something
@@ -2244,7 +2244,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-series-failing-sources', series.id] })
     },
-    onError: (e: any) => alert(e?.response?.data?.detail ?? 'Remove failed.'),
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Remove failed.'),
   })
 
   const detailContent = (
@@ -3616,7 +3616,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const deleteDispatcharrConnection = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/dispatcharr-connections/${id}/`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-dispatcharr-connections'] }),
-    onError:    (e: any) => alert(e?.response?.data?.detail ?? 'Delete failed.'),
+    onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
   // The real token is deliberately never included in dispatcharrConnectionsQuery's
   // response (backend/vod_routes.py's _redact_connection) -- fetched on demand
@@ -4318,7 +4318,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     try {
       return await quickCreateCategory.mutateAsync({ name: name.trim(), content_type: contentType })
     } catch (e: any) {
-      alert(e?.response?.data?.detail ?? 'Failed to create category.')
+      notify(e?.response?.data?.detail ?? 'Failed to create category.')
       return null
     }
   }
@@ -8692,6 +8692,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       )}
 
       <ConfirmDialogHost />
+      <NotifyDialogHost />
     </div>
   )
 }
