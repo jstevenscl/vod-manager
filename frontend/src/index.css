@@ -101,8 +101,54 @@
     --warning-foreground:     0 0% 7%;
     --ring:                   0 0% 78%;
     --radius:                 0.5rem;
+    --brand2:                 140 12% 58%;
+    --brand2-foreground:      0 0% 7%;
+  }
+
+  /* "Warm" theme -- the Sonarr/Radarr-style poster-grid redesign mockup's
+     exact palette (vod_manager-8fi), offered as a 5th selectable theme
+     alongside the 4 existing ones rather than replacing the app's
+     established cyan brand color everywhere. --brand2 (teal) is this
+     mockup's secondary accent (used for movie-specific actions, distinct
+     from --primary's series/orange actions) -- added to every theme, not
+     just this one, so shared components (poster cards, detail modals)
+     read correctly no matter which theme is active. */
+  [data-theme="warm"] {
+    --background:             223 24% 6%;
+    --foreground:             220 19% 94%;
+    --card:                   222 23% 11%;
+    --card-foreground:        220 19% 94%;
+    --border:                 223 19% 18%;
+    --input:                  223 19% 18%;
+    --primary:                27 79% 57%;
+    --primary-foreground:     24 69% 10%;
+    --secondary:              224 21% 14%;
+    --secondary-foreground:   220 19% 94%;
+    --muted:                  224 21% 14%;
+    --muted-foreground:       225 12% 61%;
+    --accent:                 224 21% 14%;
+    --accent-foreground:      220 19% 94%;
+    --destructive:            358 75% 59%;
+    --destructive-foreground: 0 0% 98%;
+    --success:                169 36% 54%;
+    --success-foreground:     169 51% 8%;
+    --warning:                40 90% 55%;
+    --warning-foreground:     24 69% 10%;
+    --ring:                   27 79% 57%;
+    --radius:                 0.625rem;
+    --brand2:                 169 36% 54%;
+    --brand2-foreground:      169 51% 8%;
   }
 }
+
+/* --brand2 for the 3 pre-existing non-mono themes -- their own --success
+   color is already teal/green-family in each, so reusing it keeps the new
+   poster-card/modal components coherent under any theme without inventing
+   an unrelated new hue per theme. mono's --brand2 is set inline above
+   since it lives in the same rule block as its other tokens. */
+:root, [data-theme="dark"] { --brand2: 160 70% 45%; --brand2-foreground: 224 71% 7%; }
+[data-theme="mid"]         { --brand2: 160 65% 42%; --brand2-foreground: 215 28% 10%; }
+[data-theme="light"]       { --brand2: 160 75% 28%; --brand2-foreground: 0 0% 100%; }
 
 @layer base {
   * { @apply border-border; }
