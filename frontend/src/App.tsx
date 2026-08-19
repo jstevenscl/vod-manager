@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  CalendarDays, Film, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  CalendarDays, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
@@ -9,7 +9,7 @@ import Login from '@/pages/Login'
 import Settings from '@/pages/Settings'
 import api from '@/lib/api'
 
-export const THEMES = ['dark', 'mid', 'light', 'mono'] as const
+export const THEMES = ['dark', 'mid', 'light', 'mono', 'warm'] as const
 export type Theme = typeof THEMES[number]
 
 const THEME_META: Record<Theme, { label: string; icon: React.ReactNode }> = {
@@ -17,6 +17,7 @@ const THEME_META: Record<Theme, { label: string; icon: React.ReactNode }> = {
   mid:   { label: 'Mid',   icon: <Palette size={11} /> },
   light: { label: 'Light', icon: <Sun size={11} /> },
   mono:  { label: 'Mono',  icon: <span className="text-[10px] font-bold leading-none">M</span> },
+  warm:  { label: 'Warm',  icon: <Flame size={11} /> },
 }
 
 function initTheme(): Theme {
