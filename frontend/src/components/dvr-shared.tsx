@@ -12,7 +12,10 @@ export function SectionCard({ title, icon, children }: { title: string; icon: Re
   return (
     <Card>
       <CardContent className="space-y-3">
-        <h2 className="text-sm font-semibold flex items-center gap-1.5">{icon}{title}</h2>
+        <h2 className="text-sm font-bold flex items-center gap-2">
+          <span className="flex items-center justify-center w-6 h-6 rounded-md bg-primary/10 text-primary shrink-0 [&_svg]:w-3.5 [&_svg]:h-3.5">{icon}</span>
+          {title}
+        </h2>
         {children}
       </CardContent>
     </Card>
@@ -27,9 +30,9 @@ export function KpiTile({ icon, label, value, note, noteTone = 'default' }: {
   noteTone?: 'default' | 'warn'
 }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-3.5 shadow-sm">
+    <div className="rounded-lg border border-border bg-card p-3.5 shadow-sm hover:border-primary/30 transition-colors">
       <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-        <span className="text-primary [&_svg]:w-3.5 [&_svg]:h-3.5">{icon}</span>
+        <span className="flex items-center justify-center w-5 h-5 rounded bg-primary/10 text-primary shrink-0 [&_svg]:w-3 [&_svg]:h-3">{icon}</span>
         {label}
       </div>
       <div className="mt-2 text-2xl font-bold tracking-tight tabular-nums">{value}</div>

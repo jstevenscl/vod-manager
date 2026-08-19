@@ -6541,27 +6541,27 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           Every catalog source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin. (DVR is enabled per Dispatcharr
           connection in Configuration, not added here.)
         </p>
-        <div className="overflow-x-auto rounded-lg border border-border">
+        <div className="overflow-x-auto rounded-xl border border-border">
         <table className="w-full text-xs min-w-[1100px]">
           <thead>
             <tr className="text-muted-foreground text-left bg-secondary/50">
-              <th className="py-2 px-2 font-semibold">Name</th>
-              <th className="py-2 px-2 font-semibold">Base URL</th>
-              <th className="py-2 px-2 font-semibold" title="Imported (in the pool) / the provider's own reported total, as of its last import pass — a gap between them can mean items are stuck (Needs Review, blank names) or the provider's list changed since. XC providers only; Plex/Emby import differently and don't report this.">Movies (Imported / Provider)</th>
-              <th className="py-2 px-2 font-semibold" title="Distinct series with at least one episode from this provider. Imported (in the pool) / the provider's own reported total, as of its last import pass — XC providers only.">Series (Imported / Provider)</th>
-              <th className="py-2 px-2 font-semibold" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
-              <th className="py-2 px-2 font-semibold" title="Higher number wins when multiple providers carry the same title">Priority</th>
-              <th className="py-2 px-2 font-semibold">Max Streams</th>
-              <th className="py-2 px-2 font-semibold" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
-              <th className="py-2 px-2 font-semibold" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it. If another provider entry has the exact same username/password (e.g. a '5x1' account split into separate rows, one per real login), their usage is pooled together automatically, mirroring how Dispatcharr itself treats a shared login.">Shared Limit / Live Accounts</th>
-              <th className="py-2 px-2 font-semibold" title="Multiple real logins nested under this one provider entry (Dispatcharr M3U-profile parity) — each with its own connection limit, no combined total. Playback tries each in order, failing over to the next when one's full, same as Dispatcharr itself.">Sub-accounts</th>
-              <th className="py-2 px-2 font-semibold" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
-              <th className="py-2 px-2 font-semibold"></th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Name</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Base URL</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Imported (in the pool) / the provider's own reported total, as of its last import pass — a gap between them can mean items are stuck (Needs Review, blank names) or the provider's list changed since. XC providers only; Plex/Emby import differently and don't report this.">Movies (Imported / Provider)</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Distinct series with at least one episode from this provider. Imported (in the pool) / the provider's own reported total, as of its last import pass — XC providers only.">Series (Imported / Provider)</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Higher number wins when multiple providers carry the same title">Priority</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Max Streams</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="How many Dispatcharr connections have a synced profile for this provider">Synced</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Real total connection cap for this provider, shared across every linked live-TV account (on any Dispatcharr instance) plus our own VOD usage — VOD will fail over to the next provider instead of exceeding it. If another provider entry has the exact same username/password (e.g. a '5x1' account split into separate rows, one per real login), their usage is pooled together automatically, mirroring how Dispatcharr itself treats a shared login.">Shared Limit / Live Accounts</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Multiple real logins nested under this one provider entry (Dispatcharr M3U-profile parity) — each with its own connection limit, no combined total. Playback tries each in order, failing over to the next when one's full, same as Dispatcharr itself.">Sub-accounts</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Most providers work fine with the default browser User-Agent. Only set this if one blocks even that.">User-Agent Override</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide"></th>
             </tr>
           </thead>
           <tbody>
             {providersQuery.data?.filter((p) => p.provider_type !== 'dispatcharr_dvr').map((p) => (
-              <tr key={p.id} className={`border-t border-border ${!p.is_active ? 'opacity-50' : ''}`}>
+              <tr key={p.id} className={`border-t border-border hover:bg-secondary/30 transition-colors ${!p.is_active ? 'opacity-50' : ''}`}>
                 <td className="py-2 px-2">
                   <span className="flex items-center gap-1.5 flex-wrap">
                     <input
