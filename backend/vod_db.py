@@ -6324,12 +6324,12 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                             did_create = True
                             did_archive = should_archive
                     conn.execute(
-                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
-                           VALUES (?,?,?,?,?,?,?,?)
+                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, provider_category_name, added_at, last_seen_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                                movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key,
-                               file_size_bytes=excluded.file_size_bytes""",
-                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), item.get("file_size_bytes"), now, now),
+                               file_size_bytes=excluded.file_size_bytes, provider_category_name=excluded.provider_category_name""",
+                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"), item.get("plex_rating_key"), item.get("file_size_bytes"), item.get("provider_category_name"), now, now),
                     )
                     created += did_create
                     matched += did_match
@@ -6526,12 +6526,17 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                     )
                                     episode_id = cur.lastrowid
                                 conn.execute(
-                                    """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, added_at, last_seen_at)
-                                       VALUES (?,?,?,?,?,?,?,?)
+                                    """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, plex_rating_key, file_size_bytes, provider_category_name, added_at, last_seen_at)
+                                       VALUES (?,?,?,?,?,?,?,?,?)
                                        ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                                            episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at, plex_rating_key=excluded.plex_rating_key,
-                                           file_size_bytes=excluded.file_size_bytes""",
-                                    (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), ep.get("file_size_bytes"), now, now),
+                                           file_size_bytes=excluded.file_size_bytes, provider_category_name=excluded.provider_category_name""",
+                                    # Unlike XC (per-episode category unknown until enrich_series
+                                    # lazily fetches it, see that function's docstring), Plex/Emby
+                                    # already know every episode up front -- the series-level
+                                    # item's own category_name (GH#9) applies directly here, no
+                                    # staging through series.provider_category_name needed.
+                                    (episode_id, provider_id, ep["provider_stream_id"], ep.get("container_extension", "mp4"), ep.get("plex_rating_key"), ep.get("file_size_bytes"), item.get("provider_category_name"), now, now),
                                 )
                                 episodes_total += 1
                         except Exception as exc:

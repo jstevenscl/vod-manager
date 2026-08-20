@@ -266,10 +266,13 @@ per-provider counts: how many titles were newly archived by the rules you
 just set, not just how many providers finished.
 
 **Language** exclusion applies to Plex/Emby/Jellyfin imports too, not just
-Xtream-Codes (XC) providers. **Category** exclusion (including the
-Uncategorized checkbox above) is XC-only for now — Plex/Emby have their own
-library/collection concepts rather than an XC-style flat category list, so
-that side needs its own design pass.
+Xtream-Codes (XC) providers. **Category** exclusion now does too: for a
+Plex/Emby/Jellyfin provider, the picker lists that provider's own library
+sections (Plex) or virtual folders (Emby/Jellyfin) instead of an XC-style
+category list — e.g. exclude a "Music Videos" or "Home Videos" library the
+same way you'd exclude an XC category. **Archive new categories** and
+**Auto-create categories** remain XC-only for now — those need their own
+design pass for what "newly discovered" means for a library-based source.
 
 ### Multiple profiles on one subscription
 

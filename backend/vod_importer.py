@@ -35,11 +35,13 @@ def _should_auto_archive(
     per-provider (providers.import_exclude_categories), since available
     categories genuinely differ provider to provider.
 
-    provider_category_name/provider_exclude_categories default to no-ops so
-    plex_importer.py/emby_vod_importer.py can call this for language rules
-    only -- Plex/Emby have their own library/collection concepts, not
-    XC-style flat category lists, so category-rule support there needs its
-    own design pass (see vod_manager-i4i).
+    provider_category_name/provider_exclude_categories default to no-ops
+    for callers that only want language rules -- plex_importer.py/
+    emby_vod_importer.py (GH#9) pass their own provider's library/
+    collection-folder name in this same field, since a Plex library
+    section (or Emby/Jellyfin virtual folder) is exactly what a user means
+    by "category" for those provider types, even though it's not an
+    XC-style flat category list under the hood.
 
     exclude_uncategorized (GH issue #7): a real provider was found shipping
     movies with no category attached at all -- the category-name check below
