@@ -42,7 +42,9 @@ import apply_exclusions_job
 import dispatcharr_dvr_client
 import dispatcharr_dvr_importer
 import duplicate_confirm
+import emby_vod_client
 import emby_vod_importer
+import plex_client
 import plex_importer
 import portal_auth
 import tmdb_sync
@@ -1302,10 +1304,22 @@ async def set_provider_archive_new_categories(provider_id: int, enabled: bool):
 
 @router.get("/providers/{provider_id}/available-categories/", dependencies=_GUARDS)
 async def get_provider_available_categories(provider_id: int):
-    """Live category names from the provider itself (both movie and series
-    categories, combined/deduped) -- powers the exclude-categories picker
-    with what this specific provider actually calls things, not a guessed
-    or stale list. XC-only: Plex/Emby don't have this category concept.
+    """Live category names from the provider itself -- powers the
+    exclude-categories picker with what this specific provider actually
+    calls things, not a guessed or stale list.
+
+    XC: both movie and series categories (combined/deduped) from
+    get_vod_categories/get_series_categories.
+
+    Plex/Emby/Jellyfin (GH#9): these have no XC-style flat category list,
+    but DO have an equivalent concept -- library sections (Plex) / virtual
+    folders (Emby, Jellyfin uses the same Emby-compatible API) are exactly
+    what a user thinks of as "categories" here (a "Kids Movies" library vs.
+    a "Music Videos" library they'd rather auto-archive). Movie and show/
+    tvshows sections only, matching what {plex,emby}_vod_importer.py itself
+    imports -- other section types (music, photos) are never imported in
+    the first place, so listing them here would just be noise no exclusion
+    rule could ever match against.
 
     Stripped the same way set_provider_import_exclude_categories strips on
     save (GH#4 reopened): a provider whose category names carry stray
@@ -1316,16 +1330,33 @@ async def get_provider_available_categories(provider_id: int):
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise HTTPException(404, detail="provider not found")
-    if provider.get("provider_type") not in (None, "xc"):
-        return {"categories": []}
-    client = vod_importer.XCProviderClient(provider)
-    movie_categories = await client.get_vod_categories()
-    series_categories = await client.get_series_categories()
-    names = sorted({
-        n for c in movie_categories + series_categories
-        if (n := (c.get("category_name") or "").strip())
-    })
-    return {"categories": names}
+    provider_type = provider.get("provider_type")
+    if provider_type in (None, "xc"):
+        client = vod_importer.XCProviderClient(provider)
+        movie_categories = await client.get_vod_categories()
+        series_categories = await client.get_series_categories()
+        names = sorted({
+            n for c in movie_categories + series_categories
+            if (n := (c.get("category_name") or "").strip())
+        })
+        return {"categories": names}
+    if provider_type == "plex":
+        async with plex_client.PlexClient(provider) as client:
+            sections = await client.list_libraries()
+        names = sorted({
+            n for s in sections
+            if s.get("type") in ("movie", "show") and (n := (s.get("title") or "").strip())
+        })
+        return {"categories": names}
+    if provider_type in ("emby", "jellyfin"):
+        async with emby_vod_client.EmbyVodClient(provider) as client:
+            libraries = await client.list_libraries()
+        names = sorted({
+            n for lib in libraries
+            if lib.get("CollectionType") in ("movies", "tvshows") and (n := (lib.get("Name") or "").strip())
+        })
+        return {"categories": names}
+    return {"categories": []}
 
 
 @router.post("/providers/{provider_id}/import-exclude-categories/", dependencies=_GUARDS)

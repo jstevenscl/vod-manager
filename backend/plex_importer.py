@@ -78,6 +78,14 @@ async def import_plex_library(provider_id: int) -> dict:
 
     now = str(time.time())
 
+    # GH#9: a Plex library section IS this provider's equivalent of an XC
+    # category -- a user with "Movies" and "Kids Movies" and "Music Videos"
+    # sections wants to exclude/auto-archive by section the same way an XC
+    # user excludes by provider-reported category. Read the same
+    # provider-level settings XC's import_provider_catalog already uses.
+    exclude_categories = provider.get("import_exclude_categories") or []
+    exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
+
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
 
@@ -88,6 +96,7 @@ async def import_plex_library(provider_id: int) -> dict:
             section_key = section.get("key")
             if section_type not in ("movie", "show") or not section_key:
                 continue
+            category_name = (section.get("title") or "").strip() or None
 
             if section_type == "movie":
                 raw_movies = await client.list_movies(section_key)
@@ -112,7 +121,10 @@ async def import_plex_library(provider_id: int) -> dict:
                         "rating": fields["rating"],
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
-                        "auto_archive": vod_importer._should_auto_archive(item.get("title", "")),
+                        "provider_category_name": category_name,
+                        "auto_archive": vod_importer._should_auto_archive(
+                            item.get("title", ""), category_name, exclude_categories, exclude_uncategorized,
+                        ),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
                 for k in movie_result:
@@ -146,7 +158,10 @@ async def import_plex_library(provider_id: int) -> dict:
                         "rating": fields["rating"],
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
-                        "auto_archive": vod_importer._should_auto_archive(show.get("title", "")),
+                        "provider_category_name": category_name,
+                        "auto_archive": vod_importer._should_auto_archive(
+                            show.get("title", ""), category_name, exclude_categories, exclude_uncategorized,
+                        ),
                         "episodes": episodes,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_series, provider_id, series_items)
