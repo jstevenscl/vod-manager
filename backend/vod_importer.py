@@ -614,9 +614,20 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
 
 
 async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
-    """Enriches every movie and series in the pool. Movies first, then series
-    — each batch runs at bounded concurrency so we're never hitting a single
-    provider with more than `concurrency` simultaneous requests."""
+    """Enriches every movie and series in the pool, movies and series running
+    CONCURRENTLY -- each kind gets its own `concurrency`-sized semaphore, so
+    a large movie catalog can never starve series out of running entirely.
+
+    Used to run movies-to-completion, then series, as two sequential
+    gather() batches. Real bug found live 2026-08-20: a large movie catalog
+    (230k+ movies) took long enough -- especially with a flaky provider
+    throwing periodic 502s/connection failures along the way -- that the
+    process restarted before the movie batch ever finished, so the series
+    batch never even started. Every series enrich_series() call is also
+    where a series' episodes come from (see that function's docstring), so
+    this wasn't just delayed metadata -- it meant zero episodes for the
+    entire TV library, indefinitely, until a single enrich run survived
+    long enough to get all the way through movies first."""
     if _ENRICH_PROGRESS["running"]:
         return
 
@@ -631,14 +642,22 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, concurrency=%d",
                 len(movie_ids), len(series_ids), concurrency)
 
-    sem = asyncio.Semaphore(concurrency)
+    # Separate semaphores -- movies and series shouldn't compete with each
+    # other for the same `concurrency` slots (that would just reproduce the
+    # starvation this is fixing, only softer), each kind gets its own
+    # provider-request budget.
+    movie_sem = asyncio.Semaphore(concurrency)
+    series_sem = asyncio.Semaphore(concurrency)
     try:
         # return_exceptions=True: _enrich_one already catches everything it can
         # anticipate, but a single unanticipated exception must not abort the
         # rest of the batch (gather() without this re-raises immediately on
         # the first failure, leaving every other in-flight task orphaned).
-        await asyncio.gather(*(_enrich_one("movie", sem, mid, force) for mid in movie_ids), return_exceptions=True)
-        await asyncio.gather(*(_enrich_one("series", sem, sid, force) for sid in series_ids), return_exceptions=True)
+        await asyncio.gather(
+            *(_enrich_one("movie", movie_sem, mid, force) for mid in movie_ids),
+            *(_enrich_one("series", series_sem, sid, force) for sid in series_ids),
+            return_exceptions=True,
+        )
     finally:
         _ENRICH_PROGRESS["running"] = False
         _ENRICH_PROGRESS["finished_at"] = time.time()
