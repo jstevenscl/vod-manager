@@ -2803,23 +2803,31 @@ def find_providers_sharing_credentials(provider_id: int) -> list[dict]:
     return [get_provider(pid) for pid in siblings]
 
 
-def list_providers() -> list[dict]:
-    conn = _connect()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM providers ORDER BY name").fetchall()]
-    for r in rows:
-        r["password"] = decrypt_value(r["password"])
-        r["import_exclude_categories"] = _parse_json_list(r.get("import_exclude_categories"))
+_PROVIDER_COUNTS_CACHE: dict = {"counts": None, "computed_at": 0.0}
+_PROVIDER_COUNTS_TTL_SECS = 60.0
+
+
+def _provider_counts(conn) -> dict[int, dict]:
+    """Per-provider content/link counts. series_count is DISTINCT series with
+    at least one episode actually sourced from this provider (not "series
+    this provider happened to create the row for" via series.import_
+    provider_id, which undercounts any series a later provider's episodes
+    merged into but didn't originally create) -- episode_count is the raw
+    episode_sources row count, a different, larger number by design.
+
+    series_count's join+COUNT(DISTINCT) has no selective filter to index
+    against (every episode_sources row participates), so at real catalog
+    size it's a multi-second hash join. Provider content counts don't change
+    meaningfully faster than imports/enrichment runs do, so a short
+    in-process TTL cache turns "every /vod/providers/ call recomputes this"
+    into "at most once a minute" without restructuring the query."""
+    now = time.time()
+    if _PROVIDER_COUNTS_CACHE["counts"] is not None and now - _PROVIDER_COUNTS_CACHE["computed_at"] < _PROVIDER_COUNTS_TTL_SECS:
+        return _PROVIDER_COUNTS_CACHE["counts"]
+
     movie_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM movie_sources GROUP BY provider_id"
     ).fetchall()}
-    # Distinct series with at least one episode actually sourced from this
-    # provider — not "series this provider happened to create the row for"
-    # (series.import_provider_id), which undercounts any series a later
-    # provider's episodes merged into but didn't originally create. Reported
-    # alongside the raw episode count (a different, larger number by design —
-    # e.g. one series with 62 episodes contributes 1 to series_count but 62
-    # to episode_count) so both are visible instead of one figure standing
-    # in for two different things.
     series_counts = {r["provider_id"]: r["c"] for r in conn.execute("""
         SELECT es.provider_id, COUNT(DISTINCT e.series_id) c
         FROM episode_sources es
@@ -2838,14 +2846,38 @@ def list_providers() -> list[dict]:
     sub_account_counts = {r["provider_id"]: r["c"] for r in conn.execute(
         "SELECT provider_id, COUNT(*) c FROM provider_sub_accounts GROUP BY provider_id"
     ).fetchall()}
+
+    counts: dict[int, dict] = {}
+    for pid in set(movie_counts) | set(series_counts) | set(episode_counts) | set(synced_counts) | set(live_account_counts) | set(sub_account_counts):
+        counts[pid] = {
+            "movie_count": movie_counts.get(pid, 0),
+            "series_count": series_counts.get(pid, 0),
+            "episode_count": episode_counts.get(pid, 0),
+            "synced_connection_count": synced_counts.get(pid, 0),
+            "live_account_count": live_account_counts.get(pid, 0),
+            "sub_account_count": sub_account_counts.get(pid, 0),
+        }
+    _PROVIDER_COUNTS_CACHE["counts"] = counts
+    _PROVIDER_COUNTS_CACHE["computed_at"] = now
+    return counts
+
+
+def list_providers() -> list[dict]:
+    conn = _connect()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM providers ORDER BY name").fetchall()]
+    for r in rows:
+        r["password"] = decrypt_value(r["password"])
+        r["import_exclude_categories"] = _parse_json_list(r.get("import_exclude_categories"))
+    counts = _provider_counts(conn)
     conn.close()
     for p in rows:
-        p["movie_count"] = movie_counts.get(p["id"], 0)
-        p["series_count"] = series_counts.get(p["id"], 0)
-        p["episode_count"] = episode_counts.get(p["id"], 0)
-        p["synced_connection_count"] = synced_counts.get(p["id"], 0)
-        p["live_account_count"] = live_account_counts.get(p["id"], 0)
-        p["sub_account_count"] = sub_account_counts.get(p["id"], 0)
+        c = counts.get(p["id"], {})
+        p["movie_count"] = c.get("movie_count", 0)
+        p["series_count"] = c.get("series_count", 0)
+        p["episode_count"] = c.get("episode_count", 0)
+        p["synced_connection_count"] = c.get("synced_connection_count", 0)
+        p["live_account_count"] = c.get("live_account_count", 0)
+        p["sub_account_count"] = c.get("sub_account_count", 0)
     return rows
 
 
@@ -3315,6 +3347,81 @@ def merge_duplicate_group(content_type: str, keep_id: int, merge_ids: list[int])
             merge_series(mid, keep_id)
         merged += 1
     return {"kept_id": keep_id, "merged_count": merged}
+
+
+def merge_duplicate_groups_bulk(content_type: str, groups: list[tuple[int, list[int]]], _retry_depth: int = 0) -> dict:
+    """Batch counterpart to merge_duplicate_group -- used by the
+    /duplicates/merge-confirmed/ bulk actions (GH issue #2's second pass and
+    the original all-confirmed-matches merge), which can hand back hundreds
+    to low-thousands of groups in one request.
+
+    Real bug found live 2026-08-23, same shape as bulk_import_movies/series'
+    own 2026-07-30/07-31 incidents (see _WRITE_LOCK's docstring):
+    merge_duplicate_group's per-pair loop called merge_movie/merge_series,
+    each of which acquires _WRITE_LOCK, opens its OWN connection, and commits
+    individually -- fine for a handful of groups, but a 993-group request
+    under concurrent bulk TMDB enrichment (both real concurrent-usage cases,
+    not edge cases) took 8+ minutes and then hard-failed with an unhandled
+    'database is locked' OperationalError, permanently losing every item
+    after the failure point. A single one-connection/one-commit batch isn't
+    the fix either -- enrichment's own writes don't go through _WRITE_LOCK,
+    so a lone giant transaction is still exposed to the same mid-batch lock
+    error, and holding the writer lock continuously for minutes starves
+    every other writer exactly like the 2026-07-31 incident this function
+    mirrors. So: one connection, one _WRITE_LOCK acquisition, but each
+    individual merge wrapped in _item_savepoint (one bad/contended item
+    can't lose the rest), periodic commit + lock release/reacquire every
+    batch_size items (bounds how long any other writer is blocked), and
+    transient 'database is locked' failures collected for one more retry
+    pass instead of being treated as permanent losses."""
+    items = [(keep_id, from_id) for keep_id, merge_ids in groups for from_id in merge_ids if from_id != keep_id]
+    if not items:
+        return {"merged_groups": len(groups), "merged_items": 0}
+
+    batch_size = 25
+    merged_items = 0
+    lock_retry_items: list[tuple[int, int]] = []
+    _WRITE_LOCK.acquire()
+    try:
+        conn = _connect()
+        for i, (keep_id, from_id) in enumerate(items):
+            try:
+                with _item_savepoint(conn):
+                    if content_type == "movie":
+                        _merge_movie_row(conn, from_id, keep_id)
+                    else:
+                        _merge_series_row(conn, from_id, keep_id)
+                merged_items += 1
+            except sqlite3.OperationalError as exc:
+                # Same transient-vs-permanent distinction as bulk_import_movies'
+                # identical handling -- a lock collision here means another
+                # writer (enrichment, a provider sync) briefly held the
+                # engine-level write lock, not that this pair is bad.
+                if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
+                    lock_retry_items.append((keep_id, from_id))
+                else:
+                    logger.warning("[vod_db] merge_duplicate_groups_bulk: skipped keep_id=%s from_id=%s: %s", keep_id, from_id, exc)
+            except Exception as exc:
+                logger.warning("[vod_db] merge_duplicate_groups_bulk: skipped keep_id=%s from_id=%s: %s", keep_id, from_id, exc)
+            finally:
+                if (i + 1) % batch_size == 0:
+                    _commit_with_retry(conn)
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
+        _commit_with_retry(conn)
+        conn.close()
+    finally:
+        _WRITE_LOCK.release()
+
+    if lock_retry_items:
+        time.sleep(0.5 * (_retry_depth + 1))
+        logger.info("[vod_db] merge_duplicate_groups_bulk: retrying %d item(s) after transient lock contention (pass %d/%d)",
+                     len(lock_retry_items), _retry_depth + 1, _MAX_LOCK_RETRY_DEPTH)
+        retry_groups = [(keep_id, [from_id]) for keep_id, from_id in lock_retry_items]
+        retry_result = merge_duplicate_groups_bulk(content_type, retry_groups, _retry_depth=_retry_depth + 1)
+        merged_items += retry_result["merged_items"]
+
+    return {"merged_groups": len(groups), "merged_items": merged_items}
 
 
 # ── XC clients ───────────────────────────────────────────────────────────────
@@ -6780,6 +6887,52 @@ def apply_metadata_rules_to_pool(content_type: str, force: bool = False) -> dict
 # as authoritative; `from_id` only ever contributes its sources/episodes/
 # placements before being deleted, never overwrites into_id's metadata.
 
+def _merge_movie_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> None:
+    """The actual reassign-then-delete SQL for one movie merge, against an
+    already-open connection -- no lock/connect/commit/close of its own, so a
+    caller merging many pairs in one request (see merge_duplicate_groups_bulk)
+    can batch them all into a single transaction instead of paying a fresh
+    connection + WAL fsync per pair. merge_movie (single-item) wraps this with
+    its own lock/connect/commit for the ordinary one-at-a-time UI path."""
+    from_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (from_id,)).fetchone()
+    into_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (into_id,)).fetchone()
+    # This permanently deletes `from_id` below (its sources/placements move
+    # to `into_id` first) -- irreversible outside a DB backup, so a merge
+    # triggered by a bad tmdb_id match (GH issue #6) leaves no trace to
+    # diagnose without this. Logged as a warning, not info, since a merge
+    # between two rows that don't actually share a tmdb_id is exactly the
+    # signature of a false match, not a routine dedup.
+    logger.warning(
+        "[merge_movie] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
+        from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
+        into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
+    )
+    # movie_sources has no per-movie uniqueness (UNIQUE is (provider_id,
+    # provider_stream_id) only) -- a plain reassignment can never collide.
+    conn.execute("UPDATE movie_sources SET movie_id=? WHERE movie_id=?", (into_id, from_id))
+
+    placements = conn.execute(
+        "SELECT category_id FROM movie_category_placements WHERE movie_id=?", (from_id,)
+    ).fetchall()
+    for p in placements:
+        target_has_it = conn.execute(
+            "SELECT 1 FROM movie_category_placements WHERE movie_id=? AND category_id=?",
+            (into_id, p["category_id"]),
+        ).fetchone()
+        if target_has_it:
+            conn.execute(
+                "DELETE FROM movie_category_placements WHERE movie_id=? AND category_id=?",
+                (from_id, p["category_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE movie_category_placements SET movie_id=? WHERE movie_id=? AND category_id=?",
+                (into_id, from_id, p["category_id"]),
+            )
+
+    conn.execute("DELETE FROM movies WHERE id=?", (from_id,))
+
+
 def merge_movie(from_id: int, into_id: int) -> None:
     """Holds _WRITE_LOCK for the whole operation -- see delete_provider's
     docstring for why an unlocked `movies` delete here can race a concurrent
@@ -6788,45 +6941,65 @@ def merge_movie(from_id: int, into_id: int) -> None:
         return
     with _WRITE_LOCK:
         conn = _connect()
-        from_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (from_id,)).fetchone()
-        into_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (into_id,)).fetchone()
-        # This permanently deletes `from_id` below (its sources/placements move
-        # to `into_id` first) -- irreversible outside a DB backup, so a merge
-        # triggered by a bad tmdb_id match (GH issue #6) leaves no trace to
-        # diagnose without this. Logged as a warning, not info, since a merge
-        # between two rows that don't actually share a tmdb_id is exactly the
-        # signature of a false match, not a routine dedup.
-        logger.warning(
-            "[merge_movie] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
-            from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
-            into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
-        )
-        # movie_sources has no per-movie uniqueness (UNIQUE is (provider_id,
-        # provider_stream_id) only) -- a plain reassignment can never collide.
-        conn.execute("UPDATE movie_sources SET movie_id=? WHERE movie_id=?", (into_id, from_id))
-
-        placements = conn.execute(
-            "SELECT category_id FROM movie_category_placements WHERE movie_id=?", (from_id,)
-        ).fetchall()
-        for p in placements:
-            target_has_it = conn.execute(
-                "SELECT 1 FROM movie_category_placements WHERE movie_id=? AND category_id=?",
-                (into_id, p["category_id"]),
-            ).fetchone()
-            if target_has_it:
-                conn.execute(
-                    "DELETE FROM movie_category_placements WHERE movie_id=? AND category_id=?",
-                    (from_id, p["category_id"]),
-                )
-            else:
-                conn.execute(
-                    "UPDATE movie_category_placements SET movie_id=? WHERE movie_id=? AND category_id=?",
-                    (into_id, from_id, p["category_id"]),
-                )
-
-        conn.execute("DELETE FROM movies WHERE id=?", (from_id,))
+        _merge_movie_row(conn, from_id, into_id)
         _commit_with_retry(conn)
         conn.close()
+
+
+def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> None:
+    """The actual reassign-then-delete SQL for one series merge, against an
+    already-open connection -- see _merge_movie_row's identical docstring for
+    why this exists separately from merge_series (single-item)."""
+    from_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (from_id,)).fetchone()
+    into_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (into_id,)).fetchone()
+    # See merge_movie's identical logging comment -- same irreversible-delete risk.
+    logger.warning(
+        "[merge_series] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
+        from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
+        into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
+    )
+
+    from_episodes = conn.execute(
+        "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (from_id,)
+    ).fetchall()
+    for ep in from_episodes:
+        target_ep = conn.execute(
+            "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+            (into_id, ep["season_number"], ep["episode_number"]),
+        ).fetchone()
+        if target_ep:
+            # Both sides already have this episode -- move from's sources
+            # onto into's existing episode row, then drop from's now-empty
+            # episode (episode_sources cascades on the episodes delete).
+            conn.execute(
+                "UPDATE episode_sources SET episode_id=? WHERE episode_id=?",
+                (target_ep["id"], ep["id"]),
+            )
+            conn.execute("DELETE FROM episodes WHERE id=?", (ep["id"],))
+        else:
+            # into doesn't have this episode yet -- just move it over wholesale.
+            conn.execute("UPDATE episodes SET series_id=? WHERE id=?", (into_id, ep["id"]))
+
+    placements = conn.execute(
+        "SELECT category_id FROM series_category_placements WHERE series_id=?", (from_id,)
+    ).fetchall()
+    for p in placements:
+        target_has_it = conn.execute(
+            "SELECT 1 FROM series_category_placements WHERE series_id=? AND category_id=?",
+            (into_id, p["category_id"]),
+        ).fetchone()
+        if target_has_it:
+            conn.execute(
+                "DELETE FROM series_category_placements WHERE series_id=? AND category_id=?",
+                (from_id, p["category_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE series_category_placements SET series_id=? WHERE series_id=? AND category_id=?",
+                (into_id, from_id, p["category_id"]),
+            )
+
+    conn.execute("DELETE FROM series WHERE id=?", (from_id,))
 
 
 def merge_series(from_id: int, into_id: int) -> None:
@@ -6837,56 +7010,7 @@ def merge_series(from_id: int, into_id: int) -> None:
         return
     with _WRITE_LOCK:
         conn = _connect()
-        from_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (from_id,)).fetchone()
-        into_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (into_id,)).fetchone()
-        # See merge_movie's identical logging comment -- same irreversible-delete risk.
-        logger.warning(
-            "[merge_series] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
-            from_id, from_row["name"] if from_row else None, from_row["year"] if from_row else None, from_row["tmdb_id"] if from_row else None,
-            into_id, into_row["name"] if into_row else None, into_row["year"] if into_row else None, into_row["tmdb_id"] if into_row else None,
-        )
-
-        from_episodes = conn.execute(
-            "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (from_id,)
-        ).fetchall()
-        for ep in from_episodes:
-            target_ep = conn.execute(
-                "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
-                (into_id, ep["season_number"], ep["episode_number"]),
-            ).fetchone()
-            if target_ep:
-                # Both sides already have this episode -- move from's sources
-                # onto into's existing episode row, then drop from's now-empty
-                # episode (episode_sources cascades on the episodes delete).
-                conn.execute(
-                    "UPDATE episode_sources SET episode_id=? WHERE episode_id=?",
-                    (target_ep["id"], ep["id"]),
-                )
-                conn.execute("DELETE FROM episodes WHERE id=?", (ep["id"],))
-            else:
-                # into doesn't have this episode yet -- just move it over wholesale.
-                conn.execute("UPDATE episodes SET series_id=? WHERE id=?", (into_id, ep["id"]))
-
-        placements = conn.execute(
-            "SELECT category_id FROM series_category_placements WHERE series_id=?", (from_id,)
-        ).fetchall()
-        for p in placements:
-            target_has_it = conn.execute(
-                "SELECT 1 FROM series_category_placements WHERE series_id=? AND category_id=?",
-                (into_id, p["category_id"]),
-            ).fetchone()
-            if target_has_it:
-                conn.execute(
-                    "DELETE FROM series_category_placements WHERE series_id=? AND category_id=?",
-                    (from_id, p["category_id"]),
-                )
-            else:
-                conn.execute(
-                    "UPDATE series_category_placements SET series_id=? WHERE series_id=? AND category_id=?",
-                    (into_id, from_id, p["category_id"]),
-                )
-
-        conn.execute("DELETE FROM series WHERE id=?", (from_id,))
+        _merge_series_row(conn, from_id, into_id)
         _commit_with_retry(conn)
         conn.close()
 

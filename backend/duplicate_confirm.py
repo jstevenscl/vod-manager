@@ -49,15 +49,18 @@ async def _run_job(job_id: str, content_type: str) -> None:
     job = _jobs[job_id]
     try:
         groups = await asyncio.to_thread(vod_db.find_duplicate_groups, content_type)
-        # "Pure" groups only -- every candidate shares one non-null tmdb_id.
-        # A group with even one tmdb_id-less candidate has no way to confirm
-        # that candidate belongs, so it stays in manual review regardless of
-        # what the rest of the group's ids say.
-        pure_groups = [
-            g for g in groups
-            if len({i["tmdb_id"] for i in g["items"]}) == 1 and g["items"][0]["tmdb_id"]
-        ]
-        distinct_ids = sorted({g["items"][0]["tmdb_id"] for g in pure_groups})
+        # find_duplicate_groups already splits apart any group with 2+
+        # DIFFERING tmdb_ids (see vod_db._split_by_tmdb_conflict) before this
+        # ever runs -- a conflicting id is treated as proof of non-duplicate,
+        # not ambiguity. So every group reaching here has at most ONE
+        # distinct non-null tmdb_id among its candidates. That leaves two
+        # real cases: every candidate carries it ("pure" -- existing
+        # confirmed-match tier below), or only some do while the rest have
+        # no id at all ("partial" -- GH issue #2's second pass, see below).
+        id_groups = [g for g in groups if len({i["tmdb_id"] for i in g["items"] if i["tmdb_id"]}) == 1]
+        pure_groups = [g for g in id_groups if all(i["tmdb_id"] for i in g["items"])]
+        partial_groups = [g for g in id_groups if not all(i["tmdb_id"] for i in g["items"])]
+        distinct_ids = sorted({i["tmdb_id"] for g in id_groups for i in g["items"] if i["tmdb_id"]})
         job["total"] = len(distinct_ids)
 
         details: dict[str, dict] = {}
@@ -103,9 +106,39 @@ async def _run_job(job_id: str, content_type: str) -> None:
                 "exact_title_match": exact_match is not None,
             })
         job["confirmed"] = confirmed
+
+        # Second pass (GH issue #2): a group where only SOME candidates carry
+        # the group's one tmdb_id isn't as airtight as "pure" (no sibling
+        # corroborates that id), but it's still real evidence -- ONLY trust
+        # it when the id-holder's own year also matches TMDB's canonical year
+        # for that id (self-consistent), same bar the frontend's "unconfirmed
+        # -- TMDB confirms only this candidate" badge already uses. A
+        # self-INCONSISTENT id-holder (year mismatch) never qualifies here --
+        # that's the strongest negative signal short of an outright conflict,
+        # not a green light.
+        second_pass = []
+        for g in partial_groups:
+            tmdb_id = next(i["tmdb_id"] for i in g["items"] if i["tmdb_id"])
+            detail = details.get(tmdb_id, {})
+            true_year = detail.get("year")
+            id_holders = [i for i in g["items"] if i["tmdb_id"]]
+            self_consistent_holders = [i for i in id_holders if true_year is not None and i["year"] == true_year]
+            if not self_consistent_holders:
+                continue
+            exact_match = _find_keeper(self_consistent_holders, detail.get("title"))
+            keeper = exact_match or self_consistent_holders[0]
+            second_pass.append({
+                "keep_id": keeper["id"],
+                "merge_ids": [i["id"] for i in g["items"] if i["id"] != keeper["id"]],
+                "matched_title": keeper["name"],
+                "tmdb_id": tmdb_id,
+                "exact_title_match": exact_match is not None,
+            })
+        job["second_pass"] = second_pass
+
         job["status"] = "done"
-        logger.info("[duplicate_confirm] job=%s content_type=%s checked=%d confirmed=%d",
-                     job_id, content_type, len(distinct_ids), len(confirmed))
+        logger.info("[duplicate_confirm] job=%s content_type=%s checked=%d confirmed=%d second_pass=%d",
+                     job_id, content_type, len(distinct_ids), len(confirmed), len(second_pass))
     except Exception as exc:
         logger.warning("[duplicate_confirm] job=%s failed: %s", job_id, exc)
         job["status"] = "error"
@@ -119,7 +152,7 @@ def start_job(content_type: str) -> str:
     job_id = uuid.uuid4().hex
     _jobs[job_id] = {
         "content_type": content_type, "status": "running",
-        "checked": 0, "total": 0, "confirmed": [], "error": None,
+        "checked": 0, "total": 0, "confirmed": [], "second_pass": [], "error": None,
         "cancelled": False, "started_at": time.time(),
     }
     asyncio.create_task(_run_job(job_id, content_type))

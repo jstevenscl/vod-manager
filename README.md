@@ -323,15 +323,19 @@ catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
 language-aware filter and sibling-safe bulk archiving), **Language Filter**
 (the same language filtering over your whole library, not just
 poster-missing items), **Duplicate Finder** (matches on punctuation
-variants, adjacent-year mislabeling, and TMDB id, with a one-click bulk
-merge for TMDB-confirmed matches), **Needs Review** (resolves year-ambiguous
-imports), and **Orphan Checker** (finds dead rows a provider deletion can
-leave behind — a series whose only source provider no longer exists, or
-movies/episodes with zero sources at all). Every movie/series can also be
-manually renamed or have its year corrected from its own detail view, for
-whatever a provider's own catalog data got wrong with no other way to fix
-it. **Apply TMDB Titles** (Movies/TV Shows toolbar) does this in bulk for
-every already-confirmed TMDB match at once, instead of one item at a time.
+variants, adjacent-year mislabeling, and TMDB id, with one-click bulk merges
+for both fully-corroborated TMDB-confirmed matches and a second, separate
+tier where only one candidate carries a self-consistent TMDB id), **Needs
+Review** (resolves year-ambiguous imports), and **Orphan Checker** (finds
+dead rows a provider deletion can leave behind — a series whose only source
+provider no longer exists, or movies/episodes with zero sources at all).
+Every movie/series can also be manually renamed or have its year corrected
+from its own detail view, for whatever a provider's own catalog data got
+wrong with no other way to fix it. **Apply TMDB Titles** (Movies/TV Shows
+toolbar) does this in bulk for every already-confirmed TMDB match at once,
+instead of one item at a time. **Client Title Format** (Curation &
+Maintenance) is a separate, ongoing setting to have VOD clients see a
+"(Year)" suffix on every title, independent of the pool's own stored data.
 
 **Auto-create categories** (per provider, Providers → *Auto-create
 categories*) creates a Smart Category for every distinct category name a

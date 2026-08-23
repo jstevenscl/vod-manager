@@ -914,6 +914,15 @@ each with a **list** or **grid** (poster wall) mode.
   new matches itself. Large libraries process in bounded batches, so this
   can take a little while — the button's label updates with a running "N
   renamed" count as it works.
+- **Client Title Format** (Curation & Maintenance) is a separate, ongoing
+  setting rather than a one-time rename: *Append year to titles served to
+  clients* controls what Dispatcharr/TiviMate/etc. actually display for
+  every title, e.g. "Movie Name (2024)" — the pool's own name/year fields,
+  dedup matching, and Title & Metadata Rules are untouched by it. Combine
+  with *Apply TMDB Titles* above to have clients see TMDB's own canonical
+  title, with its year, instead of whatever a provider happened to send.
+
+![Client Title Format toggle](docs/screenshots/client-title-format.png)
 - **Archive** (the archive-box icon on each row) is a true archive: an
   archived item is immediately removed from every category placement (so
   Dispatcharr stops seeing it right away, not just eventually) and hidden
@@ -1161,13 +1170,23 @@ different one any time before merging.
 **Check TMDB-confirmed matches** goes a step further: it checks every group in
 the current scan against TMDB in the background (a real API call per
 candidate id, so it can take a few minutes on a large scan — progress shows
-live). A group only counts as confirmed when every candidate shares the same
-TMDB id *and* one candidate's name matches TMDB's own title exactly — that
-candidate becomes the confident merge target, not whichever happens to have
-the most sources. Confirmed groups are pulled out of the manual review list
-entirely and offered as a single **Merge all confirmed matches** action — one
-click merges the whole batch, since there's no real ambiguity left for a
-human to resolve.
+live). A group counts as **confirmed** when every candidate shares the same
+TMDB id — that alone is proof they're duplicates. The merge target is
+whichever candidate's name matches TMDB's own title exactly, when one does;
+otherwise the most-sourced candidate is used instead of dropping the group.
+Confirmed groups are pulled out of the manual review list entirely and
+offered as a single **Merge all confirmed matches** action — one click merges
+the whole batch, since there's no real ambiguity left for a human to resolve.
+
+A second, separate tier catches the case where only *one* candidate in a
+group carries the shared TMDB id and the rest have no id at all — less
+airtight than a corroborated match (no sibling confirms the id), so it's
+never folded into the confirmed batch above. It's only offered when that
+lone candidate's own year also matches TMDB's canonical year for that id
+(the same self-consistency check behind the per-candidate **unconfirmed**
+badge) — a candidate whose year *doesn't* match is never trusted here.
+**Trust TMDB for these too** merges this second tier in one click, same as
+the confirmed batch.
 
 ![Orphan Checker, Duplicate Finder, and TMDB Lists](docs/screenshots/curation-tools.png)
 ![Duplicate Finder with TMDB-confirmed matches](docs/screenshots/duplicate-finder.png)

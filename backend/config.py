@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.03"
+APP_VERSION = "0.2.04"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -204,6 +204,24 @@ def save_stream_priority_mode(mode: str) -> None:
         raise ValueError(f"invalid stream_priority_mode: {mode!r}")
     data = _read_raw()
     data["stream_priority_mode"] = mode
+    _write_raw(data)
+
+
+# ── XC title display format (GH issue #1) ────────────────────────────────────
+# Pool identity (movies.name/year, dedup matching, Title & Metadata Rules) is
+# untouched by this -- it only controls what's appended to the "name" field
+# XC clients (Dispatcharr, TiviMate, etc.) actually see in get_vod_streams/
+# get_vod_info, so it composes with "Apply TMDB Titles" (which already lets a
+# user adopt TMDB's own title into the pool) instead of requiring a second,
+# separate title-source toggle.
+
+def get_xc_title_include_year() -> bool:
+    return bool(_read_raw().get("xc_title_include_year", False))
+
+
+def save_xc_title_include_year(enabled: bool) -> None:
+    data = _read_raw()
+    data["xc_title_include_year"] = bool(enabled)
     _write_raw(data)
 
 

@@ -285,6 +285,18 @@ _LIVE_PLACEHOLDER_STREAM = {
 }
 
 
+def _display_name(row, include_year: bool) -> str:
+    """Name served to XC clients (GH issue #1): pool identity (movies/series
+    .name, dedup matching, Title & Metadata Rules) is untouched by this --
+    it's purely what's appended for display, so it composes with whatever
+    title is currently stored (a provider's own, or TMDB's via "Apply TMDB
+    Titles") instead of requiring a second title-source toggle."""
+    name = row["name"]
+    if include_year and row.get("year"):
+        name = f"{name} ({row['year']})"
+    return name + row["name_suffix"]
+
+
 def _handle_player_api_action(action: str, params, authenticated: dict) -> dict | list:
     """All the actual catalog work for player_api.php, as a plain synchronous
     function run off the event loop via asyncio.to_thread (see the route
@@ -296,6 +308,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
     sync froze the whole server, including totally unrelated requests like
     a login, until the sync's burst of get_series_info calls finished."""
     allowed_category_ids = _allowed_category_ids(authenticated)
+    include_year = config.get_xc_title_include_year()
 
     if action == "get_live_categories":
         return [_LIVE_PLACEHOLDER_CATEGORY]
@@ -316,7 +329,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             rows = [r for r in rows if r["category_id"] in allowed_category_ids]
         return [{
             "num": i + 1,
-            "name": row["name"] + row["name_suffix"],
+            "name": _display_name(row, include_year),
             "stream_type": "movie",
             "stream_id": row["export_stream_id"],
             "stream_icon": row.get("poster_url") or "",
@@ -347,7 +360,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             return {"info": {}, "movie_data": {}}
         return {
             "info": {
-                "name": row["name"] + row["name_suffix"],
+                "name": _display_name(row, include_year),
                 "o_name": row["name"],
                 "cover_big": row.get("poster_url") or "",
                 "genre": row["genre"] or "",
@@ -368,7 +381,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             },
             "movie_data": {
                 "stream_id": row["export_stream_id"],
-                "name": row["name"] + row["name_suffix"],
+                "name": _display_name(row, include_year),
                 "added": str(int(time.time())),
                 "category_id": str(row["category_id"]),
                 "container_extension": row["container_extension"] or "mp4",
@@ -388,7 +401,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             rows = [r for r in rows if r["category_id"] in allowed_category_ids]
         return [{
             "num": i + 1,
-            "name": row["name"] + row["name_suffix"],
+            "name": _display_name(row, include_year),
             "series_id": row["export_series_id"],
             "cover": row.get("poster_url") or "",
             "plot": row["description"] or "",
@@ -432,7 +445,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
         return {
             "seasons": [{"season_number": int(s)} for s in sorted(episodes_by_season, key=int)],
             "info": {
-                "name": row["name"] + row["name_suffix"],
+                "name": _display_name(row, include_year),
                 "cover": row.get("poster_url") or "",
                 "plot": row["description"] or "",
                 "genre": row["genre"] or "",

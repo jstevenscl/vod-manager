@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -1642,6 +1642,27 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
   isIgnorePending: boolean
   tmdbDetails?: Record<string, { year: number | null; title: string | null }>
 }) {
+  // A shared tmdb_id across 2+ candidates means TMDB itself confirms
+  // they're the same real title. A CONFLICTING (different) tmdb_id never
+  // reaches this component at all -- that's positive proof they're
+  // different content, so the backend splits it into separate groups
+  // before this ever renders (see vod_db._split_by_tmdb_conflict).
+  //
+  // Declared before rankTmdbTier/bestDefaultId below, not after -- GH#10:
+  // rankTmdbTier's closure reads tmdbIdCounts, and having this declaration
+  // AFTER that reduce() call was invoked used to throw "Cannot access
+  // 'tmdbIdCounts' before initialization" (a const's temporal dead zone)
+  // the moment any item in the group actually had a tmdb_id, since that's
+  // the only path that touches tmdbIdCounts at all -- silent with no
+  // matches (nothing ever enriched yet), reproducible once enrichment
+  // populates real ids, and fatal with no error boundary to catch it,
+  // which is what made the whole Duplicate Finder scan go blank.
+  const tmdbIdCounts = new Map<string, number>()
+  for (const item of group.items) {
+    if (item.tmdb_id) tmdbIdCounts.set(item.tmdb_id, (tmdbIdCounts.get(item.tmdb_id) ?? 0) + 1)
+  }
+  const sameTmdbMatch = [...tmdbIdCounts.values()].some((c) => c > 1)
+
   // Backend sorts most-sourced/most-placed first, but that ignores TMDB
   // confirmation entirely -- an unconfirmed candidate with more sources used
   // to beat a TMDB-confirmed one for the default "keep" pick. Rank by TMDB
@@ -1688,17 +1709,6 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
     if (item.poster_url) posterCounts.set(item.poster_url, (posterCounts.get(item.poster_url) ?? 0) + 1)
   }
   const artworkMatches = group.items.some((item) => item.poster_url && (posterCounts.get(item.poster_url) ?? 0) > 1)
-
-  // A shared tmdb_id across 2+ candidates means TMDB itself confirms
-  // they're the same real title. A CONFLICTING (different) tmdb_id never
-  // reaches this component at all -- that's positive proof they're
-  // different content, so the backend splits it into separate groups
-  // before this ever renders (see vod_db._split_by_tmdb_conflict).
-  const tmdbIdCounts = new Map<string, number>()
-  for (const item of group.items) {
-    if (item.tmdb_id) tmdbIdCounts.set(item.tmdb_id, (tmdbIdCounts.get(item.tmdb_id) ?? 0) + 1)
-  }
-  const sameTmdbMatch = [...tmdbIdCounts.values()].some((c) => c > 1)
 
   return (
     <div className="border border-border rounded px-2 py-1.5 space-y-1.5">
@@ -5010,6 +5020,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (mode: string) => api.post('/vod/stream-priority-mode/', { mode }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-priority-mode'] }),
   })
+  // ── XC title display format (GH issue #1) ──
+  const xcTitleIncludeYearQuery = useQuery<{ enabled: boolean }>({
+    queryKey: ['vod-xc-title-include-year'],
+    queryFn:  () => api.get('/vod/xc-title-include-year/').then((r) => r.data),
+  })
+  const setXcTitleIncludeYear = useMutation({
+    mutationFn: (enabled: boolean) => api.post('/vod/xc-title-include-year/', { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-title-include-year'] }),
+  })
   const setCategorySyncSource = useMutation({
     mutationFn: ({ id, sync_source }: { id: number; sync_source: string | null }) =>
       api.post(`/vod/categories/${id}/sync-source/`, null, { params: sync_source ? { sync_source } : {} }),
@@ -5115,7 +5134,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: () => api.post('/vod/duplicates/confirm-scan/', null, { params: { content_type: duplicatesContentType } }),
     onSuccess: (r) => setDuplicatesConfirmJobId(r.data.job_id),
   })
-  const confirmScanQuery = useQuery<{ status: string; checked: number; total: number; confirmed: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string; exact_title_match: boolean }[]; error: string | null }>({
+  const confirmScanQuery = useQuery<{ status: string; checked: number; total: number; confirmed: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string; exact_title_match: boolean }[]; second_pass: { keep_id: number; merge_ids: number[]; matched_title: string; tmdb_id: string; exact_title_match: boolean }[]; error: string | null }>({
     queryKey: ['vod-duplicates-confirm-scan', duplicatesConfirmJobId],
     queryFn:  () => api.get(`/vod/duplicates/confirm-scan/${duplicatesConfirmJobId}/`).then((r) => r.data),
     enabled:  !!duplicatesConfirmJobId,
@@ -5126,7 +5145,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const duplicatesConfirmed = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.confirmed : []
   const duplicatesConfirmedKeys = new Set(duplicatesConfirmed.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
-  const duplicatesNeedsReview = (duplicatesQuery.data ?? []).filter((g) => !duplicatesConfirmedKeys.has(groupSignature(g.items)))
+  // Second pass (GH issue #2): groups where only ONE side of the group
+  // carries the shared tmdb_id, but that candidate's own year also matches
+  // TMDB's canonical year for it -- "TMDB confirms only this candidate" in
+  // the per-item badge below. Less airtight than duplicatesConfirmed (no
+  // sibling shares the same id), so kept as its own opt-in bulk action
+  // rather than folded into "Merge all confirmed matches".
+  const duplicatesSecondPass = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.second_pass : []
+  const duplicatesSecondPassKeys = new Set(duplicatesSecondPass.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
+  const duplicatesNeedsReview = (duplicatesQuery.data ?? []).filter(
+    (g) => !duplicatesConfirmedKeys.has(groupSignature(g.items)) && !duplicatesSecondPassKeys.has(groupSignature(g.items)),
+  )
 
   const [duplicatesConfirmMergeResult, setDuplicatesConfirmMergeResult] = useState<string | null>(null)
   const mergeConfirmedDuplicates = useMutation({
@@ -5142,6 +5171,21 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
     onError: (e: any) => setDuplicatesConfirmMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const [duplicatesSecondPassMergeResult, setDuplicatesSecondPassMergeResult] = useState<string | null>(null)
+  const mergeSecondPassDuplicates = useMutation({
+    mutationFn: () => api.post('/vod/duplicates/merge-confirmed/', {
+      content_type: duplicatesContentType,
+      groups: duplicatesSecondPass.map((c) => ({ keep_id: c.keep_id, merge_ids: c.merge_ids })),
+    }),
+    onSuccess: (r) => {
+      setDuplicatesSecondPassMergeResult(`Merged ${r.data.merged_groups} second-pass group${r.data.merged_groups === 1 ? '' : 's'} (${r.data.merged_items} item${r.data.merged_items === 1 ? '' : 's'}).`)
+      setDuplicatesConfirmJobId(null)
+      duplicatesQuery.refetch()
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setDuplicatesSecondPassMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
   // Scoped to just the tmdb_ids actually visible on the current results page
@@ -8289,6 +8333,24 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </select>
       </SectionCard>
 
+      <SectionCard title="Client Title Format" icon={<Type size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Controls only what VOD clients (Dispatcharr, TiviMate, etc.) see in the title text — the pool's own name/
+          year fields, dedup matching, and Title & Metadata Rules are unaffected. Combine with "Apply TMDB Titles"
+          (Movies/TV Shows toolbar) to have clients see TMDB's own canonical title with its year, instead of
+          whatever a provider happened to send.
+        </p>
+        <label className="flex items-center gap-2 text-xs cursor-pointer">
+          <input
+            type="checkbox"
+            checked={!!xcTitleIncludeYearQuery.data?.enabled}
+            disabled={xcTitleIncludeYearQuery.isLoading || setXcTitleIncludeYear.isPending}
+            onChange={(e) => setXcTitleIncludeYear.mutate(e.target.checked)}
+          />
+          Append year to titles served to clients, e.g. "Movie Name (2024)"
+        </label>
+      </SectionCard>
+
       <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds pool entries that look like the same real title split into two rows: names that only differ by
@@ -8367,6 +8429,24 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               </>
             )}
             {duplicatesConfirmMergeResult && <span className="text-xs text-muted-foreground">{duplicatesConfirmMergeResult}</span>}
+          </div>
+        )}
+        {confirmScanQuery.data?.status === 'done' && !!duplicatesSecondPass.length && (
+          <div className="flex items-center gap-1.5 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5">
+            <span className="text-xs text-amber-400">
+              ⚠ {duplicatesSecondPass.length} more where only one candidate has a confirmed TMDB id (self-consistent, but no sibling shares it)
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={mergeSecondPassDuplicates.isPending}
+              onClick={() => mergeSecondPassDuplicates.mutate()}
+              title="Each group's TMDB-confirmed candidate is kept; the rest (which carry no TMDB id at all) merge into it. Less airtight than the confirmed tier above since nothing corroborates the id, so this is a separate opt-in step"
+            >
+              {mergeSecondPassDuplicates.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Trust TMDB for these too ({duplicatesSecondPass.length})
+            </Button>
+            {duplicatesSecondPassMergeResult && <span className="text-xs text-muted-foreground">{duplicatesSecondPassMergeResult}</span>}
           </div>
         )}
         {!!duplicatesPageItems.length && (

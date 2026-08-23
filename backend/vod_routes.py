@@ -21,6 +21,7 @@ from config import (
     get_smtp_settings,
     get_stream_priority_mode,
     get_tmdb_api_key,
+    get_xc_title_include_year,
     has_credentials,
     save_ai_provider,
     save_anthropic_api_key,
@@ -32,6 +33,7 @@ from config import (
     save_smtp_settings,
     save_stream_priority_mode,
     save_tmdb_api_key,
+    save_xc_title_include_year,
     set_default_categories_prompt_dismissed,
     set_hide_dvr_tab,
 )
@@ -763,6 +765,21 @@ async def save_stream_priority_mode_route(body: StreamPriorityModeRequest):
         save_stream_priority_mode(body.mode)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
+    return {"ok": True}
+
+
+@router.get("/xc-title-include-year/", dependencies=_GUARDS)
+async def get_xc_title_include_year_route():
+    return {"enabled": get_xc_title_include_year()}
+
+
+class XcTitleIncludeYearRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/xc-title-include-year/", dependencies=_GUARDS)
+async def save_xc_title_include_year_route(body: XcTitleIncludeYearRequest):
+    save_xc_title_include_year(body.enabled)
     return {"ok": True}
 
 
@@ -2533,13 +2550,7 @@ class MergeConfirmedDuplicatesRequest(BaseModel):
 
 
 def _merge_confirmed_groups(content_type: str, groups: list) -> dict:
-    merged_groups = 0
-    merged_items = 0
-    for pair in groups:
-        result = vod_db.merge_duplicate_group(content_type, pair.keep_id, pair.merge_ids)
-        merged_groups += 1
-        merged_items += result["merged_count"]
-    return {"merged_groups": merged_groups, "merged_items": merged_items}
+    return vod_db.merge_duplicate_groups_bulk(content_type, [(pair.keep_id, pair.merge_ids) for pair in groups])
 
 
 @router.post("/duplicates/merge-confirmed/", dependencies=_GUARDS)
@@ -2578,6 +2589,7 @@ async def get_duplicate_confirm_scan(job_id: str):
     return {
         "status": job["status"], "checked": job["checked"], "total": job["total"],
         "confirmed": job["confirmed"] if job["status"] == "done" else [],
+        "second_pass": job["second_pass"] if job["status"] == "done" else [],
         "error": job["error"],
     }
 
