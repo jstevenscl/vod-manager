@@ -200,6 +200,16 @@ that (see *Rich Metadata* at the top of the same tab for a manual bulk-fetch
 button, or just let the background refresh schedule handle it — §6 in
 [README.md](README.md#refresh-schedule)).
 
+**Plex/Emby/Jellyfin: only Movies and TV Shows libraries are imported.** A
+library's own **Content type** setting (in Plex/Emby/Jellyfin's own library
+manager) is what tells VOD & DVR Manager whether it's a movie library, a TV
+show library, or something else — a library added as "Mixed content" or
+"Home Videos" reports neither, so none of its items can be imported. If a
+library you expected to see content from doesn't show up after importing,
+check that library's Content type is explicitly set to Movies or TV Shows;
+the import result now calls out any library it couldn't classify by name so
+this is visible instead of silently importing nothing.
+
 ### Excluding content on import
 
 If a provider's catalog includes languages or categories you don't want in

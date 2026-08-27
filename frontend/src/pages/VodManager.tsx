@@ -4913,9 +4913,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: (r) => {
       const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
       const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
+      const skipped: { name: string; collection_type: string | null }[] = r.data.skipped_libraries ?? []
       setImportResult(
         `Imported: ${r.data.movies_created} new movies (${r.data.movies_matched} already known), ${r.data.series_created} new series (${r.data.series_matched} already known)`
         + (archived || unarchived ? ` — ${archived} archived, ${unarchived} restored by the current exclusion rules.` : '.')
+        + (skipped.length
+          ? ` Warning: ${skipped.length} librar${skipped.length === 1 ? 'y' : 'ies'} could not be classified as movies/TV and were skipped — `
+            + skipped.map(s => `"${s.name}" (type: ${s.collection_type ?? 'none'})`).join(', ')
+            + '. Check that library\'s content type in Plex/Emby/Jellyfin.'
+          : '')
       )
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })

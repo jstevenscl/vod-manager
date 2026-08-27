@@ -88,6 +88,15 @@ async def import_plex_library(provider_id: int) -> dict:
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
+    # See emby_vod_importer.import_emby_library's identical tracking. Unlike
+    # Jellyfin/Emby (where a "movies"/"tvshows" library can end up
+    # unclassified purely from user misconfiguration), Plex sections are
+    # strictly typed by Plex itself and "artist"/"photo" are legitimate,
+    # intentionally-unsynced library kinds -- only flag a type this importer
+    # has genuinely never seen, so a user's music/photo library doesn't show
+    # up as a false-positive warning on every sync.
+    _EXPECTED_NON_VOD_TYPES = {"artist", "photo"}
+    skipped_libraries = []
 
     async with plex_client.PlexClient(provider) as client:
         libraries = await client.list_libraries()
@@ -95,6 +104,13 @@ async def import_plex_library(provider_id: int) -> dict:
             section_type = section.get("type")
             section_key = section.get("key")
             if section_type not in ("movie", "show") or not section_key:
+                if section_type not in _EXPECTED_NON_VOD_TYPES:
+                    name = (section.get("title") or "?").strip()
+                    logger.warning(
+                        "[plex_importer] provider=%s: skipping section %r -- unrecognized type=%r",
+                        provider["name"], name, section_type,
+                    )
+                    skipped_libraries.append({"name": name, "collection_type": section_type})
                 continue
             category_name = (section.get("title") or "").strip() or None
 
@@ -173,6 +189,7 @@ async def import_plex_library(provider_id: int) -> dict:
         "movies_created": movie_result["movies_created"], "movies_matched": movie_result["movies_matched"],
         "series_created": series_result["series_created"], "series_matched": series_result["series_matched"],
         "episodes_imported": series_result["episodes_imported"],
+        "skipped_libraries": skipped_libraries,
     }
     logger.info("[plex_importer] provider=%s result=%s", provider["name"], result)
     return result

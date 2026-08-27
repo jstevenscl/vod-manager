@@ -71,6 +71,12 @@ async def import_emby_library(provider_id: int) -> dict:
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
+    # Surfaced in the import result so a library that's silently invisible to
+    # this importer (e.g. Jellyfin "Mixed content"/"Home Videos" libraries,
+    # which report CollectionType=null rather than "movies"/"tvshows") shows
+    # up as a warning in the UI instead of just importing zero items with no
+    # explanation.
+    skipped_libraries = []
 
     async with emby_vod_client.EmbyVodClient(provider) as client:
         libraries = await client.list_libraries()
@@ -78,6 +84,13 @@ async def import_emby_library(provider_id: int) -> dict:
             collection_type = lib.get("CollectionType")
             library_id = lib.get("ItemId")
             if not library_id or collection_type not in ("movies", "tvshows"):
+                name = (lib.get("Name") or "?").strip()
+                logger.warning(
+                    "[emby_vod_importer] provider=%s: skipping library %r -- CollectionType=%r "
+                    "is not 'movies' or 'tvshows' (check the library's Content type in Jellyfin/Emby)",
+                    provider["name"], name, collection_type,
+                )
+                skipped_libraries.append({"name": name, "collection_type": collection_type})
                 continue
             category_name = (lib.get("Name") or "").strip() or None
 
@@ -155,6 +168,7 @@ async def import_emby_library(provider_id: int) -> dict:
         "movies_created": movie_result["movies_created"], "movies_matched": movie_result["movies_matched"],
         "series_created": series_result["series_created"], "series_matched": series_result["series_matched"],
         "episodes_imported": series_result["episodes_imported"],
+        "skipped_libraries": skipped_libraries,
     }
     logger.info("[emby_vod_importer] provider=%s result=%s", provider["name"], result)
     return result
