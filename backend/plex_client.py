@@ -19,6 +19,15 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 20.0
+# Same reasoning as emby_vod_client._CATALOG_REQUEST_TIMEOUT: list_movies/
+# list_shows are each ONE unpaginated /library/sections/{key}/all call for
+# the whole section -- needs real headroom for a large library instead of
+# retrying forever against a 20s wall every refresh cycle.
+_CATALOG_REQUEST_TIMEOUT = 120.0
+# Page size for list_movies/list_shows -- keeps each individual request fast
+# (and each one still gets the full _CATALOG_REQUEST_TIMEOUT) no matter how
+# large the section grows, instead of relying on one ever-larger call.
+_CATALOG_PAGE_SIZE = 500
 
 _TOKEN_RE = re.compile(r"(X-Plex-Token=)[^&\s'\"]+", re.IGNORECASE)
 
@@ -59,21 +68,21 @@ class PlexClient:
             await self._client.aclose()
             self._client = None
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None, timeout: float = _REQUEST_TIMEOUT) -> dict:
         query = {"X-Plex-Token": self.token}
         if params:
             query.update(params)
 
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=_REQUEST_TIMEOUT, follow_redirects=True)
+        client = self._client or httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         t0 = time.monotonic()
         try:
             # Defense in depth on top of httpx's own timeout= — a hang here
             # once blocked the whole import indefinitely; belt-and-suspenders
             # against whatever edge case caused that.
             r = await asyncio.wait_for(
-                client.get(f"{self.base_url}{path}", params=query, headers={"Accept": "application/json"}),
-                timeout=_REQUEST_TIMEOUT + 5.0,
+                client.get(f"{self.base_url}{path}", params=query, headers={"Accept": "application/json"}, timeout=timeout),
+                timeout=timeout + 5.0,
             )
             r.raise_for_status()
             return r.json()
@@ -93,13 +102,38 @@ class PlexClient:
         data = await self._get("/library/sections")
         return (data.get("MediaContainer", {}) or {}).get("Directory", []) or []
 
+    async def _list_all_paged(self, section_key: str, item_type: int) -> list[dict]:
+        """/library/sections/{key}/all in pages of _CATALOG_PAGE_SIZE via
+        Plex's X-Plex-Container-Start/-Size paging, rather than one call for
+        the whole section -- belt-and-suspenders on top of
+        _CATALOG_REQUEST_TIMEOUT: a single giant library can still outgrow
+        even 120s, but each individual page request stays fast regardless of
+        total library size."""
+        items: list[dict] = []
+        start = 0
+        while True:
+            data = await self._get(
+                f"/library/sections/{section_key}/all",
+                params={
+                    "type": item_type, "includeGuids": 1,
+                    "X-Plex-Container-Start": start, "X-Plex-Container-Size": _CATALOG_PAGE_SIZE,
+                },
+                timeout=_CATALOG_REQUEST_TIMEOUT,
+            )
+            container = data.get("MediaContainer", {}) or {}
+            page = container.get("Metadata", []) or []
+            items.extend(page)
+            total = container.get("totalSize")
+            start += len(page)
+            if len(page) < _CATALOG_PAGE_SIZE or not page or (total is not None and start >= total):
+                break
+        return items
+
     async def list_movies(self, section_key: str) -> list[dict]:
-        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 1, "includeGuids": 1})
-        return (data.get("MediaContainer", {}) or {}).get("Metadata", []) or []
+        return await self._list_all_paged(section_key, item_type=1)
 
     async def list_shows(self, section_key: str) -> list[dict]:
-        data = await self._get(f"/library/sections/{section_key}/all", params={"type": 2, "includeGuids": 1})
-        return (data.get("MediaContainer", {}) or {}).get("Metadata", []) or []
+        return await self._list_all_paged(section_key, item_type=2)
 
     async def list_episodes(self, show_rating_key: str) -> list[dict]:
         """allLeaves returns every episode across every season for a show in

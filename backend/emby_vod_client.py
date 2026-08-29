@@ -26,6 +26,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 20.0
+# list_movies/list_series each do ONE unpaginated /emby/Items call for the
+# whole library (Recursive=true plus a heavy Fields= list) -- fine for a
+# small library, but a large one (confirmed live: a user's movie library
+# that never once completed within 20s, every ~5min refresh, for days) needs
+# real headroom rather than retrying forever against the same wall.
+_CATALOG_REQUEST_TIMEOUT = 120.0
+# Page size for list_movies/list_series -- keeps each individual request
+# fast (and each one still gets the full _CATALOG_REQUEST_TIMEOUT) no matter
+# how large the library grows, instead of relying on one ever-larger call.
+_CATALOG_PAGE_SIZE = 500
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+", re.IGNORECASE)
 
@@ -71,18 +81,18 @@ class EmbyVodClient:
             await self._client.aclose()
             self._client = None
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None, timeout: float = _REQUEST_TIMEOUT) -> dict:
         query = {"api_key": self.api_key}
         if params:
             query.update(params)
 
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
+        client = self._client or httpx.AsyncClient(timeout=timeout)
         t0 = time.monotonic()
         try:
             r = await asyncio.wait_for(
-                client.get(f"{self.base_url}{path}", params=query),
-                timeout=_REQUEST_TIMEOUT + 5.0,
+                client.get(f"{self.base_url}{path}", params=query, timeout=timeout),
+                timeout=timeout + 5.0,
             )
             r.raise_for_status()
             return r.json() if r.content else {}
@@ -137,8 +147,28 @@ class EmbyVodClient:
         data = await self._get("/emby/Library/VirtualFolders")
         return data or []
 
+    async def _list_items_paged(self, params: dict) -> list[dict]:
+        """/emby/Items in pages of _CATALOG_PAGE_SIZE rather than one
+        Recursive=true call for the whole library -- belt-and-suspenders on
+        top of _CATALOG_REQUEST_TIMEOUT: a single giant library can still
+        outgrow even 120s, but each individual page request stays fast
+        regardless of total library size."""
+        items: list[dict] = []
+        start = 0
+        while True:
+            data = await self._get("/emby/Items", params={
+                **params, "StartIndex": start, "Limit": _CATALOG_PAGE_SIZE,
+            }, timeout=_CATALOG_REQUEST_TIMEOUT)
+            page = (data or {}).get("Items", []) or []
+            items.extend(page)
+            total = (data or {}).get("TotalRecordCount")
+            start += len(page)
+            if len(page) < _CATALOG_PAGE_SIZE or not page or (total is not None and start >= total):
+                break
+        return items
+
     async def list_movies(self, library_id: str) -> list[dict]:
-        data = await self._get("/emby/Items", params={
+        return await self._list_items_paged({
             "ParentId": library_id,
             "IncludeItemTypes": "Movie",
             "Recursive": "true",
@@ -150,16 +180,14 @@ class EmbyVodClient:
             # pass after the rating fix).
             "Fields": "Overview,Genres,ProductionYear,People,MediaSources,ProviderIds,CommunityRating,PremiereDate",
         })
-        return (data or {}).get("Items", []) or []
 
     async def list_series(self, library_id: str) -> list[dict]:
-        data = await self._get("/emby/Items", params={
+        return await self._list_items_paged({
             "ParentId": library_id,
             "IncludeItemTypes": "Series",
             "Recursive": "true",
             "Fields": "Overview,Genres,ProductionYear,People,ProviderIds,CommunityRating,PremiereDate",
         })
-        return (data or {}).get("Items", []) or []
 
     async def list_episodes(self, series_id: str) -> list[dict]:
         """All episodes for a series in one call — Emby's answer to XC's
