@@ -178,7 +178,18 @@ class EmbyVodClient:
             # PremiereDate added same day, same bug (release date was always
             # blank for Emby-sourced content, found doing a completeness
             # pass after the rating fix).
-            "Fields": "Overview,Genres,ProductionYear,People,MediaSources,ProviderIds,CommunityRating,PremiereDate",
+            #
+            # Path replaces MediaSources 2026-08-29 -- real bug found live:
+            # MediaSources makes Emby/Jellyfin probe the actual video file
+            # per item (confirmed ~0.2-0.4s/item from this same server's own
+            # per-episode MediaSources fetch timings), so a movies library
+            # never once finished even a single _CATALOG_PAGE_SIZE page
+            # within _CATALOG_REQUEST_TIMEOUT -- unlike list_series, which
+            # never requested MediaSources at all. Path is plain indexed
+            # metadata (no probing), and extract_stream_id() only ever used
+            # MediaSources for its Container field, which the file extension
+            # in Path gives for free.
+            "Fields": "Overview,Genres,ProductionYear,People,Path,ProviderIds,CommunityRating,PremiereDate",
         })
 
     async def list_series(self, library_id: str) -> list[dict]:
@@ -203,12 +214,21 @@ def extract_stream_id(item: dict) -> tuple[str | None, str]:
     response entry. The Id is what gets replayed back to
     /Videos/{Id}/stream as both the path segment and MediaSourceId at
     playback time (see xc_server.py) — correct for the common case of one
-    media file per item, which covers a typical home library."""
+    media file per item, which covers a typical home library.
+
+    Container comes from MediaSources when present (episodes) or, failing
+    that, from the file extension in Path (movies -- see list_movies for why
+    MediaSources isn't requested there)."""
     item_id = item.get("Id")
     if not item_id:
         return None, "mp4"
     sources = item.get("MediaSources") or []
     container = sources[0].get("Container") if sources else None
+    if not container:
+        path = item.get("Path") or ""
+        filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if "." in filename:
+            container = filename.rsplit(".", 1)[-1]
     return item_id, (container or "mp4")
 
 
