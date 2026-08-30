@@ -115,7 +115,16 @@ async def import_emby_library(provider_id: int) -> dict:
                         "tmdb_id": fields["tmdb_id"],
                         "rating": fields["rating"],
                         "release_date": fields["release_date"],
-                        "last_enriched_at": now,
+                        # last_enriched_at deliberately omitted (unlike the
+                        # series branch below) -- list_movies() no longer
+                        # requests People (see its docstring), so cast_list/
+                        # director above are always None here. Leaving this
+                        # unset means movie_needs_enrichment() sees it as
+                        # stale immediately, so the normal lazy-enrichment
+                        # pass (vod_importer.enrich_movie) picks it up and
+                        # backfills cast/director one item at a time via
+                        # get_movie_people() instead of blocking the bulk
+                        # import on every item's People up front.
                         "provider_category_name": category_name,
                         "auto_archive": vod_importer._should_auto_archive(
                             item.get("Name", ""), category_name, exclude_categories, exclude_uncategorized,

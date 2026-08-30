@@ -19,6 +19,7 @@ import time
 import httpx
 
 import config
+import emby_vod_client
 import vod_db
 
 
@@ -409,6 +410,24 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
         # time (see plex_importer.py) — nothing more to lazily fetch here,
         # just refresh the TTL stamp so the scheduler leaves it alone.
         await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id)
+        return True
+
+    if provider.get("provider_type") in ("emby", "jellyfin"):
+        # Emby/Jellyfin's library listing already hands back everything
+        # except People (see emby_vod_client.list_movies's docstring for why
+        # that field is excluded from the bulk import) -- so this is the one
+        # thing left to lazily backfill here, one item at a time instead of
+        # for the whole library up front.
+        async with emby_vod_client.EmbyVodClient(provider) as client:
+            item = await client.get_movie_people(source["provider_stream_id"])
+        fields = emby_vod_client.extract_common_fields(item)
+        await asyncio.to_thread(
+            vod_db.set_movie_enrichment, movie_id,
+            **_apply_field_rules("movie", {
+                "director": fields["director"],
+                "cast_list": fields["cast_list"],
+            }),
+        )
         return True
 
     client = XCProviderClient(provider)

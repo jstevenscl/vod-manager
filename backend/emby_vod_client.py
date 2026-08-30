@@ -189,8 +189,26 @@ class EmbyVodClient:
             # metadata (no probing), and extract_stream_id() only ever used
             # MediaSources for its Container field, which the file extension
             # in Path gives for free.
-            "Fields": "Overview,Genres,ProductionYear,People,Path,ProviderIds,CommunityRating,PremiereDate",
+            #
+            # People dropped 2026-08-30 -- real bug found live: it was the
+            # NEXT expensive field after MediaSources (confirmed ~0.4s/item
+            # against a real Jellyfin instance -- 468 movies went from 7.5s
+            # without People to 187s with it, well past
+            # _CATALOG_REQUEST_TIMEOUT), same shape of problem, just a
+            # different field. cast_list/director for Emby/Jellyfin movies
+            # now come from get_movie_people() instead, one item at a time
+            # via the normal lazy-enrichment pass (see vod_importer.
+            # enrich_movie) rather than blocking the whole bulk import.
+            "Fields": "Overview,Genres,ProductionYear,Path,ProviderIds,CommunityRating,PremiereDate",
         })
+
+    async def get_movie_people(self, item_id: str) -> dict:
+        """Single-item People fetch for the lazy-enrichment path -- cheap at
+        one item (~0.4s), unlike requesting People for an entire movies
+        library in one call (see list_movies)."""
+        data = await self._get("/emby/Items", params={"Ids": item_id, "Fields": "People"})
+        items = (data or {}).get("Items", []) or []
+        return items[0] if items else {}
 
     async def list_series(self, library_id: str) -> list[dict]:
         return await self._list_items_paged({
