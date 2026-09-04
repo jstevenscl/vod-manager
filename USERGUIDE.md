@@ -1073,6 +1073,13 @@ works.
   continuing to hammer it — other providers keep enriching at full speed.
   Items skipped this way aren't errors and aren't lost; they're retried
   automatically once the cooldown ends or on the next run.
+- Even short of a full backoff, each provider's own share of concurrent
+  requests **adapts automatically** to how it's actually responding: a
+  provider starts at full concurrency, narrows itself the moment it shows
+  trouble, and eases back up as requests keep succeeding (a status line
+  shows which provider is currently running at reduced concurrency, if
+  any). No configuration needed — this is separate from, and layered on
+  top of, the pause-and-cooldown backoff above.
 - Enrichment also happens lazily, per item, the moment it's actually
   needed (e.g. a movie/series detail modal's own **Fetch full detail**
   button) — so a freshly-imported series showing no episodes yet just
@@ -1166,6 +1173,15 @@ three ways at once:
   gap than the rule above alone would allow. A *conflicting* TMDB id is
   treated the opposite way: proof they're genuinely different, so that pair
   is ruled out and never shown as a duplicate at all.
+
+There's also an **opt-in fourth check, off by default**: a checkbox above the
+scan button groups a quality-tagged title with its plain version — e.g.
+"4K: Predator" with "Predator" — as candidates too. Leave it off and those
+stay two separate, unrelated pool entries, same as today. Turn it on, merge
+the group, and Stream Priority's "quality" mode (Configuration) then picks
+whichever source is actually the best quality automatically — this is purely
+about getting split rows *grouped* for review; nothing merges on its own just
+from turning the checkbox on.
 
 Each candidate shows its poster, a **same TMDB match** badge when a shared id
 confirms the group, and a per-candidate **true match**/**year mismatch** badge

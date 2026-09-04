@@ -22,7 +22,10 @@ import threading
 import time
 from pathlib import Path
 
-from config import DATA_DIR, get_config, get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id
+from config import (
+    DATA_DIR, get_config, get_duplicate_finder_quality_prefix_matching, get_refresh_settings,
+    get_stream_priority_mode, get_vod_xc_account_id,
+)
 from secrets_util import decrypt_value, encrypt_value, is_encrypted
 
 logger = logging.getLogger(__name__)
@@ -3164,6 +3167,20 @@ def _normalize_title_for_dedup(name: str) -> str:
     return _DUPLICATE_WS_RE.sub(" ", stripped).strip().lower()
 
 
+# Same 4K/UHD/FHD markers _QUALITY_TIER_SQL_TEMPLATE (below) already ranks
+# sources by -- here, applied to a title text instead of raw_name, for
+# find_duplicate_groups' opt-in quality-prefix matching (config.
+# get_duplicate_finder_quality_prefix_matching). Matched AFTER
+# _normalize_title_for_dedup has already stripped punctuation (so "4K: Title"
+# has become "4k title" by this point, no colon left to anchor on) -- hence a
+# plain leading-word match, not a colon-anchored one.
+_QUALITY_PREFIX_RE = re.compile(r"^(4k|uhd|fhd)\s+")
+
+
+def _strip_quality_prefix_for_dedup(normalized_name: str) -> str:
+    return _QUALITY_PREFIX_RE.sub("", normalized_name, count=1)
+
+
 def _duplicate_ignore_signature(item_ids: list[int]) -> str:
     return ",".join(str(i) for i in sorted(item_ids))
 
@@ -3243,7 +3260,15 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     we're confident about (year IS NOT NULL) -- pairing on name alone would
     be a much weaker signal and belongs to needs_year_review instead, not
     this scan. A cluster a human already reviewed and dismissed (see
-    duplicate_ignores) never resurfaces."""
+    duplicate_ignores) never resurfaces.
+
+    Pass (1)'s normalization also strips a leading "4K:"/"UHD:"/"FHD:"
+    quality-tier prefix when config.get_duplicate_finder_quality_prefix_
+    matching() is on (opt-in, default off -- see that setting's own
+    docstring) -- so "4K: Predator" and "Predator" surface as one candidate
+    group instead of two permanently-separate pool entries. Grouping only;
+    the actual merge still goes through the normal review/confirm flow
+    below, same as any other candidate this function surfaces."""
     table = "movies" if content_type == "movie" else "series"
     id_col = "movie_id" if content_type == "movie" else "series_id"
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
@@ -3253,9 +3278,12 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
         f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE year IS NOT NULL AND review_excluded=0"
     ).fetchall()
 
+    match_quality_prefixes = get_duplicate_finder_quality_prefix_matching()
     by_name: dict[str, list[dict]] = {}
     for r in rows:
         key = _normalize_title_for_dedup(r["name"])
+        if match_quality_prefixes:
+            key = _strip_quality_prefix_for_dedup(key)
         by_name.setdefault(key, []).append({
             "id": r["id"], "name": r["name"], "year": r["year"],
             "tmdb_id": r["tmdb_id"], "poster_url": r["poster_url"],

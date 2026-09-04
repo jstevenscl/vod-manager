@@ -212,6 +212,78 @@ def _record_provider_success(provider_id: int) -> None:
     _PROVIDER_BACKOFF.pop(provider_id, None)
 
 
+# Adaptive per-provider concurrency cap, layered on top of the binary
+# backoff above -- raised in a 2026-09-04 discussion prompted by a user still
+# seeing real provider rate-limiting: the binary backoff only ever goes from
+# "full concurrency" to "fully paused", with no middle ground. This narrows a
+# provider's own share of the concurrency budget gradually the moment it
+# shows trouble (halves it, floor 1), then creeps back up by 1 after a run of
+# clean calls -- an AIMD approach, same shape as TCP congestion control, so a
+# genuinely-throttled provider settles near whatever concurrency it can
+# actually sustain instead of alternating between "wide open" and "fully
+# stopped". A healthy provider is never artificially slowed down -- every
+# provider starts at _PROVIDER_MAX_CONCURRENCY (today's unrestricted
+# behavior) and only narrows in response to an actual failure signal (the
+# same _BACKOFF_STATUS_CODES/_BACKOFF_EXCEPTION_TYPES the binary backoff
+# already watches for). In-memory only, same as _PROVIDER_BACKOFF -- resets
+# on restart, which just means a provider gets to prove itself healthy again
+# rather than staying permanently throttled from a stale prior run. This is
+# independent of bulk_enrich_all's own `concurrency` semaphore (which caps
+# TOTAL in-flight movie/series work across every provider combined) -- this
+# caps one specific provider's share of that budget, which the shared
+# semaphore alone can't do when several providers' items are interleaved in
+# the same run.
+_PROVIDER_MIN_CONCURRENCY = 1
+_PROVIDER_MAX_CONCURRENCY = 8
+_PROVIDER_RAMP_SUCCESSES = 25  # consecutive clean calls at the current cap before nudging it up by 1
+
+
+class _AdaptiveLimiter:
+    def __init__(self) -> None:
+        self.cap = _PROVIDER_MAX_CONCURRENCY
+        self._in_use = 0
+        self._streak = 0
+        self._cond = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._in_use >= self.cap:
+                await self._cond.wait()
+            self._in_use += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._in_use -= 1
+            self._cond.notify_all()
+
+    async def note_failure(self) -> None:
+        async with self._cond:
+            self._streak = 0
+            self.cap = max(_PROVIDER_MIN_CONCURRENCY, self.cap // 2)
+
+    async def note_success(self) -> None:
+        async with self._cond:
+            if self.cap >= _PROVIDER_MAX_CONCURRENCY:
+                self._streak = 0
+                return
+            self._streak += 1
+            if self._streak >= _PROVIDER_RAMP_SUCCESSES:
+                self.cap += 1
+                self._streak = 0
+                self._cond.notify_all()  # newly-available slot(s) -- wake any acquire() waiters
+
+
+_PROVIDER_LIMITERS: dict[int, _AdaptiveLimiter] = {}
+
+
+def _get_provider_limiter(provider_id: int) -> _AdaptiveLimiter:
+    limiter = _PROVIDER_LIMITERS.get(provider_id)
+    if limiter is None:
+        limiter = _AdaptiveLimiter()
+        _PROVIDER_LIMITERS[provider_id] = limiter
+    return limiter
+
+
 class XCProviderClient:
     def __init__(self, provider: dict):
         self.provider = provider
@@ -224,33 +296,43 @@ class XCProviderClient:
         self.headers = {"User-Agent": custom_ua} if custom_ua else _UPSTREAM_HEADERS
 
     async def _call(self, action: str | None = None, **params) -> object:
+        limiter = None
         if self.provider_id is not None:
             remaining = _provider_backoff_remaining(self.provider_id)
             if remaining > 0:
                 raise ProviderBackoffError(
                     f"provider={self.provider_name} is backing off for another {remaining:.0f}s (looked rate-limited/blocked)"
                 )
+            limiter = _get_provider_limiter(self.provider_id)
+            await limiter.acquire()
         query = {"username": self.username, "password": self.password}
         if action:
             query["action"] = action
         query.update(params)
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
-                r = await client.get(f"{self.base_url}/player_api.php", params=query)
-                r.raise_for_status()
-                result = r.json()
-        except _BACKOFF_EXCEPTION_TYPES:
-            if self.provider_id is not None:
-                _record_provider_failure(self.provider_id, self.provider_name)
-            raise
-        except httpx.HTTPStatusError as exc:
-            if self.provider_id is not None and exc.response.status_code in _BACKOFF_STATUS_CODES:
-                _record_provider_failure(self.provider_id, self.provider_name)
-            raise
-        else:
-            if self.provider_id is not None:
-                _record_provider_success(self.provider_id)
-            return result
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
+                    r = await client.get(f"{self.base_url}/player_api.php", params=query)
+                    r.raise_for_status()
+                    result = r.json()
+            except _BACKOFF_EXCEPTION_TYPES:
+                if self.provider_id is not None:
+                    _record_provider_failure(self.provider_id, self.provider_name)
+                    await limiter.note_failure()
+                raise
+            except httpx.HTTPStatusError as exc:
+                if self.provider_id is not None and exc.response.status_code in _BACKOFF_STATUS_CODES:
+                    _record_provider_failure(self.provider_id, self.provider_name)
+                    await limiter.note_failure()
+                raise
+            else:
+                if self.provider_id is not None:
+                    _record_provider_success(self.provider_id)
+                    await limiter.note_success()
+                return result
+        finally:
+            if limiter is not None:
+                await limiter.release()
 
     async def auth(self) -> dict:
         return await self._call()
@@ -711,6 +793,13 @@ def get_enrich_progress() -> dict:
         {"provider_id": pid, "seconds_remaining": round(remaining, 1)}
         for pid, remaining in ((pid, _provider_backoff_remaining(pid)) for pid in list(_PROVIDER_BACKOFF))
         if remaining > 0
+    ]
+    # Only surfaces a provider actually narrowed below the default -- most
+    # runs never show anything here, same as providers_backing_off above.
+    progress["providers_throttled"] = [
+        {"provider_id": pid, "concurrency": limiter.cap, "max_concurrency": _PROVIDER_MAX_CONCURRENCY}
+        for pid, limiter in list(_PROVIDER_LIMITERS.items())
+        if limiter.cap < _PROVIDER_MAX_CONCURRENCY
     ]
     return progress
 

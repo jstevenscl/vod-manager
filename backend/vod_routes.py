@@ -12,6 +12,7 @@ from config import (
     get_ai_provider,
     get_anthropic_api_key,
     get_default_categories_prompt_dismissed,
+    get_duplicate_finder_quality_prefix_matching,
     get_gemini_api_key,
     get_hide_dvr_tab,
     get_import_language_exclusion,
@@ -25,6 +26,7 @@ from config import (
     has_credentials,
     save_ai_provider,
     save_anthropic_api_key,
+    save_duplicate_finder_quality_prefix_matching,
     save_gemini_api_key,
     save_import_language_exclusion,
     save_lockout_settings,
@@ -2491,6 +2493,21 @@ async def resweep_uncategorized():
 # Self-service scan/merge for pool entries that look like the same real
 # title split into two rows -- cosmetic punctuation variants, adjacent-year
 # mislabeling, or both -- see vod_db.find_duplicate_groups/merge_duplicate_group.
+
+@router.get("/duplicates/quality-prefix-matching/", dependencies=_GUARDS)
+async def get_duplicate_finder_quality_prefix_matching_route():
+    return {"enabled": get_duplicate_finder_quality_prefix_matching()}
+
+
+class DuplicateFinderQualityPrefixMatchingRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/duplicates/quality-prefix-matching/", dependencies=_GUARDS)
+async def save_duplicate_finder_quality_prefix_matching_route(body: DuplicateFinderQualityPrefixMatchingRequest):
+    save_duplicate_finder_quality_prefix_matching(body.enabled)
+    return {"ok": True}
+
 
 @router.get("/duplicates/", dependencies=_GUARDS)
 async def scan_duplicates(content_type: str):

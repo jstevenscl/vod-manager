@@ -325,7 +325,10 @@ language-aware filter and sibling-safe bulk archiving), **Language Filter**
 poster-missing items), **Duplicate Finder** (matches on punctuation
 variants, adjacent-year mislabeling, and TMDB id, with one-click bulk merges
 for both fully-corroborated TMDB-confirmed matches and a second, separate
-tier where only one candidate carries a self-consistent TMDB id), **Needs
+tier where only one candidate carries a self-consistent TMDB id; an opt-in,
+off-by-default checkbox also groups a quality-tagged title like "4K: Movie"
+with its plain "Movie" as a candidate, for consolidating with Stream
+Priority's quality mode below), **Needs
 Review** (resolves year-ambiguous imports), and **Orphan Checker** (finds
 dead rows a provider deletion can leave behind — a series whose only source
 provider no longer exists, or movies/episodes with zero sources at all).

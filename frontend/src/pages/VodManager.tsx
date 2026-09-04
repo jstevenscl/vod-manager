@@ -1169,6 +1169,7 @@ interface EnrichProgress {
   series_total: number; series_done: number; series_errors: number; series_backoff_skipped: number
   started_at: number | null; finished_at: number | null
   providers_backing_off: { provider_id: number; seconds_remaining: number }[]
+  providers_throttled: { provider_id: number; concurrency: number; max_concurrency: number }[]
 }
 
 interface Page<T> { items: T[]; total: number; limit: number; offset: number }
@@ -5036,6 +5037,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (enabled: boolean) => api.post('/vod/xc-title-include-year/', { enabled }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-xc-title-include-year'] }),
   })
+  // ── Duplicate Finder: quality-prefix matching (vod_manager-cct) ──
+  const dupQualityPrefixMatchingQuery = useQuery<{ enabled: boolean }>({
+    queryKey: ['vod-duplicates-quality-prefix-matching'],
+    queryFn:  () => api.get('/vod/duplicates/quality-prefix-matching/').then((r) => r.data),
+  })
+  const setDupQualityPrefixMatching = useMutation({
+    mutationFn: (enabled: boolean) => api.post('/vod/duplicates/quality-prefix-matching/', { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-duplicates-quality-prefix-matching'] }),
+  })
   const setCategorySyncSource = useMutation({
     mutationFn: ({ id, sync_source }: { id: number; sync_source: string | null }) =>
       api.post(`/vod/categories/${id}/sync-source/`, null, { params: sync_source ? { sync_source } : {} }),
@@ -6475,6 +6485,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               const name = providersQuery.data?.find((p) => p.id === b.provider_id)?.name ?? `provider ${b.provider_id}`
               return `${name} (~${Math.ceil(b.seconds_remaining)}s)`
             }).join(', ')} — it looked rate-limited/blocked, so requests to it are paused rather than retried immediately. Already-enriched items are unaffected; skipped ones are retried automatically once the pause ends.
+          </p>
+        )}
+        {enrichProgress && enrichProgress.running && enrichProgress.providers_throttled.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Running at reduced concurrency for {enrichProgress.providers_throttled.map((t) => {
+              const name = providersQuery.data?.find((p) => p.id === t.provider_id)?.name ?? `provider ${t.provider_id}`
+              return `${name} (${t.concurrency}/${t.max_concurrency})`
+            }).join(', ')} after recent errors — eases back up automatically as requests keep succeeding.
           </p>
         )}
         {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
@@ -8379,6 +8397,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           merge into it (sources, categories, and episodes move over, nothing is lost) — or Ignore a group that
           isn't actually a duplicate so it stops resurfacing.
         </p>
+        <label className="flex items-center gap-2 text-xs cursor-pointer">
+          <input
+            type="checkbox"
+            checked={!!dupQualityPrefixMatchingQuery.data?.enabled}
+            disabled={dupQualityPrefixMatchingQuery.isLoading || setDupQualityPrefixMatching.isPending}
+            onChange={(e) => setDupQualityPrefixMatching.mutate(e.target.checked)}
+          />
+          Also group quality-tagged titles together (e.g. "4K: Predator" with "Predator") — off by default; once
+          merged, Stream Priority's "quality" mode (above) picks the best source automatically
+        </label>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             <button

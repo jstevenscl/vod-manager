@@ -225,6 +225,29 @@ def save_xc_title_include_year(enabled: bool) -> None:
     _write_raw(data)
 
 
+# ── Duplicate Finder: quality-prefix matching ────────────────────────────────
+# User request 2026-09-04 (vod_manager-cct): a provider's "4K: Title" and
+# plain "Title" import as two separate pool entries (exact name+year matching
+# only) -- Stream Priority's "quality" mode (above) already picks the best
+# SOURCE once they're on one movie/series, but nothing groups the split rows
+# together in the first place. Opt-in, default OFF, deliberately -- per the
+# user's own explicit requirement: recognizing a leading "4K:"/"UHD:"/"FHD:"
+# as the same title changes what Duplicate Finder surfaces for every existing
+# install the moment it's on, which is a bigger blast radius than a typical
+# bugfix default. Only affects what Duplicate Finder GROUPS as candidates for
+# review -- merging still goes through the existing manual/bulk-confirm merge
+# flow, nothing auto-merges just from this being enabled.
+
+def get_duplicate_finder_quality_prefix_matching() -> bool:
+    return bool(_read_raw().get("duplicate_finder_quality_prefix_matching", False))
+
+
+def save_duplicate_finder_quality_prefix_matching(enabled: bool) -> None:
+    data = _read_raw()
+    data["duplicate_finder_quality_prefix_matching"] = bool(enabled)
+    _write_raw(data)
+
+
 # ── AI provider selection ────────────────────────────────────────────────────
 # ai_assist.py can talk to any of these three -- a user might already have a
 # key for one and not another, or want to compare quality/cost, so the key
