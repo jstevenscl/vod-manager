@@ -6745,6 +6745,18 @@ def _effective_pattern(rule: dict) -> str:
     return rule["pattern"] if rule.get("is_regex") else re.escape(rule["pattern"])
 
 
+
+# Keyed by (id, pattern, is_regex) so a bad pattern logs once per distinct
+# rule, not once per row it's applied to -- apply_rules_to_value runs inside
+# per-item loops (bulk import, bulk enrich, preview_metadata_rule's pool
+# scan), and a single invalid regex applied across a 195k-movie pool used
+# to produce one warning per movie (200k+ log lines from a single bad
+# preview click, real user report 2026-09-02). No TTL/eviction needed --
+# process-lifetime is fine, and the set stays tiny (bounded by how many
+# distinct bad patterns ever get tried).
+_WARNED_BAD_PATTERNS: set[tuple] = set()
+
+
 def apply_rules_to_value(value: str | None, rules: list[dict]) -> str | None:
     if not value or not rules:
         return value
@@ -6752,7 +6764,10 @@ def apply_rules_to_value(value: str | None, rules: list[dict]) -> str | None:
         try:
             value = re.sub(_effective_pattern(r), r["replacement"], value)
         except re.error as exc:
-            logger.warning("[vod_db] bad metadata rule pattern id=%s: %s", r.get("id"), exc)
+            key = (r.get("id"), r["pattern"], bool(r.get("is_regex")))
+            if key not in _WARNED_BAD_PATTERNS:
+                _WARNED_BAD_PATTERNS.add(key)
+                logger.warning("[vod_db] bad metadata rule pattern id=%s: %s", r.get("id"), exc)
     return value
 
 

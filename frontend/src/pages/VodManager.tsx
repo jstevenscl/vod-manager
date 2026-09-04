@@ -7202,7 +7202,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </div>
           </>
         ) : (
-          <p className="text-xs text-muted-foreground">No language-tagged titles ("AR| ...", "EN| ...") found in the pool yet — import a catalog first.</p>
+          <p className="text-xs text-muted-foreground">
+            No titles in the pool carry a language prefix in the name itself (e.g. "AR| ...", "EN| ..."). If your
+            providers tag language by category name instead (e.g. "ARA: ...", "ENG: ..."), this panel has nothing to
+            catch — use that provider's own "Exclude Categories" button above instead.
+          </p>
         )}
         <Button
           size="sm"
