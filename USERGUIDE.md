@@ -1067,6 +1067,12 @@ works.
 - Progress tracks movies and series separately, each with its own running
   error count — a nonzero count usually means a source's own API rejected
   or timed out on some items, not that the whole run failed.
+- If a provider starts throwing connection failures or 403/429/503
+  responses, enrichment automatically **backs off just that provider**
+  (an amber banner names it and shows the remaining cooldown) instead of
+  continuing to hammer it — other providers keep enriching at full speed.
+  Items skipped this way aren't errors and aren't lost; they're retried
+  automatically once the cooldown ends or on the next run.
 - Enrichment also happens lazily, per item, the moment it's actually
   needed (e.g. a movie/series detail modal's own **Fetch full detail**
   button) — so a freshly-imported series showing no episodes yet just
