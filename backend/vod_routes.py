@@ -3043,7 +3043,10 @@ async def delete_movie(movie_id: int):
 async def enrich_movie(movie_id: int, force: bool = False):
     if not vod_db.get_movie(movie_id):
         raise HTTPException(404, detail="movie not found")
-    fetched = await vod_importer.enrich_movie(movie_id, force=force)
+    try:
+        fetched = await vod_importer.enrich_movie(movie_id, force=force)
+    except vod_importer.ProviderBackoffError as exc:
+        raise HTTPException(503, detail=str(exc))
     return {"fetched": fetched, "movie": vod_db.get_movie(movie_id)}
 
 
@@ -3264,7 +3267,10 @@ async def delete_series(series_id: int):
 async def enrich_series(series_id: int, force: bool = False):
     if not vod_db.get_series(series_id):
         raise HTTPException(404, detail="series not found")
-    result = await vod_importer.enrich_series(series_id, force=force)
+    try:
+        result = await vod_importer.enrich_series(series_id, force=force)
+    except vod_importer.ProviderBackoffError as exc:
+        raise HTTPException(503, detail=str(exc))
     series = vod_db.get_series(series_id)
     series["episodes"] = vod_db.list_episodes(series_id)
     episode_sources_by_id = vod_db.list_episode_sources_for_episode_ids([e["id"] for e in series["episodes"]])

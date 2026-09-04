@@ -1165,9 +1165,10 @@ interface DvrRecordingFailure {
 
 interface EnrichProgress {
   running: boolean
-  movies_total: number; movies_done: number; movies_errors: number
-  series_total: number; series_done: number; series_errors: number
+  movies_total: number; movies_done: number; movies_errors: number; movies_backoff_skipped: number
+  series_total: number; series_done: number; series_errors: number; series_backoff_skipped: number
   started_at: number | null; finished_at: number | null
+  providers_backing_off: { provider_id: number; seconds_remaining: number }[]
 }
 
 interface Page<T> { items: T[]; total: number; limit: number; offset: number }
@@ -6468,6 +6469,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <span className="text-xs text-muted-foreground">took {Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s</span>
           )}
         </div>
+        {enrichProgress && enrichProgress.running && enrichProgress.providers_backing_off.length > 0 && (
+          <p className="text-xs text-amber-500">
+            Backing off {enrichProgress.providers_backing_off.map((b) => {
+              const name = providersQuery.data?.find((p) => p.id === b.provider_id)?.name ?? `provider ${b.provider_id}`
+              return `${name} (~${Math.ceil(b.seconds_remaining)}s)`
+            }).join(', ')} — it looked rate-limited/blocked, so requests to it are paused rather than retried immediately. Already-enriched items are unaffected; skipped ones are retried automatically once the pause ends.
+          </p>
+        )}
         {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
           <div className="space-y-1.5">
             {(() => {
@@ -6483,14 +6492,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   <div>
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-0.5">
                       <span>Movies</span>
-                      <span className="tabular-nums">{enrichProgress.movies_done.toLocaleString()} / {enrichProgress.movies_total.toLocaleString()}{enrichProgress.movies_errors > 0 && ` (${enrichProgress.movies_errors} errors)`}</span>
+                      <span className="tabular-nums">{enrichProgress.movies_done.toLocaleString()} / {enrichProgress.movies_total.toLocaleString()}{enrichProgress.movies_errors > 0 && ` (${enrichProgress.movies_errors} errors)`}{enrichProgress.movies_backoff_skipped > 0 && ` (${enrichProgress.movies_backoff_skipped} paused for backoff)`}</span>
                     </div>
                     <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-primary" style={{ width: `${mPct}%` }} /></div>
                   </div>
                   <div>
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-0.5">
                       <span>Series</span>
-                      <span className="tabular-nums">{enrichProgress.series_done.toLocaleString()} / {enrichProgress.series_total.toLocaleString()}{enrichProgress.series_errors > 0 && ` (${enrichProgress.series_errors} errors)`}</span>
+                      <span className="tabular-nums">{enrichProgress.series_done.toLocaleString()} / {enrichProgress.series_total.toLocaleString()}{enrichProgress.series_errors > 0 && ` (${enrichProgress.series_errors} errors)`}{enrichProgress.series_backoff_skipped > 0 && ` (${enrichProgress.series_backoff_skipped} paused for backoff)`}</span>
                     </div>
                     <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-primary" style={{ width: `${sPct}%` }} /></div>
                   </div>

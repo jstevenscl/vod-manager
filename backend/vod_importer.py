@@ -144,9 +144,79 @@ def parse_name_year(raw_name: str) -> tuple[str, int | None]:
     return name, year
 
 
+class ProviderBackoffError(Exception):
+    """Raised in place of an actual network call while a provider is under
+    an active backoff cooldown (see _PROVIDER_BACKOFF below) -- lets a
+    caller (bulk_enrich_all's per-item loop) skip the item cheaply, with no
+    request sent, instead of piling more load onto a provider that's
+    already shown signs of rate-limiting/blocking."""
+
+
+# Per-provider backoff state, keyed by provider_id: {"failures": int,
+# "until": float (time.time() timestamp, 0.0 if not currently backing off)}.
+# Real user report 2026-09-02: bulk enrich against a large catalog reliably
+# started throwing "Temporary failure in name resolution" (DNS-level, i.e.
+# the provider or the network path to it stopped responding at all) after a
+# sustained burst of requests, then 403s once it came back -- classic
+# provider-side throttling/blocking under load, not anything the app was
+# doing wrong per item. Bulk enrich has no per-provider rate limit of its
+# own (just a flat concurrency=8 semaphore shared across every source), so
+# once a provider starts rejecting/dropping connections, every one of those
+# 8 concurrent slots kept hammering it in lockstep instead of backing off --
+# maximizing exactly the load pattern that trips a provider's own rate
+# limiter, and guaranteeing every retry attempt (this run or the next) would
+# hit the exact same wall.
+_PROVIDER_BACKOFF: dict[int, dict] = {}
+_BACKOFF_FAILURE_THRESHOLD = 3
+_BACKOFF_BASE_SECONDS = 15.0
+_BACKOFF_MAX_SECONDS = 600.0
+# Status codes and exception types that indicate the PROVIDER itself is
+# throttling/blocking -- as opposed to e.g. a 404 for one missing/removed
+# item, which says nothing about the provider's overall health and would
+# otherwise trip the same backoff for every other item for no reason.
+_BACKOFF_STATUS_CODES = {403, 429, 503}
+_BACKOFF_EXCEPTION_TYPES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)
+
+
+def _provider_backoff_remaining(provider_id: int) -> float:
+    state = _PROVIDER_BACKOFF.get(provider_id)
+    if not state:
+        return 0.0
+    return max(0.0, state["until"] - time.time())
+
+
+def _record_provider_failure(provider_id: int, provider_name: str) -> None:
+    state = _PROVIDER_BACKOFF.setdefault(provider_id, {"failures": 0, "until": 0.0})
+    state["failures"] += 1
+    if state["failures"] >= _BACKOFF_FAILURE_THRESHOLD:
+        # Exponential in how many threshold-lengths of failures have piled
+        # up, so a provider that keeps failing through one cooldown gets a
+        # longer one next time instead of getting hammered again the moment
+        # the short cooldown expires.
+        tier = state["failures"] // _BACKOFF_FAILURE_THRESHOLD
+        delay = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2 ** (tier - 1)))
+        already_backing_off = _provider_backoff_remaining(provider_id) > 0
+        state["until"] = time.time() + delay
+        if not already_backing_off:
+            logger.warning(
+                "[vod_importer] provider=%s looks rate-limited/blocked (%d consecutive failures) -- "
+                "backing off enrichment requests to it for %.0fs",
+                provider_name, state["failures"], delay,
+            )
+
+
+def _record_provider_success(provider_id: int) -> None:
+    state = _PROVIDER_BACKOFF.get(provider_id)
+    if state and (state["failures"] or state["until"]):
+        logger.info("[vod_importer] provider=%s recovered -- clearing backoff", provider_id)
+    _PROVIDER_BACKOFF.pop(provider_id, None)
+
+
 class XCProviderClient:
     def __init__(self, provider: dict):
         self.provider = provider
+        self.provider_id = provider.get("id")
+        self.provider_name = provider.get("name") or str(self.provider_id)
         self.base_url = provider["base_url"].rstrip("/")
         self.username = provider["username"]
         self.password = provider["password"]
@@ -154,14 +224,33 @@ class XCProviderClient:
         self.headers = {"User-Agent": custom_ua} if custom_ua else _UPSTREAM_HEADERS
 
     async def _call(self, action: str | None = None, **params) -> object:
+        if self.provider_id is not None:
+            remaining = _provider_backoff_remaining(self.provider_id)
+            if remaining > 0:
+                raise ProviderBackoffError(
+                    f"provider={self.provider_name} is backing off for another {remaining:.0f}s (looked rate-limited/blocked)"
+                )
         query = {"username": self.username, "password": self.password}
         if action:
             query["action"] = action
         query.update(params)
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
-            r = await client.get(f"{self.base_url}/player_api.php", params=query)
-            r.raise_for_status()
-            return r.json()
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
+                r = await client.get(f"{self.base_url}/player_api.php", params=query)
+                r.raise_for_status()
+                result = r.json()
+        except _BACKOFF_EXCEPTION_TYPES:
+            if self.provider_id is not None:
+                _record_provider_failure(self.provider_id, self.provider_name)
+            raise
+        except httpx.HTTPStatusError as exc:
+            if self.provider_id is not None and exc.response.status_code in _BACKOFF_STATUS_CODES:
+                _record_provider_failure(self.provider_id, self.provider_name)
+            raise
+        else:
+            if self.provider_id is not None:
+                _record_provider_success(self.provider_id)
+            return result
 
     async def auth(self) -> dict:
         return await self._call()
@@ -606,14 +695,24 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
 
 _ENRICH_PROGRESS: dict = {
     "running": False,
-    "movies_total": 0, "movies_done": 0, "movies_errors": 0,
-    "series_total": 0, "series_done": 0, "series_errors": 0,
+    "movies_total": 0, "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
+    "series_total": 0, "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
     "started_at": None, "finished_at": None,
 }
 
 
 def get_enrich_progress() -> dict:
-    return dict(_ENRICH_PROGRESS)
+    progress = dict(_ENRICH_PROGRESS)
+    # Surfaces which provider(s), if any, enrichment is currently backing off
+    # from and for how much longer -- otherwise a stalled-looking done-count
+    # (see _record_provider_failure's docstring) has no visible explanation
+    # in the UI beyond "it's slow".
+    progress["providers_backing_off"] = [
+        {"provider_id": pid, "seconds_remaining": round(remaining, 1)}
+        for pid, remaining in ((pid, _provider_backoff_remaining(pid)) for pid in list(_PROVIDER_BACKOFF))
+        if remaining > 0
+    ]
+    return progress
 
 
 _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralizes to itself, not "seriess"
@@ -627,6 +726,14 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
                 await enrich_movie(item_id, force=force)
             else:
                 await enrich_series(item_id, force=force)
+        except ProviderBackoffError:
+            # Not a real failure -- deliberately skipped, no request sent,
+            # because that item's provider is already known to be
+            # rate-limited/blocked right now (see _record_provider_failure).
+            # Doesn't touch last_enriched_at, so this item stays eligible
+            # and gets picked up again on the next bulk-enrich run (or later
+            # in this same run, once the provider's backoff expires).
+            _ENRICH_PROGRESS[f"{prefix}_backoff_skipped"] += 1
         except Exception as exc:
             logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, exc)
             _ENRICH_PROGRESS[f"{prefix}_errors"] += 1
@@ -656,8 +763,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     series_ids = await asyncio.to_thread(vod_db.list_all_series_ids)
     _ENRICH_PROGRESS.update({
         "running": True,
-        "movies_total": len(movie_ids), "movies_done": 0, "movies_errors": 0,
-        "series_total": len(series_ids), "series_done": 0, "series_errors": 0,
+        "movies_total": len(movie_ids), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
+        "series_total": len(series_ids), "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
         "started_at": time.time(), "finished_at": None,
     })
     logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, concurrency=%d",
@@ -684,10 +791,13 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         _ENRICH_PROGRESS["finished_at"] = time.time()
         elapsed = _ENRICH_PROGRESS["finished_at"] - _ENRICH_PROGRESS["started_at"]
         logger.info(
-            "[vod_importer] bulk enrich done in %.1fs: movies %d/%d (%d errors), series %d/%d (%d errors)",
+            "[vod_importer] bulk enrich done in %.1fs: movies %d/%d (%d errors, %d backoff-skipped), "
+            "series %d/%d (%d errors, %d backoff-skipped)",
             elapsed,
             _ENRICH_PROGRESS["movies_done"], _ENRICH_PROGRESS["movies_total"], _ENRICH_PROGRESS["movies_errors"],
+            _ENRICH_PROGRESS["movies_backoff_skipped"],
             _ENRICH_PROGRESS["series_done"], _ENRICH_PROGRESS["series_total"], _ENRICH_PROGRESS["series_errors"],
+            _ENRICH_PROGRESS["series_backoff_skipped"],
         )
 
 
