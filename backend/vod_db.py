@@ -3537,10 +3537,20 @@ def delete_xc_client(client_id: int) -> None:
 
 
 def record_xc_client_seen(client_id: int, ip: str) -> None:
-    conn = _connect()
-    conn.execute("UPDATE xc_clients SET last_seen_at=?, last_seen_ip=? WHERE id=?", (_now(), ip, client_id))
-    _commit_with_retry(conn)
-    conn.close()
+    """Runs under _WRITE_LOCK despite being a small, frequent write (unlike
+    most of that lock's other exemptions -- see its docstring) because every
+    single authenticated hit on xc_server.py calls this, including the
+    catalog-metadata endpoints real XC clients (Dispatcharr) poll heavily
+    during a refresh. Confirmed live 2026-09-04: an in-progress merge_series
+    (which does hold _WRITE_LOCK) collided with this unlocked write, raised
+    'database is locked' past sqlite3's own busy_timeout, and surfaced as an
+    unhandled 500 on a completely unrelated Dispatcharr get_series_info call
+    -- exactly the write-starvation failure mode _WRITE_LOCK exists to avoid."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute("UPDATE xc_clients SET last_seen_at=?, last_seen_ip=? WHERE id=?", (_now(), ip, client_id))
+        _commit_with_retry(conn)
+        conn.close()
 
 
 # ── Dispatcharr connections ─────────────────────────────────────────────────

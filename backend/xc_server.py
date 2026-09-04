@@ -24,6 +24,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import tempfile
 import time
 
@@ -469,6 +470,22 @@ async def player_api(request: Request):
     action   = request.query_params.get("action")
     username = request.query_params.get("username", "")
     password = request.query_params.get("password", "")
+    try:
+        return await _player_api_response(action, username, password, request)
+    except sqlite3.OperationalError as exc:
+        # Safety net on top of record_xc_client_seen's own _WRITE_LOCK fix --
+        # any other read/write on this hot path (list_enabled_xc_clients,
+        # get_series_export_row_by_export_id, ...) could still, in principle,
+        # lose SQLite's busy-handler race under heavy concurrent writes. A
+        # bare 500 here reads to Dispatcharr as "this account is broken" and
+        # can knock a whole M3U/VOD account into an error state; 503 reads as
+        # transient, which is what this actually is -- see record_xc_client_
+        # seen's docstring for the incident that prompted both fixes.
+        logger.warning("[xc_server] action=%s hit a transient DB error, returning 503: %s", action, exc)
+        return Response(status_code=503, content="Temporarily unavailable")
+
+
+async def _player_api_response(action: str | None, username: str, password: str, request: Request):
     authenticated = await _authenticate(username, password, request)
     now = int(time.time())
 
