@@ -25,8 +25,10 @@ concise technical reference for people already up and running.
   an Emby/Jellyfin server
 - One or more Dispatcharr instances to pull the resulting catalog into
 - A free [TMDB](https://www.themoviedb.org/settings/api) API key (v3 auth)
-  — used for enrichment, the year-review/missing-artwork disambiguation
-  flows, and TMDB List sync; not required for basic operation
+  — used for enrichment (once a movie/series has a known TMDB id, its detail
+  refreshes straight from TMDB instead of your provider, easing load on any
+  provider that rate-limits aggressively), the year-review/missing-artwork
+  disambiguation flows, and TMDB List sync; not required for basic operation
 - Optional: an API key from Anthropic, OpenAI, and/or Google (Gemini) for
   the AI-assisted features (any one is enough; more than one lets you
   switch providers without re-entering a key)

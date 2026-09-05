@@ -979,6 +979,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # so this is a separate on/off switch, not another entry in that
         # list. See vod_importer._should_auto_archive.
         ("providers", "import_exclude_uncategorized", "INTEGER NOT NULL DEFAULT 0"),
+        # The provider's own "last_modified" for this series, as reported by
+        # the cheap bulk get_series list call (refreshed on every catalog
+        # sync) -- lets enrich_series tell "this series' episodes might have
+        # changed" apart from "nothing's changed, don't bother calling
+        # get_series_info again" without needing a blind TTL. See
+        # episodes_synced_last_modified below for the other half of that
+        # comparison.
+        ("series", "provider_last_modified", "TEXT"),
+        # Snapshot of provider_last_modified as of the last time episodes
+        # were actually (re)fetched via get_series_info. NULL until the first
+        # successful episode fetch. series_needs_enrichment compares this
+        # against the current provider_last_modified (kept fresh by every
+        # bulk import) to skip the expensive per-series provider call
+        # entirely once a series' episodes are already known and the
+        # provider hasn't reported any change since.
+        ("series", "episodes_synced_last_modified", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5271,7 +5287,22 @@ def get_series_by_name_year(name: str, year: int | None) -> dict | None:
 
 def series_needs_enrichment(series_id: int) -> bool:
     series = get_series(series_id)
-    return bool(series) and _is_stale(series.get("last_enriched_at"))
+    if not series:
+        return False
+    # Detail metadata is now captured for free on every bulk import (see
+    # bulk_import_series) for any provider that sends it, so the only thing
+    # left for enrich_series to actually do is discover episodes via
+    # get_series_info -- gate on the provider's own last_modified instead of
+    # a blind TTL wherever it's available: only worth that call again if
+    # episodes have never been fetched, or the provider says something
+    # changed since the last time they were.
+    provider_lm = series.get("provider_last_modified")
+    if provider_lm:
+        return series.get("episodes_synced_last_modified") != provider_lm
+    # Provider doesn't send last_modified at all -- fall back to the
+    # original TTL-based staleness check, same behavior as before this
+    # existed.
+    return _is_stale(series.get("last_enriched_at"))
 
 
 def set_series_enrichment(series_id: int, **fields) -> None:
@@ -5809,7 +5840,11 @@ def _looks_adult(*category_names) -> bool:
 
 
 def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
-    """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...]
+    """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...],
+    optionally carrying tmdb_id -- some providers' bulk get_vod_streams list
+    already includes it (unlike genre/cast/plot, which never appear there;
+    see bulk_import_series's identical-but-richer capture for series). Only
+    ever upgrades via COALESCE, never overwrites an id already known.
 
     Adult-content auto-detection runs on every import pass (not just first
     creation) so a provider re-categorizing something later still gets
@@ -6001,6 +6036,23 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             movie_id = cur.lastrowid
                             did_create = True
                             did_archive = should_archive
+                    if item.get("tmdb_id"):
+                        # Some providers' bulk get_vod_streams list already
+                        # includes "tmdb" (confirmed live 2026-09-05: 3 of 5
+                        # real providers) -- capturing it here means
+                        # enrich_movie's TMDB-first fallback (see its
+                        # docstring) can apply from this movie's very FIRST
+                        # enrichment pass, not just its second, skipping the
+                        # provider's get_vod_info call entirely instead of
+                        # needing one just to discover the id. Upgrade-only
+                        # (COALESCE): a provider that omits this field on one
+                        # pass must never erase an id already captured (by
+                        # this, a prior enrichment, or a Duplicate Finder
+                        # merge) on an earlier one.
+                        conn.execute(
+                            "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
+                            (item["tmdb_id"], movie_id),
+                        )
                     conn.execute(
                         """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, added_at, last_seen_at)
                            VALUES (?,?,?,?,?,?,?,?)
@@ -6073,13 +6125,26 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
 
 
 def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
-    """items: [{name, year, provider_series_id, provider_category_name}, ...]
+    """items: [{name, year, provider_series_id, provider_category_name}, ...],
+    optionally carrying genre/description/cast_list/director/poster_url/
+    rating/release_date/tmdb_id/provider_last_modified plus a truthy
+    "_has_detail" flag -- most real XC panels' bulk get_series list already
+    includes all of that (confirmed live 2026-09-05 against 5 of 6 real
+    providers), so vod_importer captures it here for free instead of paying
+    a separate get_series_info call per series just to re-fetch the same
+    fields. tmdb_id only ever upgrades via COALESCE, same reasoning as
+    _plex_detail_update_sql's identical choice. _has_detail gates the write
+    so a caller that doesn't pass these keys (or a provider that sent none
+    of them) never overwrites existing good values with NULLs.
 
     Series-level only (XC series don't carry a directly-playable stream_id —
-    only their episodes do, which are fetched lazily via get_series_info,
-    same as detail enrichment). import_provider_id/import_provider_series_id
-    are stamped so enrich_series() can call straight back to the right
-    provider instead of re-scanning every provider for a name match."""
+    only their episodes do, which are still only ever discoverable via
+    get_series_info -- see provider_last_modified/episodes_synced_last_
+    modified's migration comment for how enrich_series now decides whether
+    that per-series call is still needed). import_provider_id/
+    import_provider_series_id are stamped so enrich_series() can call
+    straight back to the right provider instead of re-scanning every
+    provider for a name match."""
     _WRITE_LOCK.acquire()
     try:
         conn = _connect()
@@ -6104,6 +6169,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     # comment -- folded into the real counters only after this item's
                     # last statement has actually succeeded.
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
+                    series_id_for_detail = None
                     # Primary match: this exact provider+series_id was already
                     # imported before -- reuse its established identity directly,
                     # UNCONDITIONALLY (not just for a blank name), same reasoning
@@ -6118,6 +6184,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     ).fetchone()
                     if existing:
                         did_match = True
+                        series_id_for_detail = existing["id"]
                         # Real bug found live 2026-07-29: this value was captured
                         # in `item` on every single import pass but never
                         # actually written anywhere -- episode_sources.
@@ -6154,13 +6221,14 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # found no established row for this provider+series_id, so this
                         # is a genuinely new item.
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
-                        conn.execute(
+                        cur = conn.execute(
                             "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                         )
                         did_create = True
                         did_flag = True
                         did_archive = should_archive
+                        series_id_for_detail = cur.lastrowid
                     else:
                         row = conn.execute(
                             "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id FROM series WHERE name=? AND year IS ?",
@@ -6168,6 +6236,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         ).fetchone()
                         if row:
                             did_match = True
+                            series_id_for_detail = row["id"]
                             # See the identical comment on the existing-identity
                             # match branch above -- same fix, same reasoning.
                             conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), row["id"]))
@@ -6200,6 +6269,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             ).fetchall()
                             if len(candidates) == 1:
                                 did_match = True
+                                series_id_for_detail = candidates[0]["id"]
                                 conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), candidates[0]["id"]))
                                 if candidates[0]["import_provider_id"] is None:
                                     conn.execute(
@@ -6217,7 +6287,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (candidates[0]["id"],))
                                     did_unarchive = True
                             else:
-                                conn.execute(
+                                cur = conn.execute(
                                     "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                     (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                                 )
@@ -6225,13 +6295,26 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 did_archive = should_archive
                                 if candidates:
                                     did_flag = True
+                                series_id_for_detail = cur.lastrowid
                         else:
-                            conn.execute(
+                            cur = conn.execute(
                                 "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                                 (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
                             )
                             did_create = True
                             did_archive = should_archive
+                            series_id_for_detail = cur.lastrowid
+                    if series_id_for_detail is not None and item.get("_has_detail"):
+                        conn.execute(
+                            "UPDATE series SET genre=?, description=?, cast_list=?, director=?, poster_url=?, "
+                            "rating=?, release_date=?, provider_last_modified=?, tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
+                            (
+                                item.get("genre"), item.get("description"), item.get("cast_list"),
+                                item.get("director"), item.get("poster_url"), item.get("rating"),
+                                item.get("release_date"), item.get("provider_last_modified"),
+                                item.get("tmdb_id"), series_id_for_detail,
+                            ),
+                        )
                     created += did_create
                     matched += did_match
                     flagged += did_flag

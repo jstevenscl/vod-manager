@@ -20,7 +20,9 @@ import httpx
 
 import config
 import emby_vod_client
+import tmdb_sync
 import vod_db
+from xc_server import _redact_upstream_url
 
 
 def _should_auto_archive(
@@ -122,6 +124,18 @@ def _coerce_year(value) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _clean_tmdb_id(value) -> str | None:
+    """Real user data found live 2026-09-05: at least one provider sends
+    tmdb="0" as its own "no id known" sentinel rather than omitting the
+    field -- a plain `value or None` check treats the non-empty string "0"
+    as truthy, so that sentinel was getting stored as a real tmdb_id (149 of
+    ~11k series in one real pool). Every tmdb_id extraction site should run
+    through this instead of a bare truthiness check."""
+    if value in (None, "", 0, "0"):
+        return None
+    return str(value)
 
 
 def parse_name_year(raw_name: str) -> tuple[str, int | None]:
@@ -421,12 +435,30 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
             "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            # Some providers' bulk get_vod_streams list already includes
+            # this (confirmed live 2026-09-05: 3 of 5 real providers) --
+            # capturing it lets enrich_movie's TMDB-first fallback kick in
+            # from this movie's very first enrichment pass. No genre/cast/
+            # plot in this endpoint though (unlike get_series), so nothing
+            # else is worth capturing here.
+            "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
     logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
 
     series_list = await client.get_series()
     series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+    # Most real XC panels' bulk get_series list already carries the same
+    # detail fields enrich_series would otherwise pay a separate
+    # get_series_info call per series to fetch (confirmed live 2026-09-05
+    # against 5 of 6 real providers: plot, cast, director, genre, cover,
+    # rating, tmdb all present). Rules fetched once here, not per item --
+    # same reasoning as series_name_rules above, just extended to every
+    # field bulk_import_series can now capture for free.
+    detail_rules = {
+        field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
+        for field in ("genre", "description", "cast_list", "director")
+    }
     series_items = []
     for s in series_list:
         name, year = parse_name_year(s.get("name") or "")
@@ -442,6 +474,18 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
             "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "_has_detail": True,
+            "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
+            "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
+            "cast_list": vod_db.apply_rules_to_value(s.get("cast") or None, detail_rules["cast_list"]),
+            "director": vod_db.apply_rules_to_value(s.get("director") or None, detail_rules["director"]),
+            "poster_url": s.get("cover") or None,
+            "rating": s.get("rating") or None,
+            "release_date": s.get("releaseDate") or s.get("release_date") or None,
+            # Some providers send this under "tmdb", not "tmdb_id" -- see
+            # enrich_series's identical comment for why both need checking.
+            "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
+            "provider_last_modified": s.get("last_modified") or None,
         })
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
@@ -601,6 +645,43 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
         )
         return True
 
+    # If this movie already carries a confirmed tmdb_id (set by a previous
+    # provider enrichment, or backfilled via Duplicate Finder's merge flow),
+    # prefer TMDB directly over the provider -- same detail fields, but
+    # against TMDB's own rate limit instead of this provider account's,
+    # which is what bulk_enrich_all's backoff/adaptive-concurrency machinery
+    # exists to protect. Only bitrate is skipped this way, since that's
+    # per-SOURCE and only the provider's get_vod_info call can supply it.
+    movie_row = await asyncio.to_thread(vod_db.get_movie, movie_id)
+    existing_tmdb_id = movie_row.get("tmdb_id") if movie_row else None
+    if existing_tmdb_id:
+        tmdb_detail = await tmdb_sync.get_movie_full_details(existing_tmdb_id)
+        if tmdb_detail:
+            name_fields = {}
+            if tmdb_detail.get("name"):
+                name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+                name_fields["name"] = vod_db.apply_rules_to_value(tmdb_detail["name"], name_rules)
+            await asyncio.to_thread(
+                vod_db.set_movie_enrichment,
+                movie_id,
+                **name_fields,
+                **_apply_field_rules("movie", {
+                    "genre": tmdb_detail.get("genre"),
+                    "description": tmdb_detail.get("description"),
+                    "cast_list": tmdb_detail.get("cast_list"),
+                    "director": tmdb_detail.get("director"),
+                    "country": tmdb_detail.get("country"),
+                }),
+                tmdb_id=existing_tmdb_id,
+                poster_url=tmdb_detail.get("poster_url"),
+                duration_secs=tmdb_detail.get("duration_secs"),
+                rating=tmdb_detail.get("rating"),
+                release_date=tmdb_detail.get("release_date"),
+            )
+            return True
+        # TMDB lookup failed (no API key configured, bad id, TMDB down) --
+        # fall through to the provider so this movie still gets enriched.
+
     client = XCProviderClient(provider)
 
     info = _as_dict(await client.get_vod_info(source["provider_stream_id"]))
@@ -632,7 +713,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
             "director": detail.get("director") or None,
             "country": detail.get("country") or None,
         }),
-        tmdb_id=detail.get("tmdb_id") or None,
+        tmdb_id=_clean_tmdb_id(detail.get("tmdb_id")),
         poster_url=detail.get("cover_big") or detail.get("movie_image") or None,
         duration_secs=detail.get("duration_secs") or None,
         # rating/release_date not run through _apply_field_rules -- those
@@ -651,9 +732,14 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
 
 
 async def enrich_series(series_id: int, *, force: bool = False) -> dict:
-    """Fetch get_series_info — this is also where episodes come from (the
-    bulk get_series list is series-metadata-only, no episodes), so this call
-    is load-bearing even just to populate episodes, not only for detail.
+    """Fetch get_series_info -- this is the only source of episodes (most
+    real XC panels' bulk get_series list already carries full series detail,
+    see bulk_import_series, but never episodes), so this call is
+    load-bearing even for a series whose detail fields are already fresh
+    from the last bulk import. series_needs_enrichment gates this on the
+    provider's own last_modified where available, not a blind TTL -- see its
+    docstring -- so this mostly only actually runs for a series that's
+    genuinely new or has reported a change.
 
     Returns {"fetched": bool, "reason": str | None} rather than a bare bool
     -- every False outcome used to look identical (nothing happened, no
@@ -719,10 +805,14 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         # (unlike its own movie endpoint, which does use "tmdb_id") -- check
         # both since key naming isn't consistent even within one provider,
         # let alone across others.
-        tmdb_id=detail.get("tmdb") or detail.get("tmdb_id") or None,
+        tmdb_id=_clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id")),
         poster_url=detail.get("cover") or None,
         rating=detail.get("rating") or None,
         release_date=detail.get("releasedate") or None,
+        # Snapshot of what bulk_import_series last saw for this series --
+        # series_needs_enrichment compares the two on the next pass to know
+        # whether this (expensive, per-series) call is worth making again.
+        episodes_synced_last_modified=series.get("provider_last_modified"),
     )
 
     # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
@@ -824,7 +914,15 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
             # in this same run, once the provider's backoff expires).
             _ENRICH_PROGRESS[f"{prefix}_backoff_skipped"] += 1
         except Exception as exc:
-            logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, exc)
+            # httpx.HTTPStatusError/ConnectError's own str() embeds the full
+            # request URL -- real, working provider credentials included --
+            # so this must go through the same redaction xc_server already
+            # uses for stream URLs, or a paid-subscription login lands in
+            # plaintext in container logs on every single failed lookup
+            # (real user log 2026-09-05: hundreds of these per bulk-enrich
+            # run, one per 404/429). tmdb_sync._redact is this same fix for
+            # TMDB's own api_key query param.
+            logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, _redact_upstream_url(str(exc)))
             _ENRICH_PROGRESS[f"{prefix}_errors"] += 1
         finally:
             _ENRICH_PROGRESS[f"{prefix}_done"] += 1

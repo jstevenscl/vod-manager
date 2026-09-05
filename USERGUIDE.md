@@ -1051,28 +1051,50 @@ first.
 
 ### Rich Metadata (enrichment)
 
-Fetches detail — genre, poster, description, cast — from each item's own
-source provider for every movie and series in the pool (**Curation &
-Maintenance** tab). Runs in the background; safe to navigate away while it
-works.
+Fetches detail — genre, poster, description, cast — for every movie and
+series in the pool (**Curation & Maintenance** tab). Runs in the
+background; safe to navigate away while it works. Where that detail
+actually comes from depends on what's already known:
+
+- **Series** — most detail (genre, cast, director, poster, rating, TMDB id)
+  is captured for free during the regular **catalog refresh** itself,
+  before enrichment ever runs, for any provider whose catalog listing
+  includes it (most do). What's left for enrichment is discovering
+  episodes, which still needs one call per series to that series' own
+  provider — but only when the provider reports something's actually
+  changed, or episodes have never been fetched at all, not on a blind
+  schedule. A series with nothing new since its last check is skipped even
+  past the Enrichment TTL.
+- **Movies** — once a movie has a known TMDB id (captured at catalog-refresh
+  time if the provider includes it, or from a prior enrichment pass),
+  enrichment fetches its detail straight from TMDB instead of the provider
+  — same fields, but against TMDB's own rate limit rather than your
+  provider account's. A movie with no TMDB id yet still goes to its
+  provider once to discover one.
+
+This matters most if you run providers with aggressive rate limits:
+enrichment now makes far fewer provider requests overall, since most series
+metadata and any movie with a known TMDB id never touch the provider at
+all.
 
 - **Bulk Enrich All** — enriches everything that hasn't been enriched yet,
   or has aged past the **Enrichment TTL** (Configuration → Refresh
   Schedule), skipping anything still fresh.
-- **Force Re-Enrich All** — re-fetches every movie/series from its provider
-  regardless of freshness, ignoring the TTL entirely. Use this once after
-  an update adds a new field it captures (e.g. rating, release date,
-  bitrate), so existing items backfill it right away instead of waiting
-  out the normal freshness window.
+- **Force Re-Enrich All** — re-fetches every movie/series regardless of
+  freshness, ignoring the TTL entirely. Use this once after an update adds
+  a new field it captures (e.g. rating, release date, bitrate), so existing
+  items backfill it right away instead of waiting out the normal freshness
+  window.
 - Progress tracks movies and series separately, each with its own running
   error count — a nonzero count usually means a source's own API rejected
   or timed out on some items, not that the whole run failed.
 - If a provider starts throwing connection failures or 403/429/503
-  responses, enrichment automatically **backs off just that provider**
-  (an amber banner names it and shows the remaining cooldown) instead of
-  continuing to hammer it — other providers keep enriching at full speed.
-  Items skipped this way aren't errors and aren't lost; they're retried
-  automatically once the cooldown ends or on the next run.
+  responses on a request that still needs to reach it, enrichment
+  automatically **backs off just that provider** (an amber banner names it
+  and shows the remaining cooldown) instead of continuing to hammer it —
+  other providers keep enriching at full speed. Items skipped this way
+  aren't errors and aren't lost; they're retried automatically once the
+  cooldown ends or on the next run.
 - Even short of a full backoff, each provider's own share of concurrent
   requests **adapts automatically** to how it's actually responding: a
   provider starts at full concurrency, narrows itself the moment it shows

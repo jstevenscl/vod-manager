@@ -253,6 +253,52 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
     return dict(results)
 
 
+async def get_movie_full_details(tmdb_id: str) -> dict | None:
+    """Full detail fields for one movie by TMDB id, shaped to match what
+    vod_importer.enrich_movie fills in from a provider's get_vod_info (genre,
+    description, cast_list, director, country, poster_url, duration_secs,
+    rating, release_date) -- lets enrich_movie skip the provider entirely
+    once a movie already carries a confirmed tmdb_id, trading the provider's
+    own per-account rate limit for TMDB's (much higher, and not shared with
+    anything else this app does against that provider). Returns None on any
+    failure (bad id, TMDB down, no API key) so the caller can fall back to
+    the provider rather than leaving the movie unenriched."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        try:
+            r = await client.get(
+                f"{_API_BASE}/movie/{tmdb_id}",
+                params={"api_key": api_key, "append_to_response": "credits"},
+            )
+            r.raise_for_status()
+        except Exception as exc:
+            logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+            return None
+        data = r.json()
+
+    director = next(
+        (c["name"] for c in data.get("credits", {}).get("crew", []) if c.get("job") == "Director"),
+        None,
+    )
+    cast = [c["name"] for c in data.get("credits", {}).get("cast", [])[:10]]
+    runtime = data.get("runtime")
+    return {
+        "name": data.get("title") or None,
+        "genre": ", ".join(g["name"] for g in data.get("genres", [])) or None,
+        "description": data.get("overview") or None,
+        "cast_list": ", ".join(cast) or None,
+        "director": director,
+        "country": ", ".join(c["name"] for c in data.get("production_countries", [])) or None,
+        "poster_url": f"https://image.tmdb.org/t/p/w500{data['poster_path']}" if data.get("poster_path") else None,
+        "duration_secs": runtime * 60 if runtime else None,
+        "rating": data.get("vote_average") or None,
+        "release_date": data.get("release_date") or None,
+    }
+
+
 def _parse_sync_source(sync_source: str) -> tuple[str, str] | None:
     if not sync_source or ":" not in sync_source:
         return None
