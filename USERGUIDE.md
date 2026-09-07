@@ -906,6 +906,10 @@ each with a **list** or **grid** (poster wall) mode.
   instead of staying confirmed-wrong. Note this can't undo a merge that
   already happened from a bad match (see *Use TMDB title* above) — that
   needs a Backup & Restore snapshot taken before the merge.
+- **Set TMDB id** — appears next to *Clear TMDB match*. For when you
+  already know the correct TMDB id (e.g. from browsing TMDB directly) and
+  don't need to go through a search — type the id and it's set directly,
+  same as if a search+match had confirmed it.
 - **Revert to this** — every source records the provider's *original* name
   at import time even after a Title & Metadata Rule cleans it up for
   display. If a source's captured original name differs from the item's
@@ -991,6 +995,34 @@ As with any source removal, **Remove all** can delete an episode (or, if
 that provider was the only one covering it, the whole show) if nothing else
 was serving it — the confirmation prompt warns before you commit.
 
+### Editing an episode's name or number
+
+A provider occasionally sends a wrong or blank episode name, or gets the
+season/episode number wrong — every episode's own detail view has an inline
+edit for both, same idea as the movie/series-level *Rename / fix year*
+above but scoped to just that one episode.
+
+### Flagging wrong content
+
+Every movie, series, episode, and individual source has a **flag** icon —
+use it to report "this isn't actually what its label says" when playback or
+browsing turns up something that doesn't match its title (a provider
+mislabeling, a bad TMDB match that slipped through, or a source that's
+actually a different cut/language than what it claims). Flagging asks for a
+short reason, which shows up alongside the flag everywhere it's visible.
+
+**Curation & Maintenance → Flagged Content** lists everything flagged
+across the whole catalog in one place, so you don't have to remember which
+item you flagged or go hunting for it again. Resolving a flag there just
+clears it — it doesn't fix anything on its own, since a mismatch can mean
+different things (a name that needs correcting, a TMDB match that needs
+clearing and redoing, or a specific source that needs moving/removing). Fix
+the actual problem from the item's own detail view first (the tools in this
+section — rename, *Clear TMDB match*, *Move to a different movie/episode*,
+*Remove source* — cover all of those), then clear the flag once it's done.
+
+![Flagged Content queue](docs/screenshots/flagged-content-queue.jpg)
+
 ---
 
 ## 10. AI-assisted features
@@ -1000,7 +1032,7 @@ the AI-assisted features — configure one or more under **Configuration →
 API Keys**, then pick which one is active. Switching providers later is
 just a click; nothing else about the features changes.
 
-![Multi-provider AI configuration](docs/screenshots/configuration-api-keys-security.png)
+![Multi-provider AI configuration, with TMDB and MDBList keys above it](docs/screenshots/configuration-api-keys-mdblist.jpg)
 
 None of these ever apply anything automatically — every one is a suggestion
 you still review and confirm yourself:
@@ -1019,6 +1051,22 @@ you still review and confirm yourself:
   correct match among the real TMDB search candidates already shown, with
   its reasoning and a confidence level. You still click a candidate
   yourself to apply it.
+- **Bulk resolve with AI** (Needs Review, Missing Artwork, Duplicate
+  Finder) — select several items (or, in Duplicate Finder, work through a
+  page of candidate groups) and run the same judgment as *Ask AI* above
+  over all of them as one background job, instead of clicking through one
+  at a time. A fix is only ever applied when the AI reports **high**
+  confidence; anything medium, low, or with no confident match is left
+  completely untouched, with the AI's reasoning shown so you know why it
+  was skipped. A progress summary (`N resolved · M skipped · E errors`)
+  appears once the job finishes, with an expandable per-item detail list.
+  Duplicate Finder's version is a little different: a group whose
+  candidates already agree on one TMDB id merges immediately with no AI
+  call at all (that agreement is already stronger proof than an AI guess),
+  the AI is only asked to judge genre/plot when a group has **no** shared
+  TMDB id, and a group with a genuine **conflicting** TMDB id is never
+  merged no matter what the AI says — the same conflict rule the manual
+  merge flow already uses.
 
 **Ask AI stays greyed out until at least one TMDB candidate is shown to
 choose among** — it picks from that list, it doesn't search TMDB itself.
@@ -1242,6 +1290,22 @@ badge) — a candidate whose year *doesn't* match is never trusted here.
 **Trust TMDB for these too** merges this second tier in one click, same as
 the confirmed batch.
 
+**Bulk resolve this page with AI** goes further still, for the groups
+neither of the above can touch — a group with **no** shared TMDB id at all,
+where a human would normally have to eyeball genre/plot to tell a real
+duplicate from a coincidental name+year collision (a remake, an unrelated
+title). The AI is only asked to judge those; a group that already agrees on
+one TMDB id merges immediately with no AI call needed, and a group with a
+genuine conflicting TMDB id is never merged regardless of what the AI says
+— same rules as the tiers above, just extended to cover what they can't.
+Scoped to the current page (not the whole scan) since each group judged
+this way is a real AI call. See [§10](#10-ai-assisted-features) for the
+full bulk-resolve behavior shared with Needs Review and Missing Artwork.
+
+Each candidate also has its own **flag** icon to report "this isn't
+actually the same title" directly from the group, without leaving Duplicate
+Finder — see [Flagging wrong content](#flagging-wrong-content) in §9.
+
 ![Orphan Checker, Duplicate Finder, and TMDB Lists](docs/screenshots/curation-tools.png)
 ![Duplicate Finder with TMDB-confirmed matches](docs/screenshots/duplicate-finder.png)
 
@@ -1268,26 +1332,59 @@ than investigating one at a time.
 ## 12. TMDB integration
 
 A free [TMDB API key](https://www.themoviedb.org/settings/api) (v3 auth)
-under Configuration → API Keys unlocks:
+under Configuration → API Keys unlocks real TMDB search for the Needs
+Review and Missing Artwork flows above, plus two ways to auto-populate
+categories from a public list — both only ever place items already present
+in your pool; neither pulls in anything new.
 
-- Real TMDB search for the Needs Review and Missing Artwork flows above
 - **TMDB Lists** (Curation & Maintenance) — link a public TMDB List (a
-  personal watchlist, or a well-known curated list like IMDB's Top 250, for
-  example) to auto-populate a category. A list can contain both movies and
-  shows, so linking one creates a paired movie category and series category
-  — kept separate since Dispatcharr's movie and TV catalogs are different
-  endpoints. Only items already present in your pool ever get placed; this
-  organizes existing content, it doesn't pull in anything new. Matching
-  first tries each list entry's own TMDB id against your pool directly, then
-  falls back to a forgiving title+year match (tolerating a provider
-  mislabeling a release year by one) for pool items that don't have a
-  confirmed TMDB id yet — a real hit backfills the id, so the match is
-  instant on the next sync. Without this fallback, a list only ever matched
-  the handful of items a provider happened to tag with their own TMDB id at
-  import time, which is why a large curated list used to place almost
-  nothing. The full list is fetched regardless of size — a list with
-  hundreds of entries (e.g. IMDB's Top 250) is no longer capped at the
-  first page TMDB returns.
+  personal watchlist, or a well-known curated list like IMDB's Top 250) to
+  create a **new** category pair from it in one step. A list can contain
+  both movies and shows, so linking one creates a paired movie category and
+  series category — kept separate since Dispatcharr's movie and TV catalogs
+  are different endpoints. This is the quick path for "I don't have a
+  category for this list yet."
+- **List Sync** (Manage Categories → the list icon on any category) is the
+  more general version — attach one or more list sources, of either kind,
+  to **any existing category**, movie or series. Mix sources freely on the
+  same category (e.g. a TMDB List and an MDBList list both feeding one
+  "Top Horror" category); the same title appearing on more than one linked
+  source is naturally deduplicated, never placed twice. A free
+  [MDBList API key](https://mdblist.com) (Configuration → API Keys) unlocks
+  MDBList as a second source kind, alongside TMDB Lists.
+
+![Multi-source List Sync on a category, with the Add only / Mirror mode picker](docs/screenshots/category-list-sync-mirror-mode.jpg)
+
+Both matching engines work the same way: each list entry's own TMDB id is
+tried against your pool directly, falling back to a forgiving title+year
+match (tolerating a provider mislabeling a release year by one) for pool
+items that don't have a confirmed TMDB id yet — a real hit backfills the
+id, so the match is instant on the next sync. Without this fallback, a list
+only ever matched the handful of items a provider happened to tag with
+their own TMDB id at import time, which is why a large curated list used to
+place almost nothing. The full list is fetched regardless of size — a list
+with hundreds of entries (e.g. IMDB's Top 250) is never capped at the first
+page a provider's API returns.
+
+**List Sync's two sync modes** (per category, next to its sources):
+
+- **Add only** (default) — a hand-curated category (e.g. "Halloween -
+  Kids") that you also want to top up from a public list. Nothing already
+  placed is ever removed just because it fell off a list — only new matches
+  get added.
+- **Mirror (also removes)** — the category becomes an exact reflection of
+  its linked source(s): anything previously placed by List Sync that's no
+  longer on **any** linked list gets removed on the next sync. Built for a
+  cycling list (a "Top 100" that changes week to week) where you want the
+  category to track it exactly, not just accumulate everything it's ever
+  contained. Skipped for that one sync pass if any linked source's fetch
+  fails (rate limit, network hiccup, the list host briefly down) — a
+  transient failure never gets treated as "everything not just
+  reconfirmed is gone."
+
+A manual **Sync now** on the category runs immediately; **Configuration →
+Refresh Schedule → List Sync** controls how often it happens automatically
+(off by default).
 
 ---
 

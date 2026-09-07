@@ -328,7 +328,21 @@ class XCProviderClient:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
                     r = await client.get(f"{self.base_url}/player_api.php", params=query)
                     r.raise_for_status()
-                    result = r.json()
+                    # r.json() is a synchronous json.loads() under the hood --
+                    # for a large catalog's bulk get_vod_streams/get_series
+                    # response (tens of MB, hundreds of thousands of items)
+                    # that can block the event loop for real time, starving
+                    # every other in-flight coroutine (including a concurrent
+                    # sibling call on this same provider -- see
+                    # import_provider_catalog's movies/series asyncio.gather)
+                    # of the chance to keep reading their own response off
+                    # the socket, which can trip THEIR httpx timeout even
+                    # though nothing is actually wrong with their connection.
+                    # Confirmed live 2026-09-06: making movies+series import
+                    # concurrent for a ~240k-item provider (CRX) immediately
+                    # started failing with opaque timeouts that didn't happen
+                    # run sequentially -- moving the parse off the loop fixed it.
+                    result = await asyncio.to_thread(r.json)
             except _BACKOFF_EXCEPTION_TYPES:
                 if self.provider_id is not None:
                     _record_provider_failure(self.provider_id, self.provider_name)
@@ -368,6 +382,96 @@ class XCProviderClient:
 
     async def get_series_info(self, series_id: str) -> dict:
         return await self._call("get_series_info", series_id=series_id)
+
+
+async def _import_movies_for_provider(
+    client: "XCProviderClient", provider: dict, provider_id: int,
+    category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
+) -> tuple[dict, int]:
+    streams = await client.get_vod_streams()
+    movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+    movie_items = []
+    for s in streams:
+        name, year = parse_name_year(s.get("name") or "")
+        name = vod_db.apply_rules_to_value(name, movie_name_rules)
+        category_name = category_names.get(str(s.get("category_id")))
+        movie_items.append({
+            "name": name,
+            "year": year,
+            "provider_stream_id": str(s["stream_id"]),
+            "container_extension": s.get("container_extension") or "mp4",
+            "provider_category_name": category_name,
+            # The provider's own unstripped name, before parse_name_year and
+            # Title & Metadata Rules clean it up -- "4K"/"UHD"-style quality
+            # markers commonly live in exactly the prefix those rules are
+            # meant to strip, and movies.name is shared across every source
+            # of this movie (that's what makes them the same movie), so it
+            # can never differentiate between two sources' quality on its
+            # own. This is the real per-source signal a quality-based stream
+            # priority feature would need (see vod_manager-ghi).
+            "raw_name": s.get("name") or "",
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            # Some providers' bulk get_vod_streams list already includes
+            # this (confirmed live 2026-09-05: 3 of 5 real providers) --
+            # capturing it lets enrich_movie's TMDB-first fallback kick in
+            # from this movie's very first enrichment pass. No genre/cast/
+            # plot in this endpoint though (unlike get_series), so nothing
+            # else is worth capturing here.
+            "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
+        })
+    movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
+    logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
+    return movie_result, len(streams)
+
+
+async def _import_series_for_provider(
+    client: "XCProviderClient", provider: dict, provider_id: int,
+    series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
+) -> tuple[dict, int]:
+    series_list = await client.get_series()
+    series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+    # Most real XC panels' bulk get_series list already carries the same
+    # detail fields enrich_series would otherwise pay a separate
+    # get_series_info call per series to fetch (confirmed live 2026-09-05
+    # against 5 of 6 real providers: plot, cast, director, genre, cover,
+    # rating, tmdb all present). Rules fetched once here, not per item --
+    # same reasoning as series_name_rules above, just extended to every
+    # field bulk_import_series can now capture for free.
+    detail_rules = {
+        field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
+        for field in ("genre", "description", "cast_list", "director")
+    }
+    series_items = []
+    for s in series_list:
+        name, year = parse_name_year(s.get("name") or "")
+        name = vod_db.apply_rules_to_value(name, series_name_rules)
+        category_name = series_category_names.get(str(s.get("category_id")))
+        series_items.append({
+            "name": name,
+            "year": year or _coerce_year(s.get("year")),
+            "provider_series_id": str(s["series_id"]),
+            "provider_category_name": category_name,
+            # See movie_items' identical raw_name field above -- the
+            # provider's own unstripped name, before parse_name_year and
+            # Title & Metadata Rules clean it up.
+            "raw_name": s.get("name") or "",
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "_has_detail": True,
+            "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
+            "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
+            "cast_list": vod_db.apply_rules_to_value(s.get("cast") or None, detail_rules["cast_list"]),
+            "director": vod_db.apply_rules_to_value(s.get("director") or None, detail_rules["director"]),
+            "poster_url": s.get("cover") or None,
+            "rating": s.get("rating") or None,
+            "release_date": s.get("releaseDate") or s.get("release_date") or None,
+            # Some providers send this under "tmdb", not "tmdb_id" -- see
+            # enrich_series's identical comment for why both need checking.
+            "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
+            "provider_last_modified": s.get("last_modified") or None,
+        })
+    series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
+    logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
+    return series_result, len(series_list)
 
 
 async def import_provider_catalog(provider_id: int) -> dict:
@@ -412,85 +516,27 @@ async def import_provider_catalog(provider_id: int) -> dict:
         sorted(seen_category_names | set(provider.get("known_import_categories") or [])),
     )
 
-    streams = await client.get_vod_streams()
-    movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
-    movie_items = []
-    for s in streams:
-        name, year = parse_name_year(s.get("name") or "")
-        name = vod_db.apply_rules_to_value(name, movie_name_rules)
-        category_name = category_names.get(str(s.get("category_id")))
-        movie_items.append({
-            "name": name,
-            "year": year,
-            "provider_stream_id": str(s["stream_id"]),
-            "container_extension": s.get("container_extension") or "mp4",
-            "provider_category_name": category_name,
-            # The provider's own unstripped name, before parse_name_year and
-            # Title & Metadata Rules clean it up -- "4K"/"UHD"-style quality
-            # markers commonly live in exactly the prefix those rules are
-            # meant to strip, and movies.name is shared across every source
-            # of this movie (that's what makes them the same movie), so it
-            # can never differentiate between two sources' quality on its
-            # own. This is the real per-source signal a quality-based stream
-            # priority feature would need (see vod_manager-ghi).
-            "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
-            # Some providers' bulk get_vod_streams list already includes
-            # this (confirmed live 2026-09-05: 3 of 5 real providers) --
-            # capturing it lets enrich_movie's TMDB-first fallback kick in
-            # from this movie's very first enrichment pass. No genre/cast/
-            # plot in this endpoint though (unlike get_series), so nothing
-            # else is worth capturing here.
-            "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
-        })
-    movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
-    logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
+    # Tried running these two concurrently via asyncio.gather (2026-09-06,
+    # CRX live test): it fetches both bulk lists in parallel fine, but
+    # bulk_import_movies/series each run in their own asyncio.to_thread
+    # worker thread and both hammer the same vod_db._WRITE_LOCK -- a plain
+    # threading.RLock with no fairness guarantee. Confirmed live: series'
+    # thread kept winning the lock and starved movies out completely for
+    # 25+ minutes straight on a real ~240k-item catalog, worse than just
+    # running them sequentially (which never contends with itself at all).
+    # Reverted to sequential; the real fix would be giving movies and
+    # series their own separate locks (they touch entirely different
+    # tables) rather than trying to make one shared lock fair -- not worth
+    # the added complexity unless this import path is ever shown to be a
+    # real bottleneck for someone.
+    movie_result, streams_total = await _import_movies_for_provider(
+        client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized,
+    )
+    series_result, series_total = await _import_series_for_provider(
+        client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized,
+    )
 
-    series_list = await client.get_series()
-    series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
-    # Most real XC panels' bulk get_series list already carries the same
-    # detail fields enrich_series would otherwise pay a separate
-    # get_series_info call per series to fetch (confirmed live 2026-09-05
-    # against 5 of 6 real providers: plot, cast, director, genre, cover,
-    # rating, tmdb all present). Rules fetched once here, not per item --
-    # same reasoning as series_name_rules above, just extended to every
-    # field bulk_import_series can now capture for free.
-    detail_rules = {
-        field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
-        for field in ("genre", "description", "cast_list", "director")
-    }
-    series_items = []
-    for s in series_list:
-        name, year = parse_name_year(s.get("name") or "")
-        name = vod_db.apply_rules_to_value(name, series_name_rules)
-        category_name = series_category_names.get(str(s.get("category_id")))
-        series_items.append({
-            "name": name,
-            "year": year or _coerce_year(s.get("year")),
-            "provider_series_id": str(s["series_id"]),
-            "provider_category_name": category_name,
-            # See movie_items' identical raw_name field above -- the
-            # provider's own unstripped name, before parse_name_year and
-            # Title & Metadata Rules clean it up.
-            "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
-            "_has_detail": True,
-            "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
-            "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
-            "cast_list": vod_db.apply_rules_to_value(s.get("cast") or None, detail_rules["cast_list"]),
-            "director": vod_db.apply_rules_to_value(s.get("director") or None, detail_rules["director"]),
-            "poster_url": s.get("cover") or None,
-            "rating": s.get("rating") or None,
-            "release_date": s.get("releaseDate") or s.get("release_date") or None,
-            # Some providers send this under "tmdb", not "tmdb_id" -- see
-            # enrich_series's identical comment for why both need checking.
-            "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
-            "provider_last_modified": s.get("last_modified") or None,
-        })
-    series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
-    logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
-
-    await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, len(streams), len(series_list))
+    await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)
 
     if provider.get("auto_create_categories"):
         try:
@@ -677,6 +723,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
                 duration_secs=tmdb_detail.get("duration_secs"),
                 rating=tmdb_detail.get("rating"),
                 release_date=tmdb_detail.get("release_date"),
+                content_rating=tmdb_detail.get("content_rating"),
             )
             return True
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
@@ -790,6 +837,21 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
         name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
 
+    # This provider sends the series' TMDB id under "tmdb", not "tmdb_id"
+    # (unlike its own movie endpoint, which does use "tmdb_id") -- check
+    # both since key naming isn't consistent even within one provider,
+    # let alone across others.
+    series_tmdb_id = _clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id"))
+
+    # Best-effort content-rating-only TMDB call -- deliberately narrow (not
+    # a full series-detail fetch, see tmdb_sync.get_tv_content_rating's
+    # docstring) since is_adult only ever flags literal porn, never general
+    # violence/maturity, leaving no real way for a "kids" smart category to
+    # keep out R/TV-MA-rated content without this.
+    content_rating = None
+    if series_tmdb_id:
+        content_rating = await tmdb_sync.get_tv_content_rating(str(series_tmdb_id))
+
     await asyncio.to_thread(
         vod_db.set_series_enrichment,
         series_id,
@@ -801,14 +863,11 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
             "director": detail.get("director") or None,
             "country": detail.get("country") or None,
         }),
-        # This provider sends the series' TMDB id under "tmdb", not "tmdb_id"
-        # (unlike its own movie endpoint, which does use "tmdb_id") -- check
-        # both since key naming isn't consistent even within one provider,
-        # let alone across others.
-        tmdb_id=_clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id")),
+        tmdb_id=series_tmdb_id,
         poster_url=detail.get("cover") or None,
         rating=detail.get("rating") or None,
         release_date=detail.get("releasedate") or None,
+        content_rating=content_rating,
         # Snapshot of what bulk_import_series last saw for this series --
         # series_needs_enrichment compares the two on the next pass to know
         # whether this (expensive, per-series) call is worth making again.

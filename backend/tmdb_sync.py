@@ -68,6 +68,36 @@ async def fetch_list_items(list_id: str) -> list[dict]:
     return items
 
 
+def normalize_list_items(raw_items: list[dict]) -> list[dict]:
+    """TMDB's own /list/{id} item shape (media_type, id, title/
+    original_title, release_date, name/original_name, first_air_date) ->
+    the common {"media_type": "movie"|"tv", "tmdb_id": int|None,
+    "title": str|None, "year": int|None} shape vod_list_sync.py's shared
+    sync loop expects, matching mdblist_sync.fetch_list_items' own already-
+    normalized output -- the shared loop never needs to know which provider
+    a source came from."""
+    out: list[dict] = []
+    for item in raw_items:
+        media_type = item.get("media_type")
+        tmdb_id = item.get("id")
+        if media_type == "movie":
+            title = item.get("title") or item.get("original_title")
+            date = item.get("release_date") or ""
+        elif media_type == "tv":
+            title = item.get("name") or item.get("original_name")
+            date = item.get("first_air_date") or ""
+        else:
+            continue
+        year = int(date[:4]) if date[:4].isdigit() else None
+        out.append({
+            "media_type": media_type,
+            "tmdb_id": int(tmdb_id) if tmdb_id is not None else None,
+            "title": title,
+            "year": year,
+        })
+    return out
+
+
 async def search_title(query: str, content_type: str) -> list[dict]:
     """Real TMDB search results for a query -- used by the year-review flow so
     a user picks from actual candidates (title/year/poster/tmdb_id/cast)
@@ -271,7 +301,7 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
         try:
             r = await client.get(
                 f"{_API_BASE}/movie/{tmdb_id}",
-                params={"api_key": api_key, "append_to_response": "credits"},
+                params={"api_key": api_key, "append_to_response": "credits,release_dates"},
             )
             r.raise_for_status()
         except Exception as exc:
@@ -296,111 +326,58 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
         "duration_secs": runtime * 60 if runtime else None,
         "rating": data.get("vote_average") or None,
         "release_date": data.get("release_date") or None,
+        "content_rating": _extract_us_movie_certification(data),
     }
 
 
-def _parse_sync_source(sync_source: str) -> tuple[str, str] | None:
-    if not sync_source or ":" not in sync_source:
-        return None
-    kind, ref = sync_source.split(":", 1)
-    return kind, ref
-
-
-async def sync_category(category_id: int) -> dict:
-    category = vod_db.get_category(category_id)
-    if not category:
-        raise ValueError(f"category {category_id} not found")
-
-    parsed = _parse_sync_source(category.get("sync_source") or "")
-    if not parsed or parsed[0] != "tmdb_list":
-        raise ValueError(f"category {category_id} has no tmdb_list sync_source configured")
-    _, list_id = parsed
-
-    items = await fetch_list_items(list_id)
-
-    matched_movie_ids: list[int] = []
-    matched_series_ids: list[int] = []
-    unmatched = 0
-
-    for item in items:
-        media_type = item.get("media_type")
-        tmdb_id = item.get("id")
-        if tmdb_id is None:
+def _extract_us_movie_certification(data: dict) -> str | None:
+    """US MPAA rating (G/PG/PG-13/R/NC-17) from a /movie/{id}?append_to_
+    response=release_dates payload -- TMDB nests this per-country, per-
+    release-type, and routinely leaves it blank for many release entries
+    even when a real certification exists elsewhere in the same country's
+    list, so this takes the first non-empty one rather than just index 0."""
+    for country in data.get("release_dates", {}).get("results", []):
+        if country.get("iso_3166_1") != "US":
             continue
-
-        if media_type == "movie" and category["content_type"] == "movie":
-            movie = vod_db.get_movie_by_tmdb_id(tmdb_id)
-            if not movie:
-                # Most pool movies never get a tmdb_id at import time (only
-                # set when the provider's own metadata happens to include
-                # one) -- fall back to a normalized title+year match against
-                # the list's own title/date fields (GH issue #3: curated
-                # lists like IMDB Top 250 were matching "very few items"
-                # because this fallback didn't exist). A hit backfills the
-                # tmdb_id so future syncs take the fast id-only path.
-                title = item.get("title") or item.get("original_title")
-                release_date = item.get("release_date") or ""
-                year = int(release_date[:4]) if release_date[:4].isdigit() else None
-                movie = title and vod_db.find_movie_by_title_year(title, year)
-                if movie:
-                    # Only source of truth for a wrong-match investigation
-                    # (GH issue #6) -- backfill_tmdb_id_if_missing's own log
-                    # doesn't have the list item's title, and this fallback
-                    # match is the one place a title/year mismatch could
-                    # silently attach the wrong id to a pool movie.
-                    logger.info(
-                        "[tmdb_sync] fallback match: pool movie id=%s (%r, year=%s) <- list title=%r year=%s tmdb_id=%s",
-                        movie["id"], movie["name"], movie["year"], title, year, tmdb_id,
-                    )
-                    vod_db.backfill_tmdb_id_if_missing("movie", movie["id"], str(tmdb_id))
-            if movie:
-                matched_movie_ids.append(movie["id"])
-            else:
-                unmatched += 1
-        elif media_type == "tv" and category["content_type"] == "series":
-            series = vod_db.get_series_by_tmdb_id(tmdb_id)
-            if not series:
-                title = item.get("name") or item.get("original_name")
-                first_air_date = item.get("first_air_date") or ""
-                year = int(first_air_date[:4]) if first_air_date[:4].isdigit() else None
-                series = title and vod_db.find_series_by_title_year(title, year)
-                if series:
-                    logger.info(
-                        "[tmdb_sync] fallback match: pool series id=%s (%r, year=%s) <- list title=%r year=%s tmdb_id=%s",
-                        series["id"], series["name"], series["year"], title, year, tmdb_id,
-                    )
-                    vod_db.backfill_tmdb_id_if_missing("series", series["id"], str(tmdb_id))
-            if series:
-                matched_series_ids.append(series["id"])
-            else:
-                unmatched += 1
-        # media_type not matching this category's content_type is silently
-        # skipped — a movie-content category ignores TV entries in the same
-        # list and vice versa, rather than erroring.
-
-    if category["content_type"] == "movie":
-        newly_placed = vod_db.bulk_place_movies_in_category(matched_movie_ids, category_id)
-        found = len(matched_movie_ids)
-    else:
-        newly_placed = vod_db.bulk_place_series_in_category(matched_series_ids, category_id)
-        found = len(matched_series_ids)
-
-    logger.info("[tmdb_sync] category=%s (%s) list=%s: %d in pool, %d newly placed, %d not in pool",
-                category["name"], category["content_type"], list_id, found, newly_placed, unmatched)
-
-    return {"list_total": len(items), "found_in_pool": found, "newly_placed": newly_placed, "not_in_pool": unmatched}
+        for release in country.get("release_dates", []):
+            cert = (release.get("certification") or "").strip()
+            if cert:
+                return cert
+    return None
 
 
-async def sync_all() -> dict:
-    """Runs sync_category for every category with a sync_source configured —
-    called both from the manual 'Sync now' endpoint and, if enabled in
-    Settings -> Refresh Schedule, the periodic background scheduler
-    (disabled by default; see main.py's _tmdb_sync_scheduler)."""
-    results = {}
-    for category in vod_db.list_sync_categories():
+async def get_tv_content_rating(tmdb_id: str) -> str | None:
+    """US TV content rating (TV-Y/TV-Y7/TV-G/TV-PG/TV-14/TV-MA) for a series --
+    see get_movie_full_details' identical certification handling. Kept
+    separate/minimal (not folded into a full series-detail fetch) since
+    nothing else calls TMDB for series detail today -- enrich_series only
+    ever asked the provider for episodes/detail. This is deliberately the
+    smallest addition that makes a real content-rating field possible for
+    series smart categories, not a rework of series enrichment."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         try:
-            results[category["name"]] = await sync_category(category["id"])
+            r = await client.get(
+                f"{_API_BASE}/tv/{tmdb_id}/content_ratings",
+                params={"api_key": api_key},
+            )
+            r.raise_for_status()
         except Exception as exc:
-            logger.warning("[tmdb_sync] sync failed for category=%s: %s", category["name"], _redact(exc))
-            results[category["name"]] = {"error": _redact(exc)}
-    return results
+            logger.warning("[tmdb_sync] failed to fetch content rating for tv tmdb_id=%s: %s", tmdb_id, _redact(exc))
+            return None
+        data = r.json()
+
+    for country in data.get("results", []):
+        if country.get("iso_3166_1") == "US":
+            rating = (country.get("rating") or "").strip()
+            return rating or None
+    return None
+
+
+# sync_category/sync_all moved to vod_list_sync.py 2026-09-07, generalized
+# to support more than one list source per category (TMDB Lists + MDBList,
+# any mix) -- see that module for the current fetch/match/place logic.
+# normalize_list_items above is this module's contribution to that shared
+# loop (mdblist_sync.fetch_list_items returns the same normalized shape).

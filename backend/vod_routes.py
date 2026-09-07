@@ -17,6 +17,7 @@ from config import (
     get_hide_dvr_tab,
     get_import_language_exclusion,
     get_lockout_settings,
+    get_mdblist_api_key,
     get_openai_api_key,
     get_refresh_settings,
     get_smtp_settings,
@@ -30,6 +31,7 @@ from config import (
     save_gemini_api_key,
     save_import_language_exclusion,
     save_lockout_settings,
+    save_mdblist_api_key,
     save_openai_api_key,
     save_refresh_settings,
     save_smtp_settings,
@@ -52,8 +54,10 @@ import plex_client
 import plex_importer
 import portal_auth
 import tmdb_sync
+import vod_bulk_ai_service
 import vod_db
 import vod_importer
+import vod_list_sync
 import vod_sync
 from xc_server import fetch_proxied_image, get_active_sessions, kill_session
 
@@ -68,6 +72,10 @@ vod_db.init_db()
 # ── Request models ──────────────────────────────────────────────────────────
 
 class TmdbApiKeyRequest(BaseModel):
+    api_key: str
+
+
+class MdblistApiKeyRequest(BaseModel):
     api_key: str
 
 
@@ -117,6 +125,7 @@ class SuggestCategoryRuleRequest(BaseModel):
 class AiEvaluateCategoryRequest(BaseModel):
     description: str
     prefilter_rule_json: Optional[str] = None
+    search: Optional[str] = None
     limit: int = 300
 
 
@@ -374,9 +383,45 @@ class MergeDuplicateGroupPair(BaseModel):
     merge_ids: list[int]
 
 
+class BulkAiResolveRequest(BaseModel):
+    content_type: str  # movie | series
+    ids: list[int]
+
+
+class BulkAiDuplicateGroup(BaseModel):
+    keep_id: int
+    merge_ids: list[int]
+
+
+class BulkAiDuplicatesRequest(BaseModel):
+    content_type: str  # movie | series
+    groups: list[BulkAiDuplicateGroup]
+
+
 class RenameRequest(BaseModel):
     name: str
     year: Optional[int] = None
+
+
+class SetTmdbIdRequest(BaseModel):
+    tmdb_id: int
+
+
+class FlagMismatchRequest(BaseModel):
+    level: str  # movie | series | episode | movie_source | episode_source
+    item_id: int
+    reason: str
+
+
+class ResolveMismatchRequest(BaseModel):
+    level: str
+    item_id: int
+
+
+class UpdateEpisodeRequest(BaseModel):
+    name: Optional[str] = None
+    season_number: Optional[int] = None
+    episode_number: Optional[int] = None
 
 
 class BulkMissingArtworkPosterRequest(BaseModel):
@@ -702,6 +747,33 @@ async def clear_stream_failures():
     return {"ok": True}
 
 
+# ── Content-mismatch flagging ────────────────────────────────────────────────
+# "This isn't actually what its label says" -- see vod_db.py's own section
+# docstring for the full reasoning and the 5 supported granularities.
+
+@router.post("/flag-mismatch/", dependencies=_GUARDS)
+async def flag_content_mismatch(body: FlagMismatchRequest):
+    if not body.reason.strip():
+        raise HTTPException(400, detail="reason is required")
+    try:
+        return vod_db.flag_content_mismatch(body.level, body.item_id, body.reason)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@router.post("/flag-mismatch/resolve/", dependencies=_GUARDS)
+async def resolve_content_mismatch(body: ResolveMismatchRequest):
+    try:
+        return vod_db.resolve_content_mismatch(body.level, body.item_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@router.get("/flag-mismatch/queue/", dependencies=_GUARDS)
+async def flag_mismatch_queue():
+    return {"items": vod_db.list_flagged_content()}
+
+
 # Deliberately NOT under dependencies=_GUARDS (the X-Session-Token HEADER
 # guard) -- a plain <img src> can't attach a custom header, so this takes
 # the session token as a `?token=` query param instead, same pattern as
@@ -724,6 +796,17 @@ async def get_tmdb_settings():
 @router.post("/tmdb-settings/", dependencies=_GUARDS)
 async def save_tmdb_settings(body: TmdbApiKeyRequest):
     save_tmdb_api_key(body.api_key)
+    return {"ok": True}
+
+
+@router.get("/mdblist-settings/", dependencies=_GUARDS)
+async def get_mdblist_settings():
+    return {"has_api_key": bool(get_mdblist_api_key())}
+
+
+@router.post("/mdblist-settings/", dependencies=_GUARDS)
+async def save_mdblist_settings(body: MdblistApiKeyRequest):
+    save_mdblist_api_key(body.api_key)
     return {"ok": True}
 
 
@@ -910,7 +993,20 @@ async def ai_evaluate_category(category_id: int, body: AiEvaluateCategoryRequest
         raise HTTPException(404, detail="category not found")
 
     limit = max(1, min(body.limit, 2000))  # hard ceiling -- real per-item AI cost, never unbounded
-    candidates, total_before_cap = vod_db.get_ai_candidate_rows(category["content_type"], body.prefilter_rule_json, limit)
+    # Real bug found live 2026-09-06: the caller never actually supplied
+    # prefilter_rule_json, so this always fell through to an arbitrary
+    # "first `limit` rows" slice -- see get_ai_candidate_rows' docstring.
+    # Falls back to this category's own saved rule_json (if it has one) so
+    # AI Evaluate genuinely refines within real candidates by default,
+    # matching this feature's actual design intent, not just whatever an
+    # explicit override happens to pass.
+    prefilter_rule_json = body.prefilter_rule_json or category.get("rule_json")
+    try:
+        candidates, total_before_cap = vod_db.get_ai_candidate_rows(
+            category["content_type"], prefilter_rule_json, limit, search=body.search,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
 
     try:
         matched_ids = await ai_assist.evaluate_candidates_for_category(body.description, category["content_type"], candidates)
@@ -971,9 +1067,41 @@ async def save_refresh_settings_route(body: RefreshSettingsRequest):
 
 @router.post("/categories/{category_id}/sync-source/", dependencies=_GUARDS)
 async def set_category_sync_source(category_id: int, sync_source: Optional[str] = None):
+    """Legacy single-source setter -- kept for any existing caller, but
+    set_category_sync_sources below (the JSON-array version) is what the UI
+    actually uses now. Setting this clears the array column so a category
+    isn't left with both a legacy single source AND a stale array."""
     if not vod_db.get_category(category_id):
         raise HTTPException(404, detail="category not found")
     vod_db.set_category_sync_source(category_id, sync_source or None)
+    if sync_source:
+        vod_db.set_category_sync_sources(category_id, [])
+    return {"ok": True}
+
+
+class SetCategorySyncSourcesRequest(BaseModel):
+    sources: list[str]  # "kind:ref" strings, e.g. ["tmdb_list:1234567", "mdblist:98765"]
+
+
+@router.post("/categories/{category_id}/sync-sources/", dependencies=_GUARDS)
+async def set_category_sync_sources(category_id: int, body: SetCategorySyncSourcesRequest):
+    """Attaches one or more public list sources (any provider mix) directly
+    to this existing category -- any category, custom or smart, not just a
+    newly-created pair. See vod_list_sync.py's module docstring."""
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    vod_db.set_category_sync_sources(category_id, body.sources)
+    return {"ok": True}
+
+
+@router.post("/categories/{category_id}/sync-mode/", dependencies=_GUARDS)
+async def set_category_sync_mode_route(category_id: int, sync_mode: str):
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    try:
+        vod_db.set_category_sync_mode(category_id, sync_mode)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
     return {"ok": True}
 
 
@@ -982,11 +1110,11 @@ async def sync_category_now(category_id: int):
     if not vod_db.get_category(category_id):
         raise HTTPException(404, detail="category not found")
     try:
-        return await tmdb_sync.sync_category(category_id)
+        return await vod_list_sync.sync_category(category_id)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(502, detail=f"TMDB sync failed: {exc}")
+        raise HTTPException(502, detail=f"List sync failed: {exc}")
 
 
 # ── Providers ────────────────────────────────────────────────────────────────
@@ -1456,8 +1584,12 @@ async def import_provider_catalog(provider_id: int):
         else:
             result = await vod_importer.import_provider_catalog(provider_id)
     except Exception as exc:
-        logger.error("[vod_routes] import_provider_catalog(%s) failed: %s", provider_id, exc)
-        raise HTTPException(502, detail=str(exc))
+        # exc_info: some failures here raise with an empty str() (e.g. a bare
+        # TimeoutError), which used to log as "failed: " with nothing else
+        # to go on -- the full traceback is the only way to actually
+        # diagnose those.
+        logger.error("[vod_routes] import_provider_catalog(%s) failed: %s", provider_id, exc, exc_info=True)
+        raise HTTPException(502, detail=str(exc) or repr(exc))
     # Without this, the periodic catalog refresher (main.py) treats a
     # manually-imported provider as still "never refreshed" and redundantly
     # re-imports it again on its very next cycle -- a real, if minor, wasted
@@ -2617,6 +2749,30 @@ async def cancel_duplicate_confirm_scan(job_id: str):
     return {"ok": True}
 
 
+# ── Bulk AI resolve: background task + polled progress, one shared shape ────
+# for Needs Year Review, Missing Artwork, and Duplicate Finder -- same
+# fire-and-forget pattern as duplicate_confirm above, generalized to an
+# arbitrary job_id since a caller-picked batch of ids/groups has no single
+# natural key.
+
+@router.post("/duplicates/bulk-resolve/", dependencies=_GUARDS, status_code=202)
+async def bulk_resolve_duplicates(body: BulkAiDuplicatesRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    job_id = await vod_bulk_ai_service.start_duplicates_bulk_resolve(
+        body.content_type, [g.model_dump() for g in body.groups],
+    )
+    return {"job_id": job_id}
+
+
+@router.get("/duplicates/bulk-resolve/{job_id}/", dependencies=_GUARDS)
+async def bulk_resolve_duplicates_progress(job_id: str):
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+    return job
+
+
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
 async def year_review_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
     if content_type not in ("movie", "series"):
@@ -2673,6 +2829,22 @@ async def resolve_year_review(content_type: str, item_id: int, body: ResolveYear
         return vod_db.resolve_year_review(content_type, item_id, body.year, body.tmdb_id)
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
+
+
+@router.post("/needs-review/bulk-resolve/", dependencies=_GUARDS, status_code=202)
+async def bulk_resolve_needs_review(body: BulkAiResolveRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    job_id = await vod_bulk_ai_service.start_needs_review_bulk_resolve(body.content_type, body.ids)
+    return {"job_id": job_id}
+
+
+@router.get("/needs-review/bulk-resolve/{job_id}/", dependencies=_GUARDS)
+async def bulk_resolve_needs_review_progress(job_id: str):
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+    return job
 
 
 # ── Missing artwork ──────────────────────────────────────────────────────────
@@ -2838,6 +3010,22 @@ async def resolve_missing_artwork(content_type: str, item_id: int, body: Resolve
         raise HTTPException(404, detail=str(exc))
 
 
+@router.post("/missing-artwork/bulk-resolve/", dependencies=_GUARDS, status_code=202)
+async def bulk_resolve_missing_artwork(body: BulkAiResolveRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    job_id = await vod_bulk_ai_service.start_missing_artwork_bulk_resolve(body.content_type, body.ids)
+    return {"job_id": job_id}
+
+
+@router.get("/missing-artwork/bulk-resolve/{job_id}/", dependencies=_GUARDS)
+async def bulk_resolve_missing_artwork_progress(job_id: str):
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+    return job
+
+
 # ── Movies ───────────────────────────────────────────────────────────────────
 
 @router.get("/movies/", dependencies=_GUARDS)
@@ -2973,6 +3161,16 @@ async def clear_movie_tmdb_id(movie_id: int):
     fix (an already-executed merge)."""
     try:
         return vod_db.clear_tmdb_id("movie", movie_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@router.post("/movies/{movie_id}/tmdb-id/set/", dependencies=_GUARDS)
+async def set_movie_tmdb_id(movie_id: int, body: SetTmdbIdRequest):
+    """Manual correction when a reviewer already knows the right tmdb_id --
+    see vod_db.set_tmdb_id's docstring."""
+    try:
+        return vod_db.set_tmdb_id("movie", movie_id, body.tmdb_id)
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
 
@@ -3216,6 +3414,25 @@ async def clear_series_tmdb_id(series_id: int):
         return vod_db.clear_tmdb_id("series", series_id)
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
+
+
+@router.post("/series/{series_id}/tmdb-id/set/", dependencies=_GUARDS)
+async def set_series_tmdb_id(series_id: int, body: SetTmdbIdRequest):
+    """See set_movie_tmdb_id's identical docstring -- same reasoning."""
+    try:
+        return vod_db.set_tmdb_id("series", series_id, body.tmdb_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@router.patch("/series/episodes/{episode_id}/", dependencies=_GUARDS)
+async def update_episode(episode_id: int, body: UpdateEpisodeRequest):
+    """Manual correction for wrong provider-supplied episode metadata --
+    see vod_db.update_episode's docstring."""
+    try:
+        return vod_db.update_episode(episode_id, body.name, body.season_number, body.episode_number)
+    except ValueError as exc:
+        raise HTTPException(404 if "not found" in str(exc) else 400, detail=str(exc))
 
 
 @router.post("/series/{series_id}/tmdb-title/", dependencies=_GUARDS)

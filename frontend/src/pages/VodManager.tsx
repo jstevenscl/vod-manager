@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -257,6 +257,17 @@ interface StreamFailure {
   created_at: string
   current_source: CurrentBestSource | null
   series_providers: string[] | null
+  client_ip: string | null
+  client_label: string | null
+}
+
+interface FlaggedContentItem {
+  level: 'movie' | 'series' | 'episode' | 'movie_source' | 'episode_source'
+  id: number
+  title: string
+  reason: string | null
+  flagged_at: string | null
+  context: { movie_id?: number; series_id?: number }
 }
 
 interface NeedsReviewItem {
@@ -583,6 +594,62 @@ function buildHlsPreviewSourceUrl(kind: 'movie' | 'series', sourceId: number, cr
   if (!creds) return null
   const path = kind === 'movie' ? 'movie-source-hls' : 'series-source-hls'
   return `${window.location.origin}/preview/${path}/${creds.username}/${creds.password}/${sourceId}/index.m3u8`
+}
+
+// "This isn't actually what its label says" -- reusable at all 5 flaggable
+// granularities (movie, series, episode, movie_source, episode_source).
+// Each caller owns its own mutation/cache-invalidation (the right query key
+// differs by context), this just manages the inline reason-input UI. A
+// styled inline input, not window.prompt(), per real UX feedback: a native
+// prompt() is jarring next to every other inline input in this UI, and
+// can't be dismissed programmatically by browser-automation testing.
+function FlagMismatchControl({ isFlagged, reason, onFlag, onResolve, pending }: {
+  isFlagged: boolean
+  reason?: string | null
+  onFlag: (reason: string) => void
+  onResolve: () => void
+  pending?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState('')
+  if (isFlagged) {
+    return (
+      <button
+        title={reason ? `Flagged: ${reason} — click to resolve` : 'Flagged as wrong content — click to resolve'}
+        className="text-warning hover:text-foreground disabled:opacity-50"
+        disabled={pending}
+        onClick={onResolve}
+      >
+        <Flag size={11} fill="currentColor" />
+      </button>
+    )
+  }
+  if (open) {
+    return (
+      <span className="flex items-center gap-1">
+        <input
+          autoFocus
+          className={inputCls('h-6 w-36 text-[11px]')}
+          placeholder="Why is this wrong?"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && draft.trim()) { onFlag(draft.trim()); setOpen(false); setDraft('') }
+            if (e.key === 'Escape') setOpen(false)
+          }}
+        />
+        <Button size="sm" className="h-6 text-[10px] px-1.5" disabled={!draft.trim() || pending} onClick={() => { onFlag(draft.trim()); setOpen(false); setDraft('') }}>
+          Flag
+        </Button>
+        <button className="text-muted-foreground hover:text-foreground text-[10px]" onClick={() => setOpen(false)}>Cancel</button>
+      </span>
+    )
+  }
+  return (
+    <button title="Flag this as wrong content (not actually what its title/label says)" className="text-muted-foreground hover:text-warning" onClick={() => setOpen(true)}>
+      <Flag size={11} />
+    </button>
+  )
 }
 
 function CopyUrlButton({ url }: { url: string | null }) {
@@ -1019,6 +1086,8 @@ interface Category {
   is_smart: number
   rule_json: string | null
   sync_source: string | null
+  sync_sources: string | null
+  sync_mode: 'add_only' | 'mirror'
   sort_order: number
   ai_description: string | null
   is_active: number
@@ -1080,11 +1149,94 @@ const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string 
     { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable, priciest' },
   ],
 }
-const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult', 'provider_category'] as const
+const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult', 'provider_category', 'content_rating'] as const
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
 
-interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null }
+// Shared shape/hook for the three bulk-AI-resolve jobs (Needs Year Review,
+// Missing Artwork, Duplicate Finder) -- one background job + polled progress
+// pattern, mirrors the AI-evaluate-category job's fire-and-forget shape,
+// just generalized to an arbitrary job_id since a caller-picked batch of
+// ids/groups has no single natural key to poll on.
+interface BulkAiJobResult {
+  id?: number
+  keep_id?: number
+  merge_ids?: number[]
+  name?: string
+  status: 'resolved' | 'skipped' | 'error'
+  detail: string
+}
+interface BulkAiJobStatus {
+  running: boolean
+  total: number
+  done: number
+  resolved: number
+  skipped: number
+  errors: number
+  results: BulkAiJobResult[]
+  error: string | null
+}
+
+function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
+  const [jobId, setJobId] = useState<string | null>(null)
+  const startMutation = useMutation({
+    mutationFn: (body: object) => api.post(startEndpoint, body).then((r) => r.data as { job_id: string }),
+    onSuccess: (data) => setJobId(data.job_id),
+  })
+  const progressQuery = useQuery<BulkAiJobStatus>({
+    queryKey: ['vod-bulk-ai-job', progressEndpointPrefix, jobId],
+    queryFn: () => api.get(`${progressEndpointPrefix}${jobId}/`).then((r) => r.data),
+    enabled: !!jobId,
+    refetchInterval: (query) => (query.state.data?.running ? 800 : false),
+  })
+  return {
+    start: startMutation.mutate,
+    starting: startMutation.isPending,
+    startError: (startMutation.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? null,
+    job: progressQuery.data ?? null,
+    reset: () => setJobId(null),
+  }
+}
+
+// Compact "N resolved · M skipped · E errors" summary + expandable per-item
+// detail list, shared by all three bulk-AI panels below.
+function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (r: BulkAiJobResult) => string }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="text-xs px-2 py-1.5 rounded border border-primary/30 bg-primary/5 space-y-1">
+      <div className="flex items-center gap-2">
+        {job.running ? (
+          <span className="flex items-center gap-1 text-muted-foreground"><Loader2 size={11} className="animate-spin" /> Resolving {job.done}/{job.total}…</span>
+        ) : (
+          <span>
+            <strong>{job.resolved}</strong> resolved · <strong>{job.skipped}</strong> skipped
+            {job.errors > 0 && <> · <strong>{job.errors}</strong> error{job.errors === 1 ? '' : 's'}</>}
+          </span>
+        )}
+        {!job.running && job.results.length > 0 && (
+          <button className="text-primary hover:underline ml-auto" onClick={() => setExpanded((v) => !v)}>
+            {expanded ? 'Hide details' : 'Show details'}
+          </button>
+        )}
+      </div>
+      {job.error && <p className="text-destructive">{job.error}</p>}
+      {expanded && (
+        <div className="max-h-48 overflow-y-auto space-y-0.5 pt-1 border-t border-border/50">
+          {job.results.map((r, i) => (
+            <div key={i} className="flex items-start gap-1.5">
+              <span className={r.status === 'resolved' ? 'text-success' : r.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
+                {r.status === 'resolved' ? '✓' : r.status === 'error' ? '✗' : '—'}
+              </span>
+              <span className="text-muted-foreground">{labelFor(r)} — {r.detail}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
 interface MoviePlacement { id: number; category_id: number; export_stream_id: number; name_suffix: string; category_name: string }
 interface Movie {
   id: number
@@ -1096,6 +1248,9 @@ interface Movie {
   is_adult: number
   review_excluded: number
   tmdb_id: string | null
+  content_rating: string | null
+  flagged_mismatch?: number
+  flagged_reason?: string | null
   sources: MovieSource[]
   placements: MoviePlacement[]
 }
@@ -1111,8 +1266,8 @@ interface MetadataRule {
   is_regex: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; consecutive_failures?: number; last_failed_at?: string | null }
-interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[] }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
+interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[]; flagged_mismatch?: number; flagged_reason?: string | null }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
   id: number
@@ -1125,6 +1280,9 @@ interface Series {
   review_excluded: number
   import_provider_name: string | null
   tmdb_id: string | null
+  content_rating: string | null
+  flagged_mismatch?: number
+  flagged_reason?: string | null
   raw_name: string | null
   episodes: Episode[]
   placements: SeriesPlacement[]
@@ -1702,6 +1860,21 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
     return next
   })
 
+  // "Flag as wrong content" directly on a duplicate candidate -- real gap:
+  // the flag action only lived in the item's full detail view, not
+  // reachable from Duplicate Finder itself, exactly where a reviewer
+  // actually notices a title doesn't match its content. Local-only
+  // "flagged" tracking (this scan's own lightweight item shape doesn't
+  // carry flagged_mismatch) -- a full page reload/re-scan will correctly
+  // reflect the real server state either way, this is just this-session
+  // visual confirmation that the flag went through.
+  const [locallyFlaggedIds, setLocallyFlaggedIds] = useState<Set<number>>(new Set())
+  const flagDuplicateMismatch = useMutation({
+    mutationFn: (v: { item_id: number; reason: string }) =>
+      api.post('/vod/flag-mismatch/', { level: contentType, item_id: v.item_id, reason: v.reason }),
+    onSuccess: (_data, v) => setLocallyFlaggedIds((prev) => new Set(prev).add(v.item_id)),
+  })
+
   // Identical (non-null) poster art across 2+ candidates is strong
   // confirming evidence they're the same real release, not just a title
   // collision -- a known limitation: same image hosted on two different
@@ -1796,9 +1969,21 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
                   </span>
                 </div>
               )}
-              <button className="text-[11px] text-primary hover:underline mt-0.5" onClick={() => togglePreview(item.id)}>
-                {previewIds.has(item.id) ? 'Hide preview' : 'Preview'}
-              </button>
+              <span className="flex items-center gap-2 mt-0.5">
+                <button className="text-[11px] text-primary hover:underline" onClick={() => togglePreview(item.id)}>
+                  {previewIds.has(item.id) ? 'Hide preview' : 'Preview'}
+                </button>
+                {locallyFlaggedIds.has(item.id) ? (
+                  <span className="text-[11px] text-warning flex items-center gap-0.5"><Flag size={10} fill="currentColor" /> Flagged</span>
+                ) : (
+                  <FlagMismatchControl
+                    isFlagged={false}
+                    pending={flagDuplicateMismatch.isPending}
+                    onFlag={(reason) => flagDuplicateMismatch.mutate({ item_id: item.id, reason })}
+                    onResolve={() => {}}
+                  />
+                )}
+              </span>
               {previewIds.has(item.id) && <DuplicateInlinePreview kind={contentType} itemId={item.id} xcCredentials={xcCredentials} />}
             </div>
           </div>
@@ -1976,6 +2161,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
 
+  // Manual correction when a reviewer already knows the right tmdb_id --
+  // clearTmdbId above can only break a wrong match, not point it at the
+  // correct one, which meant "wrong tmdb_id, right one already known" had
+  // no faster fix than clear-then-wait-for-a-later-enrichment-pass.
+  const [tmdbIdForm, setTmdbIdForm] = useState<string | null>(null)
+  const setTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/movies/${movie.id}/tmdb-id/set/`, { tmdb_id: Number(tmdbIdForm) }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); setTmdbIdForm(null) },
+  })
+
   const addSource = useMutation({
     mutationFn: () => api.post(`/vod/movies/${movie.id}/sources/`, {
       provider_id: Number(sourceForm.provider_id), provider_stream_id: sourceForm.provider_stream_id,
@@ -1985,6 +2180,19 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       setSourceForm({ provider_id: '', provider_stream_id: '', container_extension: 'mp4' })
     },
+  })
+
+  // Content-mismatch flagging (movie + per-source granularity) -- see
+  // FlagMismatchControl's own docstring.
+  const flagMismatch = useMutation({
+    mutationFn: (v: { level: 'movie' | 'movie_source'; item_id: number; reason: string }) =>
+      api.post('/vod/flag-mismatch/', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+  })
+  const resolveMismatch = useMutation({
+    mutationFn: (v: { level: 'movie' | 'movie_source'; item_id: number }) =>
+      api.post('/vod/flag-mismatch/resolve/', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
   })
   const addPlacement = useMutation({
     mutationFn: () => api.post(`/vod/movies/${movie.id}/categories/`, { category_id: Number(categoryPick) }),
@@ -2055,6 +2263,11 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
             >
               Rename / fix year
             </button>
+            {movie.content_rating && (
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title="US MPAA content rating, from TMDB">
+                {movie.content_rating}
+              </span>
+            )}
             {movie.tmdb_id && (
               <>
                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${movie.tmdb_id}`}>
@@ -2078,11 +2291,46 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                 </button>
               </>
             )}
+            {tmdbIdForm !== null ? (
+              <span className="flex items-center gap-1">
+                <input
+                  autoFocus
+                  className={inputCls('w-24')}
+                  placeholder="TMDB id"
+                  value={tmdbIdForm}
+                  onChange={(e) => setTmdbIdForm(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && tmdbIdForm.trim()) setTmdbId.mutate(); if (e.key === 'Escape') setTmdbIdForm(null) }}
+                />
+                <Button size="sm" disabled={!tmdbIdForm.trim() || setTmdbId.isPending} onClick={() => setTmdbId.mutate()}>
+                  {setTmdbId.isPending ? <Loader2 size={11} className="animate-spin" /> : 'Save'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setTmdbIdForm(null)}>Cancel</Button>
+              </span>
+            ) : (
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                title="Enter the correct TMDB id directly, when you already know it"
+                onClick={() => setTmdbIdForm(movie.tmdb_id ? String(movie.tmdb_id) : '')}
+              >
+                {movie.tmdb_id ? 'Fix TMDB id' : 'Set TMDB id'}
+              </button>
+            )}
           </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
         {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
+        {setTmdbId.isError && <p className="text-destructive">{(setTmdbId.error as any)?.response?.data?.detail ?? 'Set TMDB id failed'}</p>}
+        <div className="flex items-center gap-1.5 mt-1">
+          <span className="text-muted-foreground">Wrong content?</span>
+          <FlagMismatchControl
+            isFlagged={!!movie.flagged_mismatch}
+            reason={movie.flagged_reason}
+            pending={flagMismatch.isPending || resolveMismatch.isPending}
+            onFlag={(reason) => flagMismatch.mutate({ level: 'movie', item_id: movie.id, reason })}
+            onResolve={() => resolveMismatch.mutate({ level: 'movie', item_id: movie.id })}
+          />
+        </div>
       </div>
       {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
 
@@ -2100,6 +2348,13 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
                   title={`${movie.name}${movie.year ? ` (${movie.year})` : ''} — ${s.provider_name}`}
                 />
                 <CopyUrlButton url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)} />
+                <FlagMismatchControl
+                  isFlagged={!!s.flagged_mismatch}
+                  reason={s.flagged_reason}
+                  pending={flagMismatch.isPending || resolveMismatch.isPending}
+                  onFlag={(reason) => flagMismatch.mutate({ level: 'movie_source', item_id: s.id, reason })}
+                  onResolve={() => resolveMismatch.mutate({ level: 'movie_source', item_id: s.id })}
+                />
                 <button
                   title="Move to a different movie (fixes a wrong match)"
                   className="hover:text-foreground"
@@ -2376,6 +2631,26 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
 
+  // See Movie's identical setTmdbId -- same reasoning.
+  const [tmdbIdForm, setTmdbIdForm] = useState<string | null>(null)
+  const setTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/series/${series.id}/tmdb-id/set/`, { tmdb_id: Number(tmdbIdForm) }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-series'] }); setTmdbIdForm(null) },
+  })
+
+  // See Movie's identical flagMismatch/resolveMismatch -- same reasoning,
+  // covering the series/episode/episode_source granularities here.
+  const flagMismatch = useMutation({
+    mutationFn: (v: { level: 'series' | 'episode' | 'episode_source'; item_id: number; reason: string }) =>
+      api.post('/vod/flag-mismatch/', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+  const resolveMismatch = useMutation({
+    mutationFn: (v: { level: 'series' | 'episode' | 'episode_source'; item_id: number }) =>
+      api.post('/vod/flag-mismatch/resolve/', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
   const addPlacement = useMutation({
     mutationFn: () => api.post(`/vod/series/${series.id}/categories/`, { category_id: Number(categoryPick) }),
     onSuccess: () => {
@@ -2405,6 +2680,22 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
     onError:    (e: any) => notify(e?.response?.data?.detail ?? 'Delete failed.'),
   })
+  // Manual correction for wrong provider-supplied episode metadata (an
+  // off-by-one number, a placeholder/garbage name) -- previously the only
+  // recourse was deleting the episode's sources and waiting on a re-fetch.
+  const [editingEpisodeId, setEditingEpisodeId] = useState<number | null>(null)
+  const [episodeForm, setEpisodeForm] = useState({ name: '', season: '', episode: '' })
+  const updateEpisode = useMutation({
+    mutationFn: (episodeId: number) => api.patch(`/vod/series/episodes/${episodeId}/`, {
+      name: episodeForm.name, season_number: Number(episodeForm.season), episode_number: Number(episodeForm.episode),
+    }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-series'] }); setEditingEpisodeId(null) },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Update episode failed.'),
+  })
+  const startEditEpisode = (e: Episode) => {
+    setEditingEpisodeId(e.id)
+    setEpisodeForm({ name: e.name ?? '', season: String(e.season_number), episode: String(e.episode_number) })
+  }
   const [movingEpisodeSourceId, setMovingEpisodeSourceId] = useState<number | null>(null)
   const moveEpisodeSource = useMutation({
     mutationFn: (v: { episodeId: number; sourceId: number; targetSeriesId: number; seasonNumber: number; episodeNumber: number; name: string }) =>
@@ -2468,6 +2759,11 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
             >
               Rename / fix year
             </button>
+            {series.content_rating && (
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title="US TV content rating, from TMDB">
+                {series.content_rating}
+              </span>
+            )}
             {series.tmdb_id && (
               <>
                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border" title={`TMDB id ${series.tmdb_id}`}>
@@ -2491,11 +2787,46 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                 </button>
               </>
             )}
+            {tmdbIdForm !== null ? (
+              <span className="flex items-center gap-1">
+                <input
+                  autoFocus
+                  className={inputCls('w-24')}
+                  placeholder="TMDB id"
+                  value={tmdbIdForm}
+                  onChange={(e) => setTmdbIdForm(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && tmdbIdForm.trim()) setTmdbId.mutate(); if (e.key === 'Escape') setTmdbIdForm(null) }}
+                />
+                <Button size="sm" disabled={!tmdbIdForm.trim() || setTmdbId.isPending} onClick={() => setTmdbId.mutate()}>
+                  {setTmdbId.isPending ? <Loader2 size={11} className="animate-spin" /> : 'Save'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setTmdbIdForm(null)}>Cancel</Button>
+              </span>
+            ) : (
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                title="Enter the correct TMDB id directly, when you already know it"
+                onClick={() => setTmdbIdForm(series.tmdb_id ? String(series.tmdb_id) : '')}
+              >
+                {series.tmdb_id ? 'Fix TMDB id' : 'Set TMDB id'}
+              </button>
+            )}
           </span>
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
         {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
+        {setTmdbId.isError && <p className="text-destructive">{(setTmdbId.error as any)?.response?.data?.detail ?? 'Set TMDB id failed'}</p>}
+        <div className="flex items-center gap-1.5 mt-1">
+          <span className="text-muted-foreground">Wrong content?</span>
+          <FlagMismatchControl
+            isFlagged={!!series.flagged_mismatch}
+            reason={series.flagged_reason}
+            pending={flagMismatch.isPending || resolveMismatch.isPending}
+            onFlag={(reason) => flagMismatch.mutate({ level: 'series', item_id: series.id, reason })}
+            onResolve={() => resolveMismatch.mutate({ level: 'series', item_id: series.id })}
+          />
+        </div>
         {series.raw_name && series.raw_name !== series.name && (
           <div className="text-[11px] text-muted-foreground flex items-center gap-1.5">
             <span>Provider's original name: "{series.raw_name}"</span>
@@ -2544,22 +2875,49 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         )}
         {series.episodes.map((e) => (
           <div key={e.id} className="text-muted-foreground">
-            <div className="flex items-center justify-between">
-              <span>S{e.season_number}E{e.episode_number} — {e.name}</span>
-              <span className="flex items-center gap-1.5">
-                <PlayButton
-                  url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
-                  transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                  hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
-                  title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
+            {editingEpisodeId === e.id ? (
+              <div className="flex items-center gap-1 flex-wrap py-0.5">
+                <input className={inputCls('w-12')} placeholder="S" value={episodeForm.season} onChange={(ev) => setEpisodeForm({ ...episodeForm, season: ev.target.value })} />
+                <input className={inputCls('w-12')} placeholder="E" value={episodeForm.episode} onChange={(ev) => setEpisodeForm({ ...episodeForm, episode: ev.target.value })} />
+                <input
+                  className={inputCls('flex-1 min-w-32')}
+                  placeholder="Episode name"
+                  value={episodeForm.name}
+                  onChange={(ev) => setEpisodeForm({ ...episodeForm, name: ev.target.value })}
+                  onKeyDown={(ev) => { if (ev.key === 'Enter') updateEpisode.mutate(e.id); if (ev.key === 'Escape') setEditingEpisodeId(null) }}
                 />
-                <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
-              </span>
-            </div>
+                <Button size="sm" disabled={updateEpisode.isPending} onClick={() => updateEpisode.mutate(e.id)}>
+                  {updateEpisode.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setEditingEpisodeId(null)}>Cancel</Button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between">
+                <span>S{e.season_number}E{e.episode_number} — {e.name}</span>
+                <span className="flex items-center gap-1.5">
+                  <button title="Edit episode number/name" className="hover:text-foreground text-[11px] underline decoration-dotted" onClick={() => startEditEpisode(e)}>edit</button>
+                  <FlagMismatchControl
+                    isFlagged={!!e.flagged_mismatch}
+                    reason={e.flagged_reason}
+                    pending={flagMismatch.isPending || resolveMismatch.isPending}
+                    onFlag={(reason) => flagMismatch.mutate({ level: 'episode', item_id: e.id, reason })}
+                    onResolve={() => resolveMismatch.mutate({ level: 'episode', item_id: e.id })}
+                  />
+                  <PlayButton
+                    url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)}
+                    transcodedUrl={e.sources[0] ? buildTranscodedPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                    hlsUrl={e.sources[0] ? buildHlsPreviewSourceUrl('series', e.sources[0].id, xcCredentials) : null}
+                    title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
+                  />
+                  <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
+                </span>
+              </div>
+            )}
             {e.sources.map((s) => (
               <div key={s.id} className="pl-3 text-[11px] flex items-center justify-between">
                 <span className="flex items-center gap-1">
                   {s.provider_name} → {s.provider_stream_id}
+                  {s.provider_category_name && <span className="text-muted-foreground/70">· {s.provider_category_name}</span>}
                   {!!s.consecutive_failures && s.consecutive_failures > 0 && (
                     <span className="text-destructive flex items-center gap-0.5" title={s.last_failed_at ? `Last failed ${new Date(Number(s.last_failed_at) * 1000).toLocaleString()}` : undefined}>
                       <AlertCircle size={10} /> failed {s.consecutive_failures}x
@@ -2567,6 +2925,13 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   )}
                 </span>
                 <span className="flex items-center gap-1">
+                  <FlagMismatchControl
+                    isFlagged={!!s.flagged_mismatch}
+                    reason={s.flagged_reason}
+                    pending={flagMismatch.isPending || resolveMismatch.isPending}
+                    onFlag={(reason) => flagMismatch.mutate({ level: 'episode_source', item_id: s.id, reason })}
+                    onResolve={() => resolveMismatch.mutate({ level: 'episode_source', item_id: s.id })}
+                  />
                   <button
                     title="Move to a different series/episode (fixes a wrong match)"
                     className="hover:text-foreground"
@@ -2897,12 +3262,37 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
   const syncCategoryNow = useMutation({
     mutationFn: (id: number) => api.post(`/vod/categories/${id}/sync-now/`),
     onSuccess: (r) => {
-      setTmdbSyncResult(`List had ${r.data.list_total}: ${r.data.found_in_pool} in pool (${r.data.newly_placed} newly placed), ${r.data.not_in_pool} not in pool.`)
+      const removedNote = r.data.removed ? `, ${r.data.removed} removed (mirror mode)` : ''
+      const errorNote = r.data.source_errors ? ` — source error(s): ${Object.values(r.data.source_errors).join('; ')}` : ''
+      setTmdbSyncResult(`List had ${r.data.list_total}: ${r.data.found_in_pool} in pool (${r.data.newly_placed} newly placed), ${r.data.not_in_pool} not in pool${removedNote}.${errorNote}`)
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
     },
     onError: (e: any) => setTmdbSyncResult(`Sync failed: ${e?.response?.data?.detail ?? e.message}`),
   })
+
+  // ── Multi-source list sync: attach any mix of TMDB List / MDBList
+  // sources directly to any existing category (custom or smart), with an
+  // add_only/mirror mode toggle -- see vod_list_sync.py's module docstring.
+  const [listSyncOpenId, setListSyncOpenId] = useState<number | null>(null)
+  const [newSourceKind, setNewSourceKind] = useState<'tmdb_list' | 'mdblist'>('tmdb_list')
+  const [newSourceRef, setNewSourceRef] = useState('')
+  const setSyncSources = useMutation({
+    mutationFn: ({ id, sources }: { id: number; sources: string[] }) =>
+      api.post(`/vod/categories/${id}/sync-sources/`, { sources }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  const setSyncMode = useMutation({
+    mutationFn: ({ id, sync_mode }: { id: number; sync_mode: 'add_only' | 'mirror' }) =>
+      api.post(`/vod/categories/${id}/sync-mode/`, null, { params: { sync_mode } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
+  })
+  function parseCategorySources(c: Category): string[] {
+    if (c.sync_sources) { try { return JSON.parse(c.sync_sources) } catch { /* fall through */ } }
+    return c.sync_source ? [c.sync_source] : []
+  }
+
   const [evaluateResult, setEvaluateResult] = useState<string | null>(null)
   const evaluateCategory = useMutation({
     mutationFn: (id: number) => api.post(`/vod/categories/${id}/evaluate/`),
@@ -2940,8 +3330,8 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
   })
   const [aiEvaluateResult, setAiEvaluateResult] = useState<string | null>(null)
   const aiEvaluateCategory = useMutation({
-    mutationFn: ({ id, description }: { id: number; description: string }) =>
-      api.post(`/vod/categories/${id}/ai-evaluate/`, { description }),
+    mutationFn: ({ id, description, search }: { id: number; description: string; search?: string }) =>
+      api.post(`/vod/categories/${id}/ai-evaluate/`, { description, search }),
     onSuccess: (r) => {
       const capNote = r.data.capped ? ` (capped at ${r.data.considered} of ${r.data.total_before_cap} candidates — narrow it with a rule pre-filter or run again)` : ''
       setAiEvaluateResult(`AI reviewed ${r.data.considered} candidate(s): ${r.data.matched} matched, ${r.data.newly_placed} newly placed.${capNote}`)
@@ -2956,7 +3346,23 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
       `Describe what belongs in "${c.name}" in plain English (AI judges actual titles against this — good for criteria a field rule can't express, e.g. mood, plot, audience fit):`,
       c.ai_description ?? '',
     )
-    if (description && description.trim()) aiEvaluateCategory.mutate({ id: c.id, description: description.trim() })
+    if (!description || !description.trim()) return
+    // Real bug found live 2026-09-06: the AI can only judge candidates it's
+    // actually shown -- without this category's own rule_json (a real SQL
+    // pre-filter) or a name-keyword search to narrow the field, the backend
+    // has no way to build a meaningful candidate set and used to silently
+    // fall back to an arbitrary "first N by id" slice, producing garbage
+    // matches. A smart category with a saved rule already works with no
+    // extra input; one without a rule needs a keyword here instead.
+    let search: string | undefined
+    if (!c.rule_json) {
+      const kw = window.prompt(
+        `"${c.name}" has no saved rule to narrow candidates by, so the AI needs a name keyword to search within first (e.g. "halloween"). It can only judge titles matching this keyword:`,
+      )
+      if (!kw || !kw.trim()) return
+      search = kw.trim()
+    }
+    aiEvaluateCategory.mutate({ id: c.id, description: description.trim(), search })
   }
 
   return (
@@ -3025,7 +3431,8 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
         )}
         <ul className="space-y-0.5">
           {visibleCategories.map((c, i) => (
-            <li key={c.id} className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
+            <Fragment key={c.id}>
+            <li className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
               <span className="flex items-center gap-1 min-w-0">
                 <input
                   type="checkbox"
@@ -3045,7 +3452,9 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                   }}
                 />
                 {!!c.is_smart && <span className="text-muted-foreground"> (smart)</span>}
-                {!!c.sync_source && <span className="text-muted-foreground"> (TMDB: {c.sync_source.replace('tmdb_list:', '')})</span>}
+                {parseCategorySources(c).length > 0 && (
+                  <span className="text-muted-foreground"> ({parseCategorySources(c).length} list source{parseCategorySources(c).length === 1 ? '' : 's'}{c.sync_mode === 'mirror' ? ', mirror' : ''})</span>
+                )}
               </span>
               <span className="flex items-center gap-1.5">
                 <input
@@ -3093,8 +3502,15 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 >
                   <Sparkles size={12} />
                 </button>
-                {!!c.sync_source && (
-                  <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
+                <button
+                  title="Manage list sync sources (TMDB List / MDBList, any mix)"
+                  className={parseCategorySources(c).length > 0 ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                  onClick={() => { setListSyncOpenId(listSyncOpenId === c.id ? null : c.id); setNewSourceRef('') }}
+                >
+                  <List size={12} />
+                </button>
+                {parseCategorySources(c).length > 0 && (
+                  <button title="Sync from its list source(s) now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
                     <RefreshCw size={12} />
                   </button>
                 )}
@@ -3126,6 +3542,59 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 </button>
               </span>
             </li>
+            {listSyncOpenId === c.id && (
+              <li className="rounded border border-border/50 bg-muted/20 p-2 space-y-1.5">
+                {parseCategorySources(c).map((s) => (
+                  <span key={s} className="inline-flex items-center gap-1 mr-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground border border-border">
+                    {s}
+                    <button
+                      title="Remove this source"
+                      className="hover:text-destructive"
+                      onClick={() => setSyncSources.mutate({ id: c.id, sources: parseCategorySources(c).filter((x) => x !== s) })}
+                    >
+                      <X size={10} />
+                    </button>
+                  </span>
+                ))}
+                {parseCategorySources(c).length === 0 && <p className="text-muted-foreground">No list sources linked yet.</p>}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <select className={inputCls('w-24')} value={newSourceKind} onChange={(e) => setNewSourceKind(e.target.value as 'tmdb_list' | 'mdblist')}>
+                    <option value="tmdb_list">TMDB List</option>
+                    <option value="mdblist">MDBList</option>
+                  </select>
+                  <input
+                    className={inputCls('w-28')}
+                    placeholder={newSourceKind === 'tmdb_list' ? 'TMDB List ID' : 'MDBList List ID'}
+                    value={newSourceRef}
+                    onChange={(e) => setNewSourceRef(e.target.value)}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={!newSourceRef.trim() || setSyncSources.isPending}
+                    onClick={() => {
+                      const source = `${newSourceKind}:${newSourceRef.trim()}`
+                      setSyncSources.mutate({ id: c.id, sources: [...parseCategorySources(c), source] })
+                      setNewSourceRef('')
+                    }}
+                  >
+                    <Plus size={12} className="mr-1" /> Add source
+                  </Button>
+                  <span className="flex items-center gap-1 ml-2">
+                    <span className="text-muted-foreground">On sync:</span>
+                    <select
+                      className={inputCls('w-32')}
+                      value={c.sync_mode}
+                      title="add_only: items are added but never removed for falling off a list. mirror: also removes items no longer in any linked list (for a category meant to track a list exactly)."
+                      onChange={(e) => setSyncMode.mutate({ id: c.id, sync_mode: e.target.value as 'add_only' | 'mirror' })}
+                    >
+                      <option value="add_only">Add only</option>
+                      <option value="mirror">Mirror (also removes)</option>
+                    </select>
+                  </span>
+                </div>
+              </li>
+            )}
+            </Fragment>
           ))}
           {categories.length === 0 && <p className="text-muted-foreground">No categories yet.</p>}
           {categories.length > 0 && visibleCategories.length === 0 && <p className="text-muted-foreground">No categories match.</p>}
@@ -3166,6 +3635,16 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 <option value="1">Yes (adult)</option>
                 <option value="0">No</option>
               </select>
+            ) : categoryForm.rule_field === 'content_rating' ? (
+              <select className={inputCls()} value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })}>
+                <option value="">value…</option>
+                <optgroup label="Movies (MPAA)">
+                  {['G', 'PG', 'PG-13', 'R', 'NC-17'].map((v) => <option key={v} value={v}>{v}</option>)}
+                </optgroup>
+                <optgroup label="TV">
+                  {['TV-Y', 'TV-Y7', 'TV-G', 'TV-PG', 'TV-14', 'TV-MA'].map((v) => <option key={v} value={v}>{v}</option>)}
+                </optgroup>
+              </select>
             ) : (
               <input className={inputCls()} placeholder="value" value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })} />
             )}
@@ -3176,8 +3655,8 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
           <p className="font-medium flex items-center gap-1"><Sparkles size={12} /> Suggest a category with AI</p>
           <p className="text-muted-foreground">
             Describe a category in plain English — Claude proposes a rule using only the fields/ops above (name,
-            genre, year, country/language, director, is_adult). Review it before creating; nothing is saved until
-            you click Create.
+            genre, year, country/language, director, is_adult, content_rating). Review it before creating; nothing
+            is saved until you click Create.
           </p>
           <div className="flex flex-wrap items-center gap-1.5">
             <input
@@ -3225,6 +3704,22 @@ function NeedsReviewModal({ contentType, items, qc, xcCredentials, onClose }: {
   xcCredentials?: XcCredentials
   onClose: () => void
 }) {
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const bulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  useEffect(() => {
+    if (bulkAi.job && !bulkAi.job.running) {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      setSelected(new Set())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkAi.job?.running])
+
+  const toggle = (id: number) => {
+    const next = new Set(selected)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    setSelected(next)
+  }
+
   return (
     <Modal onClose={onClose} maxWidth="max-w-2xl">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
@@ -3232,11 +3727,37 @@ function NeedsReviewModal({ contentType, items, qc, xcCredentials, onClose }: {
           Needs Review — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({items.length})
         </span>
       </div>
-      <div className="p-4 text-xs overflow-y-auto">
+      <div className="p-4 text-xs overflow-y-auto space-y-2">
         {items.length === 0 && <p className="text-muted-foreground">Nothing needs review right now.</p>}
+        {items.length > 0 && (
+          <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5">
+            <button className="text-primary hover:underline" onClick={() => setSelected(new Set(items.map((i) => i.id)))}>Select all</button>
+            <button className="text-muted-foreground hover:underline" onClick={() => setSelected(new Set())}>Clear</button>
+            <span className="text-muted-foreground">{selected.size} selected</span>
+            <Button
+              size="sm" variant="outline" className="h-7 text-xs ml-auto"
+              disabled={selected.size === 0 || bulkAi.starting || !!bulkAi.job?.running}
+              title="Searches TMDB for each selected item and confirms the year + TMDB id only when the AI is highly confident — everything else is left for you to review."
+              onClick={() => bulkAi.start({ content_type: contentType, ids: Array.from(selected) })}
+            >
+              {bulkAi.starting || bulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+              Bulk resolve with AI ({selected.size})
+            </Button>
+          </div>
+        )}
+        {bulkAi.startError && <p className="text-destructive">{bulkAi.startError}</p>}
+        {bulkAi.job && <BulkAiJobSummary job={bulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
         <ul>
           {items.map((item) => (
-            <NeedsReviewRow key={item.id} contentType={contentType} item={item} qc={qc} xcCredentials={xcCredentials} />
+            <Fragment key={item.id}>
+              <li className="pt-1.5 -mb-1.5">
+                <label className="flex items-center gap-1.5 text-muted-foreground">
+                  <input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} title="Select for bulk AI resolve" />
+                  Select
+                </label>
+              </li>
+              <NeedsReviewRow contentType={contentType} item={item} qc={qc} xcCredentials={xcCredentials} />
+            </Fragment>
           ))}
         </ul>
       </div>
@@ -3364,6 +3885,12 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     enabled: !showExcluded && selectedIds.size > 0,
   })
 
+  const bulkAi = useBulkAiJob('/vod/missing-artwork/bulk-resolve/', '/vod/missing-artwork/bulk-resolve/')
+  useEffect(() => {
+    if (bulkAi.job && !bulkAi.job.running) invalidateAfterBulk()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkAi.job?.running])
+
   return (
     <Modal onClose={onClose} maxWidth="max-w-2xl">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
@@ -3471,8 +3998,21 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
                 ? `Archive all filtered (${previewAllFiltered.data.changed} of ${query.data?.total ?? 0}${previewAllFiltered.data.skipped ? ` — ${previewAllFiltered.data.skipped} would be skipped` : ''})`
                 : `Archive all filtered (${query.data?.total ?? 0})`}
           </Button>
+          {!showExcluded && (
+            <Button
+              size="sm" variant="outline"
+              disabled={selectedIds.size === 0 || bulkAi.starting || !!bulkAi.job?.running}
+              title="Searches TMDB for each selected item and applies the poster only when the AI is highly confident it found the right match — everything else is left for you to review."
+              onClick={() => bulkAi.start({ content_type: contentType, ids: Array.from(selectedIds) })}
+            >
+              {bulkAi.starting || bulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+              Bulk resolve with AI ({selectedIds.size})
+            </Button>
+          )}
           {bulkResult && <span className="text-muted-foreground">{bulkResult}</span>}
         </div>
+        {bulkAi.startError && <p className="text-destructive">{bulkAi.startError}</p>}
+        {bulkAi.job && <BulkAiJobSummary job={bulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
       </div>
       <div className="p-4 text-xs overflow-y-auto">
         {query.data?.items.length === 0 && (
@@ -3980,6 +4520,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-tmdb-settings'] })
       setTmdbApiKeyInput('')
+    },
+  })
+  // MDBList -- second public-list-sync source alongside TMDB Lists, see
+  // vod_list_sync.py. Same has-key/never-round-trips pattern as TMDB above.
+  const mdblistSettingsQuery = useQuery<{ has_api_key: boolean }>({
+    queryKey: ['vod-mdblist-settings'],
+    queryFn:  () => api.get('/vod/mdblist-settings/').then((r) => r.data),
+  })
+  const [mdblistApiKeyInput, setMdblistApiKeyInput] = useState('')
+  const saveMdblistApiKey = useMutation({
+    mutationFn: () => api.post('/vod/mdblist-settings/', { api_key: mdblistApiKeyInput }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-mdblist-settings'] })
+      setMdblistApiKeyInput('')
     },
   })
   // SMTP -- powers notifications.notify_quota_threshold (DVR disk-quota
@@ -5095,6 +5649,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
   })
 
+  // ── Flagged Content queue -- "this isn't actually what its label says,"
+  // aggregated across all 5 flaggable granularities (movie/series/episode/
+  // movie_source/episode_source). See FlagMismatchControl. ──
+  const flaggedContentQuery = useQuery<FlaggedContentItem[]>({
+    queryKey: ['vod-flagged-content'],
+    queryFn:  () => api.get('/vod/flag-mismatch/queue/').then((r) => r.data.items),
+  })
+  const resolveFlagged = useMutation({
+    mutationFn: (v: { level: string; item_id: number }) => api.post('/vod/flag-mismatch/resolve/', v),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-flagged-content'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+
   // ── Uncategorized checker (real sources, zero category placements --
   // invisible to Dispatcharr no matter how many sources exist) ──
   const uncategorizedQuery = useQuery<UncategorizedReport>({
@@ -5173,6 +5743,24 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const duplicatesNeedsReview = (duplicatesQuery.data ?? []).filter(
     (g) => !duplicatesConfirmedKeys.has(groupSignature(g.items)) && !duplicatesSecondPassKeys.has(groupSignature(g.items)),
   )
+
+  // Complementary to "Check TMDB-confirmed matches" above, not a replacement
+  // -- that one only ever handles groups whose members already agree on one
+  // tmdb_id. This handles the rest: when a group has no tmdb_id at all, the
+  // AI judges from genre/plot text whether they're genuinely the same title
+  // before merging; a group whose members DO already agree merges
+  // immediately, no AI call needed. Scoped to the current page only (same
+  // reasoning as duplicatesPageItems above) -- real per-group AI cost, not
+  // something to fire unbounded across a whole scan in one click.
+  const bulkAiDuplicates = useBulkAiJob('/vod/duplicates/bulk-resolve/', '/vod/duplicates/bulk-resolve/')
+  useEffect(() => {
+    if (bulkAiDuplicates.job && !bulkAiDuplicates.job.running) {
+      duplicatesQuery.refetch()
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkAiDuplicates.job?.running])
 
   const [duplicatesConfirmMergeResult, setDuplicatesConfirmMergeResult] = useState<string | null>(null)
   const mergeConfirmedDuplicates = useMutation({
@@ -5514,6 +6102,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           All series providers: {f.series_providers.join(', ')}
                         </p>
                       )}
+                      {(f.client_label || f.client_ip) && (
+                        <p className="text-muted-foreground/70 truncate">
+                          Watched by: {f.client_label ?? 'unknown client'}{f.client_ip ? ` (${f.client_ip})` : ''}
+                        </p>
+                      )}
                     </td>
                     <td
                       className="py-1 pr-2 text-muted-foreground max-w-[16rem] truncate"
@@ -5561,6 +6154,24 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {saveTmdbApiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
           </Button>
           {tmdbSettingsQuery.data?.has_api_key && (
+            <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground pt-2">
+          MDBList API key — a second public-list source for category sync, alongside TMDB Lists (see Categories below).
+        </p>
+        <div className="flex items-center gap-1.5">
+          <input
+            className={inputCls()}
+            type="password"
+            placeholder={mdblistSettingsQuery.data?.has_api_key ? '••••••••••••••••' : 'MDBList API Key'}
+            value={mdblistApiKeyInput}
+            onChange={(e) => setMdblistApiKeyInput(e.target.value)}
+          />
+          <Button size="sm" disabled={!mdblistApiKeyInput || saveMdblistApiKey.isPending} onClick={() => saveMdblistApiKey.mutate()}>
+            {saveMdblistApiKey.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          {mdblistSettingsQuery.data?.has_api_key && (
             <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
           )}
         </div>
@@ -8388,6 +8999,63 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </label>
       </SectionCard>
 
+      <SectionCard title="Flagged Content" icon={<Flag size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Items a human reported as "this isn't actually what its label says" -- at the movie/series, episode, or
+          single-provider-source level (see the flag icon on any item's detail view). Resolving here just clears
+          the flag; fix the actual mismatch (rename, re-match TMDB, move/remove the wrong source) from the item
+          itself first.
+        </p>
+        {!flaggedContentQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing flagged.</p>}
+        {!!flaggedContentQuery.data?.length && (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-muted-foreground text-left">
+                <th className="pb-1 font-normal">Flagged</th>
+                <th className="pb-1 font-normal">Item</th>
+                <th className="pb-1 font-normal">Reason</th>
+                <th className="pb-1 font-normal"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {flaggedContentQuery.data.map((f) => (
+                <tr key={`${f.level}-${f.id}`} className="border-t border-border/50">
+                  <td className="py-1 pr-2 text-muted-foreground whitespace-nowrap">
+                    {f.flagged_at ? new Date(f.flagged_at).toLocaleString() : '—'}
+                  </td>
+                  <td className="py-1 pr-2">
+                    <button
+                      className="text-left hover:text-primary underline decoration-dotted"
+                      title="Jump to this item's list, filtered by its title"
+                      onClick={() => {
+                        const isMovie = f.context.movie_id != null
+                        setActiveTab(isMovie ? 'movies' : 'series')
+                        const name = f.title.split(' — ')[0].split(' S')[0]
+                        if (isMovie) { setMovieSearch(name); setMovieOffset(0) } else { setSeriesSearch(name); setSeriesOffset(0) }
+                      }}
+                    >
+                      {f.title}
+                    </button>
+                    <span className="text-muted-foreground"> ({f.level.replace('_', ' ')})</span>
+                  </td>
+                  <td className="py-1 pr-2 text-muted-foreground max-w-[20rem] truncate" title={f.reason ?? undefined}>{f.reason}</td>
+                  <td className="py-1">
+                    <button
+                      title="Resolve (clears the flag)"
+                      className="text-muted-foreground hover:text-foreground"
+                      disabled={resolveFlagged.isPending}
+                      onClick={() => resolveFlagged.mutate({ level: f.level, item_id: f.id })}
+                    >
+                      <X size={12} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </SectionCard>
+
       <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds pool entries that look like the same real title split into two rows: names that only differ by
@@ -8495,6 +9163,33 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </Button>
             {duplicatesSecondPassMergeResult && <span className="text-xs text-muted-foreground">{duplicatesSecondPassMergeResult}</span>}
           </div>
+        )}
+        {!!duplicatesPageItems.length && (
+          <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5">
+            <span className="text-xs text-muted-foreground">
+              For groups above with no shared TMDB id, the AI judges from genre/plot whether they're genuinely the
+              same title before merging — never a blind name+year guess. Scoped to this page ({duplicatesPageItems.length}{' '}
+              group{duplicatesPageItems.length === 1 ? '' : 's'}), since each one can be a real AI call.
+            </span>
+            <Button
+              size="sm" variant="outline" className="h-7 text-xs"
+              disabled={bulkAiDuplicates.starting || !!bulkAiDuplicates.job?.running}
+              onClick={() => bulkAiDuplicates.start({
+                content_type: duplicatesContentType,
+                groups: duplicatesPageItems.map((g) => ({ keep_id: g.items[0].id, merge_ids: g.items.slice(1).map((i) => i.id) })),
+              })}
+            >
+              {bulkAiDuplicates.starting || bulkAiDuplicates.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+              Bulk resolve this page with AI
+            </Button>
+          </div>
+        )}
+        {bulkAiDuplicates.startError && <p className="text-xs text-destructive">{bulkAiDuplicates.startError}</p>}
+        {bulkAiDuplicates.job && (
+          <BulkAiJobSummary
+            job={bulkAiDuplicates.job}
+            labelFor={(r) => `#${r.keep_id} ← ${(r.merge_ids ?? []).map((id) => `#${id}`).join(', ')}`}
+          />
         )}
         {!!duplicatesPageItems.length && (
           // Client-side slice, not a second network round-trip -- the scan

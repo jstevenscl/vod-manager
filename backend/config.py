@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.12"
+APP_VERSION = "0.2.13"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -126,6 +126,17 @@ def get_tmdb_api_key() -> str | None:
 def save_tmdb_api_key(api_key: str) -> None:
     data = _read_raw()
     data["tmdb_api_key"] = api_key
+    _write_raw(data)
+
+
+def get_mdblist_api_key() -> str | None:
+    data = _read_raw()
+    return data.get("mdblist_api_key") or None
+
+
+def save_mdblist_api_key(api_key: str) -> None:
+    data = _read_raw()
+    data["mdblist_api_key"] = api_key
     _write_raw(data)
 
 

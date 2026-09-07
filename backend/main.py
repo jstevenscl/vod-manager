@@ -20,9 +20,9 @@ import emby_vod_importer
 import plex_importer
 from portal_routes import router as portal_router
 from routes import router
-import tmdb_sync
 import vod_db
 import vod_importer
+import vod_list_sync
 from vod_routes import router as vod_router
 from xc_server import _redact_upstream_url, hls_sweep_loop, router as xc_router
 
@@ -371,6 +371,20 @@ async def _smart_category_scheduler() -> None:
                         logger.info("[smart_category_scheduler] category=%s: %s", category["id"], result)
                 except Exception as exc:
                     logger.warning("[smart_category_scheduler] category=%s failed: %s", category["id"], exc)
+            # Per-category list-sync cadence -- shares schedule_interval_seconds/
+            # last_evaluated_at with the smart-rule categories above (a category
+            # is realistically one or the other, not both), so this rides the
+            # same poll tick rather than needing its own loop. A category with a
+            # list source but no OWN schedule falls to _tmdb_sync_scheduler's
+            # global interval instead -- see categories_due_for_scheduled_list_
+            # sync's docstring.
+            for category in await asyncio.to_thread(vod_db.categories_due_for_scheduled_list_sync):
+                try:
+                    result = await vod_list_sync.sync_category(category["id"])
+                    await asyncio.to_thread(vod_db.mark_category_evaluated, category["id"])
+                    logger.info("[smart_category_scheduler] category=%s list-synced: %s", category["id"], result)
+                except Exception as exc:
+                    logger.warning("[smart_category_scheduler] category=%s list-sync failed: %s", category["id"], exc)
         except Exception as exc:
             logger.warning("[smart_category_scheduler] run failed: %s", exc)
         await asyncio.sleep(_SMART_CATEGORY_SCHEDULE_POLL_SECONDS)
@@ -380,19 +394,22 @@ _TMDB_SYNC_DISABLED_POLL_SECONDS = 300
 
 
 async def _tmdb_sync_scheduler() -> None:
-    """Background task: periodically re-syncs every category with a TMDB
-    Lists sync_source configured (see tmdb_sync.py). Disabled by default
-    (Settings -> Refresh Schedule) -- this is new background API traffic
-    that didn't run at all before this was exposed, so it's opt-in rather
-    than silently started for existing deployments. Re-checks whether it's
-    been turned on every _TMDB_SYNC_DISABLED_POLL_SECONDS while disabled."""
+    """Background task: periodically re-syncs every list-sourced category
+    that HASN'T opted into its own schedule_interval_seconds (see
+    vod_list_sync.py) -- a true fallback default, not a duplicate of the
+    per-category cadence _smart_category_scheduler also runs. Disabled by
+    default (Settings -> Refresh Schedule) -- this is new background API
+    traffic that didn't run at all before this was exposed, so it's opt-in
+    rather than silently started for existing deployments. Re-checks
+    whether it's been turned on every _TMDB_SYNC_DISABLED_POLL_SECONDS
+    while disabled."""
     while True:
         interval = vod_db.get_tmdb_sync_interval_seconds()
         if not interval:
             await asyncio.sleep(_TMDB_SYNC_DISABLED_POLL_SECONDS)
             continue
         try:
-            results = await tmdb_sync.sync_all()
+            results = await vod_list_sync.sync_all(only_without_own_schedule=True)
             if results:
                 logger.info("[tmdb_sync_scheduler] synced %d categor(y/ies): %s", len(results), results)
         except Exception as exc:

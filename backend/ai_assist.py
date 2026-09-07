@@ -53,7 +53,7 @@ _RULE_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "field": {"type": "string", "enum": ["name", "genre", "year", "country", "language", "director", "is_adult"]},
+                    "field": {"type": "string", "enum": ["name", "genre", "year", "country", "language", "director", "is_adult", "provider_category", "content_rating"]},
                     "op": {"type": "string", "enum": ["contains", "starts_with", "equals", "gte", "lte"]},
                     "value": {"type": "string"},
                 },
@@ -87,6 +87,16 @@ _YEAR_MATCH_SCHEMA = {
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
     "required": ["best_match_index", "reasoning", "confidence"],
+}
+
+_DUPLICATE_VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "same_title": {"type": "boolean", "description": "True if these are genuinely the same real movie/show, not just a coincidental name+year match."},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    },
+    "required": ["same_title", "reasoning", "confidence"],
 }
 
 _AI_EVAL_BATCH_SIZE = 30
@@ -216,13 +226,35 @@ async def suggest_category_rule(description: str, content_type: str) -> dict:
         "the rule engine has no other capabilities (no keyword/plot/mood matching, no cast "
         "matching). If the description can't be fully captured by these fields, do your best "
         "partial approximation and keep the proposed name honest about what you could actually "
-        "express, rather than claiming to match something the rule can't."
+        "express, rather than claiming to match something the rule can't.\n\n"
+        "Two field misuses have caused real bad rules in production and must be avoided:\n"
+        "1. `genre` holds only real content-genre values as tagged by the catalog's metadata "
+        "source (examples: Horror, Comedy, Family, Animation, Documentary, Action, Drama) -- it "
+        "is NEVER a holiday, season, or theme like \"Halloween\" or \"Christmas\". A holiday/theme "
+        "belongs in a `name` (or `provider_category`) contains condition instead -- e.g. for "
+        "Halloween content, propose name contains \"halloween\", not genre contains \"halloween\".\n"
+        "2. `is_adult` flags literal pornographic/XXX content ONLY -- it says nothing about "
+        "violence, language, or general age-appropriateness, and must never be used to imply "
+        "\"kid-safe\" or \"family-friendly\". For that, use `content_rating` instead (the real "
+        "MPAA/TV rating from TMDB): for movies, values are G/PG/PG-13/R/NC-17; for TV shows, "
+        "TV-Y/TV-Y7/TV-G/TV-PG/TV-14/TV-MA. A genuinely kid-safe rule should combine an `any` "
+        "match of `content_rating equals G`, `content_rating equals PG` (movies) or "
+        "`content_rating equals TV-Y`, `TV-Y7`, `TV-G` (TV), not a guess at genre alone -- genre "
+        "is a reasonable secondary signal (e.g. Family/Animation) but content_rating is the field "
+        "that actually answers the age-appropriateness question. Be aware content_rating is null "
+        "for anything never TMDB-matched or never re-enriched since this field was added, so a "
+        "rating-based rule will under-match on an incompletely enriched catalog -- mention this "
+        "plainly in the proposed name rather than implying complete coverage."
     )
     user_message = (
         f"Content type: {content_type}\n"
         f"Description: {description}\n\n"
-        "Available fields: name, genre, year, country (also holds spoken language), director, "
-        "is_adult. Available ops: contains, starts_with, equals, gte, lte (gte/lte only make "
+        "Available fields: name, genre (real genre tags only, see system note), year, country "
+        "(also holds spoken language), director, is_adult (XXX/porn flag only, see system note), "
+        "content_rating (real MPAA/TV rating, see system note -- use this for any kid-safe/"
+        "family/age-appropriateness request), provider_category (the source provider's own raw "
+        "category label, sometimes holiday/theme-grouped -- e.g. \"Halloween\", \"Christmas "
+        "Movies\"). Available ops: contains, starts_with, equals, gte, lte (gte/lte only make "
         "sense for year). Propose a rule."
     )
     return await _call_ai(
@@ -299,4 +331,32 @@ async def suggest_year_review_match(item_name: str, provider_category_name: str 
         system, user_message, "report_match",
         "Report the best matching candidate, or none.",
         _YEAR_MATCH_SCHEMA, max_tokens=512,
+    )
+
+
+async def verify_duplicate_group(content_type: str, items: list[dict]) -> dict:
+    """items: pool rows from one Duplicate Finder candidate group (each with
+    at least name/year/genre/description) that already share a normalized
+    name and a close-enough year (see vod_db.find_duplicate_groups) -- that's
+    a real signal but not proof, since two genuinely different real titles
+    can share both (a remake, a same-named film in different years' release
+    windows, an obscure title collision). Judges from the same plot/genre
+    text a human reviewer would look at, never anything the group detection
+    itself didn't already have. A group whose members ALL already share one
+    confirmed tmdb_id skips this call entirely -- that's already a stronger
+    signal than an AI guess (see vod_bulk_ai_service.py)."""
+    system = (
+        f"You judge whether two or more {'movies' if content_type == 'movie' else 'TV shows'} in a catalog, "
+        "already matched on name and release year, are genuinely the SAME real title (a true duplicate to "
+        "merge) or a coincidental collision (different real content that happens to share a name/year -- a "
+        "remake, an unrelated title, a franchise entry). Be conservative: only say they're the same when the "
+        "available plot/genre details are consistent with that; if there's not enough information to tell, "
+        "say so with low confidence rather than guessing."
+    )
+    listing = "\n".join(f"{i + 1}. {_candidate_summary(item)}" for i, item in enumerate(items))
+    user_message = f"Content type: {content_type}\n\nCandidates in this group:\n{listing}\n\nAre these the same real title?"
+    return await _call_ai(
+        system, user_message, "report_duplicate_verdict",
+        "Report whether these candidates are genuinely the same title.",
+        _DUPLICATE_VERIFY_SCHEMA, max_tokens=512,
     )

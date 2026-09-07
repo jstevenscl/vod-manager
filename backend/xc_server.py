@@ -350,6 +350,20 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             # Mirrors movies.is_adult/is_adult_manual (see
             # vod_importer._looks_adult and the manual override toggle).
             "is_adult": "1" if row.get("is_adult") else "0",
+            # A real XC provider normally sends these, and most clients
+            # (Dispatcharr included) match/store catalog identity by them
+            # when present, falling back to a fragile name+year guess only
+            # when they're absent. We already have these values from our own
+            # TMDB enrichment -- omitting them forced every downstream client
+            # onto that fallback for every title, which is what let a
+            # client's own local catalog entry drift from ours whenever a
+            # title's reported year churned (a real incident: a whole
+            # series' episodes silently deleted from a client's own catalog
+            # because it could no longer match the series by name+year).
+            "tmdb_id": row.get("tmdb_id") or "",
+            "tmdb": row.get("tmdb_id") or "",
+            "imdb_id": row.get("imdb_id") or "",
+            "imdb": row.get("imdb_id") or "",
         } for i, row in enumerate(rows)]
 
     if action == "get_vod_info":
@@ -379,6 +393,8 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 # repeats it, but get_vod_streams' bulk list is Dispatcharr's
                 # actual confirmed read path (apps/vod/tasks.py) as of v0.29.0.
                 "is_adult": "1" if row.get("is_adult") else "0",
+                "tmdb_id": row.get("tmdb_id") or "",
+                "imdb_id": row.get("imdb_id") or "",
             },
             "movie_data": {
                 "stream_id": row["export_stream_id"],
@@ -386,6 +402,8 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "added": str(int(time.time())),
                 "category_id": str(row["category_id"]),
                 "container_extension": row["container_extension"] or "mp4",
+                "tmdb_id": row.get("tmdb_id") or "",
+                "imdb_id": row.get("imdb_id") or "",
             },
         }
 
@@ -418,6 +436,15 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "youtube_trailer": "",
             "episode_run_time": "",
             "year": row["year"],
+            # See get_vod_streams' identical fields' comment -- without a
+            # stable external id, a client can only ever match/track this
+            # series by name+year, which is exactly what let a client's
+            # locally-tracked identity for a series drift from ours whenever
+            # its reported year (or lack of one) changed between refreshes.
+            "tmdb_id": row.get("tmdb_id") or "",
+            "tmdb": row.get("tmdb_id") or "",
+            "imdb_id": row.get("imdb_id") or "",
+            "imdb": row.get("imdb_id") or "",
         } for i, row in enumerate(rows)]
 
     if action == "get_series_info":
@@ -456,6 +483,8 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "country": row.get("country") or "",
                 "rating": row.get("rating") or "0",
                 "year": row["year"],
+                "tmdb_id": row.get("tmdb_id") or "",
+                "imdb_id": row.get("imdb_id") or "",
             },
             "episodes": episodes_by_season,
         }
@@ -1231,6 +1260,7 @@ async def _proxy_vod_stream(
     kind: str, username: str, sources: list[dict], request: Request,
     title: str = "?", duration_secs: int | None = None,
     movie_id: int | None = None, episode_id: int | None = None,
+    xc_client_id: int | None = None,
 ) -> Response:
     """Tries each source (provider carrying this movie/episode) in order,
     most-recently-imported first, falling over to the next one if a provider
@@ -1238,10 +1268,12 @@ async def _proxy_vod_stream(
     capacity — real cross-provider failover, not just a single best-guess
     source. See vod_db.list_movie_sources_for_streaming."""
     conn_id = f"{username}-{time.time():.3f}"
+    client_ip = _client_ip(request)
 
     if not sources:
         logger.warning("[xc_server] %s stream 404 id=%s (no active source)", kind, conn_id)
-        vod_db.log_stream_failure(kind, title, username, [], "no active source", movie_id=movie_id, episode_id=episode_id)
+        vod_db.log_stream_failure(kind, title, username, [], "no active source", movie_id=movie_id, episode_id=episode_id,
+                                   client_ip=client_ip, xc_client_id=xc_client_id)
         return Response(status_code=404, content="not found")
 
     forward_headers = {}
@@ -1436,6 +1468,7 @@ async def _proxy_vod_stream(
                     kind, title, username,
                     [{"provider": provider["name"], "error": f"started OK, broke mid-stream after {bytes_sent} bytes"}],
                     outcome, movie_id=movie_id, episode_id=episode_id,
+                    client_ip=client_ip, xc_client_id=xc_client_id,
                 )
                 vod_db.record_source_failure(kind, source["source_id"])
                 raise
@@ -1502,7 +1535,8 @@ async def _proxy_vod_stream(
 
     logger.warning("[xc_server] %s stream id=%s exhausted %d source(s), last error: %s",
                     kind, conn_id, len(sources), last_error)
-    vod_db.log_stream_failure(kind, title, username, attempts, last_error or "all sources failed", movie_id=movie_id, episode_id=episode_id)
+    vod_db.log_stream_failure(kind, title, username, attempts, last_error or "all sources failed", movie_id=movie_id, episode_id=episode_id,
+                               client_ip=client_ip, xc_client_id=xc_client_id)
     return Response(status_code=502, content="all sources failed")
 
 
@@ -1521,7 +1555,7 @@ async def movie_stream(username: str, password: str, stream_id_ext: str, request
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(row["movie_id"])
     title = f"{row['name']} ({row['year']})" if row.get("year") else row["name"]
-    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=row.get("duration_secs"), movie_id=row["movie_id"])
+    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=row.get("duration_secs"), movie_id=row["movie_id"], xc_client_id=client["id"])
 
 
 @router.get("/series/{username}/{password}/{episode_id_ext}")
@@ -1540,7 +1574,7 @@ async def series_stream(username: str, password: str, episode_id_ext: str, reque
     series = vod_db.get_series(row["series_id"])
     series_name = series["name"] if series else "?"
     title = f"{series_name} S{row['season_number']}E{row['episode_number']} — {row['name']}"
-    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=row.get("duration_secs"), episode_id=row["episode_id"])
+    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=row.get("duration_secs"), episode_id=row["episode_id"], xc_client_id=client["id"])
 
 
 # ── Preview streaming ────────────────────────────────────────────────────────
@@ -1566,7 +1600,7 @@ async def preview_movie_stream(username: str, password: str, movie_id_ext: str, 
         return Response(status_code=404, content="not found")
     sources = vod_db.list_movie_sources_for_streaming(movie_id)
     title = f"{movie['name']} ({movie['year']})" if movie.get("year") else movie["name"]
-    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=movie.get("duration_secs"), movie_id=movie_id)
+    return await _proxy_vod_stream("movie", username, sources, request, title=title, duration_secs=movie.get("duration_secs"), movie_id=movie_id, xc_client_id=client["id"])
 
 
 @router.get("/preview/series/{username}/{password}/{episode_id_ext}")
@@ -1586,7 +1620,7 @@ async def preview_episode_stream(username: str, password: str, episode_id_ext: s
         title = f"{series_name} S{episode['season_number']}E{episode['episode_number']} — {episode['name']}"
     else:
         title = "?"
-    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=episode.get("duration_secs") if episode else None, episode_id=episode_id)
+    return await _proxy_vod_stream("series", username, sources, request, title=title, duration_secs=episode.get("duration_secs") if episode else None, episode_id=episode_id, xc_client_id=client["id"])
 
 
 # Per-source preview — forces exactly one specific provider's copy rather
@@ -1607,7 +1641,7 @@ async def preview_movie_source_stream(username: str, password: str, source_id_ex
     if not source or not _movie_allowed(client, source["movie_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['movie_name']} ({source['movie_year']})" if source.get("movie_year") else source["movie_name"]
-    return await _proxy_vod_stream("movie", username, [source], request, title=title, duration_secs=source.get("duration_secs"), movie_id=source["movie_id"])
+    return await _proxy_vod_stream("movie", username, [source], request, title=title, duration_secs=source.get("duration_secs"), movie_id=source["movie_id"], xc_client_id=client["id"])
 
 
 @router.get("/preview/series-source/{username}/{password}/{source_id_ext}")
@@ -1621,7 +1655,7 @@ async def preview_episode_source_stream(username: str, password: str, source_id_
     if not source or not _series_allowed(client, source["series_id"]):
         return Response(status_code=404, content="not found")
     title = f"{source['series_name']} S{source['season_number']}E{source['episode_number']} — {source['episode_name']}"
-    return await _proxy_vod_stream("series", username, [source], request, title=title, duration_secs=source.get("duration_secs"), episode_id=source["episode_id"])
+    return await _proxy_vod_stream("series", username, [source], request, title=title, duration_secs=source.get("duration_secs"), episode_id=source["episode_id"], xc_client_id=client["id"])
 
 
 # Transcoded variants — same auth/lookup, but re-encode to browser-compatible

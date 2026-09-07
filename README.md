@@ -28,7 +28,9 @@ concise technical reference for people already up and running.
   — used for enrichment (once a movie/series has a known TMDB id, its detail
   refreshes straight from TMDB instead of your provider, easing load on any
   provider that rate-limits aggressively), the year-review/missing-artwork
-  disambiguation flows, and TMDB List sync; not required for basic operation
+  disambiguation flows, and category List Sync; not required for basic operation
+- Optional: a free [MDBList](https://mdblist.com) API key — a second public
+  list source for category List Sync, alongside TMDB Lists
 - Optional: an API key from Anthropic, OpenAI, and/or Google (Gemini) for
   the AI-assisted features (any one is enough; more than one lets you
   switch providers without re-entering a key)
@@ -158,6 +160,15 @@ automatically — every one is a suggestion you still review and confirm:
   the AI picks the most likely correct match with its reasoning and a
   confidence level, as an extra hint alongside the normal TMDB suggestion
   list. You still click a candidate yourself to actually resolve it.
+- **Bulk resolve with AI** (Needs Review, Missing Artwork, Duplicate Finder)
+  — the same three judgments as above, run as a background job over a
+  batch you select instead of one item at a time. Only ever applies a
+  fix when the AI reports *high* confidence — anything medium/low/no-match
+  is left untouched with its reasoning shown, never guessed into the pool.
+  Duplicate Finder's version only calls the AI when a group has no shared
+  TMDB id at all; a group that already agrees on one merges immediately, no
+  AI call needed, and a group with a genuine *conflicting* TMDB id is never
+  merged regardless of what the AI says.
 
 See [USERGUIDE.md](USERGUIDE.md#11-curation-tools) for the full set of
 curation tools (Missing Artwork, Language Filter, Duplicate Finder, Needs
@@ -301,9 +312,10 @@ Configuration → Refresh Schedule controls how often background work runs:
 - **Enrichment TTL** — how long detail-level metadata (posters, cast, genre)
   is cached before a movie/series is eligible to be refetched. Defaults to
   24 hours.
-- **TMDB Lists sync** — how often categories linked to a TMDB List
-  auto-resync. Off (manual "Sync now" only) by default — enabling it adds
-  new recurring TMDB API traffic.
+- **List Sync** — how often categories with a linked public list source
+  (TMDB List or MDBList) auto-resync. Off (manual "Sync now" only) by
+  default — enabling it adds new recurring API traffic to whichever
+  source(s) each category uses.
 
 ## Backup and restore
 
@@ -336,11 +348,31 @@ dead rows a provider deletion can leave behind — a series whose only source
 provider no longer exists, or movies/episodes with zero sources at all).
 Every movie/series can also be manually renamed or have its year corrected
 from its own detail view, for whatever a provider's own catalog data got
-wrong with no other way to fix it. **Apply TMDB Titles** (Movies/TV Shows
+wrong with no other way to fix it — including setting its TMDB id directly
+when you already know the correct match, and (for a series) editing an
+individual episode's name/number. **Apply TMDB Titles** (Movies/TV Shows
 toolbar) does this in bulk for every already-confirmed TMDB match at once,
 instead of one item at a time. **Client Title Format** (Curation &
 Maintenance) is a separate, ongoing setting to have VOD clients see a
 "(Year)" suffix on every title, independent of the pool's own stored data.
+
+**Flag as wrong content** (the flag icon on any movie, series, episode, or
+individual source) reports "this isn't actually what its label says" —
+Curation & Maintenance's **Flagged Content** queue lists everything flagged
+across the whole catalog in one place. Resolving there just clears the
+flag; fix the actual mismatch (rename, re-match TMDB, move/remove the wrong
+source) from the item itself first.
+
+**Category List Sync** (Manage Categories → the list icon on any category)
+auto-populates a category from one or more public lists — a TMDB List
+and/or an MDBList list, mixed freely on the same category — matching each
+list entry against your pool by TMDB id first, falling back to a forgiving
+title+year match. Two sync modes: **Add only** (default) never removes
+anything already placed, for a curated category you're still hand-tuning;
+**Mirror** also removes anything no longer on any linked list, keeping the
+category an exact reflection of its source(s) (e.g. a "Top 100" list that
+cycles over time) — skipped for that pass if any linked source's fetch
+fails, so a transient error never looks like "everything's gone."
 
 **Auto-create categories** (per provider, Providers → *Auto-create
 categories*) creates a Smart Category for every distinct category name a

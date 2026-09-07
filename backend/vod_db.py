@@ -995,6 +995,66 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # entirely once a series' episodes are already known and the
         # provider hasn't reported any change since.
         ("series", "episodes_synced_last_modified", "TEXT"),
+        # US content rating (movies: MPAA G/PG/PG-13/R/NC-17; series: TV-Y/
+        # TV-Y7/TV-G/TV-PG/TV-14/TV-MA), from TMDB -- deliberately separate
+        # from `rating` (TMDB's numeric vote_average, a popularity score
+        # with nothing to do with age-appropriateness). is_adult only ever
+        # flags literal porn, never general violence/maturity, so a "kids"
+        # smart category had no real field to filter inappropriate content
+        # on until this. NULL whenever the item has no confirmed tmdb_id,
+        # TMDB has no US certification on file, or it predates this column.
+        ("movies", "content_rating", "TEXT"),
+        ("series", "content_rating", "TEXT"),
+        # Content-mismatch flagging: "this isn't actually what its label
+        # says," reported by a human at whichever granularity they actually
+        # noticed it -- distinct from needs_year_review (ambiguous year) and
+        # review_excluded (language/category exclusion). One flag/reason/at
+        # triple per level: whole movie/series, one episode, or one specific
+        # provider's copy (a source can be wrong even when every other
+        # source of the same movie/episode is correct).
+        ("movies", "flagged_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "flagged_reason", "TEXT"),
+        ("movies", "flagged_at", "TEXT"),
+        ("series", "flagged_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "flagged_reason", "TEXT"),
+        ("series", "flagged_at", "TEXT"),
+        ("episodes", "flagged_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("episodes", "flagged_reason", "TEXT"),
+        ("episodes", "flagged_at", "TEXT"),
+        ("movie_sources", "flagged_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("movie_sources", "flagged_reason", "TEXT"),
+        ("movie_sources", "flagged_at", "TEXT"),
+        ("episode_sources", "flagged_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("episode_sources", "flagged_reason", "TEXT"),
+        ("episode_sources", "flagged_at", "TEXT"),
+        # Failed-streams client attribution: `username` on vod_stream_failures
+        # is only the shared VOD-relay/XC-client login (e.g. one whole
+        # Dispatcharr instance's credential), never the actual viewer --
+        # xc_server._authenticate already resolves the caller's real IP and
+        # matched xc_clients row at auth time; these just keep that instead
+        # of discarding it right after. xc_client_id deliberately has no FK
+        # constraint, same "always a snapshot" contract as movie_id/
+        # episode_id's own SET-NULL-on-delete already documents above for
+        # *why* a resolvable link is nice-to-have but never load-bearing --
+        # here it's simpler still: an xc_clients row can be deleted outright
+        # (client revoked) and the failure history should keep showing
+        # whatever it can, not lose the row or null out unrelated fields.
+        ("vod_stream_failures", "client_ip", "TEXT"),
+        ("vod_stream_failures", "xc_client_id", "INTEGER"),
+        # Multi-source category list sync: generalizes the single sync_source
+        # column above (kept as a back-compat fallback -- see
+        # list_sync_categories) into a JSON array of "kind:ref" strings, so
+        # one category can pull from several public lists at once (any
+        # provider mix, e.g. a TMDB List and an MDBList list feeding the
+        # same category). sync_mode: "add_only" (default -- items are added
+        # as they appear in a linked list, but never removed just because
+        # they later fall off it) or "mirror" (a sync also removes anything
+        # placed here that's no longer in ANY linked list, for a category
+        # meant to track a list exactly, e.g. "Top 100 Horror Movies"). See
+        # vod_list_sync.sync_category for the actual fetch/match/place/
+        # (optionally) remove logic.
+        ("categories", "sync_sources", "TEXT"),
+        ("categories", "sync_mode", "TEXT NOT NULL DEFAULT 'add_only'"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1994,13 +2054,22 @@ _MAX_STORED_STREAM_FAILURES = 500
 def log_stream_failure(
     kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str,
     movie_id: int | None = None, episode_id: int | None = None,
+    client_ip: str | None = None, xc_client_id: int | None = None,
 ) -> None:
+    """client_ip/xc_client_id: the caller's real identity, distinct from
+    `username` above (only the shared VOD-relay/XC-client login, e.g. one
+    whole Dispatcharr instance's credential, never the actual viewer) --
+    xc_server._authenticate already resolves both at auth time; this just
+    keeps them instead of discarding them right after. xc_client_id is
+    deliberately not a DB-level FK, same "always a snapshot" contract as
+    title/kind/attempts already have -- resolved back to a label via an
+    app-level join in list_stream_failures_grouped."""
     import json
     conn = _connect()
     conn.execute(
-        "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at, movie_id, episode_id) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (kind, title, username, json.dumps(attempts), final_reason, _now(), movie_id, episode_id),
+        "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at, movie_id, episode_id, client_ip, xc_client_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (kind, title, username, json.dumps(attempts), final_reason, _now(), movie_id, episode_id, client_ip, xc_client_id),
     )
     conn.execute(
         "DELETE FROM vod_stream_failures WHERE id NOT IN "
@@ -2022,28 +2091,44 @@ def record_source_failure(kind: str, source_id: int) -> None:
     request ever actually failed outright. See _source_order_by, which
     reads this to try a source with a live failure streak last instead of
     first, and record_source_success, which clears it."""
+    # Runs under _WRITE_LOCK for the same reason record_xc_client_seen does
+    # (see its docstring) -- called on every single failed stream attempt in
+    # xc_server._proxy_vod_stream's failover loop, so it's exactly the kind
+    # of small-but-frequent write that can otherwise race a heavy writer
+    # (a bulk import/enrich pass) past sqlite3's busy_timeout and surface as
+    # an unhandled 500. Real user report 2026-09-06: this exact race hit
+    # record_source_success below (same table, same call site's neighbor)
+    # and turned an already-successful upstream connection (status=200) into
+    # a dead request -- the video was right there and never got served over
+    # a stats update failing.
     table = "movie_sources" if kind == "movie" else "episode_sources"
-    conn = _connect()
-    conn.execute(
-        f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
-        (_now(), source_id),
-    )
-    _commit_with_retry(conn)
-    conn.close()
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
+            (_now(), source_id),
+        )
+        _commit_with_retry(conn)
+        conn.close()
 
 
 def record_source_success(kind: str, source_id: int) -> None:
     """Clears a source's failure streak the moment it actually works again --
     a provider that was down can come back, and a source that's currently
-    serving successfully shouldn't stay deprioritized on its past record."""
+    serving successfully shouldn't stay deprioritized on its past record.
+
+    Runs under _WRITE_LOCK -- see record_source_failure's identical note
+    just above; this is the specific call site a real user's log confirmed
+    losing the race and 500ing an otherwise-successful stream open."""
     table = "movie_sources" if kind == "movie" else "episode_sources"
-    conn = _connect()
-    conn.execute(
-        f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
-        (source_id,),
-    )
-    _commit_with_retry(conn)
-    conn.close()
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
+            (source_id,),
+        )
+        _commit_with_retry(conn)
+        conn.close()
 
 
 def _current_best_source(kind: str, movie_id: int | None, episode_id: int | None) -> dict | None:
@@ -2107,6 +2192,20 @@ def list_stream_failures(limit: int = 200) -> list[dict]:
             episode = get_episode(d["episode_id"])
             if episode:
                 d["series_providers"] = _series_providers(episode["series_id"])
+        # client_label: who was actually connected, not just the shared
+        # VOD-relay/XC-client login `username` above -- see
+        # log_stream_failure's docstring. Only set for rows captured after
+        # this column existed (older rows show nothing here, same as they
+        # show nothing for attempts/providers when that data predates
+        # capture); the xc_clients row itself may also since be deleted, in
+        # which case this stays None too rather than erroring.
+        d["client_label"] = None
+        if d.get("xc_client_id"):
+            client_conn = _connect()
+            client_row = client_conn.execute("SELECT label FROM xc_clients WHERE id=?", (d["xc_client_id"],)).fetchone()
+            client_conn.close()
+            if client_row:
+                d["client_label"] = client_row["label"]
         out.append(d)
     return out
 
@@ -4097,6 +4196,29 @@ def categories_due_for_scheduled_evaluation() -> list[dict]:
     ]
 
 
+def categories_due_for_scheduled_list_sync() -> list[dict]:
+    """List-sourced categories (sync_sources or the legacy sync_source set)
+    with their OWN schedule_interval_seconds explicitly set, whose
+    last_evaluated_at is either null or older than that interval. Shares
+    schedule_interval_seconds/last_evaluated_at with
+    categories_due_for_scheduled_evaluation -- a category is realistically
+    either smart-rule-driven or list-sync-driven, not both, so one interval
+    field per category is enough. A category with a list source but NO own
+    schedule_interval_seconds isn't returned here at all -- it's covered by
+    the separate global list-sync interval instead (Settings -> Refresh
+    Schedule), which is a true fallback default only for categories that
+    haven't opted into their own cadence."""
+    rows = [
+        r for r in list_sync_categories()
+        if r.get("schedule_interval_seconds") is not None
+    ]
+    now = time.time()
+    return [
+        r for r in rows
+        if not r["last_evaluated_at"] or (now - float(r["last_evaluated_at"])) > r["schedule_interval_seconds"]
+    ]
+
+
 def set_category_ai_description(category_id: int, ai_description: str | None) -> None:
     """Persisted so a re-run of AI Evaluate (see ai_assist.py) doesn't require
     re-typing the description each time -- same pattern as sync_source for
@@ -4116,24 +4238,60 @@ def set_category_sync_source(category_id: int, sync_source: str | None) -> None:
     conn.close()
 
 
-def list_sync_categories() -> list[dict]:
-    """All categories with a sync_source configured — what the scheduled/manual sync walks."""
+def set_category_sync_sources(category_id: int, sources: list[str]) -> None:
+    """sources: a list of 'kind:ref' strings, e.g. ['tmdb_list:1234567',
+    'mdblist:98765'] -- any provider mix, one category. See
+    vod_list_sync.sync_category for the fetch/match/place logic that reads
+    this. Stored as a JSON string (same convention as categories.rule_json),
+    empty list stored as NULL so list_sync_categories' NOT NULL check still
+    excludes a category that's been fully unlinked."""
+    import json
     conn = _connect()
-    rows = conn.execute("SELECT * FROM categories WHERE sync_source IS NOT NULL AND sync_source != ''").fetchall()
+    conn.execute(
+        "UPDATE categories SET sync_sources=? WHERE id=?",
+        (json.dumps(sources) if sources else None, category_id),
+    )
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def set_category_sync_mode(category_id: int, sync_mode: str) -> None:
+    if sync_mode not in ("add_only", "mirror"):
+        raise ValueError(f"invalid sync_mode {sync_mode!r}")
+    conn = _connect()
+    conn.execute("UPDATE categories SET sync_mode=? WHERE id=?", (sync_mode, category_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_sync_categories() -> list[dict]:
+    """All categories with sync_sources (or the legacy singular sync_source)
+    configured — what the scheduled/manual sync walks."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT * FROM categories
+        WHERE (sync_sources IS NOT NULL AND sync_sources != '')
+           OR (sync_source IS NOT NULL AND sync_source != '')
+    """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_movie_by_tmdb_id(tmdb_id: str) -> dict | None:
+    """ORDER BY id: tmdb_id isn't actually unique in the pool until
+    Duplicate Finder merges them -- a real, expected transient state, not
+    an error condition. Picks the lowest/most-established id deterministically
+    rather than whatever SQLite happens to return first with no ORDER BY."""
     conn = _connect()
-    row = conn.execute("SELECT * FROM movies WHERE tmdb_id=?", (str(tmdb_id),)).fetchone()
+    row = conn.execute("SELECT * FROM movies WHERE tmdb_id=? ORDER BY id LIMIT 1", (str(tmdb_id),)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
 def get_series_by_tmdb_id(tmdb_id: str) -> dict | None:
+    """See get_movie_by_tmdb_id's identical docstring -- same reasoning."""
     conn = _connect()
-    row = conn.execute("SELECT * FROM series WHERE tmdb_id=?", (str(tmdb_id),)).fetchone()
+    row = conn.execute("SELECT * FROM series WHERE tmdb_id=? ORDER BY id LIMIT 1", (str(tmdb_id),)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -4866,6 +5024,16 @@ def move_movie_source(source_id: int, movie_id: int, target_movie_id: int) -> No
     conn.close()
 
 
+def list_movie_placements_for_category(category_id: int) -> list[dict]:
+    """Every movie currently placed in this category -- used by
+    vod_list_sync's mirror-mode sync to know what to remove (anything
+    placed here that a fresh fetch no longer matched)."""
+    conn = _connect()
+    rows = conn.execute("SELECT movie_id FROM movie_category_placements WHERE category_id=?", (category_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def remove_movie_from_category(movie_id: int, category_id: int) -> None:
     conn = _connect()
     conn.execute(
@@ -5045,6 +5213,7 @@ def get_movie_export_rows() -> list[dict]:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -5106,6 +5275,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -5557,6 +5727,14 @@ def remove_provider_sources_from_series(series_id: int, provider_id: int) -> int
     return len(rows)
 
 
+def list_series_placements_for_category(category_id: int) -> list[dict]:
+    """See list_movie_placements_for_category's identical docstring -- same reasoning."""
+    conn = _connect()
+    rows = conn.execute("SELECT series_id FROM series_category_placements WHERE category_id=?", (category_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def remove_series_from_category(series_id: int, category_id: int) -> None:
     conn = _connect()
     conn.execute(
@@ -5683,6 +5861,7 @@ def get_series_export_rows() -> list[dict]:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -5702,6 +5881,7 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -7770,6 +7950,77 @@ def clear_tmdb_id(content_type: str, item_id: int) -> dict:
     return {"cleared_id": item_id}
 
 
+def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
+    """Manual counterpart to clear_tmdb_id -- lets a reviewer directly
+    correct a wrong (or missing) tmdb_id when they already know the right
+    one, right from the item's own detail view, instead of only being able
+    to clear it and hope a later enrichment/List Sync pass happens to find
+    the right match on its own. Same merge-on-collision safety as
+    rename_item: if another item already carries this exact tmdb_id, merge
+    into it rather than leaving two rows claiming the same real title."""
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    row = conn.execute(f"SELECT id, name, tmdb_id FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+    existing = conn.execute(
+        f"SELECT id FROM {table} WHERE tmdb_id=? AND id != ?", (tmdb_id, item_id),
+    ).fetchone()
+    conn.close()
+
+    if existing:
+        if content_type == "movie":
+            merge_movie(item_id, existing["id"])
+        else:
+            merge_series(item_id, existing["id"])
+        return {"merged_into": existing["id"]}
+
+    conn = _connect()
+    conn.execute(f"UPDATE {table} SET tmdb_id=?, updated_at=? WHERE id=?", (tmdb_id, _now(), item_id))
+    _commit_with_retry(conn)
+    conn.close()
+    logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
+    return {"resolved_id": item_id}
+
+
+def update_episode(episode_id: int, name: str | None = None, season_number: int | None = None, episode_number: int | None = None) -> dict:
+    """Manual correction for a wrong episode name/season/episode number --
+    provider-supplied episode metadata is often wrong (off-by-one numbering,
+    a placeholder/garbage name) with no existing way to fix it short of
+    deleting and re-fetching the whole series. Only touches the fields
+    actually passed (None = leave as-is), same convention as rename_item's
+    caller-provides-final-values contract."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        row = conn.execute("SELECT id FROM episodes WHERE id=?", (episode_id,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"episode {episode_id} not found")
+        sets, vals = [], []
+        if name is not None:
+            name = name.strip()
+            if not name:
+                conn.close()
+                raise ValueError("name cannot be blank")
+            sets.append("name=?")
+            vals.append(name)
+        if season_number is not None:
+            sets.append("season_number=?")
+            vals.append(season_number)
+        if episode_number is not None:
+            sets.append("episode_number=?")
+            vals.append(episode_number)
+        if sets:
+            sets.append("updated_at=?")
+            vals.append(_now())
+            vals.append(episode_id)
+            conn.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id=?", vals)
+            _commit_with_retry(conn)
+        conn.close()
+    return {"id": episode_id}
+
+
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
     """Manually corrects a movie/series' own name/year -- the general
     escape hatch for whatever a provider's own catalog data got wrong (most
@@ -7812,12 +8063,121 @@ def rename_item(content_type: str, item_id: int, name: str, year: int | None) ->
     return {"renamed_id": item_id}
 
 
+# ── Content-mismatch flagging ────────────────────────────────────────────────
+# "This isn't actually what its label says" -- distinct from needs_year_review
+# (ambiguous year) and review_excluded (language/category exclusion), reported
+# by a human at whichever granularity they actually noticed it: the whole
+# movie/series, one episode, or one specific provider's copy (a source can be
+# wrong even when every other source of the same movie/episode is correct).
+_FLAG_MISMATCH_TABLES = {
+    "movie": "movies", "series": "series", "episode": "episodes",
+    "movie_source": "movie_sources", "episode_source": "episode_sources",
+}
+# Only these three tables have their own updated_at column to stamp.
+_FLAG_MISMATCH_HAS_UPDATED_AT = {"movies", "series", "episodes"}
+
+
+def flag_content_mismatch(level: str, item_id: int, reason: str) -> dict:
+    table = _FLAG_MISMATCH_TABLES.get(level)
+    if table is None:
+        raise ValueError(f"unknown level {level!r}")
+    reason = reason.strip()[:500]
+    with _WRITE_LOCK:
+        conn = _connect()
+        row = conn.execute(f"SELECT id FROM {table} WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"{level} #{item_id} not found")
+        extra = ", updated_at=?" if table in _FLAG_MISMATCH_HAS_UPDATED_AT else ""
+        params = [1, reason, _now()] + ([_now()] if extra else []) + [item_id]
+        conn.execute(f"UPDATE {table} SET flagged_mismatch=?, flagged_reason=?, flagged_at=?{extra} WHERE id=?", params)
+        _commit_with_retry(conn)
+        conn.close()
+    return {"ok": True}
+
+
+def resolve_content_mismatch(level: str, item_id: int) -> dict:
+    table = _FLAG_MISMATCH_TABLES.get(level)
+    if table is None:
+        raise ValueError(f"unknown level {level!r}")
+    with _WRITE_LOCK:
+        conn = _connect()
+        row = conn.execute(f"SELECT id FROM {table} WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"{level} #{item_id} not found")
+        extra = ", updated_at=?" if table in _FLAG_MISMATCH_HAS_UPDATED_AT else ""
+        params = [0, None, None] + ([_now()] if extra else []) + [item_id]
+        conn.execute(f"UPDATE {table} SET flagged_mismatch=?, flagged_reason=?, flagged_at=?{extra} WHERE id=?", params)
+        _commit_with_retry(conn)
+        conn.close()
+    return {"ok": True}
+
+
+def list_flagged_content() -> list[dict]:
+    """One row per flagged item across all 5 granularities, newest first.
+    `context` carries whatever the frontend needs to open the right detail
+    view (a movie/series id, since episode/source rows aren't independently
+    viewable -- they only ever open inside their parent series' modal)."""
+    conn = _connect()
+    out: list[dict] = []
+
+    for r in conn.execute("SELECT id, name, flagged_reason, flagged_at FROM movies WHERE flagged_mismatch=1").fetchall():
+        out.append({"level": "movie", "id": r["id"], "title": r["name"], "reason": r["flagged_reason"],
+                    "flagged_at": r["flagged_at"], "context": {"movie_id": r["id"]}})
+
+    for r in conn.execute("SELECT id, name, flagged_reason, flagged_at FROM series WHERE flagged_mismatch=1").fetchall():
+        out.append({"level": "series", "id": r["id"], "title": r["name"], "reason": r["flagged_reason"],
+                    "flagged_at": r["flagged_at"], "context": {"series_id": r["id"]}})
+
+    for r in conn.execute("""
+        SELECT e.id, e.season_number, e.episode_number, e.name, e.flagged_reason, e.flagged_at,
+               s.id AS series_id, s.name AS series_name
+        FROM episodes e JOIN series s ON s.id = e.series_id
+        WHERE e.flagged_mismatch=1
+    """).fetchall():
+        out.append({
+            "level": "episode", "id": r["id"],
+            "title": f"{r['series_name']} S{r['season_number']}E{r['episode_number']} — {r['name'] or '(untitled)'}",
+            "reason": r["flagged_reason"], "flagged_at": r["flagged_at"], "context": {"series_id": r["series_id"]},
+        })
+
+    for r in conn.execute("""
+        SELECT ms.id, ms.movie_id, ms.flagged_reason, ms.flagged_at, m.name AS movie_name, p.name AS provider_name
+        FROM movie_sources ms JOIN movies m ON m.id = ms.movie_id JOIN providers p ON p.id = ms.provider_id
+        WHERE ms.flagged_mismatch=1
+    """).fetchall():
+        out.append({
+            "level": "movie_source", "id": r["id"], "title": f"{r['movie_name']} — {r['provider_name']}'s copy",
+            "reason": r["flagged_reason"], "flagged_at": r["flagged_at"], "context": {"movie_id": r["movie_id"]},
+        })
+
+    for r in conn.execute("""
+        SELECT es.id, es.flagged_reason, es.flagged_at, e.season_number, e.episode_number,
+               s.id AS series_id, s.name AS series_name, p.name AS provider_name
+        FROM episode_sources es
+        JOIN episodes e ON e.id = es.episode_id
+        JOIN series s ON s.id = e.series_id
+        JOIN providers p ON p.id = es.provider_id
+        WHERE es.flagged_mismatch=1
+    """).fetchall():
+        out.append({
+            "level": "episode_source", "id": r["id"],
+            "title": f"{r['series_name']} S{r['season_number']}E{r['episode_number']} — {r['provider_name']}'s copy",
+            "reason": r["flagged_reason"], "flagged_at": r["flagged_at"], "context": {"series_id": r["series_id"]},
+        })
+
+    conn.close()
+    out.sort(key=lambda r: r["flagged_at"] or "", reverse=True)
+    return out
+
+
 # ── Smart categories ─────────────────────────────────────────────────────────
 # rule_json shape: {"match": "all"|"any", "conditions": [{"field", "op", "value"}, ...]}
 # field: name | genre | year | country | director (movies/series share these)
 # op: contains | equals | starts_with | gte | lte
 
-_SMART_CATEGORY_FIELDS = {"name", "genre", "year", "country", "language", "director", "is_adult", "provider_category"}
+_SMART_CATEGORY_FIELDS = {"name", "genre", "year", "country", "language", "director", "is_adult", "provider_category", "content_rating"}
 # "language" isn't a real column — providers report spoken language(s) in what
 # we store as "country" (e.g. "English, Español"), so it's an alias onto that
 # same data rather than a separate field. Named clearly for the UI since
@@ -8001,26 +8361,52 @@ def evaluate_smart_category(category_id: int) -> dict:
     return {"evaluated": len(rows), "matched": len(matched_ids), "newly_placed": newly_placed}
 
 
-def get_ai_candidate_rows(content_type: str, prefilter_rule_json: str | None, limit: int) -> tuple[list[dict], int]:
+def get_ai_candidate_rows(
+    content_type: str, prefilter_rule_json: str | None, limit: int, search: str | None = None,
+) -> tuple[list[dict], int]:
     """Bounded candidate pool for AI Evaluate (see ai_assist.py's
     evaluate_candidates_for_category) -- real per-item API cost means this
     can never run over the raw pool. Reuses the exact same rule_json
     pre-filter mechanism as rule-based smart categories (see
     evaluate_smart_category above) to narrow the field before applying the
-    cap; without a pre-filter, it's just the first `limit` rows by id.
+    cap.
+
+    Real bug found live 2026-09-06: with neither prefilter_rule_json nor
+    search given (the common case -- nothing in the caller ever actually
+    supplied either), this fell back to "the first `limit` rows by id" --
+    an arbitrary, content-irrelevant slice of the whole catalog. The AI then
+    dutifully picked its "best fits" from that meaningless sample, producing
+    exactly the garbage results you'd expect ("kids halloween movies"
+    matching unrelated titles). Now raises a clear error instead of
+    silently evaluating nonsense when there's no way to build a meaningful
+    candidate set at all. Also excludes review_excluded=1 rows, matching
+    evaluate_smart_category's identical guard -- an archived item should
+    never surface as an AI-evaluate match any more than it auto-places via
+    a rule.
+
     Returns (candidates, total_before_cap) so the caller can tell the user
     how much was left out, rather than silently truncating."""
     import json
+    if not prefilter_rule_json and not search:
+        raise ValueError(
+            "This category has no usable rule and no search term was given, so there's no way to build a "
+            "relevant set of candidates -- the AI can only judge titles it's shown, it can't search your "
+            "whole catalog. Save a rule first (e.g. via \"Suggest rule\"), or narrow by a name keyword."
+        )
+
     conn = _connect()
     if content_type == "movie":
-        rows = [dict(r) for r in conn.execute("SELECT * FROM movies").fetchall()]
+        rows = [dict(r) for r in conn.execute("SELECT * FROM movies WHERE review_excluded=0").fetchall()]
     else:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM series").fetchall()]
+        rows = [dict(r) for r in conn.execute("SELECT * FROM series WHERE review_excluded=0").fetchall()]
     conn.close()
 
     if prefilter_rule_json:
         rule = json.loads(prefilter_rule_json)
         rows = [r for r in rows if _rule_matches(r, rule)]
+    if search:
+        needle = search.strip().lower()
+        rows = [r for r in rows if needle in (r.get("name") or "").lower()]
 
     return rows[:limit], len(rows)
 
