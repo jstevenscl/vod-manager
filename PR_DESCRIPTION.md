@@ -243,17 +243,22 @@ those counts once `running` became `false`. While `running: true`, the counts we
 computed and stored but never shown.
 
 ### Fix
-Button label now shows `(N checked, M renamed)` live while `running: true`, using the
+Button label now shows `(N renamed, M checked)` live while `running: true`, using the
 same state values already being updated every batch — no new state or backend calls
-needed. Once the run completes, the label reverts to the existing `(M renamed)`
-summary format. Applied identically to both the movie-side and series-side buttons.
+needed. Renamed leads because it's the number that reflects actual work done; checked
+trails as secondary scan-progress context (it climbs with every item the cursor passes,
+including ones that already matched TMDB and needed no change, so on its own it can look
+much larger than the real rename count and is misleading as the headline number). Once
+the run completes, the label reverts to the existing `(M renamed)` summary format.
+Applied identically to both the movie-side and series-side buttons.
 
 ### Before / After
 
 | | Before | After |
 |---|---|---|
-| Button text while running | Spinner only, no counts | Spinner + `(N checked, M renamed)`, live per-batch |
-| Way to distinguish "still working" from "hung" in the UI | None — required server-side/log inspection | Counts visibly climbing confirms forward progress |
+| Button text while running | Spinner only, no counts | Spinner + `(N renamed, M checked)`, live per-batch |
+| Way to distinguish "still working" from "hung" in the UI | None — required server-side/log inspection | Renamed count visibly climbing confirms forward progress |
+| Headline number while running | N/A | Renamed (actual work done), not checked (scan position) |
 
 ### Files changed
 - `frontend/src/pages/VodManager.tsx` — button label JSX for both movie-side (~line 9393) and series-side (~line 9560) bulk-apply buttons
@@ -261,7 +266,58 @@ summary format. Applied identically to both the movie-side and series-side butto
 ### Verification
 `tsc --noEmit` clean. Confirmed via code inspection that `checked`/`renamed` are
 already updated after every batch (not just at completion), so the live counts will
-be accurate. UI has not yet been visually verified in a browser against a live run.
+be accurate. Validated against a real production run: final `checked` reached 42,503
+(cursor position across all series ids, including long-deleted/merged gaps) while the
+actual `renamed` count — cross-checked directly against `series.updated_at` in the
+database — was 8,509, confirming renamed is the correct, non-inflated number to lead
+with. UI has not yet been visually verified in a browser against a live run.
+
+---
+
+## 6. Break out "not renamed" into no-change vs. genuine errors, with a completion summary
+
+**Files modified:** `backend/vod_routes.py`, `frontend/src/pages/VodManager.tsx`
+
+### Problem
+The bulk-apply endpoints only ever returned `{checked, renamed, has_more, last_id}`.
+Every item that wasn't renamed fell into one bucket, whether it was because the title
+already matched TMDB (the overwhelmingly common, entirely expected case) or because
+`rename_item()` raised a genuine `ValueError` (an actual failure, silently discarded
+via a bare `except ValueError: continue`). There was no way for a user to tell, after
+a run finished, whether anything actually needs their attention.
+
+### Fix
+`bulk_apply_tmdb_title_movies`/`_series` (`backend/vod_routes.py`) now track three
+disjoint outcomes per batch: `renamed`, `no_change` (title already matched — not an
+error), and `errors` (genuine `ValueError` from `rename_item`, with up to 10 sampled
+`"{name}: {error}"` strings returned as `error_samples` so the cause is visible instead
+of swallowed). The final batch (`has_more: false`) also returns `total_in_db` — the
+live row count via the existing `count_movies()`/`count_series()` helpers — so the
+completion summary can reconcile total activity against what's actually left in the
+library, closing the gap between "what happened" and "what (if anything) still needs
+manual review."
+
+Frontend (`VodManager.tsx`) accumulates the three counts and error samples across
+batches in `tmdbBulkApply` state, same pattern as `checked`/`renamed` already used.
+Once a run completes without a hard error, a summary line renders below the button:
+`N renamed, N no change needed[, N not renamed (see reasons)] — N {movies|series} in database`,
+with the sampled error reasons available via a tooltip on the summary text.
+
+### Before / After
+
+| | Before | After |
+|---|---|---|
+| Batch response | `{checked, renamed, has_more, last_id}` | adds `no_change`, `errors`, `error_samples` (≤10), and `total_in_db` on the final batch |
+| "Not renamed" items | Indistinguishable — could be no-op or real failure | Split into `no_change` (expected) vs. `errors` (needs review), with sampled reasons |
+| Post-run visibility | Only final `renamed`/`checked` counts | Three-way breakdown + live DB total, so the user can see at a glance whether anything needs manual fixing |
+
+### Files changed
+- `backend/vod_routes.py` — `bulk_apply_tmdb_title_movies` (~line 3213) and `bulk_apply_tmdb_title_series` (~line 3462)
+- `frontend/src/pages/VodManager.tsx` — `tmdbBulkApply` state and `runBulkApplyTmdbTitles` (~line 5826), completion summary JSX for both movie-side and series-side buttons
+
+### Verification
+`py_compile` clean on `vod_routes.py`; `tsc --noEmit` clean on the frontend. Not yet
+deployed or exercised against a live run with real error cases.
 
 ---
 
@@ -281,6 +337,8 @@ be accurate. UI has not yet been visually verified in a browser against a live r
   failure is still pending** — see note in section 4 above.
 - **Fix #5**: `tsc --noEmit` clean. Not yet committed/pushed or visually
   verified in a browser — see note in section 5 above.
+- **Fix #6**: `py_compile` and `tsc --noEmit` both clean. Not yet deployed or
+  exercised against a live run with real error cases — see note in section 6 above.
 
 ## Not included in this PR
 
