@@ -7975,7 +7975,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('movie') }}
           >
             {tmdbBulkApply.movie?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
-            Apply TMDB Titles{tmdbBulkApply.movie && !tmdbBulkApply.movie.running ? ` (${tmdbBulkApply.movie.renamed} renamed)` : ''}
+            Apply TMDB Titles{tmdbBulkApply.movie?.running ? ` (${tmdbBulkApply.movie.checked} checked, ${tmdbBulkApply.movie.renamed} renamed)` : (tmdbBulkApply.movie ? ` (${tmdbBulkApply.movie.renamed} renamed)` : '')}
           </Button>
           {tmdbBulkApply.movie?.error && (
             <>
@@ -8142,7 +8142,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('series') }}
           >
             {tmdbBulkApply.series?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
-            Apply TMDB Titles{tmdbBulkApply.series && !tmdbBulkApply.series.running ? ` (${tmdbBulkApply.series.renamed} renamed)` : ''}
+            Apply TMDB Titles{tmdbBulkApply.series?.running ? ` (${tmdbBulkApply.series.checked} checked, ${tmdbBulkApply.series.renamed} renamed)` : (tmdbBulkApply.series ? ` (${tmdbBulkApply.series.renamed} renamed)` : '')}
           </Button>
           {tmdbBulkApply.series?.error && (
             <>
