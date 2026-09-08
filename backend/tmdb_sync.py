@@ -25,7 +25,7 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
-_YEAR_LOOKUP_CONCURRENCY = 6
+_YEAR_LOOKUP_CONCURRENCY = 10
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
 
