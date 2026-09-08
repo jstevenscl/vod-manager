@@ -6859,6 +6859,33 @@ def backfill_tmdb_id_if_missing(content_type: str, item_id: int, tmdb_id: str) -
         conn.close()
 
 
+def list_movies_with_tmdb_id(after_id: int, limit: int) -> list[dict]:
+    """Cursor-paginated (by id, not OFFSET) so bulk_apply_tmdb_title_movies
+    can keep calling this across a whole library in bounded batches without
+    ever re-fetching a batch it already processed -- OFFSET would have kept
+    returning the exact same first `limit` rows forever, since renaming a
+    movie to already match TMDB's title doesn't remove it from a WHERE
+    tmdb_id IS NOT NULL filter."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, year, tmdb_id FROM movies WHERE tmdb_id IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+        (after_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_series_with_tmdb_id(after_id: int, limit: int) -> list[dict]:
+    """See list_movies_with_tmdb_id's identical docstring."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, year, tmdb_id FROM series WHERE tmdb_id IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+        (after_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
     """Manually corrects a movie/series' own name/year -- the general
     escape hatch for whatever a provider's own catalog data got wrong (most
