@@ -4794,6 +4794,35 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     enabled:  !!duplicatesTmdbIdsKey,
   })
 
+  // ── Bulk "apply TMDB title" (GH issue #1) ──
+  // Catches the whole library up to TMDB's own titles in one action instead
+  // of the existing per-item button being the only way. Still only ever
+  // touches items with an already-confirmed tmdb_id -- same manual-only,
+  // opt-in-per-run philosophy as the single-item version, just looped
+  // client-side against the cursor-paginated bulk-apply endpoint so one
+  // huge library doesn't have to fit in a single request.
+  const [tmdbBulkApply, setTmdbBulkApply] = useState<Record<'movie' | 'series', { running: boolean; checked: number; renamed: number; error?: string } | null>>({ movie: null, series: null })
+  async function runBulkApplyTmdbTitles(contentType: 'movie' | 'series') {
+    setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: 0, renamed: 0 } }))
+    let afterId = 0
+    let totalChecked = 0
+    let totalRenamed = 0
+    try {
+      for (;;) {
+        const r = await api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/tmdb-title/bulk-apply/`, null, { params: { after_id: afterId, limit: 100 } })
+        totalChecked += r.data.checked
+        totalRenamed += r.data.renamed
+        afterId = r.data.last_id
+        setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: totalChecked, renamed: totalRenamed } }))
+        if (!r.data.has_more) break
+      }
+      qc.invalidateQueries({ queryKey: [contentType === 'movie' ? 'vod-movies' : 'vod-series'] })
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed } }))
+    } catch (e: any) {
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, error: e?.response?.data?.detail ?? e.message ?? 'Failed' } }))
+    }
+  }
+
   // ── Movies ──
   const [movieSearch, setMovieSearch] = useState('')
   const [movieOffset, setMovieOffset] = useState(0)
@@ -7921,6 +7950,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('movie')}>
             Language Filter
           </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!!tmdbBulkApply.movie?.running}
+            title="Renames every movie with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-movie TMDB-title button, just for the whole library at once"
+            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('movie') }}
+          >
+            {tmdbBulkApply.movie?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
+            Apply TMDB Titles{tmdbBulkApply.movie && !tmdbBulkApply.movie.running ? ` (${tmdbBulkApply.movie.renamed} renamed)` : ''}
+          </Button>
+          {tmdbBulkApply.movie?.error && <span className="text-xs text-destructive">{tmdbBulkApply.movie.error}</span>}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
@@ -8071,6 +8110,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button size="sm" variant="outline" onClick={() => setLibraryLanguageModalOpen('series')}>
             Language Filter
           </Button>
+          <Button
+            size="sm" variant="outline"
+            disabled={!!tmdbBulkApply.series?.running}
+            title="Renames every series with an already-confirmed TMDB id to TMDB's own title/year, wherever it differs from what's stored now -- same effect as the per-series TMDB-title button, just for the whole library at once"
+            onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('series') }}
+          >
+            {tmdbBulkApply.series?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
+            Apply TMDB Titles{tmdbBulkApply.series && !tmdbBulkApply.series.running ? ` (${tmdbBulkApply.series.renamed} renamed)` : ''}
+          </Button>
+          {tmdbBulkApply.series?.error && <span className="text-xs text-destructive">{tmdbBulkApply.series.error}</span>}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
               title="List view"
