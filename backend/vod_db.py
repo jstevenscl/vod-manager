@@ -6087,238 +6087,304 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
         archived = 0
         unarchived = 0
         lock_retry_items = []
-        # Committed every batch_size items rather than once at the very end (see
-        # _commit_with_retry's docstring) -- a real XC catalog is thousands of
-        # items, and holding one uncommitted transaction open for the whole loop
-        # made this a bad neighbor to every other background writer (enrichment,
-        # TMDB sync, category schedules, a concurrent provider's own import):
-        # they'd block on the write lock for the full 30s connect timeout and
-        # then fail with "database is locked" -- confirmed as the root cause of a
-        # real user's flood of exactly that warning during import. 200 wasn't
-        # small enough: the writer lock is held for the WHOLE batch (SAVEPOINTs
-        # don't release it, only the periodic commit does), and 200 items' worth
-        # of per-item SELECT/INSERT/UPDATE queries can itself run long enough to
-        # outlast even a 30s busy_timeout under real load -- confirmed live
-        # 2026-07-30: a provider's manually-triggered import collided with
-        # bulk_enrich_all's 8 concurrent writers running against a different
-        # provider and lost ~48% of its items to permanent lock errors even after
-        # all 3 retry passes. Matches bulk_import_plex_series's existing 20.
-        batch_size = 25
-        for i, item in enumerate(items):
-            try:
-                with _item_savepoint(conn):
+        # Chunked at 1000 items/round-trip instead of the old one-SELECT-plus-
+        # one-or-more-writes-PER-ITEM loop (up to 5 individual statements x
+        # 180K+ items in a real two-account import, confirmed live 2026-09-08
+        # as a multi-hour import). Each chunk now does a small constant number
+        # of bulk `WHERE ... IN (...)` SELECTs up front, resolves every item's
+        # branch (create/match/archive/flag) against those in-memory dicts --
+        # byte-for-byte the same decision logic as the old per-item version,
+        # just evaluated against a prefetched snapshot instead of a live
+        # per-item query -- then applies all writes for the chunk via
+        # `executemany`. Modeled on Dispatcharr's own VOD import
+        # (apps/vod/tasks.py: bulk-fetch existing keys by IN-query, diff in a
+        # Python dict, `bulk_create`/`bulk_update` per chunk) after comparing
+        # its ~1000x-fewer-round-trips approach against this function's
+        # original row-by-row design (see beads-otn).
+        #
+        # The write lock is still released/reacquired between chunks (see the
+        # loop below) for the same reason as the old batch_size=25 commit
+        # cadence: holding it for the whole import starves every other writer
+        # (enrichment, a concurrent provider's own import) with no timeout --
+        # confirmed live 2026-07-31/07-30, see _WRITE_LOCK's docstring. A
+        # 1000-item chunk's SELECTs+executemany run fast enough (bulk, not
+        # per-item) that this no longer needs to be as small as 25 to keep
+        # each lock-hold window short.
+        chunk_size = 1000
+        for chunk_start in range(0, len(items), chunk_size):
+            chunk = items[chunk_start:chunk_start + chunk_size]
+
+            # -- Bulk-fetch every lookup this chunk could possibly need, in a
+            # small constant number of round trips, instead of one SELECT per
+            # item. Every dict below is keyed exactly the way the old
+            # per-item queries were keyed, so the branch logic per item is
+            # unchanged -- only where the row comes from differs.
+            stream_ids = [item["provider_stream_id"] for item in chunk]
+            sources_by_stream_id: dict[str, sqlite3.Row] = {}
+            for i in range(0, len(stream_ids), 900):
+                sub = stream_ids[i:i + 900]
+                placeholders = ",".join("?" * len(sub))
+                rows = conn.execute(
+                    f"SELECT provider_stream_id, movie_id FROM movie_sources "
+                    f"WHERE provider_id=? AND provider_stream_id IN ({placeholders})",
+                    (provider_id, *sub),
+                ).fetchall()
+                for row in rows:
+                    sources_by_stream_id[row["provider_stream_id"]] = row
+
+            matched_movie_ids = {row["movie_id"] for row in sources_by_stream_id.values()}
+            movies_by_id: dict[int, sqlite3.Row] = {}
+            if matched_movie_ids:
+                ids = list(matched_movie_ids)
+                for i in range(0, len(ids), 900):
+                    sub = ids[i:i + 900]
+                    placeholders = ",".join("?" * len(sub))
+                    rows = conn.execute(
+                        f"SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                        f"FROM movies WHERE id IN ({placeholders})", sub,
+                    ).fetchall()
+                    for row in rows:
+                        movies_by_id[row["id"]] = row
+
+            # Only items with no provider_stream_id match need name/year
+            # lookups -- same short-circuit the old per-item code had via
+            # elif/else, just computed once per chunk instead of per item.
+            unresolved = [item for item in chunk if item["provider_stream_id"] not in sources_by_stream_id]
+            name_year_pairs = {(item["name"], item.get("year")) for item in unresolved if item["name"].strip()}
+            movies_by_name_year: dict[tuple[str, object], sqlite3.Row] = {}
+            names_needing_candidates = {item["name"] for item in unresolved if item["name"].strip() and item.get("year") is None}
+            movies_by_name: dict[str, list[sqlite3.Row]] = {}
+            if name_year_pairs:
+                names = list({n for n, _ in name_year_pairs})
+                for i in range(0, len(names), 900):
+                    sub = names[i:i + 900]
+                    placeholders = ",".join("?" * len(sub))
+                    rows = conn.execute(
+                        f"SELECT id, name, year, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                        f"FROM movies WHERE name IN ({placeholders})", sub,
+                    ).fetchall()
+                    for row in rows:
+                        movies_by_name_year.setdefault((row["name"], row["year"]), row)
+                        if row["name"] in names_needing_candidates:
+                            movies_by_name.setdefault(row["name"], []).append(row)
+
+            # -- Resolve every item's identity/branch against the prefetched
+            # dicts above (identical decision tree to the old per-item
+            # version), collecting writes to apply in bulk below instead of
+            # executing them one at a time.
+            movie_updates_adult: list[tuple] = []
+            movie_updates_archive: list[tuple] = []
+            movie_updates_unarchive: list[tuple] = []
+            movie_updates_tmdb: list[tuple] = []
+            movie_inserts: list[tuple] = []  # (name, year, is_adult, needs_year_review, review_excluded, created_at)
+            movie_source_upserts: list[tuple] = []
+            # Each entry resolved below either already has a real movie_id
+            # (matched an existing row) or is a pending insert referenced by
+            # its position in movie_inserts -- resolved to a real id only
+            # after the bulk INSERT runs (SQLite has no multi-row RETURNING
+            # id here), same as the old code getting `cur.lastrowid`
+            # per-item, just deferred to right after the bulk insert instead
+            # of inline.
+            #
+            # movies_by_name_year/movies_by_name are updated in place as new
+            # rows are queued below (not just read from the initial
+            # snapshot) -- otherwise two items in the same chunk sharing a
+            # brand-new (name, year) (a real case: the same title filed under
+            # two provider categories) would both miss the snapshot and both
+            # get inserted, creating a duplicate the old live-requery,
+            # one-item-at-a-time code would never have produced. A pending
+            # insert's id isn't known yet (no id until the bulk INSERT flush
+            # below runs), so it's represented by a plain dict carrying its
+            # insert_index instead of a real sqlite3.Row.
+            pending: list[dict] = []
+
+            for item in chunk:
+                try:
                     name = item["name"]
                     year = item.get("year")
                     category_looks_adult = _looks_adult(item.get("provider_category_name"))
                     should_archive = bool(item.get("auto_archive"))
-                    # Counted locally and only folded into the real created/matched/
-                    # flagged/archived totals once this item's last statement has
-                    # actually succeeded -- incrementing the outer counters
-                    # immediately would drift them out of sync with what's really
-                    # in the DB if a later statement in this same item (e.g. the
-                    # movie_sources insert below) goes on to raise and roll this
-                    # item back.
+                    movie_id = None
+                    insert_index = None
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
-                    # Primary match: this exact provider+stream_id was already
-                    # imported before -- reuse its established movie_id directly,
-                    # UNCONDITIONALLY (checked before any name-based matching,
-                    # not just for a blank name), rather than re-deriving identity
-                    # from name/year on every single re-import. This is what makes
-                    # it safe for enrichment (vod_importer.enrich_movie) to
-                    # overwrite a raw-filename/placeholder name with the
-                    # provider's own clean title without the NEXT re-import
-                    # creating a duplicate orphaned row: a re-import's identity
-                    # now comes from provider_stream_id, not from re-matching a
-                    # (now-different) name string. Real gap closed here, found
-                    # live 2026-07-29: enrichment already fetches a movie's clean
-                    # title from get_vod_info but had nowhere safe to persist it,
-                    # because every earlier version of this function re-derived
-                    # identity from (name, year) on every single pass -- writing
-                    # the clean name would have silently duplicated on the very
-                    # next refresh.
-                    existing_source = conn.execute(
-                        "SELECT movie_id FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
-                        (provider_id, item["provider_stream_id"]),
-                    ).fetchone()
+
+                    existing_source = sources_by_stream_id.get(item["provider_stream_id"])
                     if existing_source:
                         movie_id = existing_source["movie_id"]
                         did_match = True
-                        existing = conn.execute(
-                            "SELECT is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM movies WHERE id=?", (movie_id,)
-                        ).fetchone()
+                        existing = movies_by_id.get(movie_id)
                         if existing:
                             if category_looks_adult and not existing["is_adult"] and not existing["is_adult_manual"]:
-                                conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+                                movie_updates_adult.append((movie_id,))
                             if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
-                                conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
-                                conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                movie_updates_archive.append((movie_id,))
                                 did_archive = True
                             elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
-                                # Mirror of the archive branch above -- no active
-                                # rule matches this item any more (see this
-                                # function's docstring), so lift an
-                                # automatically-applied archive.
-                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                movie_updates_unarchive.append((movie_id,))
                                 did_unarchive = True
                     elif not name.strip():
-                        # A blank provider-supplied name has no real identity to match
-                        # on -- treating "" like any other string let unrelated titles
-                        # silently collapse into one shared row (a real corruption found
-                        # in production: 3 completely unrelated movies from the same
-                        # provider, different genres, merged into a single blank-named
-                        # entry because they all matched (name='', year=NULL) exactly).
-                        # Never match a blank name against anything, including another
-                        # blank one -- reaching this branch at all already means the
-                        # existing_source check above found no established identity for
-                        # this stream, so this is a genuinely new item.
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
-                        cur = conn.execute(
-                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), now),
-                        )
-                        movie_id = cur.lastrowid
+                        insert_index = len(movie_inserts)
+                        movie_inserts.append((placeholder, year, int(category_looks_adult), 1, int(should_archive), now))
                         did_create = True
                         did_flag = True
                         did_archive = should_archive
                     else:
-                        row = conn.execute(
-                            "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM movies WHERE name=? AND year IS ?",
-                            (name, year),
-                        ).fetchone()
+                        row = movies_by_name_year.get((name, year))
                         if row:
                             movie_id = row["id"]
                             did_match = True
                             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
-                                conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+                                movie_updates_adult.append((movie_id,))
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
-                                # Becoming archived doesn't just set a flag -- it has to
-                                # actually remove any existing category placement, or
-                                # Dispatcharr keeps seeing it via whatever category it
-                                # was already in (the exact bug this whole block exists
-                                # to fix -- see evaluate_smart_category's docstring).
-                                conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                movie_updates_archive.append((movie_id,))
                                 did_archive = True
                             elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                # Mirror of the archive branch above -- see this
-                                # function's docstring for why an automatically
-                                # applied archive can be automatically lifted too.
-                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                movie_updates_unarchive.append((movie_id,))
                                 did_unarchive = True
                         elif year is None:
-                            # No exact (name, NULL) row, and no year to key an exact match
-                            # on -- same reasoning as upsert_movie: exactly one same-named
-                            # candidate means this is almost certainly it, just missing year
-                            # metadata from this provider; two or more is genuinely
-                            # ambiguous, flag rather than silently duplicate.
-                            candidates = conn.execute(
-                                "SELECT id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
-                            ).fetchall()
+                            candidates = movies_by_name.get(name, [])
                             if len(candidates) == 1:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
-                                # Same archive-upgrade check as the exact (name, year)
-                                # match above -- a null-year row matched this way is
-                                # just as real a match, and must not silently skip
-                                # becoming archived (a real bug: this branch used to
-                                # apply no exclusion rules at all, so a null-year
-                                # movie/series could never be caught by language/
-                                # category import exclusion no matter how many times
-                                # the catalog was re-imported).
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
-                                    conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                    movie_updates_archive.append((movie_id,))
                                     did_archive = True
                                 elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                    movie_updates_unarchive.append((movie_id,))
                                     did_unarchive = True
                             else:
-                                cur = conn.execute(
-                                    "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
-                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), now),
-                                )
-                                movie_id = cur.lastrowid
+                                insert_index = len(movie_inserts)
+                                movie_inserts.append((name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), now))
                                 did_create = True
                                 did_archive = should_archive
                                 if candidates:
                                     did_flag = True
+                                # Register this brand-new row immediately so a
+                                # later item in the same chunk with the same
+                                # name (still year=None) sees it as a
+                                # same-named candidate -- matches what a live
+                                # per-item requery would have found on the
+                                # next item's SELECT. "id" is a negative
+                                # placeholder (-1 - insert_index) resolved to
+                                # a real id in the flush step below, once the
+                                # bulk INSERT has actually run.
+                                new_row = {"id": -1 - insert_index, "review_excluded": int(should_archive), "review_excluded_manual": 0,
+                                           "is_adult": int(category_looks_adult), "is_adult_manual": 0}
+                                movies_by_name.setdefault(name, []).append(new_row)
                         else:
-                            cur = conn.execute(
-                                "INSERT INTO movies (name, year, is_adult, review_excluded, created_at) VALUES (?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), int(should_archive), now),
-                            )
-                            movie_id = cur.lastrowid
+                            insert_index = len(movie_inserts)
+                            # needs_year_review=0 here (vs. the other two insert
+                            # branches above, which pass 1) -- a real year means
+                            # there's nothing ambiguous to flag, matching the old
+                            # code's separate 5-column INSERT (no needs_year_review
+                            # column, defaulting to its schema default of 0) for
+                            # this exact branch.
+                            movie_inserts.append((name, year, int(category_looks_adult), 0, int(should_archive), now))
                             did_create = True
                             did_archive = should_archive
-                    if item.get("tmdb_id"):
-                        # Some providers' bulk get_vod_streams list already
-                        # includes "tmdb" (confirmed live 2026-09-05: 3 of 5
-                        # real providers) -- capturing it here means
-                        # enrich_movie's TMDB-first fallback (see its
-                        # docstring) can apply from this movie's very FIRST
-                        # enrichment pass, not just its second, skipping the
-                        # provider's get_vod_info call entirely instead of
-                        # needing one just to discover the id. Upgrade-only
-                        # (COALESCE): a provider that omits this field on one
-                        # pass must never erase an id already captured (by
-                        # this, a prior enrichment, or a Duplicate Finder
-                        # merge) on an earlier one.
-                        conn.execute(
-                            "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
-                            (item["tmdb_id"], movie_id),
-                        )
-                    conn.execute(
-                        """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, added_at, last_seen_at)
-                           VALUES (?,?,?,?,?,?,?,?)
-                           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                               movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
-                               raw_name=excluded.raw_name""",
-                        (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                         item.get("provider_category_name"), item.get("raw_name"), now, now),
-                    )
-                    created += did_create
-                    matched += did_match
-                    flagged += did_flag
-                    archived += did_archive
-                    unarchived += did_unarchive
-            except sqlite3.OperationalError as exc:
-                # A periodic commit (above) frees the write lock regularly, but a
-                # concurrent writer can still grab it in the gap between this
-                # item's statements and the next periodic commit -- that's
-                # transient contention, not a bad item, so it gets one more pass
-                # after this batch finishes instead of being counted as a
-                # permanent failure (this is the exact "database is locked"
-                # flood a real user hit during import -- items were being
-                # silently and permanently dropped by this, not actually
-                # malformed).
-                if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
-                    lock_retry_items.append(item)
-                else:
+                            # Same same-chunk-visibility fix as the year=None
+                            # insert branch above, keyed by (name, year) this
+                            # time -- a later item in this chunk with the same
+                            # (name, year) must match this row, not insert its
+                            # own duplicate. Same negative-placeholder id
+                            # scheme, resolved in the flush step below.
+                            new_row = {"id": -1 - insert_index, "review_excluded": int(should_archive), "review_excluded_manual": 0,
+                                       "is_adult": int(category_looks_adult), "is_adult_manual": 0}
+                            movies_by_name_year[(name, year)] = new_row
+
+                    pending.append({
+                        "item": item, "movie_id": movie_id, "insert_index": insert_index,
+                        "did_create": did_create, "did_match": did_match, "did_flag": did_flag,
+                        "did_archive": did_archive, "did_unarchive": did_unarchive,
+                    })
+                except Exception as exc:
                     errors += 1
                     logger.warning("[vod_db] bulk_import_movies: skipped item name=%r stream_id=%r: %s",
                                     item.get("name"), item.get("provider_stream_id"), exc)
+
+            try:
+                with conn:
+                    # Inserts first so pending items get real ids before the
+                    # tmdb_id/movie_sources writes below reference them. One
+                    # INSERT per row (not executemany) because lastrowid is
+                    # needed back per-row to resolve each pending entry's
+                    # movie_id -- SQLite's executemany doesn't report a
+                    # lastrowid per row, only for the last statement run.
+                    insert_id_map: dict[int, int] = {}
+                    for idx, row in enumerate(movie_inserts):
+                        cur = conn.execute(
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
+                            row,
+                        )
+                        insert_id_map[idx] = cur.lastrowid
+
+                    def _resolve(movie_id):
+                        # Negative ids are the -1-insert_index placeholders
+                        # used above so a later item in the same chunk could
+                        # match a not-yet-inserted row; real SQLite rowids
+                        # are always positive, so this is an unambiguous
+                        # sentinel, not a guess.
+                        return insert_id_map[-1 - movie_id] if movie_id < 0 else movie_id
+
+                    for entry in pending:
+                        if entry["insert_index"] is not None:
+                            entry["movie_id"] = insert_id_map[entry["insert_index"]]
+                        elif entry["movie_id"] is not None:
+                            entry["movie_id"] = _resolve(entry["movie_id"])
+                    movie_updates_adult = [(_resolve(mid),) for (mid,) in movie_updates_adult]
+                    movie_updates_archive = [(_resolve(mid),) for (mid,) in movie_updates_archive]
+                    movie_updates_unarchive = [(_resolve(mid),) for (mid,) in movie_updates_unarchive]
+
+                    if movie_updates_adult:
+                        conn.executemany("UPDATE movies SET is_adult=1 WHERE id=?", movie_updates_adult)
+                    if movie_updates_archive:
+                        conn.executemany("UPDATE movies SET review_excluded=1 WHERE id=?", movie_updates_archive)
+                        conn.executemany("DELETE FROM movie_category_placements WHERE movie_id=?", movie_updates_archive)
+                    if movie_updates_unarchive:
+                        conn.executemany("UPDATE movies SET review_excluded=0 WHERE id=?", movie_updates_unarchive)
+
+                    for entry in pending:
+                        item = entry["item"]
+                        if item.get("tmdb_id"):
+                            conn.execute(
+                                "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
+                                (item["tmdb_id"], entry["movie_id"]),
+                            )
+                        conn.execute(
+                            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, added_at, last_seen_at)
+                               VALUES (?,?,?,?,?,?,?,?)
+                               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
+                                   raw_name=excluded.raw_name""",
+                            (entry["movie_id"], provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
+                             item.get("provider_category_name"), item.get("raw_name"), now, now),
+                        )
+                        created += entry["did_create"]
+                        matched += entry["did_match"]
+                        flagged += entry["did_flag"]
+                        archived += entry["did_archive"]
+                        unarchived += entry["did_unarchive"]
+            except sqlite3.OperationalError as exc:
+                # Same transient-lock-contention handling as the old per-item
+                # code, just applied to a whole chunk that failed to commit --
+                # the whole chunk's items retry together on the next pass
+                # rather than being permanently dropped (see this function's
+                # existing lock_retry_items handling below).
+                if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
+                    lock_retry_items.extend(chunk)
+                else:
+                    errors += len(chunk)
+                    logger.warning("[vod_db] bulk_import_movies: skipped chunk of %d item(s): %s", len(chunk), exc)
             except Exception as exc:
-                errors += 1
-                logger.warning("[vod_db] bulk_import_movies: skipped item name=%r stream_id=%r: %s",
-                                item.get("name"), item.get("provider_stream_id"), exc)
-            finally:
-                # In a `finally` (not inline after the try/except) so this still
-                # fires on the blank-name branch's `continue` -- that continue
-                # jumps straight to the next loop iteration and would otherwise
-                # skip this check entirely for that item's index.
-                if (i + 1) % batch_size == 0:
-                    _commit_with_retry(conn)
-                    # Release+reacquire between batches -- holding the lock for the
-                    # WHOLE function (a large catalog can take many minutes) blocked
-                    # every other writer with no timeout, which could exhaust the
-                    # async thread pool if enough piled up waiting -- confirmed live
-                    # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
-                    # requests hanging/500ing during a large concurrent import, fixed
-                    # by matching the lock's hold window to one batch's real SQLite
-                    # write-transaction span instead of the whole import.
-                    _WRITE_LOCK.release()
-                    _WRITE_LOCK.acquire()
-        _commit_with_retry(conn)
+                errors += len(chunk)
+                logger.warning("[vod_db] bulk_import_movies: skipped chunk of %d item(s): %s", len(chunk), exc)
+
+            # Release+reacquire between chunks -- see this function's lock
+            # docstring above; unchanged reasoning, just once per 1000-item
+            # chunk instead of once per 25.
+            _WRITE_LOCK.release()
+            _WRITE_LOCK.acquire()
         conn.close()
     finally:
         _WRITE_LOCK.release()
@@ -6358,7 +6424,17 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
     that per-series call is still needed). import_provider_id/
     import_provider_series_id are stamped so enrich_series() can call
     straight back to the right provider instead of re-scanning every
-    provider for a name match."""
+    provider for a name match.
+
+    Chunked (1000 items/round-trip) the same way as bulk_import_movies --
+    see that function's docstring for the full rationale (~180K+ items,
+    hours -> seconds, confirmed live 2026-09-08). Series has no separate
+    join table like movie_sources -- import_provider_id/
+    import_provider_series_id live directly on the series row -- so the
+    primary-match lookup here is a single bulk SELECT against `series`
+    keyed on (import_provider_id, import_provider_series_id) instead of a
+    movie_sources-style join.
+    """
     _WRITE_LOCK.acquire()
     try:
         conn = _connect()
@@ -6371,199 +6447,263 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
         unarchived = 0
         lock_retry_items = []
         # See bulk_import_movies's identical comment -- same fix, same reason.
-        batch_size = 25
-        for i, item in enumerate(items):
-            try:
-                with _item_savepoint(conn):
+        chunk_size = 1000
+        for chunk_start in range(0, len(items), chunk_size):
+            chunk = items[chunk_start:chunk_start + chunk_size]
+
+            # -- Bulk-fetch every lookup this chunk could possibly need, in a
+            # small constant number of round trips -- see bulk_import_movies's
+            # identical comment for the general approach. The primary-match
+            # lookup here is keyed on (import_provider_id, import_provider_
+            # series_id) directly against `series` (no movie_sources-style
+            # join table for series).
+            series_ids = [item.get("provider_series_id") for item in chunk]
+            existing_by_series_id: dict[object, sqlite3.Row] = {}
+            for i in range(0, len(series_ids), 900):
+                sub = series_ids[i:i + 900]
+                placeholders = ",".join("?" * len(sub))
+                rows = conn.execute(
+                    f"SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_series_id "
+                    f"FROM series WHERE import_provider_id=? AND import_provider_series_id IN ({placeholders})",
+                    (provider_id, *sub),
+                ).fetchall()
+                for row in rows:
+                    existing_by_series_id[row["import_provider_series_id"]] = row
+
+            # Only items with no provider_series_id match need name/year
+            # lookups -- same short-circuit as bulk_import_movies.
+            unresolved = [item for item in chunk if item.get("provider_series_id") not in existing_by_series_id]
+            name_year_pairs = {(item["name"], item.get("year")) for item in unresolved if item["name"].strip()}
+            series_by_name_year: dict[tuple[str, object], sqlite3.Row] = {}
+            names_needing_candidates = {item["name"] for item in unresolved if item["name"].strip() and item.get("year") is None}
+            series_by_name: dict[str, list[sqlite3.Row]] = {}
+            if name_year_pairs:
+                names = list({n for n, _ in name_year_pairs})
+                for i in range(0, len(names), 900):
+                    sub = names[i:i + 900]
+                    placeholders = ",".join("?" * len(sub))
+                    rows = conn.execute(
+                        f"SELECT id, name, year, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id "
+                        f"FROM series WHERE name IN ({placeholders})", sub,
+                    ).fetchall()
+                    for row in rows:
+                        series_by_name_year.setdefault((row["name"], row["year"]), row)
+                        if row["name"] in names_needing_candidates:
+                            series_by_name.setdefault(row["name"], []).append(row)
+
+            # -- Resolve every item's identity/branch against the prefetched
+            # dicts above (identical decision tree to the old per-item
+            # version) -- see bulk_import_movies's identical comment block
+            # for the full explanation of the pending/negative-placeholder-id
+            # scheme used to keep same-chunk duplicates from being created.
+            series_updates_adult: list[tuple] = []
+            series_updates_archive: list[tuple] = []
+            series_updates_unarchive: list[tuple] = []
+            series_updates_import_provider: list[tuple] = []  # (provider_id, provider_series_id, series_id)
+            # (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at)
+            series_inserts: list[tuple] = []
+            pending: list[dict] = []
+
+            for item in chunk:
+                try:
                     name = item["name"]
                     year = item.get("year")
                     category_looks_adult = _looks_adult(item.get("provider_category_name"))
                     should_archive = bool(item.get("auto_archive"))
-                    # See bulk_import_movies's identical did_create/did_match/did_flag
-                    # comment -- folded into the real counters only after this item's
-                    # last statement has actually succeeded.
+                    series_id = None
+                    insert_index = None
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
-                    series_id_for_detail = None
-                    # Primary match: this exact provider+series_id was already
-                    # imported before -- reuse its established identity directly,
-                    # UNCONDITIONALLY (not just for a blank name), same reasoning
-                    # as bulk_import_movies's identical hoist above (see its
-                    # comment for the full explanation of why this is what makes
-                    # it safe for enrichment to later overwrite a raw/placeholder
-                    # name with the provider's clean title without the next
-                    # re-import creating a duplicate orphaned row).
-                    existing = conn.execute(
-                        "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
-                        (provider_id, item.get("provider_series_id")),
-                    ).fetchone()
+                    cat_update_needed = False
+
+                    existing = existing_by_series_id.get(item.get("provider_series_id"))
                     if existing:
+                        series_id = existing["id"]
                         did_match = True
-                        series_id_for_detail = existing["id"]
-                        # Real bug found live 2026-07-29: this value was captured
-                        # in `item` on every single import pass but never
-                        # actually written anywhere -- episode_sources.
-                        # provider_category_name (what evaluate_smart_category's
-                        # provider_category rule field and auto-create-categories
-                        # both actually read) was NULL for every episode of every
-                        # series ever imported through this path, so series-side
-                        # provider-category matching never worked for any
-                        # provider, not just whichever one happened to be tested.
-                        # Stored here (unconditionally overwritten -- provider-
-                        # sourced, not user-editable) so enrich_series can read it
-                        # back and stamp it onto each episode as episodes are
-                        # discovered (episodes aren't known yet at this cheap
-                        # bulk-list stage, only lazily via get_series_info).
-                        conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), existing["id"]))
+                        cat_update_needed = True
                         if category_looks_adult and not existing["is_adult"] and not existing["is_adult_manual"]:
-                            conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (existing["id"],))
+                            series_updates_adult.append((series_id,))
                         if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
-                            conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (existing["id"],))
-                            conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (existing["id"],))
+                            series_updates_archive.append((series_id,))
                             did_archive = True
                         elif not should_archive and existing["review_excluded"] and not existing["review_excluded_manual"]:
-                            # Mirror of the archive branch above -- see
-                            # bulk_import_movies's docstring for why an
-                            # automatically applied archive can be
-                            # automatically lifted too.
-                            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (existing["id"],))
+                            series_updates_unarchive.append((series_id,))
                             did_unarchive = True
                     elif not name.strip():
-                        # Same reasoning as bulk_import_movies's identical guard -- a
-                        # blank name has no real identity to match on, so never match it
-                        # against anything, including another blank one. Reaching this
-                        # branch at all already means the existing-identity check above
-                        # found no established row for this provider+series_id, so this
-                        # is a genuinely new item.
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · series {item.get('provider_series_id')}"
-                        cur = conn.execute(
-                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
-                        )
+                        insert_index = len(series_inserts)
+                        series_inserts.append((placeholder, year, int(category_looks_adult), 1, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now))
                         did_create = True
                         did_flag = True
                         did_archive = should_archive
-                        series_id_for_detail = cur.lastrowid
                     else:
-                        row = conn.execute(
-                            "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id FROM series WHERE name=? AND year IS ?",
-                            (name, year),
-                        ).fetchone()
+                        row = series_by_name_year.get((name, year))
                         if row:
+                            series_id = row["id"]
                             did_match = True
-                            series_id_for_detail = row["id"]
-                            # See the identical comment on the existing-identity
-                            # match branch above -- same fix, same reasoning.
-                            conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), row["id"]))
+                            cat_update_needed = True
                             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
-                                conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (row["id"],))
+                                series_updates_adult.append((series_id,))
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (row["id"],))
-                                # See the identical comment in bulk_import_movies -- this
-                                # is what actually makes "archived" hide it from
-                                # Dispatcharr, not just the flag on its own.
-                                conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (row["id"],))
+                                series_updates_archive.append((series_id,))
                                 did_archive = True
                             elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
+                                series_updates_unarchive.append((series_id,))
                                 did_unarchive = True
                             if row["import_provider_id"] is None:
                                 # This series previously had no working way to fetch episode
                                 # detail (e.g. its only prior source's provider was later
                                 # deleted) -- this provider can, so give it one rather than
                                 # leaving it permanently stuck.
-                                conn.execute(
-                                    "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
-                                    (provider_id, item.get("provider_series_id"), row["id"]),
-                                )
+                                series_updates_import_provider.append((provider_id, item.get("provider_series_id"), series_id))
                         elif year is None:
-                            # Same reasoning as bulk_import_movies above.
-                            candidates = conn.execute(
-                                "SELECT id, import_provider_id, review_excluded, review_excluded_manual FROM series WHERE name=?",
-                                (name,),
-                            ).fetchall()
+                            candidates = series_by_name.get(name, [])
                             if len(candidates) == 1:
+                                series_id = candidates[0]["id"]
                                 did_match = True
-                                series_id_for_detail = candidates[0]["id"]
-                                conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), candidates[0]["id"]))
+                                cat_update_needed = True
                                 if candidates[0]["import_provider_id"] is None:
-                                    conn.execute(
-                                        "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
-                                        (provider_id, item.get("provider_series_id"), candidates[0]["id"]),
-                                    )
-                                # Same archive-upgrade check as the exact (name, year)
-                                # match above -- see the identical comment in
-                                # bulk_import_movies for why this branch needs it too.
+                                    series_updates_import_provider.append((provider_id, item.get("provider_series_id"), series_id))
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (candidates[0]["id"],))
-                                    conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (candidates[0]["id"],))
+                                    series_updates_archive.append((series_id,))
                                     did_archive = True
                                 elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (candidates[0]["id"],))
+                                    series_updates_unarchive.append((series_id,))
                                     did_unarchive = True
                             else:
-                                cur = conn.execute(
-                                    "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
-                                )
+                                insert_index = len(series_inserts)
+                                series_inserts.append((name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now))
                                 did_create = True
                                 did_archive = should_archive
                                 if candidates:
                                     did_flag = True
-                                series_id_for_detail = cur.lastrowid
+                                # Register this brand-new row immediately -- see
+                                # bulk_import_movies's identical comment for why
+                                # (a later item in this chunk with the same
+                                # still-year=None name must see this as a
+                                # same-named candidate, not create a duplicate).
+                                new_row = {"id": -1 - insert_index, "import_provider_id": provider_id,
+                                           "review_excluded": int(should_archive), "review_excluded_manual": 0,
+                                           "is_adult": int(category_looks_adult), "is_adult_manual": 0}
+                                series_by_name.setdefault(name, []).append(new_row)
                         else:
-                            cur = conn.execute(
-                                "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
-                            )
+                            insert_index = len(series_inserts)
+                            series_inserts.append((name, year, int(category_looks_adult), 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now))
                             did_create = True
                             did_archive = should_archive
-                            series_id_for_detail = cur.lastrowid
-                    if series_id_for_detail is not None and item.get("_has_detail"):
-                        conn.execute(
-                            "UPDATE series SET genre=?, description=?, cast_list=?, director=?, poster_url=?, "
-                            "rating=?, release_date=?, provider_last_modified=?, tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
-                            (
-                                item.get("genre"), item.get("description"), item.get("cast_list"),
-                                item.get("director"), item.get("poster_url"), item.get("rating"),
-                                item.get("release_date"), item.get("provider_last_modified"),
-                                item.get("tmdb_id"), series_id_for_detail,
-                            ),
+                            # Same same-chunk-visibility fix as the year=None
+                            # insert branch above, keyed by (name, year) this
+                            # time -- see bulk_import_movies's identical comment.
+                            new_row = {"id": -1 - insert_index, "import_provider_id": provider_id,
+                                       "review_excluded": int(should_archive), "review_excluded_manual": 0,
+                                       "is_adult": int(category_looks_adult), "is_adult_manual": 0}
+                            series_by_name_year[(name, year)] = new_row
+
+                    pending.append({
+                        "item": item, "series_id": series_id, "insert_index": insert_index,
+                        "did_create": did_create, "did_match": did_match, "did_flag": did_flag,
+                        "did_archive": did_archive, "did_unarchive": did_unarchive,
+                        "cat_update_needed": cat_update_needed,
+                    })
+                except Exception as exc:
+                    errors += 1
+                    logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
+                                    item.get("name"), item.get("provider_series_id"), exc)
+
+            try:
+                with conn:
+                    # Inserts first so pending items get real ids before the
+                    # category-name/detail writes below reference them --
+                    # see bulk_import_movies's identical comment for why this
+                    # is one INSERT per row instead of executemany (lastrowid
+                    # needed back per-row).
+                    insert_id_map: dict[int, int] = {}
+                    for idx, row in enumerate(series_inserts):
+                        cur = conn.execute(
+                            "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            row,
                         )
-                    created += did_create
-                    matched += did_match
-                    flagged += did_flag
-                    archived += did_archive
-                    unarchived += did_unarchive
+                        insert_id_map[idx] = cur.lastrowid
+
+                    def _resolve(series_id):
+                        # See bulk_import_movies's identical helper -- negative
+                        # ids are the -1-insert_index placeholders used above.
+                        return insert_id_map[-1 - series_id] if series_id < 0 else series_id
+
+                    for entry in pending:
+                        if entry["insert_index"] is not None:
+                            entry["series_id"] = insert_id_map[entry["insert_index"]]
+                        elif entry["series_id"] is not None:
+                            entry["series_id"] = _resolve(entry["series_id"])
+                    series_updates_adult = [(_resolve(sid),) for (sid,) in series_updates_adult]
+                    series_updates_archive = [(_resolve(sid),) for (sid,) in series_updates_archive]
+                    series_updates_unarchive = [(_resolve(sid),) for (sid,) in series_updates_unarchive]
+                    series_updates_import_provider = [(pid, psid, _resolve(sid)) for (pid, psid, sid) in series_updates_import_provider]
+
+                    if series_updates_adult:
+                        conn.executemany("UPDATE series SET is_adult=1 WHERE id=?", series_updates_adult)
+                    if series_updates_archive:
+                        conn.executemany("UPDATE series SET review_excluded=1 WHERE id=?", series_updates_archive)
+                        conn.executemany("DELETE FROM series_category_placements WHERE series_id=?", series_updates_archive)
+                    if series_updates_unarchive:
+                        conn.executemany("UPDATE series SET review_excluded=0 WHERE id=?", series_updates_unarchive)
+                    if series_updates_import_provider:
+                        conn.executemany("UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?", series_updates_import_provider)
+
+                    for entry in pending:
+                        item = entry["item"]
+                        series_id = entry["series_id"]
+                        if entry["cat_update_needed"]:
+                            # Real bug found live 2026-07-29: this value was captured
+                            # in `item` on every single import pass but never
+                            # actually written anywhere -- episode_sources.
+                            # provider_category_name (what evaluate_smart_category's
+                            # provider_category rule field and auto-create-categories
+                            # both actually read) was NULL for every episode of every
+                            # series ever imported through this path, so series-side
+                            # provider-category matching never worked for any
+                            # provider, not just whichever one happened to be tested.
+                            # Stored here (unconditionally overwritten -- provider-
+                            # sourced, not user-editable) so enrich_series can read it
+                            # back and stamp it onto each episode as episodes are
+                            # discovered (episodes aren't known yet at this cheap
+                            # bulk-list stage, only lazily via get_series_info).
+                            conn.execute(
+                                "UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?",
+                                (item.get("provider_category_name"), item.get("raw_name"), series_id),
+                            )
+                        if item.get("_has_detail"):
+                            conn.execute(
+                                "UPDATE series SET genre=?, description=?, cast_list=?, director=?, poster_url=?, "
+                                "rating=?, release_date=?, provider_last_modified=?, tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
+                                (
+                                    item.get("genre"), item.get("description"), item.get("cast_list"),
+                                    item.get("director"), item.get("poster_url"), item.get("rating"),
+                                    item.get("release_date"), item.get("provider_last_modified"),
+                                    item.get("tmdb_id"), series_id,
+                                ),
+                            )
+                        created += entry["did_create"]
+                        matched += entry["did_match"]
+                        flagged += entry["did_flag"]
+                        archived += entry["did_archive"]
+                        unarchived += entry["did_unarchive"]
             except sqlite3.OperationalError as exc:
                 # See bulk_import_movies's identical handler -- transient lock
                 # contention gets a retry pass instead of a permanent, silent
                 # data loss.
                 if "locked" in str(exc).lower() and _retry_depth < _MAX_LOCK_RETRY_DEPTH:
-                    lock_retry_items.append(item)
+                    lock_retry_items.extend(chunk)
                 else:
-                    errors += 1
-                    logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
-                                    item.get("name"), item.get("provider_series_id"), exc)
+                    errors += len(chunk)
+                    logger.warning("[vod_db] bulk_import_series: skipped chunk of %d item(s): %s", len(chunk), exc)
             except Exception as exc:
-                errors += 1
-                logger.warning("[vod_db] bulk_import_series: skipped item name=%r series_id=%r: %s",
-                                item.get("name"), item.get("provider_series_id"), exc)
-            finally:
-                # See bulk_import_movies's identical comment -- must be `finally`
-                # so the blank-name branch's `continue` doesn't skip it.
-                if (i + 1) % batch_size == 0:
-                    _commit_with_retry(conn)
-                    # Release+reacquire between batches -- holding the lock for the
-                    # WHOLE function (a large catalog can take many minutes) blocked
-                    # every other writer with no timeout, which could exhaust the
-                    # async thread pool if enough piled up waiting -- confirmed live
-                    # 2026-07-31 as the cause of Dispatcharr's VOD detail-refresh
-                    # requests hanging/500ing during a large concurrent import, fixed
-                    # by matching the lock's hold window to one batch's real SQLite
-                    # write-transaction span instead of the whole import.
-                    _WRITE_LOCK.release()
-                    _WRITE_LOCK.acquire()
-        _commit_with_retry(conn)
+                errors += len(chunk)
+                logger.warning("[vod_db] bulk_import_series: skipped chunk of %d item(s): %s", len(chunk), exc)
+
+            # Release+reacquire between chunks -- see bulk_import_movies's
+            # identical comment for the full reasoning.
+            _WRITE_LOCK.release()
+            _WRITE_LOCK.acquire()
         conn.close()
     finally:
         _WRITE_LOCK.release()
