@@ -316,8 +316,52 @@ with the sampled error reasons available via a tooltip on the summary text.
 - `frontend/src/pages/VodManager.tsx` — `tmdbBulkApply` state and `runBulkApplyTmdbTitles` (~line 5826), completion summary JSX for both movie-side and series-side buttons
 
 ### Verification
-`py_compile` clean on `vod_routes.py`; `tsc --noEmit` clean on the frontend. Not yet
-deployed or exercised against a live run with real error cases.
+`py_compile` clean on `vod_routes.py`; `tsc --noEmit` clean on the frontend.
+**Deployed and verified live**: confirmed via `docker exec` grep against the running
+container's `/app/vod_routes.py` (all new fields present at expected lines) and the
+served frontend bundle (`index-CkM4aWcz.js`, new label text present, 2 matches for
+movie + series buttons). Not yet exercised against a live run with a real error case
+(no known rename-failure scenario on hand to trigger `error_samples` end-to-end);
+feature degrades safely to 0 errors if none occur.
+
+---
+
+## 7. Raise TMDB year-lookup concurrency from 6 to 10
+
+**Commit:** `b2e72f2`
+**Files modified:** `backend/tmdb_sync.py`
+
+### Problem
+Bulk "Apply TMDB Titles" is inherently slow against a large catalog, and the
+question was whether anything about it could be safely sped up.
+
+### Root cause
+Each batch (60 items) in `get_tmdb_details_for_ids()` makes one real HTTP GET per
+distinct `tmdb_id` against `api.themoviedb.org`, gated by an `asyncio.Semaphore` at
+`_YEAR_LOOKUP_CONCURRENCY` (was 6) — i.e. up to 10 sequential waves of 6 concurrent
+requests per batch. At ~200–400ms per TMDB response, this network round-trip time
+dominates each batch by a wide margin; local SQLite writes (single-row
+rename/merge, milliseconds) are negligible in comparison. The bottleneck is TMDB
+API latency, not the local database.
+
+### Fix
+Raised `_YEAR_LOOKUP_CONCURRENCY` from 6 to 10 — more requests in flight per wave,
+directly reducing wall-clock time per batch. Chosen conservatively to stay well
+clear of TMDB's documented rate limit; can be raised further if a live run shows
+headroom.
+
+### Before / After
+
+| | Before | After |
+|---|---|---|
+| Concurrent TMDB requests per wave | 6 | 10 |
+| Waves needed for a 60-item batch | 10 | 6 |
+
+### Files changed
+- `backend/tmdb_sync.py` — `_YEAR_LOOKUP_CONCURRENCY` (line 28)
+
+### Verification
+`py_compile` clean. Pushed; not yet measured against a live run at the new value.
 
 ---
 
@@ -337,8 +381,12 @@ deployed or exercised against a live run with real error cases.
   failure is still pending** — see note in section 4 above.
 - **Fix #5**: `tsc --noEmit` clean. Not yet committed/pushed or visually
   verified in a browser — see note in section 5 above.
-- **Fix #6**: `py_compile` and `tsc --noEmit` both clean. Not yet deployed or
-  exercised against a live run with real error cases — see note in section 6 above.
+- **Fix #6**: `py_compile` and `tsc --noEmit` both clean. **Deployed and verified
+  live** via `docker exec` grep against the running container's source and served
+  frontend bundle — see note in section 6 above. Not yet exercised against a live
+  run with a real error case.
+- **Fix #7**: `py_compile` clean. Pushed; not yet measured against a live run at
+  the new concurrency value.
 
 ## Not included in this PR
 
