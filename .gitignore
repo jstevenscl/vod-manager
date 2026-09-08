@@ -54,3 +54,6 @@ Thumbs.db
 # see C:\Tools\scripts\Release-ToPublic.ps1 / EDM CURRENT.md for the
 # private->public release workflow this repo is paired with
 .beads/
+
+# local-only working notes, never pushed (other users don't have bd access)
+PR_DESCRIPTION.md
