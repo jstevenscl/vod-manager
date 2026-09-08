@@ -27,7 +27,7 @@ from xc_server import _redact_upstream_url
 
 def _should_auto_archive(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
-    exclude_uncategorized: bool = False,
+    exclude_uncategorized: bool = False, lang: dict | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -51,7 +51,7 @@ def _should_auto_archive(
     can never catch that (there's no name to compare), so this is a
     dedicated switch, checked only when the item truly has no category,
     never as a substitute for an actual category-name match."""
-    lang = config.get_import_language_exclusion()
+    lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
         code = vod_db._name_prefix_code(name)
         if code and code in lang["exclude_prefixes"]:
@@ -390,6 +390,7 @@ async def _import_movies_for_provider(
 ) -> tuple[dict, int]:
     streams = await client.get_vod_streams()
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+    lang = config.get_import_language_exclusion()
     movie_items = []
     for s in streams:
         name, year = parse_name_year(s.get("name") or "")
@@ -410,7 +411,7 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -441,6 +442,7 @@ async def _import_series_for_provider(
         field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
         for field in ("genre", "description", "cast_list", "director")
     }
+    lang = config.get_import_language_exclusion()
     series_items = []
     for s in series_list:
         name, year = parse_name_year(s.get("name") or "")
@@ -455,7 +457,7 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),

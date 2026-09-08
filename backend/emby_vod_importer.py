@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 
+import config
 import emby_vod_client
 import vod_db
 import vod_importer
@@ -68,6 +69,7 @@ async def import_emby_library(provider_id: int) -> dict:
     # comment.
     exclude_categories = provider.get("import_exclude_categories") or []
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
+    lang = config.get_import_language_exclusion()
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
@@ -127,7 +129,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         # import on every item's People up front.
                         "provider_category_name": category_name,
                         "auto_archive": vod_importer._should_auto_archive(
-                            item.get("Name", ""), category_name, exclude_categories, exclude_uncategorized,
+                            item.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
                         ),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
@@ -164,7 +166,7 @@ async def import_emby_library(provider_id: int) -> dict:
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
                         "auto_archive": vod_importer._should_auto_archive(
-                            show.get("Name", ""), category_name, exclude_categories, exclude_uncategorized,
+                            show.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
                         ),
                         "episodes": episodes,
                     })

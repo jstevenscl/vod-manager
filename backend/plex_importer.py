@@ -21,6 +21,7 @@ import asyncio
 import logging
 import time
 
+import config
 import plex_client
 import vod_db
 import vod_importer
@@ -85,6 +86,7 @@ async def import_plex_library(provider_id: int) -> dict:
     # provider-level settings XC's import_provider_catalog already uses.
     exclude_categories = provider.get("import_exclude_categories") or []
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
+    lang = config.get_import_language_exclusion()
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
@@ -139,7 +141,7 @@ async def import_plex_library(provider_id: int) -> dict:
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
                         "auto_archive": vod_importer._should_auto_archive(
-                            item.get("title", ""), category_name, exclude_categories, exclude_uncategorized,
+                            item.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
                         ),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
@@ -176,7 +178,7 @@ async def import_plex_library(provider_id: int) -> dict:
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
                         "auto_archive": vod_importer._should_auto_archive(
-                            show.get("title", ""), category_name, exclude_categories, exclude_uncategorized,
+                            show.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
                         ),
                         "episodes": episodes,
                     })
