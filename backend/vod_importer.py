@@ -388,7 +388,9 @@ async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
 ) -> tuple[dict, int]:
+    fetch_started = time.time()
     streams = await client.get_vod_streams()
+    fetch_elapsed = time.time() - fetch_started
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
     lang = config.get_import_language_exclusion()
     movie_items = []
@@ -420,8 +422,13 @@ async def _import_movies_for_provider(
             # else is worth capturing here.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
         })
+    db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
-    logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
+    db_elapsed = time.time() - db_started
+    logger.info(
+        "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
+        provider["name"], movie_result, fetch_elapsed, db_elapsed, len(streams),
+    )
     return movie_result, len(streams)
 
 
@@ -429,7 +436,9 @@ async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
 ) -> tuple[dict, int]:
+    fetch_started = time.time()
     series_list = await client.get_series()
+    fetch_elapsed = time.time() - fetch_started
     series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
     # Most real XC panels' bulk get_series list already carries the same
     # detail fields enrich_series would otherwise pay a separate
@@ -471,8 +480,13 @@ async def _import_series_for_provider(
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
             "provider_last_modified": s.get("last_modified") or None,
         })
+    db_started = time.time()
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
-    logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
+    db_elapsed = time.time() - db_started
+    logger.info(
+        "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
+        provider["name"], series_result, fetch_elapsed, db_elapsed, len(series_list),
+    )
     return series_result, len(series_list)
 
 
