@@ -2690,26 +2690,41 @@ async def bulk_apply_tmdb_title_movies(after_id: int = 0, limit: int = 100):
     loops, passing back the highest id seen, until has_more is false."""
     candidates = await asyncio.to_thread(vod_db.list_movies_with_tmdb_id, after_id, limit)
     if not candidates:
-        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+        return {"checked": 0, "renamed": 0, "no_change": 0, "errors": 0, "error_samples": [], "has_more": False, "last_id": after_id, "total_in_db": vod_db.count_movies()}
     try:
         details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "movie")
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     renamed = 0
+    no_change = 0
+    errors = 0
+    error_samples: list[str] = []
     for c in candidates:
         detail = details.get(c["tmdb_id"], {})
         title = detail.get("title")
         year = detail.get("year") or c["year"]
         if not title or (title == c["name"] and year == c["year"]):
+            no_change += 1
             continue
         try:
             result = vod_db.rename_item("movie", c["id"], title, year)
-        except ValueError:
+        except ValueError as exc:
+            errors += 1
+            if len(error_samples) < 10:
+                error_samples.append(f"{c['name']}: {exc}")
             continue
         if "merged_into" in result:
             vod_db.backfill_tmdb_id_if_missing("movie", result["merged_into"], c["tmdb_id"])
         renamed += 1
-    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
+    has_more = len(candidates) == limit
+    result = {
+        "checked": len(candidates), "renamed": renamed, "no_change": no_change,
+        "errors": errors, "error_samples": error_samples,
+        "has_more": has_more, "last_id": candidates[-1]["id"],
+    }
+    if not has_more:
+        result["total_in_db"] = vod_db.count_movies()
+    return result
 
 
 @router.delete("/movies/{movie_id}/", dependencies=_GUARDS)
@@ -2902,26 +2917,41 @@ async def bulk_apply_tmdb_title_series(after_id: int = 0, limit: int = 100):
     """See bulk_apply_tmdb_title_movies' identical docstring -- same reasoning."""
     candidates = await asyncio.to_thread(vod_db.list_series_with_tmdb_id, after_id, limit)
     if not candidates:
-        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+        return {"checked": 0, "renamed": 0, "no_change": 0, "errors": 0, "error_samples": [], "has_more": False, "last_id": after_id, "total_in_db": vod_db.count_series()}
     try:
         details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "series")
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     renamed = 0
+    no_change = 0
+    errors = 0
+    error_samples: list[str] = []
     for c in candidates:
         detail = details.get(c["tmdb_id"], {})
         title = detail.get("title")
         year = detail.get("year") or c["year"]
         if not title or (title == c["name"] and year == c["year"]):
+            no_change += 1
             continue
         try:
             result = vod_db.rename_item("series", c["id"], title, year)
-        except ValueError:
+        except ValueError as exc:
+            errors += 1
+            if len(error_samples) < 10:
+                error_samples.append(f"{c['name']}: {exc}")
             continue
         if "merged_into" in result:
             vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], c["tmdb_id"])
         renamed += 1
-    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
+    has_more = len(candidates) == limit
+    result = {
+        "checked": len(candidates), "renamed": renamed, "no_change": no_change,
+        "errors": errors, "error_samples": error_samples,
+        "has_more": has_more, "last_id": candidates[-1]["id"],
+    }
+    if not has_more:
+        result["total_in_db"] = vod_db.count_series()
+    return result
 
 
 @router.delete("/series/{series_id}/", dependencies=_GUARDS)

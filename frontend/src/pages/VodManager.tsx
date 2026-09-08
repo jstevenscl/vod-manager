@@ -4810,12 +4810,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // can continue from there instead of restarting the whole scan at id 0.
   const TMDB_BULK_APPLY_BATCH_SIZE = 60
   const TMDB_BULK_APPLY_MAX_RETRIES = 3
-  const [tmdbBulkApply, setTmdbBulkApply] = useState<Record<'movie' | 'series', { running: boolean; checked: number; renamed: number; afterId: number; error?: string } | null>>({ movie: null, series: null })
+  const [tmdbBulkApply, setTmdbBulkApply] = useState<Record<'movie' | 'series', { running: boolean; checked: number; renamed: number; noChange: number; errors: number; errorSamples: string[]; afterId: number; totalInDb?: number; error?: string } | null>>({ movie: null, series: null })
   async function runBulkApplyTmdbTitles(contentType: 'movie' | 'series', resumeFromId: number = 0) {
-    setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: 0, renamed: 0, afterId: resumeFromId } }))
+    setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: 0, renamed: 0, noChange: 0, errors: 0, errorSamples: [], afterId: resumeFromId } }))
     let afterId = resumeFromId
     let totalChecked = 0
     let totalRenamed = 0
+    let totalNoChange = 0
+    let totalErrors = 0
+    let errorSamples: string[] = []
+    let totalInDb: number | undefined
     try {
       for (;;) {
         let r
@@ -4830,14 +4834,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         }
         totalChecked += r.data.checked
         totalRenamed += r.data.renamed
+        totalNoChange += r.data.no_change ?? 0
+        totalErrors += r.data.errors ?? 0
+        if (r.data.error_samples?.length) errorSamples = [...errorSamples, ...r.data.error_samples].slice(0, 10)
+        if (r.data.total_in_db != null) totalInDb = r.data.total_in_db
         afterId = r.data.last_id
-        setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: totalChecked, renamed: totalRenamed, afterId } }))
+        setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: true, checked: totalChecked, renamed: totalRenamed, noChange: totalNoChange, errors: totalErrors, errorSamples, afterId, totalInDb } }))
         if (!r.data.has_more) break
       }
       qc.invalidateQueries({ queryKey: [contentType === 'movie' ? 'vod-movies' : 'vod-series'] })
-      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, afterId } }))
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, noChange: totalNoChange, errors: totalErrors, errorSamples, afterId, totalInDb } }))
     } catch (e: any) {
-      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, afterId, error: e?.response?.data?.detail ?? e.message ?? 'Failed' } }))
+      setTmdbBulkApply((s) => ({ ...s, [contentType]: { running: false, checked: totalChecked, renamed: totalRenamed, noChange: totalNoChange, errors: totalErrors, errorSamples, afterId, totalInDb, error: e?.response?.data?.detail ?? e.message ?? 'Failed' } }))
     }
   }
 
@@ -7975,7 +7983,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed movie in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('movie') }}
           >
             {tmdbBulkApply.movie?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
-            Apply TMDB Titles{tmdbBulkApply.movie?.running ? ` (${tmdbBulkApply.movie.checked} checked, ${tmdbBulkApply.movie.renamed} renamed)` : (tmdbBulkApply.movie ? ` (${tmdbBulkApply.movie.renamed} renamed)` : '')}
+            Apply TMDB Titles{tmdbBulkApply.movie?.running ? ` (${tmdbBulkApply.movie.renamed} renamed, ${tmdbBulkApply.movie.checked} checked)` : (tmdbBulkApply.movie ? ` (${tmdbBulkApply.movie.renamed} renamed)` : '')}
           </Button>
           {tmdbBulkApply.movie?.error && (
             <>
@@ -7984,6 +7992,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 Resume
               </Button>
             </>
+          )}
+          {tmdbBulkApply.movie && !tmdbBulkApply.movie.running && !tmdbBulkApply.movie.error && (
+            <span className="text-xs text-muted-foreground" title={tmdbBulkApply.movie.errorSamples.join('\n')}>
+              {tmdbBulkApply.movie.renamed} renamed, {tmdbBulkApply.movie.noChange} no change needed
+              {tmdbBulkApply.movie.errors > 0 ? `, ${tmdbBulkApply.movie.errors} not renamed (see reasons)` : ''}
+              {tmdbBulkApply.movie.totalInDb != null ? ` — ${tmdbBulkApply.movie.totalInDb} movies in database` : ''}
+            </span>
           )}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
@@ -8142,7 +8157,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             onClick={() => { if (confirm('Apply TMDB\'s own title to every confirmed series in the library where it differs? This may take a while for a large library.')) runBulkApplyTmdbTitles('series') }}
           >
             {tmdbBulkApply.series?.running ? <Loader2 size={12} className="mr-1 animate-spin" /> : null}
-            Apply TMDB Titles{tmdbBulkApply.series?.running ? ` (${tmdbBulkApply.series.checked} checked, ${tmdbBulkApply.series.renamed} renamed)` : (tmdbBulkApply.series ? ` (${tmdbBulkApply.series.renamed} renamed)` : '')}
+            Apply TMDB Titles{tmdbBulkApply.series?.running ? ` (${tmdbBulkApply.series.renamed} renamed, ${tmdbBulkApply.series.checked} checked)` : (tmdbBulkApply.series ? ` (${tmdbBulkApply.series.renamed} renamed)` : '')}
           </Button>
           {tmdbBulkApply.series?.error && (
             <>
@@ -8151,6 +8166,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 Resume
               </Button>
             </>
+          )}
+          {tmdbBulkApply.series && !tmdbBulkApply.series.running && !tmdbBulkApply.series.error && (
+            <span className="text-xs text-muted-foreground" title={tmdbBulkApply.series.errorSamples.join('\n')}>
+              {tmdbBulkApply.series.renamed} renamed, {tmdbBulkApply.series.noChange} no change needed
+              {tmdbBulkApply.series.errors > 0 ? `, ${tmdbBulkApply.series.errors} not renamed (see reasons)` : ''}
+              {tmdbBulkApply.series.totalInDb != null ? ` — ${tmdbBulkApply.series.totalInDb} series in database` : ''}
+            </span>
           )}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5 ml-auto">
             <button
