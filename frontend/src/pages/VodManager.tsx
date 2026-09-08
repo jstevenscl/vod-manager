@@ -5684,7 +5684,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // ── Duplicate finder (punctuation variants + adjacent-year mislabeling) ──
   const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
   const [duplicatesOffset, setDuplicatesOffset] = useState(0)
-  const DUPLICATES_PAGE_SIZE = 20
+  const DUPLICATES_PAGE_SIZE = 50
   const duplicatesQuery = useQuery<DuplicateGroup[]>({
     queryKey: ['vod-duplicates', duplicatesContentType],
     queryFn:  () => api.get('/vod/duplicates/', { params: { content_type: duplicatesContentType } }).then((r) => r.data),
