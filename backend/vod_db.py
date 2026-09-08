@@ -3850,7 +3850,28 @@ def upsert_movie(name: str, year: int | None = None, **fields) -> int:
         else:
             movie_id = _insert(needs_review=1 if candidates else 0)
     else:
-        movie_id = _insert()
+        # #knm: normalized-title + year-proximity import matching (was exact-string only)
+        # No exact-string row exists, but a provider formatting the same
+        # title slightly differently (punctuation, casing, a "4K:"-style
+        # quality prefix) shouldn't spawn a permanent second row -- that's
+        # exactly what find_duplicate_groups' pass (1)+(2) recognize after
+        # the fact (see there). Apply the same normalized-title +
+        # year-proximity matching here, at import time, so identical real
+        # titles land on one row instead of needing a later manual merge.
+        # Exactly one same-normalized-title candidate within 1 year -> treat
+        # as the same row. Anything more ambiguous (0 or 2+ candidates)
+        # falls back to a plain insert, same as before -- the Duplicate
+        # Finder remains the safety net for whatever this doesn't catch.
+        target_key = _normalize_title_for_dedup(name)
+        nearby_rows = conn.execute(
+            "SELECT id, name FROM movies WHERE year IS NOT NULL AND ABS(year - ?) <= 1", (year,),
+        ).fetchall()
+        candidates = [r for r in nearby_rows if _normalize_title_for_dedup(r["name"]) == target_key]
+        if len(candidates) == 1:
+            movie_id = candidates[0]["id"]
+            _update(movie_id)
+        else:
+            movie_id = _insert()
 
     _commit_with_retry(conn)
     conn.close()
@@ -4488,7 +4509,20 @@ def upsert_series(name: str, year: int | None = None, **fields) -> int:
         else:
             series_id = _insert(needs_review=1 if candidates else 0)
     else:
-        series_id = _insert()
+        # Same normalized-title + year-proximity matching as upsert_movie
+        # above (beads-bzg.3) -- without this, series get the exact-string-
+        # only behavior that used to duplicate movies whenever a provider
+        # formatted the same title slightly differently.
+        target_key = _normalize_title_for_dedup(name)
+        nearby_rows = conn.execute(
+            "SELECT id, name FROM series WHERE year IS NOT NULL AND ABS(year - ?) <= 1", (year,),
+        ).fetchall()
+        candidates = [r for r in nearby_rows if _normalize_title_for_dedup(r["name"]) == target_key]
+        if len(candidates) == 1:
+            series_id = candidates[0]["id"]
+            _update(series_id)
+        else:
+            series_id = _insert()
 
     _commit_with_retry(conn)
     conn.close()
