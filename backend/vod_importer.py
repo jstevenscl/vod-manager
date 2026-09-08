@@ -22,7 +22,10 @@ import config
 import vod_db
 
 
-def _should_auto_archive(name: str, provider_category_name: str | None, provider_exclude_categories: list[str]) -> bool:
+def _should_auto_archive(
+    name: str, provider_category_name: str | None, provider_exclude_categories: list[str],
+    lang: dict | None = None,
+) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
     for that tool's "don't archive the only copy" behavior): an explicit
@@ -30,8 +33,14 @@ def _should_auto_archive(name: str, provider_category_name: str | None, provider
     not "prefer another language's copy if one exists". Language rules are
     global (config.get_import_language_exclusion); category rules are
     per-provider (providers.import_exclude_categories), since available
-    categories genuinely differ provider to provider."""
-    lang = config.get_import_language_exclusion()
+    categories genuinely differ provider to provider.
+
+    lang is optional so any other/future caller that doesn't pre-fetch it
+    keeps working -- falls back to the original per-call read below. Import
+    callers (import_provider_catalog, plex_importer.py, emby_vod_importer.py)
+    fetch it once per provider-import call and pass it through instead of
+    re-reading it per item -- see 3411db8's commit message for why."""
+    lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
         code = vod_db._name_prefix_code(name)
         if code and code in lang["exclude_prefixes"]:
@@ -172,6 +181,9 @@ async def import_provider_catalog(provider_id: int) -> dict:
     client = XCProviderClient(provider)
 
     exclude_categories = provider.get("import_exclude_categories") or []
+    # Fetched once per provider-import call, not per item -- see
+    # _should_auto_archive's docstring and 3411db8's commit message.
+    lang = config.get_import_language_exclusion()
 
     categories = await client.get_vod_categories()
     category_names = {str(c["category_id"]): c["category_name"] for c in categories}
@@ -198,7 +210,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, lang),
         })
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
     logger.info("[vod_importer] provider=%s movies: %s", provider["name"], movie_result)
@@ -222,7 +234,7 @@ async def import_provider_catalog(provider_id: int) -> dict:
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, lang),
         })
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
     logger.info("[vod_importer] provider=%s series: %s", provider["name"], series_result)
