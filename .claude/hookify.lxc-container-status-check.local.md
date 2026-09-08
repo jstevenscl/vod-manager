@@ -5,9 +5,14 @@ event: bash
 pattern: plink.*-batch.*(root@|pw\s)
 ---
 
+**CORRECTED 2026-09-08: vod-manager (LXC 510) is reachable DIRECTLY at 192.168.1.210 —
+prefer `ssh VOD-MANAGER-210 "<command>"` over the prox3+pct-exec route below. See
+[[vod-manager-ssh-access]] hookify rule for the confirmed-working direct path. Only fall
+back to plink+pct-exec (below) if .210 becomes unreachable.**
+
 Reaching into vod-manager's host/LXC over SSH — reuse the verified pattern instead of re-discovering it:
 
-**Key auth (preferred, confirmed working for prox3):**
+**Fallback via prox3 + pct exec (only if direct .210 access is down):**
 ```
 "/c/Program Files/PuTTY/plink" -ssh -batch -i "$HOME/.ssh/kid_rsa.ppk" root@192.168.1.244 "pct exec 510 -- <command>"
 ```

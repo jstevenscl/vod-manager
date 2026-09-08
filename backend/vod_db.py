@@ -7637,6 +7637,14 @@ _LANG_PREFIX_PIPE_RE = re.compile(r"^([A-Z]{2,6})\|")
 # real titles as language-tagged across every feature that reuses this
 # (duplicate-sibling detection, missing-artwork/library-language filtering).
 _LANG_PREFIX_COLON_RE = re.compile(r"^([A-Z]{2,6}):\s")
+# Dash-style prefixes ("FR - Movie Title") -- same whitelist-only reasoning
+# as colon below: a bare dash is common enough in real titles ("Spider-Man",
+# "Stars 80, la suite") that fuzzy-matching any 2-6 capital letters would
+# misdetect them, so this only fires for a KNOWN language code too.
+# KNM: added 2026-09-08 -- pipe/colon detection alone missed real "FR -
+# Title" provider naming, so FR/RU items using this format weren't being
+# auto-archived and were showing up in the catalog/Duplicate Finder.
+_LANG_PREFIX_DASH_RE = re.compile(r"^([A-Z]{2,6})\s-\s")
 _KNOWN_LANGUAGE_CODES = {
     "EN", "AR", "FR", "ES", "DE", "IT", "PT", "BR", "RU", "TR", "PL", "NL",
     "GR", "HU", "BG", "RO", "SE", "NO", "DK", "FI", "CZ", "SK", "HR", "SR",
@@ -7644,12 +7652,14 @@ _KNOWN_LANGUAGE_CODES = {
     "ID", "MY", "HE", "FA", "UR", "BN", "TA", "TE", "PK", "AF", "SW", "ALB",
     "EXYU", "LT", "LV", "EE", "GE", "AM", "AZ", "KZ", "SC",
 }
-# Real titles that happen to start with "<known code>: " -- checked against
-# the colon match specifically (never the pipe match, which no real title
-# ever collides with). Confirmed against TMDB: "IT: Chapter Two" (2019) is
-# the only real title colliding with "IT" (Italian); add further entries
-# here if another known code ever turns out to collide with a real title.
+# Real titles that happen to start with "<known code>: " or "<known code> - "
+# -- checked against the colon/dash matches specifically (never the pipe
+# match, which no real title ever collides with). Confirmed against TMDB:
+# "IT: Chapter Two" (2019) is the only real title colliding with "IT"
+# (Italian); add further entries here if another known code ever turns out
+# to collide with a real title.
 _LANG_PREFIX_COLON_EXCEPTIONS = {"it: chapter two"}
+_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = set()
 
 
 def _colon_prefix_code(name: str) -> str | None:
@@ -7662,21 +7672,37 @@ def _colon_prefix_code(name: str) -> str | None:
     return m.group(1)
 
 
+def _dash_prefix_code(name: str) -> str | None:
+    m = _LANG_PREFIX_DASH_RE.match(name)
+    if not m or m.group(1) not in _KNOWN_LANGUAGE_CODES:
+        return None
+    lowered = name.strip().lower()
+    if any(lowered.startswith(exc) for exc in _LANG_PREFIX_DASH_EXCEPTIONS):
+        return None
+    return m.group(1)
+
+
 def _name_prefix_code(name: str) -> str | None:
     m = _LANG_PREFIX_PIPE_RE.match(name)
     if m:
         return m.group(1)
-    return _colon_prefix_code(name)
+    code = _colon_prefix_code(name)
+    if code:
+        return code
+    return _dash_prefix_code(name)
 
 
 def _strip_one_lang_prefix(name: str) -> str | None:
     """One leading language-style prefix removed, or None if there isn't
-    one -- see _name_prefix_code for why colon-matching is whitelist-only."""
+    one -- see _name_prefix_code for why colon/dash-matching is
+    whitelist-only."""
     m = _LANG_PREFIX_PIPE_RE.match(name)
     if m:
         return name[m.end():].strip()
     if _colon_prefix_code(name):
         return _LANG_PREFIX_COLON_RE.sub("", name, count=1).strip()
+    if _dash_prefix_code(name):
+        return _LANG_PREFIX_DASH_RE.sub("", name, count=1).strip()
     return None
 
 
