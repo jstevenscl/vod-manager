@@ -136,6 +136,36 @@ def init_db() -> None:
             last_enriched_at TEXT
         );
 
+        -- Multi-provider support for series, mirroring movie_sources --
+        -- series.import_provider_id/import_provider_series_id (below) stay
+        -- as the "primary"/originally-matched provider for backward compat
+        -- (existing code, existing UI), but a second (or third...) provider
+        -- matching the same series now gets its own row here instead of
+        -- being silently discarded (vod_manager series/episode failover
+        -- work, 2026-09-09) -- enrich_series loops over every row here to
+        -- pull episodes from every matching provider, and
+        -- find_duplicate_groups("series") already reads through
+        -- episode_sources/providers to attribute multiple sources per
+        -- series, so no changes were needed there once this table is
+        -- actually populated with real multi-provider data.
+        -- consecutive_failures/last_failed_at mirror movie_sources/
+        -- episode_sources' identically-named columns -- same per-source
+        -- backoff purpose, just present from creation instead of migrated
+        -- in later since this table has no pre-existing rows to migrate.
+        CREATE TABLE IF NOT EXISTS series_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            provider_series_id TEXT NOT NULL,
+            provider_category_name TEXT,
+            raw_name TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_failed_at TEXT,
+            added_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            UNIQUE(provider_id, provider_series_id)
+        );
+
         CREATE TABLE IF NOT EXISTS episodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
@@ -564,6 +594,7 @@ def init_db() -> None:
         -- event-loop-blocking O(n*m) scan that looked like a hang.
         CREATE INDEX IF NOT EXISTS idx_movie_sources_movie_id ON movie_sources(movie_id);
         CREATE INDEX IF NOT EXISTS idx_episode_sources_episode_id ON episode_sources(episode_id);
+        CREATE INDEX IF NOT EXISTS idx_series_sources_series_id ON series_sources(series_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_profiles_provider_id ON dvr_recording_profiles(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_user_limits_provider_id ON dvr_user_limits(provider_id);
         CREATE INDEX IF NOT EXISTS idx_watch_sessions_connection_open ON watch_sessions(dispatcharr_connection_id, ended_at);
@@ -5550,6 +5581,90 @@ def set_series_enrichment(series_id: int, **fields) -> None:
         conn.close()
 
 
+def list_series_sources(series_id: int) -> list[dict]:
+    """Every provider recorded as carrying this series -- enrich_series
+    loops over this (added 2026-09-09 for series/episode failover) instead
+    of only ever calling back to series.import_provider_id, the single
+    legacy "primary provider" column. Ordered by id so a series' original/
+    longest-known source is tried first, which is an arbitrary but stable
+    tie-break -- there's no meaningful "best" provider to prefer otherwise."""
+    conn = _connect()
+    rows = conn.execute(
+        """SELECT ss.*, p.name AS provider_name FROM series_sources ss
+           JOIN providers p ON p.id = ss.provider_id
+           WHERE ss.series_id=? ORDER BY ss.id""",
+        (series_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def series_source_needs_enrichment(source: dict) -> bool:
+    """Per-source TTL check -- the simple v1 alternative to migrating
+    series.provider_last_modified/episodes_synced_last_modified (which stay
+    scalar/single-provider, unchanged) to a per-source table. Every source
+    is just attempted again once its own last_seen_at goes stale, same
+    _is_stale TTL movies/series already use elsewhere -- no per-provider
+    last_modified comparison, by explicit user decision (2026-09-09) to
+    keep the first multi-provider-series cut small."""
+    return _is_stale(source.get("last_seen_at"))
+
+
+def set_series_source_enrichment(series_id: int, provider_id: int, provider_series_id: str) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            "UPDATE series_sources SET last_seen_at=?, consecutive_failures=0, last_failed_at=NULL "
+            "WHERE series_id=? AND provider_id=? AND provider_series_id=?",
+            (_now(), series_id, provider_id, provider_series_id),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def record_series_source_failure(series_id: int, provider_id: int, provider_series_id: str) -> None:
+    """Mirrors movie_sources/episode_sources' identically-purposed
+    consecutive_failures/last_failed_at columns -- called when a provider's
+    get_series_info call fails for this series, so a provider that's
+    consistently broken for this series doesn't get retried every single
+    enrichment pass forever, without a human ever seeing it happened."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            "UPDATE series_sources SET consecutive_failures=consecutive_failures+1, last_failed_at=? "
+            "WHERE series_id=? AND provider_id=? AND provider_series_id=?",
+            (_now(), series_id, provider_id, provider_series_id),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def backfill_series_sources() -> int:
+    """One-time migration helper: every existing series with a legacy
+    import_provider_id/import_provider_series_id but no matching
+    series_sources row yet gets one created from those columns, so nothing
+    already-imported regresses (loses its only known provider) the moment
+    enrich_series switches from reading series.import_provider_id directly
+    to reading series_sources instead. Safe to call more than once --
+    INSERT OR IGNORE against the same UNIQUE(provider_id,
+    provider_series_id) constraint series_sources already enforces."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        now = _now()
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO series_sources
+                   (series_id, provider_id, provider_series_id, provider_category_name, raw_name, added_at, last_seen_at)
+               SELECT id, import_provider_id, import_provider_series_id, provider_category_name, raw_name, ?, ?
+               FROM series
+               WHERE import_provider_id IS NOT NULL AND import_provider_series_id IS NOT NULL""",
+            (now, now),
+        )
+        inserted = cur.rowcount
+        _commit_with_retry(conn)
+        conn.close()
+        return inserted
+
+
 def get_episode(episode_id: int) -> dict | None:
     conn = _connect()
     row = conn.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -6459,12 +6574,16 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
 
     Chunked (1000 items/round-trip) the same way as bulk_import_movies --
     see that function's docstring for the full rationale (~180K+ items,
-    hours -> seconds, confirmed live 2026-09-08). Series has no separate
-    join table like movie_sources -- import_provider_id/
-    import_provider_series_id live directly on the series row -- so the
-    primary-match lookup here is a single bulk SELECT against `series`
-    keyed on (import_provider_id, import_provider_series_id) instead of a
-    movie_sources-style join.
+    hours -> seconds, confirmed live 2026-09-08). The primary-match lookup
+    here is still a single bulk SELECT against `series` keyed on
+    (import_provider_id, import_provider_series_id) -- import_provider_id/
+    import_provider_series_id remain the legacy "primary provider" columns
+    directly on the series row, kept for backward compat with existing
+    code/UI. But every matching provider -- not just whichever one wins
+    that primary slot -- now also gets its own row in series_sources
+    (added 2026-09-09), mirroring movie_sources, so enrich_series can pull
+    episodes from every provider that actually carries this series instead
+    of only the first one matched.
     """
     _WRITE_LOCK.acquire()
     try:
@@ -6683,6 +6802,25 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     for entry in pending:
                         item = entry["item"]
                         series_id = entry["series_id"]
+                        # Record this provider as a source for this series
+                        # regardless of whether it also won the legacy
+                        # import_provider_id "primary" slot above -- a
+                        # SECOND (or third...) matching provider used to be
+                        # silently discarded here (vod_manager series/
+                        # episode failover work, 2026-09-09), which meant
+                        # enrich_series only ever had one provider to fall
+                        # back to for a series multiple providers actually
+                        # carry. Mirrors movie_sources' upsert in
+                        # bulk_import_movies exactly.
+                        if item.get("provider_series_id") is not None:
+                            conn.execute(
+                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, added_at, last_seen_at) "
+                                "VALUES (?,?,?,?,?,?,?) "
+                                "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
+                                "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
+                                "raw_name=excluded.raw_name, last_seen_at=excluded.last_seen_at",
+                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now, now),
+                            )
                         if entry["cat_update_needed"]:
                             # Real bug found live 2026-07-29: this value was captured
                             # in `item` on every single import pass but never
