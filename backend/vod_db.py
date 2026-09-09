@@ -3020,18 +3020,28 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     second real pool entry instead of matching the existing one; (2) within
     that, same-year or adjacent-year, never 2+ years apart (see
     _split_by_year_proximity); (3) within that, split apart again by any
-    CONFIRMED tmdb_id conflict (see _split_by_tmdb_conflict). Only years
-    we're confident about (year IS NOT NULL) -- pairing on name alone would
+    CONFIRMED tmdb_id conflict (see _split_by_tmdb_conflict). Only rows with
+    a real year feed the year-proximity pass -- pairing on name alone would
     be a much weaker signal and belongs to needs_year_review instead, not
     this scan. A cluster a human already reviewed and dismissed (see
-    duplicate_ignores) never resurfaces."""
+    duplicate_ignores) never resurfaces.
+
+    A same-name row with NO year (year IS NULL) never enters the
+    year-proximity pass -- there's no year to compare. But if it shares a
+    tmdb_id with a row that DID make it into a cluster, that shared id is
+    already proof (same standard _split_by_tmdb_conflict uses to split
+    clusters apart), so it's folded into that cluster after the fact rather
+    than silently dropped. This is exactly the real case that motivated it:
+    a provider's "12 Strong" row importing with no year sitting right next
+    to a dated "12 Strong (2018)" row, both same tmdb_id, never clustering
+    because the null-year row never got as far as the year-proximity check."""
     table = "movies" if content_type == "movie" else "series"
     id_col = "movie_id" if content_type == "movie" else "series_id"
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
 
     conn = _connect()
     rows = conn.execute(
-        f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE year IS NOT NULL AND review_excluded=0"
+        f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE review_excluded=0"
     ).fetchall()
 
     by_name: dict[str, list[dict]] = {}
@@ -3045,15 +3055,36 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     ignored = set(list_ignored_duplicate_signatures(content_type))
     candidate_groups: list[list[dict]] = []
     for items in by_name.values():
-        if len(items) < 2:
+        dated = [i for i in items if i["year"] is not None]
+        undated_by_tmdb: dict[str, list[dict]] = {}
+        for i in items:
+            if i["year"] is None and i.get("tmdb_id"):
+                undated_by_tmdb.setdefault(i["tmdb_id"], []).append(i)
+
+        if len(dated) < 2 and not undated_by_tmdb:
             continue
-        for year_cluster in _split_by_year_proximity(items):
+
+        for year_cluster in _split_by_year_proximity(dated):
             for sub in _split_by_tmdb_conflict(year_cluster):
+                cluster_tmdb_ids = {i["tmdb_id"] for i in sub if i.get("tmdb_id")}
+                for tid in cluster_tmdb_ids:
+                    sub = sub + undated_by_tmdb.pop(tid, [])
                 if len(sub) < 2:
                     continue
                 if _duplicate_ignore_signature([i["id"] for i in sub]) in ignored:
                     continue
                 candidate_groups.append(sub)
+
+        # Undated rows whose tmdb_id never matched a dated cluster above
+        # (e.g. every row sharing that name has no year) still cluster with
+        # each other on tmdb_id alone -- same proof standard, just with no
+        # dated row to attach to.
+        for tid, leftover in undated_by_tmdb.items():
+            if len(leftover) < 2:
+                continue
+            if _duplicate_ignore_signature([i["id"] for i in leftover]) in ignored:
+                continue
+            candidate_groups.append(leftover)
 
     if not candidate_groups:
         conn.close()
