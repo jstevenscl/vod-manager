@@ -3291,9 +3291,60 @@ def _normalize_title_for_dedup(name: str) -> str:
 # plain leading-word match, not a colon-anchored one.
 _QUALITY_PREFIX_RE = re.compile(r"^(4k|uhd|fhd)\s+")
 
+# Compound quality+country prefix ("4K-DE - Severance", "UHD-AR - Title") --
+# a provider naming convention distinct from the bare "4K: Title" form above.
+# Must be matched on the RAW name, before _normalize_title_for_dedup strips
+# the dash that anchors it (post-normalization "4kde severance" has no
+# boundary left to split on). Reuses _KNOWN_LANGUAGE_CODES so this can never
+# fire on an unrelated leading word -- same false-positive concern as
+# _LANG_PREFIX_DASH_RE (KNM: added 2026-09-09, see that comment for why
+# fuzzy-matching any leading token is unsafe here).
+_QUALITY_LANG_DASH_RE = re.compile(r"^(4k|uhd|fhd)-([A-Za-z]{2,6})\s*-\s+", re.IGNORECASE)
+
+
+def _strip_quality_lang_prefix_for_dedup(name: str) -> str:
+    """Strips a leading "<4K/UHD/FHD>-<lang code> - " prefix from a RAW
+    (not yet normalized) title, when the code is a known language code --
+    e.g. "4K-DE - Severance (2022)" -> "Severance (2022)". Falls back to the
+    existing bare dash-prefix code (_dash_prefix_code's allowlist) for
+    country-only prefixes with no quality tag ("IR - Severance")."""
+    m = _QUALITY_LANG_DASH_RE.match(name)
+    if m and m.group(2).upper() in _KNOWN_LANGUAGE_CODES:
+        return name[m.end():].strip()
+    stripped = _strip_one_lang_prefix(name)
+    return stripped if stripped is not None else name
+
 
 def _strip_quality_prefix_for_dedup(normalized_name: str) -> str:
     return _QUALITY_PREFIX_RE.sub("", normalized_name, count=1)
+
+
+# Trailing origin-country tag ("Severance (2022) (US)", "Title (UK)") --
+# a separate provider convention from the leading language/quality prefixes
+# above (measured on live data: US, GB, ES, FR, CA, AU, KR, IT, DE, MX, TR,
+# SE, BR, PL, JP, NO, IN, ZA, CO, AR, DK, BE, IL, NL, IE, NZ, FI, TH, IS, PT
+# are the common ones). Allowlist-only, same reasoning as _KNOWN_LANGUAGE_
+# CODES: a real title can legitimately end in "(Something)" (a subtitle,
+# an edition tag), so only a code on this list is ever stripped -- never
+# any 2-4 capital letters.
+_KNOWN_COUNTRY_SUFFIX_CODES = {
+    "US", "GB", "UK", "ES", "FR", "CA", "AU", "KR", "IT", "DE", "MX", "TR",
+    "SE", "BR", "PL", "JP", "NO", "IN", "ZA", "CO", "AR", "DK", "BE", "IL",
+    "NL", "IE", "NZ", "FI", "TH", "IS", "PT",
+}
+_COUNTRY_SUFFIX_RE = re.compile(r"\s*\(([A-Za-z]{2,4})\)\s*$")
+
+
+def _strip_country_suffix_for_dedup(name: str) -> str:
+    """Strips a single trailing "(<known country code>)" tag, e.g.
+    "Severance (2022) (US)" -> "Severance (2022)". Only removes ONE layer
+    -- a title with two stacked tags is not a pattern seen in the data, and
+    stripping repeatedly would raise the risk of eating a legitimate
+    trailing parenthetical."""
+    m = _COUNTRY_SUFFIX_RE.search(name)
+    if m and m.group(1).upper() in _KNOWN_COUNTRY_SUFFIX_CODES:
+        return name[:m.start()].rstrip()
+    return name
 
 
 def _duplicate_ignore_signature(item_ids: list[int]) -> str:
@@ -3378,12 +3429,20 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     duplicate_ignores) never resurfaces.
 
     Pass (1)'s normalization also strips a leading "4K:"/"UHD:"/"FHD:"
-    quality-tier prefix when config.get_duplicate_finder_quality_prefix_
-    matching() is on (opt-in, default off -- see that setting's own
-    docstring) -- so "4K: Predator" and "Predator" surface as one candidate
-    group instead of two permanently-separate pool entries. Grouping only;
-    the actual merge still goes through the normal review/confirm flow
-    below, same as any other candidate this function surfaces.
+    quality-tier prefix, separately a compound quality+country prefix
+    ("4K-DE - ") or a bare known-language-code dash prefix ("IR - ", reusing
+    _KNOWN_LANGUAGE_CODES), and a trailing known-country-code parenthetical
+    ("Severance (2022) (US)" -> "Severance (2022)", see
+    _KNOWN_COUNTRY_SUFFIX_CODES) when config.get_duplicate_finder_quality_
+    prefix_matching() is on (opt-in, default off -- see that setting's own
+    docstring) -- so "4K: Predator", "4K-DE - Predator", "Predator (US)",
+    and "Predator" all surface as one candidate group instead of
+    permanently-separate pool entries. All of the country/language
+    stripping is allowlist-only (same pattern as _KNOWN_LANGUAGE_CODES +
+    exception-set guard used by _strip_lang_prefixes) so it never fires on
+    an unrelated leading or trailing word. Grouping only; the actual merge
+    still goes through the normal review/confirm flow below, same as any
+    other candidate this function surfaces.
 
     A same-name row with NO year (year IS NULL) never enters the
     year-proximity pass -- there's no year to compare. But if it shares a
@@ -3406,7 +3465,11 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     match_quality_prefixes = get_duplicate_finder_quality_prefix_matching()
     by_name: dict[str, list[dict]] = {}
     for r in rows:
-        key = _normalize_title_for_dedup(r["name"])
+        raw_name = r["name"]
+        if match_quality_prefixes:
+            raw_name = _strip_quality_lang_prefix_for_dedup(raw_name)
+            raw_name = _strip_country_suffix_for_dedup(raw_name)
+        key = _normalize_title_for_dedup(raw_name)
         if match_quality_prefixes:
             key = _strip_quality_prefix_for_dedup(key)
         by_name.setdefault(key, []).append({
