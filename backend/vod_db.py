@@ -7212,6 +7212,18 @@ def _merge_movie_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> No
     its own lock/connect/commit for the ordinary one-at-a-time UI path."""
     from_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (from_id,)).fetchone()
     into_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (into_id,)).fetchone()
+    if from_row is None or into_row is None:
+        # A caller merging several pairs from the same batch (e.g.
+        # merge_duplicate_groups_bulk) can hand this function a pair where
+        # one side was already deleted by an earlier pair's merge in the
+        # same batch/transaction. This is the last checkpoint before the
+        # UPDATE/DELETE below -- no-op instead of letting it hit a
+        # now-nonexistent row and raise a FOREIGN KEY constraint error.
+        logger.warning(
+            "[merge_movie] skipping id=%s -> id=%s -- one side no longer exists (already merged)",
+            from_id, into_id,
+        )
+        return
     # This permanently deletes `from_id` below (its sources/placements move
     # to `into_id` first) -- irreversible outside a DB backup, so a merge
     # triggered by a bad tmdb_id match (GH issue #6) leaves no trace to
@@ -7268,6 +7280,15 @@ def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> N
     why this exists separately from merge_series (single-item)."""
     from_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (from_id,)).fetchone()
     into_row = conn.execute("SELECT name, year, tmdb_id FROM series WHERE id=?", (into_id,)).fetchone()
+    if from_row is None or into_row is None:
+        # See _merge_movie_row's identical guard -- same batch-caller race
+        # (merge_duplicate_groups_bulk can hand this a pair where one side
+        # was already deleted by an earlier pair in the same batch).
+        logger.warning(
+            "[merge_series] skipping id=%s -> id=%s -- one side no longer exists (already merged)",
+            from_id, into_id,
+        )
+        return
     # See merge_movie's identical logging comment -- same irreversible-delete risk.
     logger.warning(
         "[merge_series] id=%s (%r, year=%s, tmdb_id=%s) merging into id=%s (%r, year=%s, tmdb_id=%s) -- from_id row will be deleted",
