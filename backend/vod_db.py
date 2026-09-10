@@ -7987,6 +7987,118 @@ def merge_series(from_id: int, into_id: int) -> None:
         conn.close()
 
 
+def auto_merge_series_by_tmdb(series_id: int) -> None:
+    """Called right after enrichment confirms/refreshes `series_id`'s tmdb_id
+    (see vod_importer.enrich_series) -- every OTHER series row sharing that
+    same non-null tmdb_id gets merged into a single survivor automatically,
+    no human click, regardless of how many there are. Same design as
+    auto_merge_movie_by_tmdb (beads-w80) -- tmdb_id equality is the sole
+    MUST-match gate, trusted at any group size because it's independently
+    corroborated by TMDB, not derived from our own name-normalization
+    heuristics. Year agreement is logged as an audit/reinforcer signal only,
+    never a requirement or blocker. A row with no tmdb_id can never appear in
+    this function's lookup query at all, so there's no "partial" member to
+    strand -- agreement is total by construction (beads-91l).
+
+    Survivor tiebreak differs from movies (user direction 2026-09-10):
+    movies keep the just-enriched row as survivor; series instead prefer
+    whichever row in the cluster has the "cleanest" name -- no leftover
+    provider/language prefix like "EN -"/"NF -" (see
+    _strip_quality_lang_prefix_for_dedup). A prefixed name is very often the
+    result of a raw provider feed field bleeding through un-normalized, so
+    keeping the un-prefixed row's metadata (poster, description, etc.) as the
+    survivor is more likely to already be clean. Ties (all names equally
+    clean, or all equally prefixed) fall back to keeping series_id, the
+    just-enriched row, same as movies.
+
+    Respects duplicate_ignores per-pair exactly like movies' version and the
+    manual Duplicate Finder flow -- a pair a human already dismissed is
+    skipped even if the rest of the group still qualifies. Also carries the
+    same beads-3qf concurrency guard: other_rows is snapshotted once, then
+    immediately before each individual merge both rows are re-verified to
+    still exist, since a tmdb_id cluster of 3+ variants means each variant's
+    own enrichment independently triggers this function, and a later call in
+    the same batch can find its target/source already deleted by an earlier
+    concurrent call.
+
+    No undo path exists for this merge (see _merge_series_row's docstring on
+    why the delete is irreversible outside a DB backup) -- the
+    logger.warning call inside _merge_series_row is the only audit trail,
+    which is why every call site here logs the year-agreement status and the
+    chosen survivor on top of it."""
+    if not get_duplicate_finder_auto_merge_tmdb():
+        return
+
+    series = get_series(series_id)
+    tmdb_id = series.get("tmdb_id") if series else None
+    if not tmdb_id:
+        return
+
+    conn = _connect()
+    other_rows = conn.execute(
+        "SELECT id, name, year FROM series WHERE tmdb_id=? AND id!=?", (tmdb_id, series_id)
+    ).fetchall()
+    conn.close()
+    if not other_rows:
+        return
+
+    ignored_sigs = set(list_ignored_duplicate_signatures("series"))
+    for row in other_rows:
+        signature = _duplicate_ignore_signature([series_id, row["id"]])
+        if signature in ignored_sigs:
+            continue
+
+        # beads-3qf: other_rows was snapshotted above -- re-verify both rows
+        # still exist immediately before merging (see auto_merge_movie_by_
+        # tmdb's identical comment for why this matters for 3+-way clusters).
+        current = get_series(series_id)
+        other = get_series(row["id"])
+        if not current or not other:
+            logger.warning(
+                "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
+                "(already merged by a concurrent auto-merge in this cluster)",
+                tmdb_id, row["id"], series_id,
+            )
+            continue
+
+        this_year = current.get("year")
+        other_year = other.get("year")
+        if this_year is None or other_year is None:
+            year_status = "one_missing"
+        elif this_year == other_year:
+            year_status = "agree"
+        else:
+            year_status = "MISMATCH"
+
+        # Cleanest-name tiebreak: prefer whichever row's name has no
+        # provider/language prefix to strip. If both (or neither) are
+        # clean, default to keeping series_id (the just-enriched row).
+        current_name = current.get("name") or ""
+        other_name = other.get("name") or ""
+        current_is_clean = _strip_quality_lang_prefix_for_dedup(current_name) == current_name
+        other_is_clean = _strip_quality_lang_prefix_for_dedup(other_name) == other_name
+        if other_is_clean and not current_is_clean:
+            keep_id, drop_id = row["id"], series_id
+        else:
+            keep_id, drop_id = series_id, row["id"]
+
+        logger.warning(
+            "[auto_merge_series_by_tmdb] tmdb_id=%s year_status=%s -- id=%s (%r) auto-merging into id=%s (%r) "
+            "[cleanest-name survivor]",
+            tmdb_id, year_status, drop_id,
+            (current_name if drop_id == series_id else other_name),
+            keep_id,
+            (current_name if keep_id == series_id else other_name),
+        )
+        merge_series(drop_id, keep_id)
+
+        # If series_id itself was the row that got merged away, there's
+        # nothing left for it to auto-merge into for the remaining rows in
+        # other_rows -- keep_id is now the live survivor going forward.
+        if drop_id == series_id:
+            series_id = keep_id
+
+
 def list_needs_year_review(content_type: str | None = None) -> dict:
     conn = _connect()
     out: dict = {}

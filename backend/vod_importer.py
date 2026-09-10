@@ -1033,6 +1033,17 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
 
     if not any_fetched:
         return {"fetched": False, "reason": last_reason}
+
+    if detail_written:
+        # Mirrors enrich_movie's auto_merge_movie_by_tmdb call sites (see
+        # those for the full design doc) -- fires once per series, after all
+        # of this series' providers have been processed, and only when a
+        # tmdb_id could actually have been (re)confirmed this pass (detail_
+        # written implies the TMDB-bearing provider's detail fetch
+        # succeeded). Gated on the same duplicate_finder_auto_merge_tmdb
+        # config flag as movies.
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
+
     return {"fetched": True, "reason": None}
 
 
