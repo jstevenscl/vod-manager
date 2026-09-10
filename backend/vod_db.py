@@ -3484,7 +3484,18 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     than silently dropped. This is exactly the real case that motivated it:
     a provider's "12 Strong" row importing with no year sitting right next
     to a dated "12 Strong (2018)" row, both same tmdb_id, never clustering
-    because the null-year row never got as far as the year-proximity check."""
+    because the null-year row never got as far as the year-proximity check.
+
+    Pass (4), after every name-key bucket above has been processed: any row
+    that never joined a same-name cluster (its bucket's lone dated row, or
+    an undated row whose tmdb_id never matched a cluster) is a candidate for
+    one final CROSS-bucket tmdb_id match. Two rows can carry a genuinely
+    different name-key -- a doubled year ("Title (2020) (2020)"), a
+    leftover prefix/suffix the cosmetic-normalize pass doesn't cover --
+    while still being the same confirmed title, and pass (1)-(3) never put
+    them in the same bucket to compare in the first place. Same tmdb_id
+    proof standard as pass (3) (_split_by_tmdb_conflict), just applied
+    across bucket boundaries instead of within one (beads-cd4)."""
     table = "movies" if content_type == "movie" else "series"
     id_col = "movie_id" if content_type == "movie" else "series_id"
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
@@ -3511,6 +3522,7 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
 
     ignored = set(list_ignored_duplicate_signatures(content_type))
     candidate_groups: list[list[dict]] = []
+    unclustered: list[dict] = []
     for items in by_name.values():
         dated = [i for i in items if i["year"] is not None]
         undated_by_tmdb: dict[str, list[dict]] = {}
@@ -3519,8 +3531,10 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
                 undated_by_tmdb.setdefault(i["tmdb_id"], []).append(i)
 
         if len(dated) < 2 and not undated_by_tmdb:
+            unclustered.extend(items)
             continue
 
+        bucket_grouped_ids: set[int] = set()
         for year_cluster in _split_by_year_proximity(dated):
             for sub in _split_by_tmdb_conflict(year_cluster):
                 cluster_tmdb_ids = {i["tmdb_id"] for i in sub if i.get("tmdb_id")}
@@ -3531,6 +3545,7 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
                 if _duplicate_ignore_signature([i["id"] for i in sub]) in ignored:
                     continue
                 candidate_groups.append(sub)
+                bucket_grouped_ids.update(i["id"] for i in sub)
 
         # Undated rows whose tmdb_id never matched a dated cluster above
         # (e.g. every row sharing that name has no year) still cluster with
@@ -3542,6 +3557,39 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
             if _duplicate_ignore_signature([i["id"] for i in leftover]) in ignored:
                 continue
             candidate_groups.append(leftover)
+            bucket_grouped_ids.update(i["id"] for i in leftover)
+
+        # Rows in this name-key bucket that never joined a same-name cluster
+        # (e.g. the bucket's lone dated row, or an undated row whose tmdb_id
+        # never matched) stay real candidates for the cross-bucket pass below
+        # -- a different name-key artifact (doubled year, leftover prefix the
+        # cosmetic-normalize pass doesn't cover) is exactly what put them in
+        # a different bucket in the first place.
+        unclustered.extend(i for i in items if i["id"] not in bucket_grouped_ids)
+
+    # Cross-bucket pass (beads-cd4): two rows can share a CONFIRMED tmdb_id
+    # while never landing in the same by_name bucket at all -- the name-key
+    # normalization above only strips punctuation/whitespace (and, opt-in,
+    # a known quality/language prefix or country suffix), so a doubled year
+    # ("Title (2020) (2020)" vs "Title (2020)") or any other leftover
+    # prefix/suffix artifact the cosmetic pass doesn't cover produces a
+    # different key and the two rows never even reach _split_by_tmdb_conflict
+    # together. tmdb_id agreement is the same proof standard
+    # _split_by_tmdb_conflict already trusts to SPLIT a cluster apart, so
+    # it's equally trustworthy to JOIN one here -- this only fires on rows
+    # that didn't already cluster by name, so it can't undo any of the
+    # name-based grouping above, only add clusters that grouping missed.
+    cross_by_tmdb: dict[str, list[dict]] = {}
+    for i in unclustered:
+        if i.get("tmdb_id"):
+            cross_by_tmdb.setdefault(i["tmdb_id"], []).append(i)
+    for tid, group in cross_by_tmdb.items():
+        if len(group) < 2:
+            continue
+        ids = [i["id"] for i in group]
+        if _duplicate_ignore_signature(ids) in ignored:
+            continue
+        candidate_groups.append(group)
 
     if not candidate_groups:
         conn.close()
