@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 
 from config import (
-    DATA_DIR, get_config, get_duplicate_finder_quality_prefix_matching, get_refresh_settings,
+    DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb,
+    get_duplicate_finder_quality_prefix_matching, get_refresh_settings,
     get_stream_priority_mode, get_vod_xc_account_id,
 )
 from secrets_util import decrypt_value, encrypt_value, is_encrypted
@@ -5747,27 +5748,38 @@ def get_episode(episode_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def _add_episode_row(conn: sqlite3.Connection, series_id: int, season_number: int, episode_number: int, name: str, **fields) -> int:
+    """The actual find-or-upsert SQL for one episode, against an already-open
+    connection -- no lock/connect/commit/close of its own, so a caller
+    writing many episodes for one series (see enrich_series_episodes_batch)
+    can hold a single connection/transaction across the whole series instead
+    of paying a fresh connection + WAL fsync per episode. add_episode wraps
+    this with its own lock/connect/commit for one-off single-episode callers."""
+    row = conn.execute(
+        "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+        (series_id, season_number, episode_number),
+    ).fetchone()
+    if row:
+        episode_id = row["id"]
+        fields["name"] = name
+        sets = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE episodes SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), episode_id))
+    else:
+        cols = ["series_id", "season_number", "episode_number", "name", *fields.keys()]
+        vals = [series_id, season_number, episode_number, name, *fields.values()]
+        placeholders = ", ".join("?" for _ in cols)
+        cur = conn.execute(
+            f"INSERT INTO episodes ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)",
+            (*vals, _now()),
+        )
+        episode_id = cur.lastrowid
+    return episode_id
+
+
 def add_episode(series_id: int, season_number: int, episode_number: int, name: str, **fields) -> int:
     with _WRITE_LOCK:
         conn = _connect()
-        row = conn.execute(
-            "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
-            (series_id, season_number, episode_number),
-        ).fetchone()
-        if row:
-            episode_id = row["id"]
-            fields["name"] = name
-            sets = ", ".join(f"{k}=?" for k in fields)
-            conn.execute(f"UPDATE episodes SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), episode_id))
-        else:
-            cols = ["series_id", "season_number", "episode_number", "name", *fields.keys()]
-            vals = [series_id, season_number, episode_number, name, *fields.values()]
-            placeholders = ", ".join("?" for _ in cols)
-            cur = conn.execute(
-                f"INSERT INTO episodes ({', '.join(cols)}, created_at) VALUES ({placeholders}, ?)",
-                (*vals, _now()),
-            )
-            episode_id = cur.lastrowid
+        episode_id = _add_episode_row(conn, series_id, season_number, episode_number, name, **fields)
         _commit_with_retry(conn)
         conn.close()
         return episode_id
@@ -5830,24 +5842,98 @@ def add_episode_source(
     yet at that earlier, cheap bulk-list stage)."""
     with _WRITE_LOCK:
         conn = _connect()
-        conn.execute(
-            """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, added_at, last_seen_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                   episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at,
-                   file_size_bytes=COALESCE(excluded.file_size_bytes, episode_sources.file_size_bytes),
-                   local_file_path=COALESCE(excluded.local_file_path, episode_sources.local_file_path),
-                   raw_name=excluded.raw_name,
-                   provider_category_name=excluded.provider_category_name""",
-            (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, _now(), _now()),
+        source_id = _add_episode_source_row(
+            conn, episode_id, provider_id, provider_stream_id, container_extension,
+            file_size_bytes=file_size_bytes, local_file_path=local_file_path, raw_name=raw_name,
+            provider_category_name=provider_category_name,
         )
         _commit_with_retry(conn)
-        source_id = conn.execute(
-            "SELECT id FROM episode_sources WHERE provider_id=? AND provider_stream_id=?",
-            (provider_id, provider_stream_id),
-        ).fetchone()["id"]
         conn.close()
         return source_id
+
+
+def _add_episode_source_row(
+    conn: sqlite3.Connection, episode_id: int, provider_id: int, provider_stream_id: str, container_extension: str = "mp4",
+    file_size_bytes: int | None = None, local_file_path: str | None = None, raw_name: str | None = None,
+    provider_category_name: str | None = None, bitrate: int | None = None,
+) -> int:
+    """The actual upsert SQL for one episode source, against an already-open
+    connection -- see _add_episode_row's docstring for why (same reasoning,
+    same caller: enrich_series_episodes_batch). bitrate folds
+    set_episode_source_bitrate's separate UPDATE into this same INSERT when
+    given, saving a third per-episode write on top of the two this already
+    collapses episode+source into. add_episode_source wraps this with its own
+    lock/connect/commit for one-off single-source callers."""
+    conn.execute(
+        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, added_at, last_seen_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+               episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at,
+               file_size_bytes=COALESCE(excluded.file_size_bytes, episode_sources.file_size_bytes),
+               local_file_path=COALESCE(excluded.local_file_path, episode_sources.local_file_path),
+               raw_name=excluded.raw_name,
+               provider_category_name=excluded.provider_category_name,
+               bitrate=COALESCE(excluded.bitrate, episode_sources.bitrate)""",
+        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _now(), _now()),
+    )
+    return conn.execute(
+        "SELECT id FROM episode_sources WHERE provider_id=? AND provider_stream_id=?",
+        (provider_id, provider_stream_id),
+    ).fetchone()["id"]
+
+
+def enrich_series_episodes_batch(series_id: int, provider_id: int, episodes: list[dict]) -> None:
+    """Writes every episode from one enrich_series/get_series_info call for
+    `series_id` under a single connection/lock/commit, instead of
+    vod_importer.enrich_series's old per-episode add_episode +
+    add_episode_source (+ conditional set_episode_source_bitrate) calls,
+    which each independently acquired _WRITE_LOCK, opened a connection, and
+    did a full fsync-backed commit (see beads-3po) -- a 20-episode series was
+    up to 40 separately-locked, separately-fsynced writes, contended against
+    every other concurrently-enriching series' own episode writes through
+    the same lock (bulk_enrich_all's series concurrency is 8). Root-caused
+    live 2026-09-09/10: series enriched at ~0.6-0.7/sec vs. movies' ~22-25/sec,
+    a ~37x gap that was write-lock+fsync overhead multiplied by episode
+    count, not provider/network latency.
+
+    One held connection + one _item_savepoint per episode (so one malformed
+    episode's bad season/episode number or missing stream id can't lose the
+    rest of the series -- same isolation add_episode/add_episode_source used
+    to get for free by being separate calls) + one _commit_with_retry at the
+    end preserves the same per-episode upsert correctness while paying the
+    lock-acquisition and fsync cost once per series instead of once per
+    episode.
+
+    `episodes` is a list of dicts with the same shape enrich_series already
+    builds per episode: season_number, episode_number, name, description,
+    duration_secs, provider_stream_id, container_extension, raw_name,
+    provider_category_name, bitrate (all but season_number/episode_number/
+    name/provider_stream_id optional, default None)."""
+    if not episodes:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        for ep in episodes:
+            try:
+                with _item_savepoint(conn):
+                    episode_id = _add_episode_row(
+                        conn, series_id, ep["season_number"], ep["episode_number"], ep["name"],
+                        description=ep.get("description"), duration_secs=ep.get("duration_secs"),
+                    )
+                    _add_episode_source_row(
+                        conn, episode_id, provider_id, ep["provider_stream_id"],
+                        ep.get("container_extension") or "mp4",
+                        raw_name=ep.get("raw_name"),
+                        provider_category_name=ep.get("provider_category_name"),
+                        bitrate=ep.get("bitrate"),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[enrich_series_episodes_batch] skipped episode series_id=%s s%re%r: %s",
+                    series_id, ep.get("season_number"), ep.get("episode_number"), exc,
+                )
+        _commit_with_retry(conn)
+        conn.close()
 
 
 def delete_series(series_id: int) -> None:
@@ -7678,6 +7764,78 @@ def merge_movie(from_id: int, into_id: int) -> None:
         _merge_movie_row(conn, from_id, into_id)
         _commit_with_retry(conn)
         conn.close()
+
+
+def auto_merge_movie_by_tmdb(movie_id: int) -> None:
+    """Called right after enrichment confirms/refreshes `movie_id`'s tmdb_id
+    (see vod_importer.enrich_movie) -- every OTHER movie row sharing that
+    same non-null tmdb_id gets merged into it automatically, no human click,
+    regardless of how many there are (a same-tmdb_id cluster is commonly 3+
+    rows in practice -- one real film plus several provider language/dub
+    variants, e.g. "Title", "IR - Title", "AR-SUBS - Title" all carrying the
+    identical tmdb_id).
+
+    Design (user direction 2026-09-10, see beads-w80): tmdb_id equality is
+    the MUST-match gate -- it's independently corroborated by TMDB itself,
+    not derived from our own name-normalization heuristics, so it's trusted
+    enough to skip manual review, at any group size. Year agreement is a
+    reinforcer only, never a requirement -- logged for audit, never blocks
+    the merge. A row with no tmdb_id at all can never appear in this
+    function's query (it only ever looks up OTHER rows sharing a specific
+    non-null id), so there's no "questionable" member to strand mid-group --
+    by the time a row shares this tmdb_id, agreement is total by
+    construction, same guarantee _split_by_tmdb_conflict already relies on.
+    A row that's merely name/year-clustered without a confirmed tmdb_id
+    match stays in the manual Duplicate Finder queue untouched (see
+    beads-sru's Tier 2) -- that case never reaches this function.
+
+    The just-enriched row (`movie_id`) is kept as the surviving `into_id`
+    for every merge in the group -- its metadata was just refreshed from
+    TMDB/provider, so it's the freshest -- each other matching row is
+    deleted in turn after its sources/placements move over (see
+    _merge_movie_row). Respects duplicate_ignores per-pair exactly like the
+    manual flow: a pair a human already dismissed is skipped even if the
+    rest of the group still qualifies and merges.
+
+    No undo path exists for this merge (see _merge_movie_row's docstring on
+    why the delete is irreversible outside a DB backup) -- the logger.warning
+    call inside _merge_movie_row is the only audit trail, which is why every
+    call site here logs the year-agreement status on top of it."""
+    if not get_duplicate_finder_auto_merge_tmdb():
+        return
+
+    movie = get_movie(movie_id)
+    tmdb_id = movie.get("tmdb_id") if movie else None
+    if not tmdb_id:
+        return
+
+    conn = _connect()
+    other_rows = conn.execute(
+        "SELECT id, name, year FROM movies WHERE tmdb_id=? AND id!=?", (tmdb_id, movie_id)
+    ).fetchall()
+    conn.close()
+    if not other_rows:
+        return
+
+    ignored_sigs = set(list_ignored_duplicate_signatures("movie"))
+    this_year = movie.get("year")
+    for row in other_rows:
+        signature = _duplicate_ignore_signature([movie_id, row["id"]])
+        if signature in ignored_sigs:
+            continue
+
+        other_year = row["year"]
+        if this_year is None or other_year is None:
+            year_status = "one_missing"
+        elif this_year == other_year:
+            year_status = "agree"
+        else:
+            year_status = "MISMATCH"
+        logger.warning(
+            "[auto_merge_movie_by_tmdb] tmdb_id=%s year_status=%s -- id=%s (%r, year=%s) auto-merging into id=%s (%r, year=%s)",
+            tmdb_id, year_status, row["id"], row["name"], other_year, movie_id, movie.get("name"), this_year,
+        )
+        merge_movie(row["id"], movie_id)
 
 
 def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> None:
