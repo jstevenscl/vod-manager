@@ -2052,7 +2052,12 @@ async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveReq
                 await dispatcharr_dvr_importer._apply_download_backfill(match, body.provider_id)
             else:
                 await dispatcharr_dvr_importer._apply_pointer_backfill(match)
-            if target_category_id:
+            # beads-4o6: don't re-surface an archived (review_excluded) series
+            # by placing it in a category -- the backfill itself (episode/
+            # pointer data) still succeeded and should count as resolved,
+            # only the category placement is skipped.
+            matched_series = vod_db.get_series(match["series_id"])
+            if target_category_id and matched_series and not matched_series.get("review_excluded"):
                 vod_db.place_series_in_category(match["series_id"], target_category_id)
         except Exception as exc:
             raise HTTPException(502, detail=f"Found in the pool but backfill failed: {exc}")
@@ -2201,8 +2206,12 @@ async def backfill_series_past_seasons(series_id: int, provider_id: int, schedul
                     await dispatcharr_dvr_importer._apply_download_backfill(match, provider_id)
                 else:
                     await dispatcharr_dvr_importer._apply_pointer_backfill(match)
+                # beads-4o6: skip category placement for an archived
+                # (review_excluded) series -- see the matching comment in
+                # backfill_missing_episode above.
                 target_category_id = (rule or {}).get("target_series_category_id")
-                if target_category_id:
+                matched_series = vod_db.get_series(match["series_id"])
+                if target_category_id and matched_series and not matched_series.get("review_excluded"):
                     vod_db.place_series_in_category(match["series_id"], target_category_id)
                 vod_db.clear_unresolved_missing_episode(series_id, season, episode)
                 results.append({"season_number": season, "episode_number": episode, "name": name, "status": "already_in_pool"})
@@ -3125,7 +3134,10 @@ async def move_movie_source(movie_id: int, source_id: int, body: MoveMovieSource
 async def place_movie_in_category(movie_id: int, body: PlacementRequest):
     if not vod_db.get_movie(movie_id):
         raise HTTPException(404, detail="movie not found")
-    export_stream_id = vod_db.place_movie_in_category(movie_id, body.category_id)
+    try:
+        export_stream_id = vod_db.place_movie_in_category(movie_id, body.category_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
     return {"export_stream_id": export_stream_id}
 
 
@@ -3394,7 +3406,10 @@ async def remove_series_provider_sources(series_id: int, provider_id: int):
 async def place_series_in_category(series_id: int, body: PlacementRequest):
     if not vod_db.get_series(series_id):
         raise HTTPException(404, detail="series not found")
-    export_series_id = vod_db.place_series_in_category(series_id, body.category_id)
+    try:
+        export_series_id = vod_db.place_series_in_category(series_id, body.category_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
     return {"export_series_id": export_series_id}
 
 
