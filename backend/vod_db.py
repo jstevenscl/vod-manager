@@ -24,8 +24,8 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb,
-    get_duplicate_finder_quality_prefix_matching, get_refresh_settings,
-    get_stream_priority_mode, get_vod_xc_account_id,
+    get_duplicate_finder_quality_prefix_matching, get_enabled_languages,
+    get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id,
 )
 from secrets_util import decrypt_value, encrypt_value, is_encrypted
 
@@ -1087,6 +1087,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # (optionally) remove logic.
         ("categories", "sync_sources", "TEXT"),
         ("categories", "sync_mode", "TEXT NOT NULL DEFAULT 'add_only'"),
+        # Per-source language, computed from raw_name at import time via
+        # _name_prefix_code (e.g. "NL - Title" -> "NL"), defaulting to "EN"
+        # when no foreign prefix is detected. Exists because auto-merge-by-
+        # tmdb_id (see auto_merge_movie_by_tmdb) correctly combines same-film
+        # rows regardless of dub/sub language, but nothing downstream gated
+        # playback/export per source -- a foreign-tagged row merged into an
+        # English card surfaced its sources with zero language check
+        # anywhere (list_movie_sources_for_streaming, _best_source_cte). See
+        # beads-974.
+        ("movie_sources", "language", "TEXT"),
+        ("series_sources", "language", "TEXT"),
+        ("episode_sources", "language", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5470,10 +5482,23 @@ def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int
     return len(rows)
 
 
+def _enabled_languages_clause(column: str) -> tuple[str, list[str]]:
+    """SQL fragment + bind params gating `column` to config.get_enabled_languages()
+    (default EN+ES, user-adjustable via the Providers tab). Sources whose
+    language isn't in that set are excluded from playback/export/failover
+    entirely -- rows stay in the DB untouched, just filtered out of these
+    read paths. See config.get_enabled_languages for why this is separate
+    from the import-time language exclusion."""
+    codes = get_enabled_languages()
+    placeholders = ",".join("?" * len(codes))
+    return f"COALESCE({column}, 'EN') IN ({placeholders})", codes
+
+
 def _best_source_cte() -> str:
     """Was a module-level constant string -- turned into a function so the
     ORDER BY reflects config.get_stream_priority_mode() at query time, not
     whatever it was when this module first loaded."""
+    lang_clause, _ = _enabled_languages_clause("ms.language")
     return f"""
     WITH best_source AS (
         SELECT ms.*, ROW_NUMBER() OVER (
@@ -5481,7 +5506,7 @@ def _best_source_cte() -> str:
         ) AS rn
         FROM movie_sources ms
         JOIN providers pr ON pr.id = ms.provider_id
-        WHERE pr.is_active = 1
+        WHERE pr.is_active = 1 AND {lang_clause}
     )
 """
 
@@ -5494,6 +5519,7 @@ def get_movie_export_rows() -> list[dict]:
     list_movie_sources_for_streaming for the full failover-ordered list.
     """
     conn = _connect()
+    _, lang_params = _enabled_languages_clause("ms.language")
     rows = conn.execute(_best_source_cte() + """
         SELECT
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
@@ -5508,9 +5534,9 @@ def get_movie_export_rows() -> list[dict]:
         FROM movie_category_placements p
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
-        LEFT JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
+        JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
         ORDER BY m.name
-    """).fetchall()
+    """, lang_params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -5541,6 +5567,7 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
     _BEST_SOURCE_CTE (metadata: one row only), this returns every candidate
     so the proxy can try them in order."""
     conn = _connect()
+    lang_clause, lang_params = _enabled_languages_clause("ms.language")
     rows = conn.execute(f"""
         SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension,
                ms.plex_rating_key, ms.local_file_path, ms.consecutive_failures AS consecutive_failures,
@@ -5548,14 +5575,16 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
         WHERE ms.movie_id = ? AND p.is_active = 1
+              AND {lang_clause}
         ORDER BY {_source_order_by('ms', 'p')}
-    """, (movie_id,)).fetchall()
+    """, (movie_id, *lang_params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
     conn = _connect()
+    _, lang_params = _enabled_languages_clause("ms.language")
     row = conn.execute(_best_source_cte() + """
         SELECT
             m.id AS movie_id, m.name AS name, m.year AS year, m.genre AS genre,
@@ -5573,7 +5602,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
         LEFT JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
         WHERE p.export_stream_id = ?
         LIMIT 1
-    """, (export_stream_id,)).fetchone()
+    """, (*lang_params, export_stream_id)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -5993,16 +6022,17 @@ def _add_episode_source_row(
     collapses episode+source into. add_episode_source wraps this with its own
     lock/connect/commit for one-off single-source callers."""
     conn.execute(
-        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, added_at, last_seen_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, language, added_at, last_seen_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                episode_id=excluded.episode_id, last_seen_at=excluded.last_seen_at,
                file_size_bytes=COALESCE(excluded.file_size_bytes, episode_sources.file_size_bytes),
                local_file_path=COALESCE(excluded.local_file_path, episode_sources.local_file_path),
                raw_name=excluded.raw_name,
                provider_category_name=excluded.provider_category_name,
-               bitrate=COALESCE(excluded.bitrate, episode_sources.bitrate)""",
-        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _now(), _now()),
+               bitrate=COALESCE(excluded.bitrate, episode_sources.bitrate),
+               language=excluded.language""",
+        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _source_language(raw_name), _now(), _now()),
     )
     return conn.execute(
         "SELECT id FROM episode_sources WHERE provider_id=? AND provider_stream_id=?",
@@ -6374,6 +6404,7 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
 
 def _episode_best_source_cte() -> str:
     """See _best_source_cte's identical docstring -- episode equivalent."""
+    lang_clause, _ = _enabled_languages_clause("es.language")
     return f"""
     WITH best_source AS (
         SELECT es.*, ROW_NUMBER() OVER (
@@ -6381,7 +6412,7 @@ def _episode_best_source_cte() -> str:
         ) AS rn
         FROM episode_sources es
         JOIN providers pr ON pr.id = es.provider_id
-        WHERE pr.is_active = 1
+        WHERE pr.is_active = 1 AND {lang_clause}
     )
 """
 
@@ -6406,6 +6437,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
 def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
     """Episode equivalent of list_movie_sources_for_streaming — see there."""
     conn = _connect()
+    lang_clause, lang_params = _enabled_languages_clause("es.language")
     rows = conn.execute(f"""
         SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension,
                es.plex_rating_key, es.local_file_path, es.consecutive_failures AS consecutive_failures,
@@ -6413,8 +6445,9 @@ def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
         WHERE es.episode_id = ? AND p.is_active = 1
+              AND {lang_clause}
         ORDER BY {_source_order_by('es', 'p')}
-    """, (episode_id,)).fetchall()
+    """, (episode_id, *lang_params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -6424,6 +6457,7 @@ def get_episode_export_row(episode_id: int) -> dict | None:
     is placed into categories), so the export id is just a stable offset of
     the episode's own row id."""
     conn = _connect()
+    _, lang_params = _enabled_languages_clause("es.language")
     row = conn.execute(_episode_best_source_cte() + """
         SELECT
             e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
@@ -6434,7 +6468,7 @@ def get_episode_export_row(episode_id: int) -> dict | None:
         FROM episodes e
         LEFT JOIN best_source es ON es.episode_id = e.id AND es.rn = 1
         WHERE e.id = ?
-    """, (episode_id,)).fetchone()
+    """, (*lang_params, episode_id)).fetchone()
     conn.close()
     if not row:
         return None
@@ -6458,6 +6492,7 @@ def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
     get_series_info for many series in a row froze the whole server for
     every other request until it finished."""
     conn = _connect()
+    _, lang_params = _enabled_languages_clause("es.language")
     rows = conn.execute(_episode_best_source_cte() + """
         SELECT
             e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
@@ -6469,7 +6504,7 @@ def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
         LEFT JOIN best_source es ON es.episode_id = e.id AND es.rn = 1
         WHERE e.series_id = ?
         ORDER BY e.season_number, e.episode_number
-    """, (series_id,)).fetchall()
+    """, (*lang_params, series_id)).fetchall()
     conn.close()
     results = [dict(r) for r in rows]
     for r in results:
@@ -6796,13 +6831,13 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                 (item["tmdb_id"], entry["movie_id"]),
                             )
                         conn.execute(
-                            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, added_at, last_seen_at)
-                               VALUES (?,?,?,?,?,?,?,?)
+                            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, added_at, last_seen_at)
+                               VALUES (?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                                    movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
-                                   raw_name=excluded.raw_name""",
+                                   raw_name=excluded.raw_name, language=excluded.language""",
                             (entry["movie_id"], provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                             item.get("provider_category_name"), item.get("raw_name"), now, now),
+                             item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), now, now),
                         )
                         created += entry["did_create"]
                         matched += entry["did_match"]
@@ -7112,12 +7147,12 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # bulk_import_movies exactly.
                         if item.get("provider_series_id") is not None:
                             conn.execute(
-                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, added_at, last_seen_at) "
-                                "VALUES (?,?,?,?,?,?,?) "
+                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, added_at, last_seen_at) "
+                                "VALUES (?,?,?,?,?,?,?,?) "
                                 "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
                                 "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
-                                "raw_name=excluded.raw_name, last_seen_at=excluded.last_seen_at",
-                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now, now),
+                                "raw_name=excluded.raw_name, language=excluded.language, last_seen_at=excluded.last_seen_at",
+                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), now, now),
                             )
                         if entry["cat_update_needed"]:
                             # Real bug found live 2026-07-29: this value was captured
@@ -8387,6 +8422,121 @@ def _strip_one_lang_prefix(name: str) -> str | None:
     if _dash_prefix_code(name):
         return _LANG_PREFIX_DASH_RE.sub("", name, count=1).strip()
     return None
+
+
+def _source_language(raw_name: str | None) -> str:
+    """Per-source language for movie_sources/series_sources/episode_sources,
+    computed from the provider's raw_name via the same prefix-detection used
+    for import-time archiving (_name_prefix_code). Defaults to "EN" when no
+    known foreign-language prefix is present -- an untagged title is treated
+    as English/Spanish-safe, matching how providers actually tag things (the
+    absence of a prefix is the common case for EN/ES content, not a sign of
+    unknown language)."""
+    if not raw_name:
+        return "EN"
+    code = _name_prefix_code(raw_name)
+    return code or "EN"
+
+
+_BACKFILL_TABLES = [
+    ("movie_sources", "movie_id", "movies"),
+    ("series_sources", "series_id", "series"),
+    ("episode_sources", "episode_id", "episodes"),
+]
+
+
+def language_backfill_dry_run_report(sample_size: int = 5) -> dict:
+    """Existing rows written before the language column existed (or by any
+    write path not yet updated to populate it) still have language IS NULL.
+    Reports what apply_language_backfill would set each of them to -- per
+    table, per detected code, a count and a few sample parent titles --
+    so the change can be sanity-checked before touching any data. See
+    beads-974."""
+    conn = _connect()
+    report = {}
+    for table, fk_col, parent_table in _BACKFILL_TABLES:
+        rows = conn.execute(
+            f"SELECT raw_name, {fk_col} AS parent_id FROM {table} WHERE language IS NULL"
+        ).fetchall()
+        by_code: dict[str, dict] = {}
+        for row in rows:
+            code = _source_language(row["raw_name"])
+            bucket = by_code.setdefault(code, {"count": 0, "sample_titles": [], "_parent_ids": set()})
+            bucket["count"] += 1
+            bucket["_parent_ids"].add(row["parent_id"])
+        for code, bucket in by_code.items():
+            sample_ids = list(bucket.pop("_parent_ids"))[:sample_size]
+            if sample_ids:
+                placeholders = ",".join("?" for _ in sample_ids)
+                name_rows = conn.execute(
+                    f"SELECT name FROM {parent_table} WHERE id IN ({placeholders})", sample_ids
+                ).fetchall()
+                bucket["sample_titles"] = [r["name"] for r in name_rows]
+        report[table] = by_code
+    conn.close()
+    return report
+
+
+def apply_language_backfill() -> int:
+    """Writes the computed language (see language_backfill_dry_run_report)
+    onto every existing movie_sources/series_sources/episode_sources row
+    that doesn't have one yet. Returns the total number of rows updated."""
+    total = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        for table, _fk_col, _parent_table in _BACKFILL_TABLES:
+            rows = conn.execute(f"SELECT id, raw_name FROM {table} WHERE language IS NULL").fetchall()
+            for row in rows:
+                conn.execute(
+                    f"UPDATE {table} SET language = ? WHERE id = ?",
+                    (_source_language(row["raw_name"]), row["id"]),
+                )
+            total += len(rows)
+        _commit_with_retry(conn)
+        conn.close()
+    return total
+
+
+def preview_enabled_languages_impact(proposed_codes: list[str]) -> dict:
+    """Counts movies/episodes that currently have an eligible source under
+    config.get_enabled_languages() but would lose all eligible sources under
+    `proposed_codes` -- lets the Providers tab warn with a real number before
+    the user removes a language, instead of just silently dropping catalog
+    coverage. Adding a language never loses anything, so callers only need
+    to call this (and show the confirm dialog) when narrowing the set."""
+    movie_current_clause, movie_current_params = _enabled_languages_clause("ms.language")
+    episode_current_clause, episode_current_params = _enabled_languages_clause("es.language")
+    placeholders = ",".join("?" * len(proposed_codes))
+    proposed_params = [c.strip().upper() for c in proposed_codes if c.strip()]
+
+    conn = _connect()
+    movies_losing_access = conn.execute(f"""
+        SELECT COUNT(DISTINCT ms.movie_id) FROM movie_sources ms
+        JOIN providers p ON p.id = ms.provider_id
+        WHERE p.is_active = 1 AND {movie_current_clause}
+          AND ms.movie_id NOT IN (
+              SELECT ms2.movie_id FROM movie_sources ms2
+              JOIN providers p2 ON p2.id = ms2.provider_id
+              WHERE p2.is_active = 1 AND COALESCE(ms2.language, 'EN') IN ({placeholders})
+          )
+    """, (*movie_current_params, *proposed_params)).fetchone()[0]
+
+    episodes_losing_access = conn.execute(f"""
+        SELECT COUNT(DISTINCT es.episode_id) FROM episode_sources es
+        JOIN providers p ON p.id = es.provider_id
+        WHERE p.is_active = 1 AND {episode_current_clause}
+          AND es.episode_id NOT IN (
+              SELECT es2.episode_id FROM episode_sources es2
+              JOIN providers p2 ON p2.id = es2.provider_id
+              WHERE p2.is_active = 1 AND COALESCE(es2.language, 'EN') IN ({placeholders})
+          )
+    """, (*episode_current_params, *proposed_params)).fetchone()[0]
+    conn.close()
+
+    return {
+        "movies_losing_access": movies_losing_access,
+        "episodes_losing_access": episodes_losing_access,
+    }
 
 
 def _strip_lang_prefixes(name: str) -> str:

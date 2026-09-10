@@ -4658,6 +4658,84 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setLanguageDraft(next)
     setLanguageLastClickedIndex(index)
   }
+  // Enabled Playback Languages -- separate from the exclusion picker above:
+  // that one gates future imports by raw_name prefix; this is a live filter
+  // over the language already computed on every source row, so toggling it
+  // takes effect immediately on already-imported content in both directions.
+  const enabledLanguagesQuery = useQuery<{ codes: string[] }>({
+    queryKey: ['vod-enabled-languages'],
+    queryFn:  () => api.get('/vod/enabled-languages/').then((r) => r.data),
+  })
+  const saveEnabledLanguages = useMutation({
+    mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
+  })
+  const [enabledLanguageSearch, setEnabledLanguageSearch] = useState('')
+  const [enabledLanguageShowFilter, setEnabledLanguageShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
+  const [enabledLanguageLastClickedIndex, setEnabledLanguageLastClickedIndex] = useState<number | null>(null)
+  const enabledLanguageDraftInitialized = useRef(false)
+  useEffect(() => {
+    if (enabledLanguageDraftInitialized.current || !enabledLanguagesQuery.data) return
+    enabledLanguageDraftInitialized.current = true
+    setEnabledLanguageDraft(new Set(enabledLanguagesQuery.data.codes))
+  }, [enabledLanguagesQuery.data])
+  // Same pool-prefix data source as the exclusion picker -- these are the
+  // same per-source language codes, just gated by a different setting.
+  const allEnabledLanguageCodes = (() => {
+    const counts = new Map((languagePrefixesQuery.data ?? []).map((p) => [p.code, p.count]))
+    for (const code of enabledLanguagesQuery.data?.codes ?? []) {
+      if (!counts.has(code)) counts.set(code, 0)
+    }
+    if (!counts.has('EN')) counts.set('EN', 0)
+    if (!counts.has('ES')) counts.set('ES', 0)
+    return [...counts.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
+  })()
+  const visibleEnabledLanguageCodes = allEnabledLanguageCodes.filter((c) => {
+    const label = `${c.code} ${LANGUAGE_CODE_NAMES[c.code] ?? ''}`.toLowerCase()
+    if (enabledLanguageSearch && !label.includes(enabledLanguageSearch.toLowerCase())) return false
+    if (enabledLanguageShowFilter === 'selected' && !enabledLanguageDraft.has(c.code)) return false
+    if (enabledLanguageShowFilter === 'unselected' && enabledLanguageDraft.has(c.code)) return false
+    return true
+  })
+  function toggleEnabledLanguageSelected(code: string, index: number, shiftKey: boolean) {
+    const willBeChecked = !enabledLanguageDraft.has(code)
+    const next = new Set(enabledLanguageDraft)
+    if (shiftKey && enabledLanguageLastClickedIndex != null) {
+      const [start, end] = [enabledLanguageLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const c = visibleEnabledLanguageCodes[j]?.code
+        if (c == null) continue
+        if (willBeChecked) next.add(c); else next.delete(c)
+      }
+    } else {
+      if (willBeChecked) next.add(code); else next.delete(code)
+    }
+    setEnabledLanguageDraft(next)
+    setEnabledLanguageLastClickedIndex(index)
+  }
+  function saveEnabledLanguagesWithImpactCheck() {
+    const nextCodes = [...enabledLanguageDraft]
+    const currentCodes = enabledLanguagesQuery.data?.codes ?? []
+    const removed = currentCodes.filter((c) => !nextCodes.includes(c))
+    if (!removed.length) {
+      saveEnabledLanguages.mutate(nextCodes)
+      return
+    }
+    api.post('/vod/enabled-languages/impact/', { codes: nextCodes }).then((r) => {
+      const { movies_losing_access, episodes_losing_access } = r.data
+      if (!movies_losing_access && !episodes_losing_access) {
+        saveEnabledLanguages.mutate(nextCodes)
+        return
+      }
+      askConfirm(
+        `Removing ${removed.join(', ')} will immediately take ${movies_losing_access} movie(s) and ${episodes_losing_access} episode(s) out of playback/export — they'll have no remaining source in an enabled language. Nothing is deleted; re-enabling the language brings them back instantly. Continue?`,
+        () => saveEnabledLanguages.mutate(nextCodes),
+      )
+    })
+  }
   const [applyExclusionsJobId, setApplyExclusionsJobId] = useState<string | null>(null)
   const applyImportExclusionsNow = useMutation({
     mutationFn: () => api.post('/vod/import-exclusions/apply-now/'),
@@ -7931,6 +8009,76 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             ))}
           </div>
         )}
+      </SectionCard>
+
+      <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          This is a different filter from "Import Language Exclusion" above. That one decides what gets imported in
+          the first place, so it only affects titles going forward (or when you click "Apply rules to existing
+          catalog now"). This one is a live backstop on top of everything already in the catalog: it gates which
+          language a movie/episode/export/failover is allowed to stream from right now, regardless of import
+          history. Checking a language back on instantly makes any matching source eligible again — no re-import
+          needed. Unchecking one instantly removes eligibility for sources in that language, which can take a title
+          out of streaming/export entirely if that was its only enabled-language source.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <input
+            className={inputCls('flex-1')}
+            placeholder="Search languages…"
+            value={enabledLanguageSearch}
+            onChange={(e) => setEnabledLanguageSearch(e.target.value)}
+          />
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+            {(['all', 'selected', 'unselected'] as const).map((f) => (
+              <button
+                key={f}
+                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${enabledLanguageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                onClick={() => setEnabledLanguageShowFilter(f)}
+              >
+                {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs">
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setEnabledLanguageDraft(new Set([...enabledLanguageDraft, ...visibleEnabledLanguageCodes.map((c) => c.code)]))}
+          >
+            Select visible ({visibleEnabledLanguageCodes.length})
+          </button>
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => { const next = new Set(enabledLanguageDraft); visibleEnabledLanguageCodes.forEach((c) => next.delete(c.code)); setEnabledLanguageDraft(next) }}
+          >
+            Deselect visible ({visibleEnabledLanguageCodes.filter((c) => enabledLanguageDraft.has(c.code)).length})
+          </button>
+          <span className="text-muted-foreground ml-auto">{enabledLanguageDraft.size} selected total · shift-click to select a range</span>
+        </div>
+        <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+          {visibleEnabledLanguageCodes.map((c, i) => (
+            <label key={c.code} className="flex items-center gap-1.5 select-none">
+              <input
+                type="checkbox"
+                checked={enabledLanguageDraft.has(c.code)}
+                onChange={() => {}}
+                onClick={(e) => toggleEnabledLanguageSelected(c.code, i, e.shiftKey)}
+              />
+              <span className="font-mono">{c.code}</span>
+              {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+              <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+            </label>
+          ))}
+          {visibleEnabledLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
+        </div>
+        <Button
+          size="sm"
+          disabled={saveEnabledLanguages.isPending || enabledLanguageDraft.size === 0}
+          onClick={saveEnabledLanguagesWithImpactCheck}
+        >
+          {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Save enabled languages
+        </Button>
       </SectionCard>
       </>
       )}

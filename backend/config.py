@@ -334,6 +334,29 @@ def save_import_language_exclusion(exclude_prefixes: list[str], exclude_non_lati
     _write_raw(data)
 
 
+def get_enabled_languages() -> list[str]:
+    """Which already-imported sources are eligible for playback/export/
+    failover (vod_db._enabled_languages_clause), independent of
+    get_import_language_exclusion above -- that one gates what gets
+    imported in the first place and only catches titles whose raw_name
+    carries a recognizable prefix, so it can't retroactively hide
+    foreign-tagged rows already sitting in the pool or ones tagged only by
+    category name. This is the backstop: a live query-time filter over
+    the `language` column already computed on every source row. Defaults
+    to English + Spanish, matching the original hardcoded behavior."""
+    data = _read_raw()
+    codes = data.get("enabled_playback_languages")
+    if not codes:
+        return ["EN", "ES"]
+    return [c.strip().upper() for c in codes if c.strip()]
+
+
+def save_enabled_languages(codes: list[str]) -> None:
+    data = _read_raw()
+    data["enabled_playback_languages"] = [c.strip().upper() for c in codes if c.strip()]
+    _write_raw(data)
+
+
 def get_default_categories_prompt_dismissed() -> bool:
     """Whether the admin has already answered the one-time "include 18+ in
     the built-in All Movies/All TV Shows categories?" prompt (see

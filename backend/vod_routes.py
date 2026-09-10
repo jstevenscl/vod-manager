@@ -13,6 +13,7 @@ from config import (
     get_anthropic_api_key,
     get_default_categories_prompt_dismissed,
     get_duplicate_finder_quality_prefix_matching,
+    get_enabled_languages,
     get_gemini_api_key,
     get_hide_dvr_tab,
     get_import_language_exclusion,
@@ -28,6 +29,7 @@ from config import (
     save_ai_provider,
     save_anthropic_api_key,
     save_duplicate_finder_quality_prefix_matching,
+    save_enabled_languages,
     save_gemini_api_key,
     save_import_language_exclusion,
     save_lockout_settings,
@@ -110,6 +112,14 @@ class HideDvrTabRequest(BaseModel):
 class ImportLanguageExclusionRequest(BaseModel):
     exclude_prefixes: list[str] = []
     exclude_non_latin: bool = False
+
+
+class EnabledLanguagesRequest(BaseModel):
+    codes: list[str] = []
+
+
+class EnabledLanguagesImpactRequest(BaseModel):
+    codes: list[str] = []
 
 
 class ProviderImportExcludeCategoriesRequest(BaseModel):
@@ -912,6 +922,26 @@ async def save_import_language_exclusion_settings(body: ImportLanguageExclusionR
 @router.get("/import-language-exclusion/prefixes/", dependencies=_GUARDS)
 async def list_import_language_exclusion_prefixes():
     return vod_db.list_all_pool_prefixes()
+
+
+@router.get("/enabled-languages/", dependencies=_GUARDS)
+async def get_enabled_languages_settings():
+    return {"codes": get_enabled_languages()}
+
+
+@router.post("/enabled-languages/", dependencies=_GUARDS)
+async def save_enabled_languages_settings(body: EnabledLanguagesRequest):
+    save_enabled_languages(body.codes)
+    return {"ok": True}
+
+
+@router.post("/enabled-languages/impact/", dependencies=_GUARDS)
+async def preview_enabled_languages_impact_endpoint(body: EnabledLanguagesImpactRequest):
+    """Real counts of movies/episodes that would lose all playback-eligible
+    sources under the proposed set, vs. what's currently enabled -- lets the
+    Curation tab warn with an accurate number before the user removes a
+    language. See vod_db.preview_enabled_languages_impact."""
+    return await asyncio.to_thread(vod_db.preview_enabled_languages_impact, body.codes)
 
 
 @router.post("/import-exclusions/apply-now/", dependencies=_GUARDS)
