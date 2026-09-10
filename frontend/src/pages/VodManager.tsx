@@ -1929,7 +1929,7 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
             <div className="flex-1 min-w-0">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="radio" checked={keepId === item.id} onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }} />
-                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name} ({item.year})</span>
+                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}{item.year ? ` (${item.year})` : ''}</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
                   {!!item.provider_names.length && <> ({item.provider_names.join(', ')})</>}
