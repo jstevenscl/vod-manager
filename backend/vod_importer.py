@@ -741,6 +741,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
                 release_date=tmdb_detail.get("release_date"),
                 content_rating=tmdb_detail.get("content_rating"),
             )
+            await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
         # fall through to the provider so this movie still gets enriched.
@@ -791,6 +792,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
     bitrate = _coerce_int(detail.get("bitrate"))
     if bitrate is not None:
         await asyncio.to_thread(vod_db.set_movie_source_bitrate, source["id"], bitrate)
+    await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
     return True
 
 
@@ -956,23 +958,27 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         episodes_raw = info.get("episodes") or {}
         season_groups = episodes_raw.items() if isinstance(episodes_raw, dict) else enumerate(episodes_raw)
 
+        # Collected in-memory and written in one batched transaction (see
+        # vod_db.enrich_series_episodes_batch) instead of the old per-episode
+        # add_episode/add_episode_source/set_episode_source_bitrate calls -- each
+        # of those independently took the process-wide write lock and did a full
+        # fsync-backed commit, which made a 20-episode series up to 40 serialized
+        # lock+fsync round-trips contended against every other concurrently-
+        # enriching series (beads-3po: series enriched ~37x slower than movies,
+        # root-caused to exactly this).
+        episode_batch = []
         for season_key, episodes in season_groups:
             for ep in episodes:
                 season_number = ep.get("season", season_key)
-                episode_id = await asyncio.to_thread(
-                    vod_db.add_episode,
-                    series_id,
-                    season_number=int(season_number),
-                    episode_number=int(ep.get("episode_num", 0)),
-                    name=ep.get("title") or f"Episode {ep.get('episode_num', '?')}",
-                    description=(ep.get("info") or {}).get("plot") or None,
-                    duration_secs=(ep.get("info") or {}).get("duration_secs") or None,
-                )
-                episode_source_id = await asyncio.to_thread(
-                    vod_db.add_episode_source,
-                    episode_id, provider["id"], str(ep["id"]),
-                    ep.get("container_extension") or "mp4",
-                    raw_name=ep.get("title") or None,
+                episode_batch.append({
+                    "season_number": int(season_number),
+                    "episode_number": int(ep.get("episode_num", 0)),
+                    "name": ep.get("title") or f"Episode {ep.get('episode_num', '?')}",
+                    "description": (ep.get("info") or {}).get("plot") or None,
+                    "duration_secs": (ep.get("info") or {}).get("duration_secs") or None,
+                    "provider_stream_id": str(ep["id"]),
+                    "container_extension": ep.get("container_extension") or "mp4",
+                    "raw_name": ep.get("title") or None,
                     # XC only reports category at the series level, not per-
                     # episode -- bulk_import_series stamped it onto this
                     # source's series_sources row for exactly this moment,
@@ -982,11 +988,11 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
                     # category-based series matching (evaluate_smart_
                     # category, auto-create-categories) had no data to work
                     # with for any provider, ever.
-                    provider_category_name=source.get("provider_category_name"),
-                )
-                episode_bitrate = _coerce_int((ep.get("info") or {}).get("bitrate"))
-                if episode_bitrate is not None:
-                    await asyncio.to_thread(vod_db.set_episode_source_bitrate, episode_source_id, episode_bitrate)
+                    "provider_category_name": source.get("provider_category_name"),
+                    "bitrate": _coerce_int((ep.get("info") or {}).get("bitrate")),
+                })
+
+        await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_batch)
 
         await asyncio.to_thread(
             vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],

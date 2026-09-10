@@ -259,6 +259,29 @@ def save_duplicate_finder_quality_prefix_matching(enabled: bool) -> None:
     _write_raw(data)
 
 
+# ── Duplicate Finder: auto-merge on tmdb_id match ────────────────────────────
+# User request 2026-09-10: enrichment can confirm a tmdb_id on a movie row
+# that turns out to match an existing row's tmdb_id exactly -- a signal that
+# comes from TMDB itself, not from our own name-normalization heuristics, so
+# it's trusted enough to merge without a human click (see
+# vod_db.auto_merge_movie_by_tmdb). Default ON, unlike the quality-prefix
+# flag above -- that flag changes what gets SUGGESTED for manual review
+# (low stakes to leave on), this flag changes what gets MERGED automatically
+# (an irreversible delete, see _merge_movie_row), so the two defaults look
+# inconsistent but are deliberately opposite: this one is gated on an
+# independently-corroborated exact-id match, which is a strong enough signal
+# to default-enable even though the action itself is destructive.
+
+def get_duplicate_finder_auto_merge_tmdb() -> bool:
+    return bool(_read_raw().get("duplicate_finder_auto_merge_tmdb", True))
+
+
+def save_duplicate_finder_auto_merge_tmdb(enabled: bool) -> None:
+    data = _read_raw()
+    data["duplicate_finder_auto_merge_tmdb"] = bool(enabled)
+    _write_raw(data)
+
+
 # ── AI provider selection ────────────────────────────────────────────────────
 # ai_assist.py can talk to any of these three -- a user might already have a
 # key for one and not another, or want to compare quality/cost, so the key
