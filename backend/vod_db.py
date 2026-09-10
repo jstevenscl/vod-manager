@@ -7716,6 +7716,20 @@ def _merge_movie_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> No
     its own lock/connect/commit for the ordinary one-at-a-time UI path."""
     from_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (from_id,)).fetchone()
     into_row = conn.execute("SELECT name, year, tmdb_id FROM movies WHERE id=?", (into_id,)).fetchone()
+    if from_row is None or into_row is None:
+        # beads-3qf: this connection holds _WRITE_LOCK for the whole merge,
+        # so this is the last checkpoint before the UPDATE/DELETE below --
+        # if either row is already gone (deleted by an earlier merge in the
+        # same tmdb_id cluster, e.g. a chained auto_merge_movie_by_tmdb pass
+        # over several variants of the same title), merging a stale id here
+        # is exactly what produced the FK constraint failures seen live
+        # 2026-09-10. No-op instead of letting the DELETE/UPDATE below hit a
+        # now-nonexistent row.
+        logger.warning(
+            "[merge_movie] skipping id=%s -> id=%s -- one side no longer exists (already merged)",
+            from_id, into_id,
+        )
+        return
     # This permanently deletes `from_id` below (its sources/placements move
     # to `into_id` first) -- irreversible outside a DB backup, so a merge
     # triggered by a bad tmdb_id match (GH issue #6) leaves no trace to
@@ -7822,6 +7836,24 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
     for row in other_rows:
         signature = _duplicate_ignore_signature([movie_id, row["id"]])
         if signature in ignored_sigs:
+            continue
+
+        # beads-3qf: other_rows was snapshotted above -- if this tmdb_id
+        # cluster has 3+ variants, a DIFFERENT concurrent/prior
+        # auto_merge_movie_by_tmdb call for another member of the same
+        # cluster can have already deleted or re-pointed movie_id or
+        # row["id"] by the time we get here (each variant's own enrichment
+        # independently triggers this function). Merging a stale id causes
+        # a merge cycle (A merges into B while B is simultaneously merging
+        # into A) and a FOREIGN KEY constraint failure. Re-check both rows
+        # still exist immediately before merging, not just at the top of
+        # this function.
+        if not get_movie(movie_id) or not get_movie(row["id"]):
+            logger.warning(
+                "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
+                "(already merged by a concurrent auto-merge in this cluster)",
+                tmdb_id, row["id"], movie_id,
+            )
             continue
 
         other_year = row["year"]
