@@ -25,7 +25,59 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
-_YEAR_LOOKUP_CONCURRENCY = 6
+_YEAR_LOOKUP_CONCURRENCY = 10
+
+# KNM: added 2026-09-08 -- prompted by a provider import running concurrently
+# with TMDB enrichment; not an observed failure this time, but nothing
+# previously stopped two TMDB-calling features from running at once and
+# stacking their concurrency against the same TMDB API key's rate limit.
+# Process-wide cap on concurrent TMDB requests, shared across every caller in
+# this module (bulk_enrich_all, provider import's tmdb_id-shortcut path,
+# Duplicate Finder/Missing Artwork's search_title, etc). Each caller already
+# bounds its OWN concurrency (e.g. bulk_enrich_all's per-kind semaphore), but
+# nothing previously stopped two features from running at once and adding
+# their concurrency together against TMDB's shared per-key rate limit.
+# KNM: raised 20 -> 40 2026-09-09 -- still comfortably under TMDB's ~50 req/s
+# limit even if every caller is maxed out simultaneously, but the old value
+# of 20 was picked before connection reuse existed and was leaving real
+# throughput on the table once handshake overhead stopped being the limiter.
+_GLOBAL_TMDB_CONCURRENCY = 40
+_tmdb_semaphore = asyncio.Semaphore(_GLOBAL_TMDB_CONCURRENCY)
+
+# KNM: added 2026-09-09 -- one persistent client shared by every function in
+# this module instead of each opening/closing its own httpx.AsyncClient per
+# call (a fresh TCP+TLS handshake per single request). keepalive pool sized
+# to _GLOBAL_TMDB_CONCURRENCY so every concurrent slot can hold a warm reused
+# connection instead of racing to open a new socket. Never explicitly closed
+# -- lives for the process lifetime.
+_tmdb_client = httpx.AsyncClient(
+    timeout=30.0,
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=_GLOBAL_TMDB_CONCURRENCY, max_keepalive_connections=_GLOBAL_TMDB_CONCURRENCY),
+)
+
+# KNM: added 2026-09-09 -- TMDB is well-behaved and rarely rate-limits, but a
+# bulk enrichment run at 40-wide concurrency can trip it. Much lighter than
+# the provider backoff (vod_importer._PROVIDER_BACKOFF): no adaptive
+# concurrency halving, just a short pause before the next call after a
+# 429/503 so a rate-limit hit doesn't get hammered through immediately.
+_TMDB_BACKOFF_STATUS_CODES = {429, 503}
+_TMDB_BACKOFF_SECONDS = 5.0
+_tmdb_backoff_until = 0.0
+
+
+async def _tmdb_get(url: str, params: dict) -> httpx.Response:
+    """GET through the shared TMDB client, honoring/setting a brief
+    process-wide backoff on 429/503 -- callers still do their own
+    raise_for_status() and exception handling on the returned response."""
+    global _tmdb_backoff_until
+    now = time.time()
+    if now < _tmdb_backoff_until:
+        await asyncio.sleep(_tmdb_backoff_until - now)
+    r = await _tmdb_client.get(url, params=params)
+    if r.status_code in _TMDB_BACKOFF_STATUS_CODES:
+        _tmdb_backoff_until = time.time() + _TMDB_BACKOFF_SECONDS
+    return r
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
 
@@ -51,19 +103,19 @@ async def fetch_list_items(list_id: str) -> list[dict]:
 
     items: list[dict] = []
     item_count: int | None = None
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        page = 1
-        while True:
-            r = await client.get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key, "page": page})
-            r.raise_for_status()
-            data = r.json()
-            page_items = data.get("items", [])
-            items.extend(page_items)
-            if item_count is None:
-                item_count = data.get("item_count")
-            if not page_items or (item_count is not None and len(items) >= item_count):
-                break
-            page += 1
+    page = 1
+    while True:
+        async with _tmdb_semaphore:
+            r = await _tmdb_get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key, "page": page})
+        r.raise_for_status()
+        data = r.json()
+        page_items = data.get("items", [])
+        items.extend(page_items)
+        if item_count is None:
+            item_count = data.get("item_count")
+        if not page_items or (item_count is not None and len(items) >= item_count):
+            break
+        page += 1
 
     return items
 
@@ -134,53 +186,54 @@ async def search_title(query: str, content_type: str) -> list[dict]:
         raise ValueError("TMDB API key not configured")
 
     endpoint = "movie" if content_type == "movie" else "tv"
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        r = await client.get(
+    async with _tmdb_semaphore:
+        r = await _tmdb_get(
             f"{_API_BASE}/search/{endpoint}",
             params={"api_key": api_key, "query": query},
         )
-        r.raise_for_status()
-        data = r.json()
+    r.raise_for_status()
+    data = r.json()
 
-        async def _build(item: dict) -> dict:
-            date = item.get("release_date") if content_type == "movie" else item.get("first_air_date")
-            year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
-            out = {
-                "tmdb_id": str(item["id"]),
-                "name": item.get("title") if content_type == "movie" else item.get("name"),
-                "year": year,
-                "poster_url": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else None,
-                "overview": item.get("overview") or None,
-                "vote_average": item.get("vote_average"),
-                "season_count": None,
-                "episode_count": None,
-                "cast": [],
-            }
-            try:
-                dr = await client.get(
+    async def _build(item: dict) -> dict:
+        date = item.get("release_date") if content_type == "movie" else item.get("first_air_date")
+        year = int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None
+        out = {
+            "tmdb_id": str(item["id"]),
+            "name": item.get("title") if content_type == "movie" else item.get("name"),
+            "year": year,
+            "poster_url": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else None,
+            "overview": item.get("overview") or None,
+            "vote_average": item.get("vote_average"),
+            "season_count": None,
+            "episode_count": None,
+            "cast": [],
+        }
+        try:
+            async with _tmdb_semaphore:
+                dr = await _tmdb_get(
                     f"{_API_BASE}/{endpoint}/{item['id']}",
                     params={"api_key": api_key, "append_to_response": "credits"},
                 )
-                dr.raise_for_status()
-                dd = dr.json()
-                if content_type == "series":
-                    out["season_count"] = dd.get("number_of_seasons")
-                    out["episode_count"] = dd.get("number_of_episodes")
-                out["cast"] = [c["name"] for c in dd.get("credits", {}).get("cast", [])[:4]]
-            except Exception as exc:
-                logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], _redact(exc))
-            return out
+            dr.raise_for_status()
+            dd = dr.json()
+            if content_type == "series":
+                out["season_count"] = dd.get("number_of_seasons")
+                out["episode_count"] = dd.get("number_of_episodes")
+            out["cast"] = [c["name"] for c in dd.get("credits", {}).get("cast", [])[:4]]
+        except Exception as exc:
+            logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", item["id"], _redact(exc))
+        return out
 
-        results = data.get("results", [])
-        query_lower = query.strip().lower()
+    results = data.get("results", [])
+    query_lower = query.strip().lower()
 
-        def _not_exact(item: dict) -> bool:
-            title = item.get("title") if content_type == "movie" else item.get("name")
-            return (title or "").strip().lower() != query_lower
+    def _not_exact(item: dict) -> bool:
+        title = item.get("title") if content_type == "movie" else item.get("name")
+        return (title or "").strip().lower() != query_lower
 
-        results.sort(key=_not_exact)  # stable sort: exact matches (False) float ahead of fuzzy ones (True)
-        candidates = results[:5]
-        return list(await asyncio.gather(*[_build(item) for item in candidates]))
+    results.sort(key=_not_exact)  # stable sort: exact matches (False) float ahead of fuzzy ones (True)
+    candidates = results[:5]
+    return list(await asyncio.gather(*[_build(item) for item in candidates]))
 
 
 async def get_series_episode_list(tmdb_id: str) -> list[dict]:
@@ -198,29 +251,30 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        r = await client.get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key})
-        r.raise_for_status()
-        seasons = [s["season_number"] for s in r.json().get("seasons", []) if s.get("season_number")]
+    async with _tmdb_semaphore:
+        r = await _tmdb_get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key})
+    r.raise_for_status()
+    seasons = [s["season_number"] for s in r.json().get("seasons", []) if s.get("season_number")]
 
-        async def _season(season_number: int) -> list[dict]:
-            try:
-                sr = await client.get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
-                sr.raise_for_status()
-                return [
-                    {
-                        "season_number": season_number,
-                        "episode_number": ep["episode_number"],
-                        "name": ep.get("name"),
-                        "air_date": ep.get("air_date"),
-                    }
-                    for ep in sr.json().get("episodes", [])
-                ]
-            except Exception as exc:
-                logger.warning("[tmdb_sync] failed to fetch season %d for tmdb_id=%s: %s", season_number, tmdb_id, _redact(exc))
-                return []
+    async def _season(season_number: int) -> list[dict]:
+        try:
+            async with _tmdb_semaphore:
+                sr = await _tmdb_get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
+            sr.raise_for_status()
+            return [
+                {
+                    "season_number": season_number,
+                    "episode_number": ep["episode_number"],
+                    "name": ep.get("name"),
+                    "air_date": ep.get("air_date"),
+                }
+                for ep in sr.json().get("episodes", [])
+            ]
+        except Exception as exc:
+            logger.warning("[tmdb_sync] failed to fetch season %d for tmdb_id=%s: %s", season_number, tmdb_id, _redact(exc))
+            return []
 
-        results = await asyncio.gather(*[_season(n) for n in seasons])
+    results = await asyncio.gather(*[_season(n) for n in seasons])
     return [ep for season_eps in results for ep in season_eps]
 
 
@@ -264,10 +318,10 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
     endpoint = "movie" if content_type == "movie" else "tv"
     semaphore = asyncio.Semaphore(_YEAR_LOOKUP_CONCURRENCY)
 
-    async def _fetch(client: httpx.AsyncClient, tmdb_id: str) -> tuple[str, dict]:
-        async with semaphore:
+    async def _fetch(tmdb_id: str) -> tuple[str, dict]:
+        async with semaphore, _tmdb_semaphore:
             try:
-                r = await client.get(f"{_API_BASE}/{endpoint}/{tmdb_id}", params={"api_key": api_key})
+                r = await _tmdb_get(f"{_API_BASE}/{endpoint}/{tmdb_id}", params={"api_key": api_key})
                 r.raise_for_status()
                 data = r.json()
                 date = data.get("release_date") if content_type == "movie" else data.get("first_air_date")
@@ -278,8 +332,7 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
                 logger.warning("[tmdb_sync] failed to fetch detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
                 return tmdb_id, {"year": None, "title": None}
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        results = await asyncio.gather(*[_fetch(client, tid) for tid in set(tmdb_ids)])
+    results = await asyncio.gather(*[_fetch(tid) for tid in set(tmdb_ids)])
     return dict(results)
 
 
@@ -297,17 +350,17 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
     if not api_key:
         return None
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        try:
-            r = await client.get(
+    try:
+        async with _tmdb_semaphore:
+            r = await _tmdb_get(
                 f"{_API_BASE}/movie/{tmdb_id}",
                 params={"api_key": api_key, "append_to_response": "credits,release_dates"},
             )
-            r.raise_for_status()
-        except Exception as exc:
-            logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
-            return None
-        data = r.json()
+        r.raise_for_status()
+    except Exception as exc:
+        logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        return None
+    data = r.json()
 
     director = next(
         (c["name"] for c in data.get("credits", {}).get("crew", []) if c.get("job") == "Director"),
@@ -357,17 +410,17 @@ async def get_tv_content_rating(tmdb_id: str) -> str | None:
     api_key = get_tmdb_api_key()
     if not api_key:
         return None
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        try:
-            r = await client.get(
+    try:
+        async with _tmdb_semaphore:
+            r = await _tmdb_get(
                 f"{_API_BASE}/tv/{tmdb_id}/content_ratings",
                 params={"api_key": api_key},
             )
-            r.raise_for_status()
-        except Exception as exc:
-            logger.warning("[tmdb_sync] failed to fetch content rating for tv tmdb_id=%s: %s", tmdb_id, _redact(exc))
-            return None
-        data = r.json()
+        r.raise_for_status()
+    except Exception as exc:
+        logger.warning("[tmdb_sync] failed to fetch content rating for tv tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        return None
+    data = r.json()
 
     for country in data.get("results", []):
         if country.get("iso_3166_1") == "US":
