@@ -3379,6 +3379,23 @@ def _strip_country_suffix_for_dedup(name: str) -> str:
     return name
 
 
+# Trailing "(YYYY)" year suffix some providers append to the title itself
+# ("Crashing (2016)") while others leave it off the same series' name
+# entirely ("Crashing") -- a distinct artifact from the actual `year` column
+# (which both rows can have set correctly), so _normalize_title_for_dedup's
+# punctuation-only stripping never unifies them into one name-key bucket.
+# Only used by the base-name pass below (find_duplicate_groups pass 5) --
+# stripping the year out of the *comparison* key, never displayed or written
+# back, so a real "(2016)" that's part of a title's actual name (rare, but
+# not impossible) only risks a false-positive manual-review candidate, never
+# a silent data change.
+_TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def _base_name_for_dedup(name: str) -> str:
+    return _normalize_title_for_dedup(_TRAILING_YEAR_RE.sub("", name))
+
+
 def _duplicate_ignore_signature(item_ids: list[int]) -> str:
     return ",".join(str(i) for i in sorted(item_ids))
 
@@ -3495,7 +3512,22 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     while still being the same confirmed title, and pass (1)-(3) never put
     them in the same bucket to compare in the first place. Same tmdb_id
     proof standard as pass (3) (_split_by_tmdb_conflict), just applied
-    across bucket boundaries instead of within one (beads-cd4)."""
+    across bucket boundaries instead of within one (beads-cd4).
+
+    Pass (5), after pass (4): any row STILL unclustered is grouped purely by
+    year-stripped base name (_base_name_for_dedup -- same punctuation
+    normalization as pass (1), plus stripping a trailing "(YYYY)"), and kept
+    as a candidate ONLY if the group mixes at least one confirmed-tmdb_id row
+    with at least one no-tmdb_id row -- exactly the case passes (1)-(4) can
+    never catch, since there's no shared name-key bucket (year-suffix
+    formatting differs, e.g. "Crashing" vs "Crashing (2016)") and no shared
+    tmdb_id to cross-bucket-match on (one side has none). Unlike pass (4),
+    same-base-name is a WEAKER signal than a shared tmdb_id -- it's not proof,
+    just a plausible pairing for a human to confirm -- so this pass can only
+    ever produce a manual-review candidate; it is never read by either
+    auto-merge path (auto_merge_movie_by_tmdb / auto_merge_series_by_tmdb),
+    which both require a confirmed tmdb_id shared by BOTH sides and never
+    call this function."""
     table = "movies" if content_type == "movie" else "series"
     id_col = "movie_id" if content_type == "movie" else "series_id"
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
@@ -3583,6 +3615,7 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     for i in unclustered:
         if i.get("tmdb_id"):
             cross_by_tmdb.setdefault(i["tmdb_id"], []).append(i)
+    pass4_grouped_ids: set[int] = set()
     for tid, group in cross_by_tmdb.items():
         if len(group) < 2:
             continue
@@ -3590,6 +3623,40 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
         if _duplicate_ignore_signature(ids) in ignored:
             continue
         candidate_groups.append(group)
+        pass4_grouped_ids.update(ids)
+
+    # Pass 5 (beads-tbd): a row with a CONFIRMED tmdb_id and a same-base-name
+    # row with NO tmdb_id at all never had anything to match on in pass 4 --
+    # there's no shared id to cross-bucket-join. They also never shared a
+    # pass (1) name-key bucket in the first place whenever one side carries
+    # a "(YYYY)" the other lacks ("Crashing" vs "Crashing (2016)", a live
+    # example that motivated this pass -- 2318 such series clusters found
+    # system-wide 2026-09-10, none previously surfaced anywhere in
+    # find_duplicate_groups). Grouped here purely on year-stripped base name
+    # (_base_name_for_dedup) since there's no tmdb_id to prove the match --
+    # this is NOT proof the way a shared tmdb_id is, so unlike pass 4 this
+    # can only ever surface a manual-review candidate, never feed an
+    # auto-merge path (see auto_merge_series_by_tmdb / auto_merge_movie_by_
+    # tmdb, both of which require BOTH sides to already share a confirmed
+    # tmdb_id and never call this function at all).
+    still_unclustered = [i for i in unclustered if i["id"] not in pass4_grouped_ids]
+    by_base_name: dict[str, list[dict]] = {}
+    for i in still_unclustered:
+        by_base_name.setdefault(_base_name_for_dedup(i["name"]), []).append(i)
+    for base_name, group in by_base_name.items():
+        if len(group) < 2:
+            continue
+        has_id = any(i.get("tmdb_id") for i in group)
+        missing_id = any(not i.get("tmdb_id") for i in group)
+        if not (has_id and missing_id):
+            continue
+        for sub in _split_by_tmdb_conflict(group):
+            if len(sub) < 2:
+                continue
+            ids = [i["id"] for i in sub]
+            if _duplicate_ignore_signature(ids) in ignored:
+                continue
+            candidate_groups.append(sub)
 
     if not candidate_groups:
         conn.close()
