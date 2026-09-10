@@ -298,6 +298,35 @@ def _get_provider_limiter(provider_id: int) -> _AdaptiveLimiter:
     return limiter
 
 
+# Persistent per-provider httpx.AsyncClient, keyed by provider_id -- kept
+# alive for the life of the process instead of opening/closing a brand new
+# TCP+TLS connection (httpx.AsyncClient(...) as a context manager, torn down
+# at the end of every single _call) for every individual API request. Under
+# bulk enrichment's 8-concurrent-per-kind load that handshake overhead was
+# pure fixed cost paid on every one of thousands of calls; httpx's own
+# connection pool handles reusing/keeping-alive the underlying sockets once
+# the client itself is long-lived. Never explicitly closed -- these live for
+# the process lifetime, same as _PROVIDER_LIMITERS/_PROVIDER_BACKOFF.
+_PROVIDER_CLIENTS: dict[int, httpx.AsyncClient] = {}
+
+
+def _get_provider_client(provider_id: int, headers: dict) -> httpx.AsyncClient:
+    client = _PROVIDER_CLIENTS.get(provider_id)
+    if client is None:
+        # keepalive pool sized to _PROVIDER_MAX_CONCURRENCY -- the adaptive
+        # limiter never lets more than that many calls to this provider run
+        # at once, so every concurrent slot can hold its own warm reused
+        # connection instead of racing to open a new socket.
+        client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            headers=headers,
+            limits=httpx.Limits(max_connections=_PROVIDER_MAX_CONCURRENCY, max_keepalive_connections=_PROVIDER_MAX_CONCURRENCY),
+        )
+        _PROVIDER_CLIENTS[provider_id] = client
+    return client
+
+
 class XCProviderClient:
     def __init__(self, provider: dict):
         self.provider = provider
@@ -325,24 +354,27 @@ class XCProviderClient:
         query.update(params)
         try:
             try:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers) as client:
-                    r = await client.get(f"{self.base_url}/player_api.php", params=query)
-                    r.raise_for_status()
-                    # r.json() is a synchronous json.loads() under the hood --
-                    # for a large catalog's bulk get_vod_streams/get_series
-                    # response (tens of MB, hundreds of thousands of items)
-                    # that can block the event loop for real time, starving
-                    # every other in-flight coroutine (including a concurrent
-                    # sibling call on this same provider -- see
-                    # import_provider_catalog's movies/series asyncio.gather)
-                    # of the chance to keep reading their own response off
-                    # the socket, which can trip THEIR httpx timeout even
-                    # though nothing is actually wrong with their connection.
-                    # Confirmed live 2026-09-06: making movies+series import
-                    # concurrent for a ~240k-item provider (CRX) immediately
-                    # started failing with opaque timeouts that didn't happen
-                    # run sequentially -- moving the parse off the loop fixed it.
-                    result = await asyncio.to_thread(r.json)
+                client = (
+                    _get_provider_client(self.provider_id, self.headers) if self.provider_id is not None
+                    else httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=self.headers)
+                )
+                r = await client.get(f"{self.base_url}/player_api.php", params=query)
+                r.raise_for_status()
+                # r.json() is a synchronous json.loads() under the hood --
+                # for a large catalog's bulk get_vod_streams/get_series
+                # response (tens of MB, hundreds of thousands of items)
+                # that can block the event loop for real time, starving
+                # every other in-flight coroutine (including a concurrent
+                # sibling call on this same provider -- see
+                # import_provider_catalog's movies/series asyncio.gather)
+                # of the chance to keep reading their own response off
+                # the socket, which can trip THEIR httpx timeout even
+                # though nothing is actually wrong with their connection.
+                # Confirmed live 2026-09-06: making movies+series import
+                # concurrent for a ~240k-item provider (CRX) immediately
+                # started failing with opaque timeouts that didn't happen
+                # run sequentially -- moving the parse off the loop fixed it.
+                result = await asyncio.to_thread(r.json)
             except _BACKOFF_EXCEPTION_TYPES:
                 if self.provider_id is not None:
                     _record_provider_failure(self.provider_id, self.provider_name)
