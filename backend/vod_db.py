@@ -3555,10 +3555,21 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
             all_ids,
         ).fetchall()
     else:
+        # series_sources (provider-level "this provider carries this series",
+        # populated at catalog-import time) rather than episode_sources
+        # (provider-level "this provider's episode N is playable", only
+        # populated once enrich_series has actually run for that series) --
+        # a series can be genuinely backed by 1-2 real providers long before
+        # its episodes get enriched (a separate, slower, per-series async
+        # step -- see enrich_series's docstring), and counting via
+        # episode_sources made every not-yet-enriched series show "0
+        # sources" in the Duplicate Finder even though it's actively
+        # carried. Found live 2026-09-09: only ~11% of series had any
+        # episodes imported yet, so nearly every series duplicate candidate
+        # showed a misleading zero.
         src_counts = conn.execute(f"""
-            SELECT e.series_id AS id, COUNT(*) c FROM episode_sources es
-            JOIN episodes e ON e.id = es.episode_id
-            WHERE e.series_id IN ({placeholders}) GROUP BY e.series_id
+            SELECT series_id AS id, COUNT(*) c FROM series_sources
+            WHERE series_id IN ({placeholders}) GROUP BY series_id
         """, all_ids).fetchall()
     src_count_by_id = {r["id"]: r["c"] for r in src_counts}
 
@@ -3579,12 +3590,13 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
             WHERE ms.movie_id IN ({placeholders})
         """, all_ids).fetchall()
     else:
+        # Same series_sources-vs-episode_sources reasoning as source_count
+        # above -- provider names should reflect who carries the series,
+        # not just who's already had its episodes enriched.
         provider_rows = conn.execute(f"""
-            SELECT DISTINCT e.series_id AS id, p.name AS provider_name
-            FROM episode_sources es
-            JOIN episodes e ON e.id = es.episode_id
-            JOIN providers p ON p.id = es.provider_id
-            WHERE e.series_id IN ({placeholders})
+            SELECT DISTINCT ss.series_id AS id, p.name AS provider_name
+            FROM series_sources ss JOIN providers p ON p.id = ss.provider_id
+            WHERE ss.series_id IN ({placeholders})
         """, all_ids).fetchall()
     provider_names_by_id: dict[int, list[str]] = {}
     for r in provider_rows:
