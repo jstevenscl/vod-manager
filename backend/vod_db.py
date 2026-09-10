@@ -5223,12 +5223,25 @@ def place_movie_in_category(movie_id: int, category_id: int) -> int:
     placements (for the same movie in additional categories) get an
     invisible zero-width-space marker appended so Dispatcharr's same-account
     (name, year) dedup treats each as a distinct catalog entry.
+
+    Raises on a review_excluded=1 movie -- same guard evaluate_smart_category
+    already applies to its own candidate pool (see that function's
+    docstring): "archived" is enforced entirely through category placement,
+    so an unguarded placement call silently un-archives the item. This was
+    the beads-4o6 leak -- single-item placement (this function) and the DVR
+    pointer-backfill call sites had no such guard, unlike the bulk/smart-
+    category paths.
     """
     conn = _connect()
-    flagged = conn.execute("SELECT needs_year_review FROM movies WHERE id=?", (movie_id,)).fetchone()
+    flagged = conn.execute(
+        "SELECT needs_year_review, review_excluded FROM movies WHERE id=?", (movie_id,)
+    ).fetchone()
     if flagged and flagged["needs_year_review"]:
         conn.close()
         raise ValueError(f"movie {movie_id} needs year review before it can be placed in a category")
+    if flagged and flagged["review_excluded"]:
+        conn.close()
+        raise ValueError(f"movie {movie_id} is archived (review_excluded) and cannot be placed in a category")
     existing = conn.execute(
         "SELECT export_stream_id FROM movie_category_placements WHERE movie_id=? AND category_id=?",
         (movie_id, category_id),
@@ -6095,12 +6108,21 @@ def remove_series_from_all_categories(series_id: int) -> None:
 
 
 def place_series_in_category(series_id: int, category_id: int) -> int:
-    """Same virtual-file mechanism as place_movie_in_category, scoped to series."""
+    """Same virtual-file mechanism as place_movie_in_category, scoped to series.
+
+    Raises on a review_excluded=1 series -- see place_movie_in_category's
+    docstring (beads-4o6): archiving is enforced through category placement,
+    so this guard is required for the same reason there."""
     conn = _connect()
-    flagged = conn.execute("SELECT needs_year_review FROM series WHERE id=?", (series_id,)).fetchone()
+    flagged = conn.execute(
+        "SELECT needs_year_review, review_excluded FROM series WHERE id=?", (series_id,)
+    ).fetchone()
     if flagged and flagged["needs_year_review"]:
         conn.close()
         raise ValueError(f"series {series_id} needs year review before it can be placed in a category")
+    if flagged and flagged["review_excluded"]:
+        conn.close()
+        raise ValueError(f"series {series_id} is archived (review_excluded) and cannot be placed in a category")
     existing = conn.execute(
         "SELECT export_series_id FROM series_category_placements WHERE series_id=? AND category_id=?",
         (series_id, category_id),

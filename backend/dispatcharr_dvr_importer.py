@@ -937,10 +937,19 @@ async def _try_backfill(program: dict, profile: dict) -> bool:
             await _apply_pointer_backfill(match)
         else:
             return False
+        # beads-4o6: skip category placement for an archived (review_excluded)
+        # match rather than letting place_*_in_category's guard raise into
+        # the except below -- the backfill itself already succeeded, so this
+        # airing is still "handled" and must not fall through to a real
+        # duplicate DVR recording just because the pool copy is archived.
         if match["type"] == "movie" and profile.get("target_movie_category_id"):
-            vod_db.place_movie_in_category(match["movie_id"], profile["target_movie_category_id"])
+            movie = vod_db.get_movie(match["movie_id"])
+            if movie and not movie.get("review_excluded"):
+                vod_db.place_movie_in_category(match["movie_id"], profile["target_movie_category_id"])
         elif match["type"] == "series" and profile.get("target_series_category_id"):
-            vod_db.place_series_in_category(match["series_id"], profile["target_series_category_id"])
+            series = vod_db.get_series(match["series_id"])
+            if series and not series.get("review_excluded"):
+                vod_db.place_series_in_category(match["series_id"], profile["target_series_category_id"])
     except Exception as exc:
         logger.warning("[dispatcharr_dvr_importer] backfill (%s) failed for %r, falling back to a normal "
                         "DVR recording for this one: %s", mode, profile["title"], exc)
