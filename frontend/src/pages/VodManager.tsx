@@ -1626,7 +1626,7 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
         <span className="min-w-0 truncate flex items-center gap-1.5">
           <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk action" />
           <ImageOff size={12} className="text-muted-foreground shrink-0" />
-          {item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}
+          {item.name} {item.year && !item.name.trim().endsWith(`(${item.year})`) && <span className="text-muted-foreground">({item.year})</span>}
         </span>
         <button className="text-muted-foreground hover:text-foreground shrink-0" onClick={() => setExpanded((e) => !e)}>
           {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
@@ -1929,7 +1929,7 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
             <div className="flex-1 min-w-0">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="radio" checked={keepId === item.id} onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }} />
-                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}{item.year ? ` (${item.year})` : ''}</span>
+                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}{item.year && !item.name.trim().endsWith(`(${item.year})`) ? ` (${item.year})` : ''}</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
                   {!!item.provider_names.length && <> ({item.provider_names.join(', ')})</>}
@@ -2523,7 +2523,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
-          {movie.name}{movie.year ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
+          {movie.name}{movie.year && !movie.name.trim().endsWith(`(${movie.year})`) ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
           {!!movie.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
@@ -3061,7 +3061,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
-          {series.name}{series.year ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
+          {series.name}{series.year && !series.name.trim().endsWith(`(${series.year})`) ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
           {!!series.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
@@ -4224,7 +4224,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
           {query.data?.items.map((item) => (
             <li key={item.id} className="border-b border-border/50 py-1.5 flex items-center gap-1.5">
               <input type="checkbox" checked={selectedIds.has(item.id)} onChange={() => toggleSelected(item.id)} />
-              <span className="min-w-0 truncate">{item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}</span>
+              <span className="min-w-0 truncate">{item.name} {item.year && !item.name.trim().endsWith(`(${item.year})`) && <span className="text-muted-foreground">({item.year})</span>}</span>
             </li>
           ))}
         </ul>
