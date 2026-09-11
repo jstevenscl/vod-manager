@@ -6698,7 +6698,13 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
             # elif/else, just computed once per chunk instead of per item.
             unresolved = [item for item in chunk if item["provider_stream_id"] not in sources_by_stream_id]
             name_year_pairs = {(item["name"], item.get("year")) for item in unresolved if item["name"].strip()}
-            movies_by_name_year: dict[tuple[str, object], sqlite3.Row] = {}
+            # (name, year) -> list of candidate rows (usually one, but a
+            # title already split by language -- beads-974 Step 3 -- can
+            # have several movies rows sharing the same (name, year), one
+            # per language). movies_by_name mirrors this for the year=None
+            # branch. The right candidate for a given item is picked by
+            # language further down, not just "first row found".
+            movies_by_name_year: dict[tuple[str, object], list[sqlite3.Row]] = {}
             names_needing_candidates = {item["name"] for item in unresolved if item["name"].strip() and item.get("year") is None}
             movies_by_name: dict[str, list[sqlite3.Row]] = {}
             if name_year_pairs:
@@ -6711,9 +6717,39 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         f"FROM movies WHERE name IN ({placeholders})", sub,
                     ).fetchall()
                     for row in rows:
-                        movies_by_name_year.setdefault((row["name"], row["year"]), row)
+                        movies_by_name_year.setdefault((row["name"], row["year"]), []).append(row)
                         if row["name"] in names_needing_candidates:
                             movies_by_name.setdefault(row["name"], []).append(row)
+
+            # beads-974 (import-path gap): language sets for every candidate
+            # movie this chunk might match, so each match branch below can
+            # refuse to attach a language-conflicting item -- same
+            # COALESCE-to-EN/overlap rule as _shares_a_language, just
+            # prefetched in bulk instead of queried per item. Covers
+            # stream-id matches (movies_by_id), name/year matches, and
+            # single-candidate-name matches in one shot.
+            language_candidate_ids = set(movies_by_id.keys())
+            for rows in movies_by_name_year.values():
+                language_candidate_ids.update(row["id"] for row in rows)
+            movie_languages: dict[int, set[str]] = {}
+            if language_candidate_ids:
+                ids = list(language_candidate_ids)
+                for i in range(0, len(ids), 900):
+                    sub = ids[i:i + 900]
+                    placeholders = ",".join("?" * len(sub))
+                    rows = conn.execute(
+                        f"SELECT movie_id, COALESCE(language, 'EN') AS lang FROM movie_sources "
+                        f"WHERE movie_id IN ({placeholders})", sub,
+                    ).fetchall()
+                    for row in rows:
+                        movie_languages.setdefault(row["movie_id"], set()).add(row["lang"])
+
+            def _movie_language_ok(movie_id: int, item_lang: str) -> bool:
+                # A candidate with no sources yet (e.g. registered this same
+                # chunk via the negative-placeholder scheme below) has
+                # nothing to conflict with.
+                existing = movie_languages.get(movie_id)
+                return not existing or item_lang in existing
 
             # -- Resolve every item's identity/branch against the prefetched
             # dicts above (identical decision tree to the old per-item
@@ -6755,8 +6791,9 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     insert_index = None
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
 
+                    item_lang = _source_language(item.get("raw_name"))
                     existing_source = sources_by_stream_id.get(item["provider_stream_id"])
-                    if existing_source:
+                    if existing_source and _movie_language_ok(existing_source["movie_id"], item_lang):
                         movie_id = existing_source["movie_id"]
                         did_match = True
                         existing = movies_by_id.get(movie_id)
@@ -6777,7 +6814,19 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         did_flag = True
                         did_archive = should_archive
                     else:
-                        row = movies_by_name_year.get((name, year))
+                        # beads-974 (import-path gap): among same-(name,year)
+                        # candidates -- there can be more than one once a
+                        # title has been split by language -- only accept a
+                        # match whose existing sources share a language with
+                        # this item (COALESCE-to-EN, overlap not equality).
+                        # A conflicting-language candidate is treated as no
+                        # match so it falls through to create-or-reuse-sibling
+                        # below, instead of re-mixing the split back together.
+                        row = next(
+                            (r for r in movies_by_name_year.get((name, year), [])
+                             if _movie_language_ok(r["id"], item_lang)),
+                            None,
+                        )
                         if row:
                             movie_id = row["id"]
                             did_match = True
@@ -6790,7 +6839,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                 movie_updates_unarchive.append((movie_id,))
                                 did_unarchive = True
                         elif year is None:
-                            candidates = movies_by_name.get(name, [])
+                            all_candidates = movies_by_name.get(name, [])
+                            candidates = [c for c in all_candidates if _movie_language_ok(c["id"], item_lang)]
                             if len(candidates) == 1:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
@@ -6802,10 +6852,17 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_unarchive = True
                             else:
                                 insert_index = len(movie_inserts)
-                                movie_inserts.append((name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), now))
+                                # needs_year_review/did_flag reflect whether the
+                                # NAME alone is ambiguous (multiple same-named
+                                # movies exist, regardless of language) -- use
+                                # the unfiltered candidate list, not the
+                                # language-filtered one, so a language mismatch
+                                # alone doesn't spuriously flag an otherwise
+                                # unambiguous title for review.
+                                movie_inserts.append((name, year, int(category_looks_adult), 1 if all_candidates else 0, int(should_archive), now))
                                 did_create = True
                                 did_archive = should_archive
-                                if candidates:
+                                if all_candidates:
                                     did_flag = True
                                 # Register this brand-new row immediately so a
                                 # later item in the same chunk with the same
@@ -6838,7 +6895,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             # scheme, resolved in the flush step below.
                             new_row = {"id": -1 - insert_index, "review_excluded": int(should_archive), "review_excluded_manual": 0,
                                        "is_adult": int(category_looks_adult), "is_adult_manual": 0}
-                            movies_by_name_year[(name, year)] = new_row
+                            movies_by_name_year.setdefault((name, year), []).append(new_row)
 
                     pending.append({
                         "item": item, "movie_id": movie_id, "insert_index": insert_index,
@@ -7025,7 +7082,10 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
             # lookups -- same short-circuit as bulk_import_movies.
             unresolved = [item for item in chunk if item.get("provider_series_id") not in existing_by_series_id]
             name_year_pairs = {(item["name"], item.get("year")) for item in unresolved if item["name"].strip()}
-            series_by_name_year: dict[tuple[str, object], sqlite3.Row] = {}
+            # (name, year) -> list of candidates -- see bulk_import_movies's
+            # identical comment: a title already split by language can have
+            # more than one series row sharing (name, year).
+            series_by_name_year: dict[tuple[str, object], list[sqlite3.Row]] = {}
             names_needing_candidates = {item["name"] for item in unresolved if item["name"].strip() and item.get("year") is None}
             series_by_name: dict[str, list[sqlite3.Row]] = {}
             if name_year_pairs:
@@ -7038,9 +7098,33 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         f"FROM series WHERE name IN ({placeholders})", sub,
                     ).fetchall()
                     for row in rows:
-                        series_by_name_year.setdefault((row["name"], row["year"]), row)
+                        series_by_name_year.setdefault((row["name"], row["year"]), []).append(row)
                         if row["name"] in names_needing_candidates:
                             series_by_name.setdefault(row["name"], []).append(row)
+
+            # beads-974 (import-path gap, series mirror of bulk_import_movies's
+            # identical fix): language sets for every candidate series this
+            # chunk might match, so each match branch below can refuse to
+            # attach a language-conflicting item.
+            series_language_candidate_ids = {row["id"] for row in existing_by_series_id.values()}
+            for rows in series_by_name_year.values():
+                series_language_candidate_ids.update(row["id"] for row in rows)
+            series_languages: dict[int, set[str]] = {}
+            if series_language_candidate_ids:
+                ids = list(series_language_candidate_ids)
+                for i in range(0, len(ids), 900):
+                    sub = ids[i:i + 900]
+                    placeholders = ",".join("?" * len(sub))
+                    rows = conn.execute(
+                        f"SELECT series_id, COALESCE(language, 'EN') AS lang FROM series_sources "
+                        f"WHERE series_id IN ({placeholders})", sub,
+                    ).fetchall()
+                    for row in rows:
+                        series_languages.setdefault(row["series_id"], set()).add(row["lang"])
+
+            def _series_language_ok(series_id: int, item_lang: str) -> bool:
+                existing_langs = series_languages.get(series_id)
+                return not existing_langs or item_lang in existing_langs
 
             # -- Resolve every item's identity/branch against the prefetched
             # dicts above (identical decision tree to the old per-item
@@ -7066,8 +7150,9 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
                     cat_update_needed = False
 
+                    item_lang = _source_language(item.get("raw_name"))
                     existing = existing_by_series_id.get(item.get("provider_series_id"))
-                    if existing:
+                    if existing and _series_language_ok(existing["id"], item_lang):
                         series_id = existing["id"]
                         did_match = True
                         cat_update_needed = True
@@ -7087,7 +7172,14 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         did_flag = True
                         did_archive = should_archive
                     else:
-                        row = series_by_name_year.get((name, year))
+                        # beads-974: only accept a same-(name,year) match whose
+                        # existing sources share a language with this item --
+                        # see bulk_import_movies's identical comment.
+                        row = next(
+                            (r for r in series_by_name_year.get((name, year), [])
+                             if _series_language_ok(r["id"], item_lang)),
+                            None,
+                        )
                         if row:
                             series_id = row["id"]
                             did_match = True
@@ -7107,7 +7199,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 # leaving it permanently stuck.
                                 series_updates_import_provider.append((provider_id, item.get("provider_series_id"), series_id))
                         elif year is None:
-                            candidates = series_by_name.get(name, [])
+                            all_candidates = series_by_name.get(name, [])
+                            candidates = [c for c in all_candidates if _series_language_ok(c["id"], item_lang)]
                             if len(candidates) == 1:
                                 series_id = candidates[0]["id"]
                                 did_match = True
@@ -7122,10 +7215,13 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_unarchive = True
                             else:
                                 insert_index = len(series_inserts)
-                                series_inserts.append((name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now))
+                                # needs_year_review/did_flag reflect name-only
+                                # ambiguity -- use the unfiltered candidate
+                                # list, same reasoning as bulk_import_movies.
+                                series_inserts.append((name, year, int(category_looks_adult), 1 if all_candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now))
                                 did_create = True
                                 did_archive = should_archive
-                                if candidates:
+                                if all_candidates:
                                     did_flag = True
                                 # Register this brand-new row immediately -- see
                                 # bulk_import_movies's identical comment for why
@@ -7147,7 +7243,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             new_row = {"id": -1 - insert_index, "import_provider_id": provider_id,
                                        "review_excluded": int(should_archive), "review_excluded_manual": 0,
                                        "is_adult": int(category_looks_adult), "is_adult_manual": 0}
-                            series_by_name_year[(name, year)] = new_row
+                            series_by_name_year.setdefault((name, year), []).append(new_row)
 
                     pending.append({
                         "item": item, "series_id": series_id, "insert_index": insert_index,
