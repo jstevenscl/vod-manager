@@ -14,7 +14,6 @@ import asyncio
 import logging
 import time
 
-import config
 import emby_vod_client
 import vod_db
 import vod_importer
@@ -69,7 +68,7 @@ async def import_emby_library(provider_id: int) -> dict:
     # comment.
     exclude_categories = provider.get("import_exclude_categories") or []
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
-    lang = config.get_import_language_exclusion()
+    lang = vod_importer._current_lang_settings()
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}

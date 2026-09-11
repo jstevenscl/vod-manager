@@ -11,6 +11,20 @@ import config
 import vod_db
 
 
+def _lang():
+    """2026-09-11 follow-up: _row_excluded_by_rule's language-prefix gate now
+    reads lang["enabled_languages"] (config.get_enabled_languages(), an
+    include-list) instead of lang["exclude_prefixes"] (an explicit
+    exclude-list) -- see test_import_exclusion_skip.py for the full
+    rationale. exclude_non_latin still comes from
+    config.get_import_language_exclusion(), which is unchanged and still
+    backs the "Import Language Exclusion" UI card's non-Latin toggle."""
+    return {
+        "enabled_languages": config.get_enabled_languages(),
+        "exclude_non_latin": config.get_import_language_exclusion()["exclude_non_latin"],
+    }
+
+
 def _import_movie(db, provider_id, name, stream_id, category_name=None, year=2001):
     db.bulk_import_movies(provider_id, [
         {
@@ -54,7 +68,7 @@ def test_purges_auto_archived_movie_matching_current_category_exclusion(db):
 
     result = vod_db.purge_excluded_archived_content(
         provider_exclusions={provider_id: (["Foreign Films"], False)},
-        lang=config.get_import_language_exclusion(),
+        lang=_lang(),
     )
 
     assert result["movies_deleted"] == 1
@@ -69,7 +83,7 @@ def test_does_not_purge_manually_archived_movie(db):
 
     result = vod_db.purge_excluded_archived_content(
         provider_exclusions={provider_id: (["Foreign Films"], False)},
-        lang=config.get_import_language_exclusion(),
+        lang=_lang(),
     )
 
     assert result["movies_deleted"] == 0
@@ -88,7 +102,7 @@ def test_does_not_purge_non_excluded_archived_movie(db):
 
     result = vod_db.purge_excluded_archived_content(
         provider_exclusions={provider_id: (["Foreign Films"], False)},
-        lang=config.get_import_language_exclusion(),
+        lang=_lang(),
     )
 
     assert result["movies_deleted"] == 0
@@ -107,7 +121,7 @@ def test_purges_auto_archived_series_matching_current_category_exclusion(db):
 
     result = vod_db.purge_excluded_archived_content(
         provider_exclusions={provider_id: (["Foreign TV"], False)},
-        lang=config.get_import_language_exclusion(),
+        lang=_lang(),
     )
 
     assert result["series_deleted"] == 1
@@ -125,8 +139,51 @@ def test_is_idempotent(db):
     conn.close()
 
     exclusions = {provider_id: (["Foreign Films"], False)}
-    first = vod_db.purge_excluded_archived_content(provider_exclusions=exclusions, lang=config.get_import_language_exclusion())
-    second = vod_db.purge_excluded_archived_content(provider_exclusions=exclusions, lang=config.get_import_language_exclusion())
+    first = vod_db.purge_excluded_archived_content(provider_exclusions=exclusions, lang=_lang())
+    second = vod_db.purge_excluded_archived_content(provider_exclusions=exclusions, lang=_lang())
 
     assert first["movies_deleted"] == 1
     assert second["movies_deleted"] == 0
+
+
+def test_purges_auto_archived_movie_whose_language_is_not_enabled(db):
+    """2026-09-11 follow-up: _row_excluded_by_rule's language gate now reads
+    lang["enabled_languages"] (an include-list) rather than
+    lang["exclude_prefixes"] (an explicit exclude-list) -- a GR-tagged row
+    is purged simply because GR isn't in the enabled set, with no
+    exclude_prefixes entry involved at all."""
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    _import_movie(db, provider_id, "GR - Some Movie", "s-1")
+    movie = db.get_movie_by_name_year("GR - Some Movie", 2001)
+    db.bulk_set_review_excluded("movie", [movie["id"]], True)
+    conn = db._connect()
+    conn.execute("UPDATE movies SET review_excluded_manual=0 WHERE id=?", (movie["id"],))
+    conn.commit()
+    conn.close()
+
+    result = vod_db.purge_excluded_archived_content(
+        provider_exclusions={provider_id: ([], False)},
+        lang={"enabled_languages": ["EN"], "exclude_non_latin": False},
+    )
+
+    assert result["movies_deleted"] == 1
+    assert db.get_movie_by_name_year("GR - Some Movie", 2001) is None
+
+
+def test_does_not_purge_movie_whose_language_is_enabled(db):
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    _import_movie(db, provider_id, "GR - Some Movie", "s-1")
+    movie = db.get_movie_by_name_year("GR - Some Movie", 2001)
+    db.bulk_set_review_excluded("movie", [movie["id"]], True)
+    conn = db._connect()
+    conn.execute("UPDATE movies SET review_excluded_manual=0 WHERE id=?", (movie["id"],))
+    conn.commit()
+    conn.close()
+
+    result = vod_db.purge_excluded_archived_content(
+        provider_exclusions={provider_id: ([], False)},
+        lang={"enabled_languages": ["EN", "GR"], "exclude_non_latin": False},
+    )
+
+    assert result["movies_deleted"] == 0
+    assert db.get_movie_by_name_year("GR - Some Movie", 2001) is not None

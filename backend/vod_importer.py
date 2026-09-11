@@ -25,6 +25,20 @@ import vod_db
 from xc_server import _redact_upstream_url
 
 
+def _current_lang_settings() -> dict:
+    """Builds the `lang` dict _should_exclude_from_import/_row_excluded_by_rule
+    read: enabled_languages (config.get_enabled_languages(), the include-list
+    the language-prefix gate now checks membership against) merged with
+    exclude_non_latin (still config.get_import_language_exclusion(), which
+    also still backs that setting's own "Import Language Exclusion" UI card).
+    Single shared builder so every caller (XC/vod_importer.py, Plex, Emby)
+    stays in sync rather than re-deriving this merge independently."""
+    return {
+        "enabled_languages": config.get_enabled_languages(),
+        "exclude_non_latin": config.get_import_language_exclusion()["exclude_non_latin"],
+    }
+
+
 def _should_exclude_from_import(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
     exclude_uncategorized: bool = False, lang: dict | None = None,
@@ -65,16 +79,24 @@ def _should_exclude_from_import(
     can never catch that (there's no name to compare), so this is a
     dedicated switch, checked only when the item truly has no category,
     never as a substitute for an actual category-name match."""
-    lang = lang if lang is not None else config.get_import_language_exclusion()
-    if lang["exclude_prefixes"]:
-        # _source_language's default applies here too: a name with no
-        # recognized prefix is untagged EN/ES-convention content, not
-        # "unknown" -- without this fallback, "EN" could be checked in the
-        # Import Language Exclusion picker and silently exclude nothing,
-        # since untagged names never match a literal prefix code.
-        code = vod_db._name_prefix_code(name) or "EN"
-        if code in lang["exclude_prefixes"]:
-            return True
+    lang = lang if lang is not None else _current_lang_settings()
+    # _source_language's default applies here too: a name with no recognized
+    # prefix is untagged EN/ES-convention content, not "unknown" -- without
+    # this fallback, an admin who leaves "EN" out of Enabled Playback
+    # Languages wouldn't actually exclude the untagged titles that setting
+    # counts as EN, since untagged names never match a literal prefix code.
+    #
+    # 2026-09-11: inverted from an explicit exclude-list membership test
+    # (lang["exclude_prefixes"], a separate manually-maintained list that
+    # could silently miss a language -- "IR" was a real gap) to an explicit
+    # include-list membership test against lang["enabled_languages"]
+    # (config.get_enabled_languages(), the same "Enabled Playback Languages"
+    # list already used query-time by vod_db._enabled_languages_clause). Any
+    # language not currently enabled for playback is now excluded at import
+    # time too, with no separate exclude list to keep in sync.
+    code = vod_db._name_prefix_code(name) or "EN"
+    if code not in lang["enabled_languages"]:
+        return True
     if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
         return True
     if provider_category_name:
@@ -443,7 +465,7 @@ async def _import_movies_for_provider(
     streams = await client.get_vod_streams()
     fetch_elapsed = time.time() - fetch_started
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
-    lang = config.get_import_language_exclusion()
+    lang = _current_lang_settings()
     movie_items = []
     for s in streams:
         name, year = parse_name_year(s.get("name") or "")
@@ -503,7 +525,7 @@ async def _import_series_for_provider(
         field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
         for field in ("genre", "description", "cast_list", "director")
     }
-    lang = config.get_import_language_exclusion()
+    lang = _current_lang_settings()
     series_items = []
     for s in series_list:
         name, year = parse_name_year(s.get("name") or "")
@@ -611,18 +633,26 @@ async def import_provider_catalog(provider_id: int) -> dict:
     # was imported-then-archived under the old behavior (before this
     # provider's exclusion rules were enforced at import time) is purged
     # now that a fresh scan has run, matching the new "never stored" model
-    # (see vod_db.purge_excluded_archived_content). Only runs when this
-    # provider actually has exclusion rules configured -- no point scanning
-    # the whole pool for a provider that excludes nothing.
-    lang = config.get_import_language_exclusion()
-    if exclude_categories or exclude_uncategorized or lang["exclude_prefixes"] or lang["exclude_non_latin"]:
-        purge_result = await asyncio.to_thread(
-            vod_db.purge_excluded_archived_content,
-            {provider_id: (exclude_categories, exclude_uncategorized)}, lang,
-        )
-        if purge_result["movies_deleted"] or purge_result["series_deleted"]:
-            logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
-                        provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
+    # (see vod_db.purge_excluded_archived_content).
+    #
+    # 2026-09-11: this used to be conditional on exclude_categories,
+    # exclude_uncategorized, or a non-empty lang["exclude_prefixes"]/
+    # lang["exclude_non_latin"] -- skipped entirely when a provider had no
+    # exclusion rules configured, since an empty exclude_prefixes list could
+    # never match anything. Now that the language gate is enabled_languages
+    # based instead, there's no "empty means inactive" case: config.
+    # get_enabled_languages() always has at least a default (["EN", "ES"]),
+    # so any provider's catalog can always contain a language outside that
+    # set. The purge scan now always runs (its own per-row work is cheap
+    # when nothing currently matches any active rule).
+    lang = _current_lang_settings()
+    purge_result = await asyncio.to_thread(
+        vod_db.purge_excluded_archived_content,
+        {provider_id: (exclude_categories, exclude_uncategorized)}, lang,
+    )
+    if purge_result["movies_deleted"] or purge_result["series_deleted"]:
+        logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
+                    provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
 
     if provider.get("auto_create_categories"):
         try:

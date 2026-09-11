@@ -9271,15 +9271,19 @@ def _row_excluded_by_rule(
     import time, adapted for purge_excluded_archived_content's already-in-DB
     rows: category_names is every provider_category_name seen across a row's
     sources (movie_sources/series_sources) rather than one item's single
-    category, since a row can carry sources from more than one provider."""
-    if lang["exclude_prefixes"]:
-        # Keep in sync with vod_importer._should_exclude_from_import's
-        # identical EN fallback -- purge and import-time filtering must
-        # agree on what excluding "EN" means, or a purge could leave behind
-        # (or delete) rows the import-time filter would treat differently.
-        code = _name_prefix_code(name) or "EN"
-        if code in lang["exclude_prefixes"]:
-            return True
+    category, since a row can carry sources from more than one provider.
+
+    2026-09-11: lang["enabled_languages"] (an include-list, from
+    config.get_enabled_languages()) replaces lang["exclude_prefixes"] (an
+    explicit exclude-list) for the language-prefix gate -- see
+    vod_importer._should_exclude_from_import's identical change for the full
+    rationale. Keep in sync with that function's identical EN fallback --
+    purge and import-time filtering must agree on what "EN" means, or a
+    purge could leave behind (or delete) rows the import-time filter would
+    treat differently."""
+    code = _name_prefix_code(name) or "EN"
+    if code not in lang["enabled_languages"]:
+        return True
     if lang["exclude_non_latin"] and _is_non_latin_name(name):
         return True
     if category_names:
