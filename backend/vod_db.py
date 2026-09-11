@@ -8633,7 +8633,7 @@ _KNOWN_LANGUAGE_CODES = {
     "GR", "HU", "BG", "RO", "SE", "NO", "DK", "FI", "CZ", "SK", "HR", "SR",
     "SL", "UA", "IN", "HI", "ZH", "CN", "JA", "JP", "KO", "KR", "TH", "VI",
     "ID", "MY", "HE", "FA", "UR", "BN", "TA", "TE", "PK", "AF", "SW", "ALB",
-    "EXYU", "LT", "LV", "EE", "GE", "AM", "AZ", "KZ", "SC",
+    "EXYU", "LT", "LV", "EE", "GE", "AM", "AZ", "KZ", "SC", "IR",
 }
 # Real titles that happen to start with "<known code>: " or "<known code> - "
 # -- checked against the colon/dash matches specifically (never the pipe
