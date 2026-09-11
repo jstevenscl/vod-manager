@@ -3011,6 +3011,17 @@ async def language_backfill_apply():
     return {"updated": updated}
 
 
+@router.get("/language-recompute/preview/", dependencies=_GUARDS)
+async def language_recompute_preview():
+    return await asyncio.to_thread(vod_db.language_recompute_dry_run_report)
+
+
+@router.post("/language-recompute/apply/", dependencies=_GUARDS)
+async def language_recompute_apply():
+    updated = await asyncio.to_thread(vod_db.apply_language_recompute)
+    return {"updated": updated}
+
+
 @router.get("/movie-language-split/preview/", dependencies=_GUARDS)
 async def movie_language_split_preview():
     return await asyncio.to_thread(vod_db.movie_language_split_dry_run_report)

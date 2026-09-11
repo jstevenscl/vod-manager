@@ -4684,6 +4684,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data as { updated: number }),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
   })
+  // Recompute (beads-d2t): distinct from backfill above. Backfill only fills
+  // in rows that were never classified (language IS NULL). This instead
+  // catches rows that WERE classified but by a since-fixed bug, e.g. "IR -"
+  // prefixed sources written as language='EN' before "IR" was added to
+  // _KNOWN_LANGUAGE_CODES. Report shape: { [table]: { [code]: { count, sample_titles } } }.
+  const languageRecomputePreview = useQuery<Record<string, Record<string, { count: number; sample_titles: string[] }>>>({
+    queryKey: ['vod-language-recompute-preview'],
+    queryFn: () => api.get('/vod/language-recompute/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageRecomputeApply = useMutation({
+    mutationFn: () => api.post('/vod/language-recompute/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
   const movieLanguageSplitPreview = useQuery<{ movies: any[] }>({
     queryKey: ['vod-movie-language-split-preview'],
     queryFn: () => api.get('/vod/movie-language-split/preview/').then((r) => r.data),
@@ -8131,6 +8145,21 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             previewCount: (d: any) => d ? Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0) : undefined,
             previewLabel: (d: any) => `${Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0)} source rows missing a language`,
             resultLabel: (r: any) => `${r.updated} rows backfilled.`,
+          },
+          {
+            key: 'recompute' as const,
+            label: 'Language recompute',
+            preview: languageRecomputePreview,
+            apply: languageRecomputeApply,
+            previewCount: (d: any) =>
+              d ? Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0) : undefined,
+            previewLabel: (d: any) => {
+              const total = Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0)
+              return `${total} source row${total === 1 ? '' : 's'} misclassified by an old bug`
+            },
+            resultLabel: (r: any) => `${r.updated} rows recomputed.`,
           },
           {
             key: 'movies' as const,
