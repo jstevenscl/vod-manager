@@ -25,7 +25,7 @@ import vod_db
 from xc_server import _redact_upstream_url
 
 
-def _should_auto_archive(
+def _should_exclude_from_import(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
     exclude_uncategorized: bool = False, lang: dict | None = None,
 ) -> bool:
@@ -37,6 +37,20 @@ def _should_auto_archive(
     global (config.get_import_language_exclusion); category rules are
     per-provider (providers.import_exclude_categories), since available
     categories genuinely differ provider to provider.
+
+    Formerly _should_auto_archive: an excluded item used to still be fully
+    imported and stored, just tagged auto_archive=True (hidden from review
+    queues, but otherwise fully present -- see vod_db.bulk_set_review_
+    excluded's "still fully browsable/playable/categorizable" archive
+    semantics). Per user direction (2026-09-10, referencing Dispatcharr's
+    VOD-group "unchecked = not imported" setting): a real exclusion should
+    mean the content is never stored at all. Every caller now uses this to
+    filter the item out of movie_items/series_items entirely, before it
+    ever reaches bulk_import_movies/bulk_import_series, instead of tagging
+    it for archive after the fact. Re-including a category (or removing a
+    language-exclusion rule) then re-importing is what brings the content
+    back -- see vod_db.purge_excluded_archived_content for the matching
+    one-time cleanup of rows that were archived under the old behavior.
 
     provider_category_name/provider_exclude_categories default to no-ops
     for callers that only want language rules -- plex_importer.py/
@@ -430,6 +444,8 @@ async def _import_movies_for_provider(
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
         category_name = category_names.get(str(s.get("category_id")))
+        if _should_exclude_from_import(name, category_name, exclude_categories, exclude_uncategorized, lang):
+            continue
         movie_items.append({
             "name": name,
             "year": year,
@@ -445,7 +461,6 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -489,6 +504,8 @@ async def _import_series_for_provider(
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         category_name = series_category_names.get(str(s.get("category_id")))
+        if _should_exclude_from_import(name, category_name, exclude_categories, exclude_uncategorized, lang):
+            continue
         series_items.append({
             "name": name,
             "year": year or _coerce_year(s.get("year")),
@@ -498,7 +515,6 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -585,6 +601,23 @@ async def import_provider_catalog(provider_id: int) -> dict:
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)
+
+    # Companion cleanup to the skip-at-import filtering above: content that
+    # was imported-then-archived under the old behavior (before this
+    # provider's exclusion rules were enforced at import time) is purged
+    # now that a fresh scan has run, matching the new "never stored" model
+    # (see vod_db.purge_excluded_archived_content). Only runs when this
+    # provider actually has exclusion rules configured -- no point scanning
+    # the whole pool for a provider that excludes nothing.
+    lang = config.get_import_language_exclusion()
+    if exclude_categories or exclude_uncategorized or lang["exclude_prefixes"] or lang["exclude_non_latin"]:
+        purge_result = await asyncio.to_thread(
+            vod_db.purge_excluded_archived_content,
+            {provider_id: (exclude_categories, exclude_uncategorized)}, lang,
+        )
+        if purge_result["movies_deleted"] or purge_result["series_deleted"]:
+            logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
+                        provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
 
     if provider.get("auto_create_categories"):
         try:

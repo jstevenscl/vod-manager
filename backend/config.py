@@ -319,7 +319,7 @@ def save_ai_provider(provider: str, model: str | None = None) -> None:
 def get_import_language_exclusion() -> dict:
     """Global (not per-provider) since the same admin almost always wants the
     same languages excluded everywhere -- unlike categories, which genuinely
-    differ provider to provider. See vod_importer._should_auto_archive."""
+    differ provider to provider. See vod_importer._should_exclude_from_import."""
     data = _read_raw()
     return {
         "exclude_prefixes": data.get("import_exclude_language_prefixes") or [],

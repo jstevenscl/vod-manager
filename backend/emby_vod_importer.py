@@ -103,6 +103,10 @@ async def import_emby_library(provider_id: int) -> dict:
                     stream_id, container = emby_vod_client.extract_stream_id(item)
                     if not stream_id:
                         continue
+                    if vod_importer._should_exclude_from_import(
+                        item.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
+                    ):
+                        continue
                     fields = emby_vod_client.extract_common_fields(item)
                     movie_items.append({
                         "name": item.get("Name", ""),
@@ -128,9 +132,6 @@ async def import_emby_library(provider_id: int) -> dict:
                         # get_movie_people() instead of blocking the bulk
                         # import on every item's People up front.
                         "provider_category_name": category_name,
-                        "auto_archive": vod_importer._should_auto_archive(
-                            item.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
-                        ),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
                 for k in movie_result:
@@ -150,6 +151,10 @@ async def import_emby_library(provider_id: int) -> dict:
                     series_id = show.get("Id")
                     if not series_id:
                         continue
+                    if vod_importer._should_exclude_from_import(
+                        show.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
+                    ):
+                        continue
                     fields = emby_vod_client.extract_common_fields(show)
                     series_items.append({
                         "name": show.get("Name", ""),
@@ -165,9 +170,6 @@ async def import_emby_library(provider_id: int) -> dict:
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
-                        "auto_archive": vod_importer._should_auto_archive(
-                            show.get("Name", ""), category_name, exclude_categories, exclude_uncategorized, lang,
-                        ),
                         "episodes": episodes,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_series, provider_id, series_items)

@@ -1009,7 +1009,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # all -- import_exclude_categories can never match those (it only
         # ever compares an actual category NAME against the exclude list),
         # so this is a separate on/off switch, not another entry in that
-        # list. See vod_importer._should_auto_archive.
+        # list. See vod_importer._should_exclude_from_import.
         ("providers", "import_exclude_uncategorized", "INTEGER NOT NULL DEFAULT 0"),
         # The provider's own "last_modified" for this series, as reported by
         # the cheap bulk get_series list call (refreshed on every catalog
@@ -2841,10 +2841,10 @@ def set_provider_auto_create_categories(provider_id: int, enabled: bool) -> None
 
 def set_provider_import_exclude_categories(provider_id: int, category_names: list[str], exclude_uncategorized: bool = False) -> None:
     """Provider category names (as this provider itself names them, e.g.
-    "Movies - Spanish") to auto-archive on import -- unlike the language
+    "Movies - Spanish") to skip entirely on import -- unlike the language
     exclusion rules (config.get/save_import_language_exclusion), this is
     per-provider since available categories genuinely differ provider to
-    provider. See vod_importer._should_auto_archive.
+    provider. See vod_importer._should_exclude_from_import.
 
     exclude_uncategorized (GH issue #7) is a separate switch, not another
     category name -- some providers ship items with no category attached at
@@ -6613,15 +6613,24 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
     is_adult to True from a matching category name, never downgrades, and
     never touches a row a human has manually corrected (is_adult_manual=1).
 
-    auto_archive (see vod_importer._should_auto_archive) mirrors the
-    is_adult/is_adult_manual upgrade-only pattern in BOTH directions: it can
-    archive an item, and if the item is already archived but was archived
-    automatically (review_excluded_manual=0), it can also un-archive it once
-    no active rule matches it any more -- e.g. an admin removes a category
-    from a provider's exclude list, then re-imports. A human's manual
+    auto_archive mirrors the is_adult/is_adult_manual upgrade-only pattern in
+    BOTH directions: it can archive an item, and if the item is already
+    archived but was archived automatically (review_excluded_manual=0), it
+    can also un-archive it once should_archive goes False. A human's manual
     archive/restore (bulk_set_review_excluded, review_excluded_manual=1) is
     never touched in either direction -- that's what review_excluded_manual
     exists to protect.
+
+    Provider-level category/uncategorized exclusion and the global language
+    exclusion rule no longer set auto_archive=True to reach this behavior --
+    per user direction (2026-09-10, follow-up to beads-974), an excluded
+    item is now filtered out of the items list entirely by the caller
+    (vod_importer._should_exclude_from_import, formerly _should_auto_
+    archive) before it ever reaches this function, so it's never stored at
+    all rather than stored-then-archived. auto_archive/should_archive stay
+    wired up here for any other caller that still wants the archive (not
+    skip) behavior; see vod_db.purge_excluded_archived_content for the
+    one-time cleanup of rows that were archived under the old behavior.
     """
     _WRITE_LOCK.acquire()
     try:
@@ -7439,11 +7448,13 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
     description, director, cast_list, poster_url, last_enriched_at,
     auto_archive}, ...]
 
-    auto_archive (see vod_importer._should_auto_archive, called with no
-    category args -- Plex/Emby have no XC-style flat category list to filter
-    on, only language rules apply here, see vod_manager-i4i) mirrors
-    bulk_import_movies' upgrade-only-both-directions archive/unarchive
-    semantics exactly -- see that function's docstring."""
+    auto_archive mirrors bulk_import_movies' upgrade-only-both-directions
+    archive/unarchive semantics exactly -- see that function's docstring,
+    including the note that provider-level category/language exclusion no
+    longer reaches this function at all: excluded items are filtered out by
+    the caller (vod_importer._should_exclude_from_import) before this is
+    even called, for Plex/Emby library-section-as-category exclusion (GH#9)
+    same as XC-provider category exclusion."""
     _WRITE_LOCK.acquire()
     try:
         conn = _connect()
@@ -9170,6 +9181,104 @@ def bulk_set_poster_url(content_type: str, ids: list[int], poster_url: str) -> i
     return len(ids)
 
 
+def _row_excluded_by_rule(
+    name: str, category_names: set[str], provider_exclude_categories: list[str],
+    exclude_uncategorized: bool, lang: dict,
+) -> bool:
+    """Same rule vod_importer._should_exclude_from_import applies per-item at
+    import time, adapted for purge_excluded_archived_content's already-in-DB
+    rows: category_names is every provider_category_name seen across a row's
+    sources (movie_sources/series_sources) rather than one item's single
+    category, since a row can carry sources from more than one provider."""
+    if lang["exclude_prefixes"]:
+        code = _name_prefix_code(name)
+        if code and code in lang["exclude_prefixes"]:
+            return True
+    if lang["exclude_non_latin"] and _is_non_latin_name(name):
+        return True
+    if category_names:
+        if category_names & set(provider_exclude_categories):
+            return True
+    elif exclude_uncategorized:
+        return True
+    return False
+
+
+def purge_excluded_archived_content(provider_exclusions: dict[int, tuple[list[str], bool]], lang: dict) -> dict:
+    """One-time (repeatable) cleanup companion to the skip-at-import change:
+    deletes movies/series rows that are currently auto-archived
+    (review_excluded=1, review_excluded_manual=0) AND still match a currently
+    active exclusion rule -- content that, under the new "skip at import,
+    never store" model (see vod_importer._should_exclude_from_import), should
+    never have been imported in the first place. A human's manual archive
+    (review_excluded_manual=1, see bulk_set_review_excluded) is never
+    touched -- same protection every other auto-archive path in this file
+    already gives that flag.
+
+    provider_exclusions: {provider_id: (exclude_categories, exclude_uncategorized)},
+    one entry per provider currently configured with import exclusions --
+    callers build this from providers.import_exclude_categories/
+    import_exclude_uncategorized (see vod_importer.import_provider_catalog).
+    A row is only ever evaluated against the exclusion rule(s) of the
+    provider(s) it actually has a source from, mirroring the per-provider
+    scoping _should_exclude_from_import already has at import time."""
+    conn = _connect()
+    movie_rows = conn.execute(
+        "SELECT id, name FROM movies WHERE review_excluded=1 AND review_excluded_manual=0"
+    ).fetchall()
+    movies_deleted = 0
+    for row in movie_rows:
+        sources = conn.execute(
+            "SELECT provider_id, provider_category_name FROM movie_sources WHERE movie_id=?", (row["id"],)
+        ).fetchall()
+        excluded = False
+        for provider_id, group in _group_by_provider(sources):
+            rule = provider_exclusions.get(provider_id)
+            if not rule:
+                continue
+            exclude_categories, exclude_uncategorized = rule
+            category_names = {s["provider_category_name"] for s in group if s["provider_category_name"]}
+            if _row_excluded_by_rule(row["name"], category_names, exclude_categories, exclude_uncategorized, lang):
+                excluded = True
+                break
+        if excluded:
+            conn.execute("DELETE FROM movies WHERE id=?", (row["id"],))
+            movies_deleted += 1
+
+    series_rows = conn.execute(
+        "SELECT id, name FROM series WHERE review_excluded=1 AND review_excluded_manual=0"
+    ).fetchall()
+    series_deleted = 0
+    for row in series_rows:
+        sources = conn.execute(
+            "SELECT provider_id, provider_category_name FROM series_sources WHERE series_id=?", (row["id"],)
+        ).fetchall()
+        excluded = False
+        for provider_id, group in _group_by_provider(sources):
+            rule = provider_exclusions.get(provider_id)
+            if not rule:
+                continue
+            exclude_categories, exclude_uncategorized = rule
+            category_names = {s["provider_category_name"] for s in group if s["provider_category_name"]}
+            if _row_excluded_by_rule(row["name"], category_names, exclude_categories, exclude_uncategorized, lang):
+                excluded = True
+                break
+        if excluded:
+            conn.execute("DELETE FROM series WHERE id=?", (row["id"],))
+            series_deleted += 1
+
+    _commit_with_retry(conn)
+    conn.close()
+    return {"movies_deleted": movies_deleted, "series_deleted": series_deleted}
+
+
+def _group_by_provider(rows) -> list[tuple[int, list]]:
+    grouped: dict[int, list] = {}
+    for r in rows:
+        grouped.setdefault(r["provider_id"], []).append(r)
+    return list(grouped.items())
+
+
 def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) -> int:
     """Archives/unarchives items out of (or back into) every review queue --
     Missing Artwork, Needs Review, Duplicate Finder -- without touching the
@@ -9180,8 +9289,8 @@ def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) 
 
     Every caller of this is a human clicking an archive/un-archive control,
     so this always stamps review_excluded_manual=1 too -- the signal that
-    stops import-time auto-archive (see vod_importer._should_auto_archive)
-    from silently re-archiving something a human deliberately restored, the
+    stops import-time auto-archive (see bulk_import_movies' auto_archive
+    param) from silently re-archiving something a human deliberately restored, the
     same is_adult/is_adult_manual pattern already used for adult-content
     auto-detection."""
     if not ids:
@@ -9851,7 +9960,8 @@ def evaluate_smart_category(category_id: int) -> dict:
     placement. Returns counts for the caller to surface in the UI.
 
     Excludes review_excluded=1 rows from the candidate pool entirely --
-    without this, an archived item (see _should_auto_archive) still gets
+    without this, an archived item (see bulk_import_movies' auto_archive
+    param) still gets
     auto-placed into any smart category whose rule it happens to match,
     including the match_all catch-all categories, which defeats the whole
     point of archiving it: "archived" only means "hidden from VOD Manager's
