@@ -3458,6 +3458,55 @@ def _split_by_year_proximity(items: list[dict]) -> list[list[dict]]:
     return clusters
 
 
+def _split_by_language_conflict(content_type: str, items: list[dict]) -> list[list[dict]]:
+    """beads-974 (Step 2): a shared tmdb_id is proof two rows are the same
+    real title, but NOT proof they should be offered as a single merge
+    candidate if they carry zero overlapping source language -- that's
+    exactly a provider language/dub variant pair (see auto_merge_movie_by_
+    tmdb / auto_merge_series_by_tmdb's identical Step 1 gate), and merging
+    them is the cross-language-failover risk this whole bead exists to
+    prevent. Movies/series have no language column of their own -- language
+    lives on their _sources rows -- so this groups by the same COALESCE-to-
+    EN source-language SET used by the auto-merge gate, then splits apart
+    any two language-groups that share no language at all. A row with no
+    sources yet reads as {"EN"} (see _source_languages), so it stays
+    grouped with other EN/untagged rows -- same backward-compatible default
+    as Step 1.
+
+    Union-style grouping, not exact-set-equality: three rows respectively
+    tagged {EN}, {EN, ES}, {ES} should all end up in ONE group (the middle
+    row bridges them), not three separate ones -- only a row/group with
+    ZERO overlap to every other group gets split off."""
+    if len(items) <= 1:
+        return [items]
+
+    sources_table = "movie_sources" if content_type == "movie" else "series_sources"
+    fk_column = "movie_id" if content_type == "movie" else "series_id"
+
+    conn = _connect()
+    try:
+        langs_by_id = {i["id"]: _source_languages(conn, sources_table, fk_column, i["id"]) for i in items}
+    finally:
+        conn.close()
+
+    groups: list[dict] = []  # each: {"langs": set[str], "items": list[dict]}
+    for item in items:
+        item_langs = langs_by_id[item["id"]]
+        joined = False
+        for g in groups:
+            if g["langs"] & item_langs:
+                g["items"].append(item)
+                g["langs"] |= item_langs
+                joined = True
+                break
+        if not joined:
+            groups.append({"langs": set(item_langs), "items": [item]})
+
+    if len(groups) <= 1:
+        return [items]
+    return [g["items"] for g in groups]
+
+
 def _split_by_tmdb_conflict(items: list[dict]) -> list[list[dict]]:
     """A confirmed DIFFERENT tmdb_id across two items is positive proof
     they're different real content -- not ambiguity for a human to review,
@@ -3669,6 +3718,25 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
             if _duplicate_ignore_signature(ids) in ignored:
                 continue
             candidate_groups.append(sub)
+
+    # beads-974 (Step 2): applied once, after every pass above has finished
+    # building candidate_groups, rather than at each individual append site
+    # -- a shared tmdb_id proves same-title, but a cluster built on tmdb_id
+    # (or on name-key alone) can still bundle rows that share zero source
+    # language, which is exactly the cross-language-merge risk this bead
+    # exists to prevent (see _split_by_language_conflict's docstring and
+    # auto_merge_movie_by_tmdb / auto_merge_series_by_tmdb's identical Step
+    # 1 gate). Re-check ignored-signature per resulting sub-group since a
+    # human may have dismissed one language pairing but not another.
+    language_split_groups: list[list[dict]] = []
+    for items in candidate_groups:
+        for sub in _split_by_language_conflict(content_type, items):
+            if len(sub) < 2:
+                continue
+            if _duplicate_ignore_signature([i["id"] for i in sub]) in ignored:
+                continue
+            language_split_groups.append(sub)
+    candidate_groups = language_split_groups
 
     if not candidate_groups:
         conn.close()
@@ -7952,6 +8020,34 @@ def merge_movie(from_id: int, into_id: int) -> None:
         conn.close()
 
 
+def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> set[str]:
+    """Distinct COALESCE(language,'EN') values across a movie's/series'
+    _sources rows (beads-974) -- the merge-gate's view of "what language(s)
+    does this card actually carry", since movies/series themselves have no
+    language column of their own. COALESCE-to-EN matches _source_language's
+    own untagged-source default, so a row with no sources yet (or only
+    untagged ones) reads as {"EN"}, same as a freshly-tagged EN source --
+    this is what makes an untagged variant merge-compatible with an
+    explicit EN variant per the untagged-defaults-to-EN rule."""
+    rows = conn.execute(
+        f"SELECT DISTINCT COALESCE(language, 'EN') AS lang FROM {sources_table} WHERE {fk_column}=?",
+        (row_id,),
+    ).fetchall()
+    return {row["lang"] for row in rows} or {"EN"}
+
+
+def _shares_a_language(conn: sqlite3.Connection, sources_table: str, fk_column: str, id_a: int, id_b: int) -> bool:
+    """True if the two rows' source-language sets overlap at all (beads-974).
+    Overlap, not equality: a card can legitimately carry sources in more than
+    one language already (e.g. two providers both tagged EN plus one tagged
+    ES) -- the merge should only be blocked when two candidates share NO
+    language at all, not whenever their sets aren't identical."""
+    return bool(
+        _source_languages(conn, sources_table, fk_column, id_a)
+        & _source_languages(conn, sources_table, fk_column, id_b)
+    )
+
+
 def auto_merge_movie_by_tmdb(movie_id: int) -> None:
     """Called right after enrichment confirms/refreshes `movie_id`'s tmdb_id
     (see vod_importer.enrich_movie) -- every OTHER movie row sharing that
@@ -8025,6 +8121,28 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
                 "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
                 "(already merged by a concurrent auto-merge in this cluster)",
                 tmdb_id, row["id"], movie_id,
+            )
+            continue
+
+        # beads-974: tmdb_id equality alone used to be sufficient -- now also
+        # require the two candidates to share at least one source language.
+        # Without this, provider language/dub variants (the exact case this
+        # function was built to merge) collapse into one card whose playback
+        # failover can silently switch the user to an unwanted-language
+        # stream (see _best_source_cte). Untagged sources read as EN (same
+        # default _source_language uses at write time), so this stays
+        # backward-compatible for the common no-language-tag case.
+        gate_conn = _connect()
+        try:
+            row_langs = _source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
+            movie_langs = _source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
+        finally:
+            gate_conn.close()
+        if not (row_langs & movie_langs):
+            logger.warning(
+                "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
+                "(languages: %s vs %s)",
+                tmdb_id, row["id"], movie_id, sorted(row_langs), sorted(movie_langs),
             )
             continue
 
@@ -8182,6 +8300,25 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
                 "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
                 "(already merged by a concurrent auto-merge in this cluster)",
                 tmdb_id, row["id"], series_id,
+            )
+            continue
+
+        # beads-974: tmdb_id equality alone used to be sufficient -- now also
+        # require the two candidates to share at least one source language
+        # (see auto_merge_movie_by_tmdb's identical gate for the full
+        # rationale). Untagged sources read as EN, same as _source_language's
+        # own default, so this stays backward-compatible for untagged feeds.
+        gate_conn = _connect()
+        try:
+            row_langs = _source_languages(gate_conn, "series_sources", "series_id", row["id"])
+            series_langs = _source_languages(gate_conn, "series_sources", "series_id", series_id)
+        finally:
+            gate_conn.close()
+        if not (row_langs & series_langs):
+            logger.warning(
+                "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
+                "(languages: %s vs %s)",
+                tmdb_id, row["id"], series_id, sorted(row_langs), sorted(series_langs),
             )
             continue
 
@@ -8495,6 +8632,279 @@ def apply_language_backfill() -> int:
         _commit_with_retry(conn)
         conn.close()
     return total
+
+
+def _group_source_languages_by_conflict(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> list[dict]:
+    """beads-974 (Step 3): union-chains a single movie's/series' own
+    movie_sources/series_sources rows by COALESCE(language,'EN') -- the same
+    grouping rule as _split_by_language_conflict, just applied to one row's
+    own sources instead of a duplicate-candidate cluster, since Step 3 is
+    the retroactive inverse of the merge Step 1/2 now block going forward.
+    Returns one dict per resulting language group: {"langs": set[str],
+    "source_ids": list[int]}, largest group first (ties broken by lowest
+    source id, for determinism) -- callers keep group [0] on the original
+    row and split the rest off."""
+    rows = conn.execute(
+        f"SELECT id, COALESCE(language, 'EN') AS lang FROM {sources_table} WHERE {fk_column}=?",
+        (row_id,),
+    ).fetchall()
+
+    groups: list[dict] = []
+    for row in rows:
+        row_langs = {row["lang"]}
+        joined = False
+        for g in groups:
+            if g["langs"] & row_langs:
+                g["source_ids"].append(row["id"])
+                g["langs"] |= row_langs
+                joined = True
+                break
+        if not joined:
+            groups.append({"langs": row_langs, "source_ids": [row["id"]]})
+
+    groups.sort(key=lambda g: (-len(g["source_ids"]), min(g["source_ids"])))
+    return groups
+
+
+def movie_language_split_dry_run_report() -> dict:
+    """beads-974 (Step 3): reports every existing movie whose movie_sources
+    span more than one language group (see _group_source_languages_by_
+    conflict) -- these were merged back when auto_merge_movie_by_tmdb gated
+    on tmdb_id alone, before Step 1's language gate existed. Read-only --
+    see apply_movie_language_split for the actual re-split."""
+    conn = _connect()
+    movie_ids = [row["movie_id"] for row in conn.execute("SELECT DISTINCT movie_id FROM movie_sources").fetchall()]
+    movies = []
+    for movie_id in movie_ids:
+        groups = _group_source_languages_by_conflict(conn, "movie_sources", "movie_id", movie_id)
+        if len(groups) > 1:
+            movies.append({
+                "movie_id": movie_id,
+                "language_groups": len(groups),
+                "languages": [sorted(g["langs"]) for g in groups],
+            })
+    conn.close()
+    return {"movies": movies}
+
+
+def apply_movie_language_split() -> dict:
+    """beads-974 (Step 3): retroactively re-splits every movie found by
+    movie_language_split_dry_run_report. The largest language group keeps
+    the original movie_id (and all its existing metadata, untouched) --
+    same "most-sourced stays put" convention the rest of the merge/dedup
+    code already follows. Each other language group is split off into a
+    brand-new movies row that's a full metadata copy of the original (per
+    user direction 2026-09-10, not a minimal stub left for re-enrichment),
+    with that group's movie_sources reassigned to the new id and the
+    original's category placements copied onto the new row via
+    place_movie_in_category (which already allocates a fresh, unique
+    export_stream_id -- see that function) so the split-off row's sources
+    stay independently browsable. Idempotent: a movie with only one
+    language group left (e.g. on a second run) is left untouched."""
+    movies_split = 0
+    new_rows_created = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        movie_ids = [row["movie_id"] for row in conn.execute("SELECT DISTINCT movie_id FROM movie_sources").fetchall()]
+        for movie_id in movie_ids:
+            groups = _group_source_languages_by_conflict(conn, "movie_sources", "movie_id", movie_id)
+            if len(groups) <= 1:
+                continue
+
+            original = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+            if original is None:
+                continue
+            category_ids = [
+                row["category_id"]
+                for row in conn.execute(
+                    "SELECT category_id FROM movie_category_placements WHERE movie_id=?", (movie_id,)
+                ).fetchall()
+            ]
+
+            movies_split += 1
+            for group in groups[1:]:
+                cur = conn.execute(
+                    """INSERT INTO movies (name, year, tmdb_id, imdb_id, genre, description, duration_secs,
+                       poster_url, cast_list, director, country, rating, release_date, is_adult, is_adult_manual,
+                       created_at, updated_at, last_enriched_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        original["name"], original["year"], original["tmdb_id"], original["imdb_id"],
+                        original["genre"], original["description"], original["duration_secs"],
+                        original["poster_url"], original["cast_list"], original["director"],
+                        original["country"], original["rating"], original["release_date"],
+                        original["is_adult"], original["is_adult_manual"], _now(), _now(),
+                        original["last_enriched_at"],
+                    ),
+                )
+                new_movie_id = cur.lastrowid
+                new_rows_created += 1
+
+                placeholders = ",".join("?" for _ in group["source_ids"])
+                conn.execute(
+                    f"UPDATE movie_sources SET movie_id=? WHERE id IN ({placeholders})",
+                    (new_movie_id, *group["source_ids"]),
+                )
+                _commit_with_retry(conn)
+
+                for category_id in category_ids:
+                    place_movie_in_category(new_movie_id, category_id)
+        conn.close()
+    return {"movies_split": movies_split, "new_rows_created": new_rows_created}
+
+
+def series_language_split_dry_run_report() -> dict:
+    """beads-974 (Step 3, series): reports every existing series whose
+    series_sources span more than one language group (see
+    _group_source_languages_by_conflict) -- the series-side equivalent of
+    movie_language_split_dry_run_report. Episode-level mixed-language
+    episodes (see apply_series_language_split's docstring for why those can
+    exist independently of the series-level grouping) are handled entirely
+    inside apply -- there is no separate "episode dry run" here since an
+    episode's own episode_sources.language is authoritative on its own and
+    doesn't need a preview to sanity-check. Read-only."""
+    conn = _connect()
+    series_ids = [row["series_id"] for row in conn.execute("SELECT DISTINCT series_id FROM series_sources").fetchall()]
+    series_list = []
+    for series_id in series_ids:
+        groups = _group_source_languages_by_conflict(conn, "series_sources", "series_id", series_id)
+        if len(groups) > 1:
+            series_list.append({
+                "series_id": series_id,
+                "language_groups": len(groups),
+                "languages": [sorted(g["langs"]) for g in groups],
+            })
+    conn.close()
+    return {"series": series_list}
+
+
+def apply_series_language_split() -> dict:
+    """beads-974 (Step 3, series): retroactively re-splits every series found
+    by series_language_split_dry_run_report, and independently re-splits
+    every episode whose OWN episode_sources span more than one language.
+
+    Series are harder than movies because _merge_series_row can collapse two
+    already-distinct episode rows together whenever both series carried the
+    same (season_number, episode_number) -- the "from" episode's
+    episode_sources get reassigned onto the "into" episode's existing row and
+    the "from" episode itself is deleted (see _merge_series_row). So a single
+    post-merge `episodes` row can carry episode_sources spanning more than
+    one language even when nothing else about it looks unusual. But since
+    episode_sources.language is set independently per source from that
+    source's own raw_name (see _add_episode_source_row), never inherited from
+    the parent series/episode, there's no lost pre-merge lineage to recover:
+    grouping each episode's own episode_sources by language is sufficient on
+    its own, done independently of (and after) the series-level split below.
+
+    Series-level: the largest series_sources language group stays on the
+    original series_id (metadata untouched). Each other group is split off
+    into a brand-new series row -- full metadata copy of the original, per
+    user direction 2026-09-10 -- with that group's series_sources reassigned,
+    and the original's category placements copied over via
+    place_series_in_category (already idempotent, already allocates a fresh
+    export_series_id).
+
+    Episode-level: for every episode under a series touched above (or any
+    series at all, since an episode can be mixed-language even when its
+    parent series_sources are single-language), each language group's
+    episode_sources are moved onto the (season_number, episode_number)
+    episode row of whichEVER series -- original or newly split-off --
+    now holds that language's series_sources; that episode row is created
+    if it doesn't exist yet. Idempotent: a series/episode with only one
+    language group left is skipped."""
+    series_split = 0
+    new_rows_created = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+
+        # -- Series-level split first, so the episode-level pass below has
+        # the right (possibly brand-new) series_id to target per language.
+        series_ids = [row["series_id"] for row in conn.execute("SELECT DISTINCT series_id FROM series_sources").fetchall()]
+        series_id_by_lang: dict[int, dict[str, int]] = {}  # original_series_id -> {lang: series_id}
+        for series_id in series_ids:
+            groups = _group_source_languages_by_conflict(conn, "series_sources", "series_id", series_id)
+            lang_map = {lang: series_id for lang in groups[0]["langs"]} if groups else {}
+            if len(groups) > 1:
+                original = conn.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
+                category_ids = [
+                    row["category_id"]
+                    for row in conn.execute(
+                        "SELECT category_id FROM series_category_placements WHERE series_id=?", (series_id,)
+                    ).fetchall()
+                ]
+                series_split += 1
+                for group in groups[1:]:
+                    cur = conn.execute(
+                        """INSERT INTO series (name, year, tmdb_id, imdb_id, genre, description, poster_url,
+                           cast_list, director, country, rating, release_date, is_adult, is_adult_manual,
+                           import_provider_id, import_provider_series_id, provider_category_name,
+                           created_at, updated_at, last_enriched_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            original["name"], original["year"], original["tmdb_id"], original["imdb_id"],
+                            original["genre"], original["description"], original["poster_url"],
+                            original["cast_list"], original["director"], original["country"],
+                            original["rating"], original["release_date"], original["is_adult"],
+                            original["is_adult_manual"], original["import_provider_id"],
+                            original["import_provider_series_id"], original["provider_category_name"],
+                            _now(), _now(), original["last_enriched_at"],
+                        ),
+                    )
+                    new_series_id = cur.lastrowid
+                    new_rows_created += 1
+                    for lang in group["langs"]:
+                        lang_map[lang] = new_series_id
+
+                    placeholders = ",".join("?" for _ in group["source_ids"])
+                    conn.execute(
+                        f"UPDATE series_sources SET series_id=? WHERE id IN ({placeholders})",
+                        (new_series_id, *group["source_ids"]),
+                    )
+                    _commit_with_retry(conn)
+
+                    for category_id in category_ids:
+                        place_series_in_category(new_series_id, category_id)
+            series_id_by_lang[series_id] = lang_map
+
+        # -- Episode-level split: independent of whether the parent series
+        # was itself split above (see docstring) -- so this runs for every
+        # series that has a lang_map (i.e. every series with any sources).
+        for original_series_id, lang_map in series_id_by_lang.items():
+            episodes = conn.execute(
+                "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (original_series_id,)
+            ).fetchall()
+            for ep in episodes:
+                groups = _group_source_languages_by_conflict(conn, "episode_sources", "episode_id", ep["id"])
+                if len(groups) <= 1:
+                    continue
+                for group in groups[1:]:
+                    # All sources in one group share overlapping languages by
+                    # construction -- any single one resolves the target series.
+                    target_lang = next(iter(group["langs"]))
+                    target_series_id = lang_map.get(target_lang, original_series_id)
+                    if target_series_id == original_series_id:
+                        continue
+                    existing_target = conn.execute(
+                        "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+                        (target_series_id, ep["season_number"], ep["episode_number"]),
+                    ).fetchone()
+                    if existing_target:
+                        target_ep_id = existing_target["id"]
+                    else:
+                        src_name = conn.execute("SELECT name FROM episodes WHERE id=?", (ep["id"],)).fetchone()["name"]
+                        target_ep_id = _add_episode_row(
+                            conn, target_series_id, ep["season_number"], ep["episode_number"], src_name,
+                        )
+
+                    placeholders = ",".join("?" for _ in group["source_ids"])
+                    conn.execute(
+                        f"UPDATE episode_sources SET episode_id=? WHERE id IN ({placeholders})",
+                        (target_ep_id, *group["source_ids"]),
+                    )
+                    _commit_with_retry(conn)
+
+        conn.close()
+    return {"series_split": series_split, "new_rows_created": new_rows_created}
 
 
 def preview_enabled_languages_impact(proposed_codes: list[str]) -> dict:
