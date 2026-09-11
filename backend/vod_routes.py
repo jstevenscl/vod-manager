@@ -2992,6 +2992,45 @@ async def bulk_exclude_library(body: BulkLibraryExcludeRequest):
     return {"changed": changed}
 
 
+# ── Language backfill / retroactive split (beads-974 Step 3) ──
+# Three maintenance actions, each following the same preview-then-apply shape
+# as library-language/bulk-exclude above: a GET .../preview/ that runs the
+# existing read-only *_dry_run_report() function, and a POST .../apply/ that
+# runs the matching apply_*() function. Full-catalog scans, so both run off
+# the event loop via asyncio.to_thread (same reasoning as the Duplicate
+# Finder scan below).
+
+@router.get("/language-backfill/preview/", dependencies=_GUARDS)
+async def language_backfill_preview():
+    return await asyncio.to_thread(vod_db.language_backfill_dry_run_report)
+
+
+@router.post("/language-backfill/apply/", dependencies=_GUARDS)
+async def language_backfill_apply():
+    updated = await asyncio.to_thread(vod_db.apply_language_backfill)
+    return {"updated": updated}
+
+
+@router.get("/movie-language-split/preview/", dependencies=_GUARDS)
+async def movie_language_split_preview():
+    return await asyncio.to_thread(vod_db.movie_language_split_dry_run_report)
+
+
+@router.post("/movie-language-split/apply/", dependencies=_GUARDS)
+async def movie_language_split_apply():
+    return await asyncio.to_thread(vod_db.apply_movie_language_split)
+
+
+@router.get("/series-language-split/preview/", dependencies=_GUARDS)
+async def series_language_split_preview():
+    return await asyncio.to_thread(vod_db.series_language_split_dry_run_report)
+
+
+@router.post("/series-language-split/apply/", dependencies=_GUARDS)
+async def series_language_split_apply():
+    return await asyncio.to_thread(vod_db.apply_series_language_split)
+
+
 @router.get("/missing-artwork/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
 async def missing_artwork_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
     if content_type not in ("movie", "series"):

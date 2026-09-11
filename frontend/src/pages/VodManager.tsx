@@ -4670,6 +4670,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
   })
+
+  // Language backfill + retroactive movie/series language split (beads-974
+  // Step 3): one-off maintenance actions, previously only runnable via a
+  // direct backend/SSH call. Each preview query runs the read-only
+  // *_dry_run_report(), and the matching mutation runs the real apply_*().
+  const languageBackfillPreview = useQuery<{ movie_sources?: number; series_sources?: number; episode_sources?: number }>({
+    queryKey: ['vod-language-backfill-preview'],
+    queryFn: () => api.get('/vod/language-backfill/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageBackfillApply = useMutation({
+    mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
+  const movieLanguageSplitPreview = useQuery<{ movies: any[] }>({
+    queryKey: ['vod-movie-language-split-preview'],
+    queryFn: () => api.get('/vod/movie-language-split/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const movieLanguageSplitApply = useMutation({
+    mutationFn: () => api.post('/vod/movie-language-split/apply/').then((r) => r.data as { movies_split: number; new_rows_created: number }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+  })
+  const seriesLanguageSplitPreview = useQuery<{ series: any[] }>({
+    queryKey: ['vod-series-language-split-preview'],
+    queryFn: () => api.get('/vod/series-language-split/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const seriesLanguageSplitApply = useMutation({
+    mutationFn: () => api.post('/vod/series-language-split/apply/').then((r) => r.data as { series_split: number; new_rows_created: number }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
   const [enabledLanguageSearch, setEnabledLanguageSearch] = useState('')
   const [enabledLanguageShowFilter, setEnabledLanguageShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
   const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
@@ -8079,6 +8112,72 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
           Save enabled languages
         </Button>
+      </SectionCard>
+
+      <SectionCard title="Language Backfill & Retroactive Split" icon={<Wrench size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Maintenance for content imported before per-language matching existed (beads-974). Movies/series that were
+          auto-merged across languages under the old rule stay mixed until split here. Run in order: 1) backfill
+          fills in any missing per-source language, 2) movie split, 3) series split (also re-splits mixed-language
+          episodes). Each is safe to re-run — once nothing is left to change, it becomes a no-op.
+        </p>
+
+        {[
+          {
+            key: 'backfill' as const,
+            label: 'Language backfill',
+            preview: languageBackfillPreview,
+            apply: languageBackfillApply,
+            previewCount: (d: any) => d ? Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0) : undefined,
+            previewLabel: (d: any) => `${Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0)} source rows missing a language`,
+            resultLabel: (r: any) => `${r.updated} rows backfilled.`,
+          },
+          {
+            key: 'movies' as const,
+            label: 'Movie language split',
+            preview: movieLanguageSplitPreview,
+            apply: movieLanguageSplitApply,
+            previewCount: (d: any) => d?.movies?.length,
+            previewLabel: (d: any) => `${d.movies.length} mixed-language movie${d.movies.length === 1 ? '' : 's'} found`,
+            resultLabel: (r: any) => `${r.movies_split} movies split, ${r.new_rows_created} new rows created.`,
+          },
+          {
+            key: 'series' as const,
+            label: 'Series language split',
+            preview: seriesLanguageSplitPreview,
+            apply: seriesLanguageSplitApply,
+            previewCount: (d: any) => d?.series?.length,
+            previewLabel: (d: any) => `${d.series.length} mixed-language series found`,
+            resultLabel: (r: any) => `${r.series_split} series split, ${r.new_rows_created} new rows created.`,
+          },
+        ].map(({ key, label, preview, apply, previewCount, previewLabel, resultLabel }) => (
+          <div key={key} className="flex items-center gap-2 border border-border rounded p-2">
+            <span className="text-xs font-medium w-40">{label}</span>
+            <Button size="sm" variant="outline" disabled={preview.isFetching} onClick={() => preview.refetch()}>
+              {preview.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Preview
+            </Button>
+            <Button
+              size="sm"
+              disabled={apply.isPending || !preview.data || previewCount(preview.data) === 0}
+              onClick={() => apply.mutate()}
+            >
+              {apply.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Apply
+            </Button>
+            <span className="text-xs text-muted-foreground flex-1">
+              {apply.data
+                ? resultLabel(apply.data)
+                : apply.isError
+                ? `Failed: ${(apply.error as any)?.response?.data?.detail ?? (apply.error as any)?.message}`
+                : preview.data
+                ? previewLabel(preview.data)
+                : preview.isError
+                ? `Failed: ${(preview.error as any)?.response?.data?.detail ?? (preview.error as any)?.message}`
+                : ''}
+            </span>
+          </div>
+        ))}
       </SectionCard>
       </>
       )}
