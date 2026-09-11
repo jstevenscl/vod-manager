@@ -7762,6 +7762,27 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                     archived += did_archive
                     unarchived += did_unarchive
 
+                    # Record this provider as a source for this series --
+                    # mirrors movie_sources' identical upsert in
+                    # bulk_import_plex_movies exactly. Missing until now
+                    # (beads-974 continuation, found live 2026-09-11): this
+                    # function wrote series/episodes/episode_sources but
+                    # never series_sources itself, so a Plex-only provider
+                    # never appeared as a source anywhere find_duplicate_
+                    # groups/enrich_series read series_sources (Duplicate
+                    # Finder provider badges + source counts, multi-provider
+                    # episode failover) -- Plex-109 had 553 movie_sources
+                    # rows but zero series_sources rows.
+                    if item.get("provider_series_id") is not None:
+                        conn.execute(
+                            "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, added_at, last_seen_at) "
+                            "VALUES (?,?,?,?,?,?,?) "
+                            "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
+                            "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
+                            "last_seen_at=excluded.last_seen_at",
+                            (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("name"), now, now),
+                        )
+
                     for ep in item.get("episodes", []):
                         # A separate inner savepoint -- one malformed episode
                         # (missing season/episode number, bad stream id) must not
