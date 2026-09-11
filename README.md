@@ -1,5 +1,17 @@
 # VOD & DVR Manager
 
+> **⚠️ This is an unofficial fork, not the upstream project.** This repo
+> (`knmplace/vod-manager`) is a personal fork of
+> [jstevenscl/vod-manager](https://github.com/jstevenscl/vod-manager) used to
+> prototype fixes and features, which are then submitted upstream as pull
+> requests for the original developer to review. The `:latest` image built
+> from this fork's `main` branch is **strictly a beta build**: it may
+> contain untested or half-verified changes that haven't been accepted
+> upstream yet, and some have broken things before being fixed. Functional,
+> but pull and run it with that in mind — for a stable release, use the
+> upstream project directly unless you specifically want this fork's
+> in-progress work.
+
 Curates movies and TV shows from multiple real sources — Xtream-Codes (XC)
 IPTV providers, Plex, and Emby/Jellyfin — into one deduplicated pool, then
 re-exposes that pool as its own XC-compatible catalog server so one or more
