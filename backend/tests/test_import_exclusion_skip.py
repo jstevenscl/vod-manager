@@ -47,3 +47,20 @@ def test_language_prefix_exclusion_still_works():
     assert vod_importer._should_exclude_from_import(
         "GR - Some Movie", None, [], False, {"exclude_prefixes": ["GR"], "exclude_non_latin": False},
     ) is True
+
+
+def test_untagged_name_excluded_when_en_in_exclude_list():
+    """A name with no recognized language prefix defaults to "EN", matching
+    vod_db._source_language's identical fallback (2026-09-11 follow-up: an
+    admin selecting "EN" in the Import Language Exclusion picker must
+    actually exclude the untagged titles that picker counts as EN, not
+    silently exclude nothing)."""
+    assert vod_importer._should_exclude_from_import(
+        "Some Movie", None, [], False, {"exclude_prefixes": ["EN"], "exclude_non_latin": False},
+    ) is True
+
+
+def test_untagged_name_not_excluded_when_en_not_in_exclude_list():
+    assert vod_importer._should_exclude_from_import(
+        "Some Movie", None, [], False, {"exclude_prefixes": ["GR"], "exclude_non_latin": False},
+    ) is False

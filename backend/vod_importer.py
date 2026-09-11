@@ -67,8 +67,13 @@ def _should_exclude_from_import(
     never as a substitute for an actual category-name match."""
     lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
-        code = vod_db._name_prefix_code(name)
-        if code and code in lang["exclude_prefixes"]:
+        # _source_language's default applies here too: a name with no
+        # recognized prefix is untagged EN/ES-convention content, not
+        # "unknown" -- without this fallback, "EN" could be checked in the
+        # Import Language Exclusion picker and silently exclude nothing,
+        # since untagged names never match a literal prefix code.
+        code = vod_db._name_prefix_code(name) or "EN"
+        if code in lang["exclude_prefixes"]:
             return True
     if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
         return True

@@ -9191,8 +9191,12 @@ def _row_excluded_by_rule(
     sources (movie_sources/series_sources) rather than one item's single
     category, since a row can carry sources from more than one provider."""
     if lang["exclude_prefixes"]:
-        code = _name_prefix_code(name)
-        if code and code in lang["exclude_prefixes"]:
+        # Keep in sync with vod_importer._should_exclude_from_import's
+        # identical EN fallback -- purge and import-time filtering must
+        # agree on what excluding "EN" means, or a purge could leave behind
+        # (or delete) rows the import-time filter would treat differently.
+        code = _name_prefix_code(name) or "EN"
+        if code in lang["exclude_prefixes"]:
             return True
     if lang["exclude_non_latin"] and _is_non_latin_name(name):
         return True
@@ -9399,7 +9403,10 @@ def _library_rows(table: str, search: str | None, excluded: bool | None, script:
         rows = [r for r in rows if _is_non_latin_name(r["name"])]
     if prefixes:
         wanted = set(prefixes)
-        rows = [r for r in rows if _name_prefix_code(r["name"]) in wanted]
+        # Keep in sync with list_library_prefixes' identical EN fallback --
+        # otherwise "EN" is listed as a selectable filter option but
+        # selecting it silently returns zero rows.
+        rows = [r for r in rows if (_name_prefix_code(r["name"]) or "EN") in wanted]
     return rows
 
 
@@ -9482,14 +9489,21 @@ def list_all_pool_prefixes() -> list[dict]:
     a fixed ISO list, so the only reliable source of "what codes exist" is
     the pool itself. Backs the Import Language Exclusion picker so an admin
     can select real, currently-seen codes instead of guessing/typing them
-    blind."""
+    blind.
+
+    A name with no recognized prefix is counted as "EN", matching
+    _source_language's/_should_exclude_from_import's identical fallback --
+    without this, the vast majority of untagged EN/ES-convention titles
+    were invisible here, making the pool look almost empty and making "EN"
+    impossible to select/exclude even though it's the actual language most
+    untagged content is in."""
     conn = _connect()
     counts: dict[str, int] = {}
     for table in ("movies", "series"):
         rows = conn.execute(f"SELECT name FROM {table}").fetchall()
         for r in rows:
-            code = _name_prefix_code(r["name"])
-            if code and code not in _NON_LANGUAGE_PIPE_TAGS:
+            code = _name_prefix_code(r["name"]) or "EN"
+            if code not in _NON_LANGUAGE_PIPE_TAGS:
                 counts[code] = counts.get(code, 0) + 1
     conn.close()
     return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])
@@ -9500,9 +9514,8 @@ def list_library_prefixes(content_type: str, search: str | None = None, excluded
     rows = _library_rows(table, search, excluded, script, None)
     counts: dict[str, int] = {}
     for r in rows:
-        code = _name_prefix_code(r["name"])
-        if code:
-            counts[code] = counts.get(code, 0) + 1
+        code = _name_prefix_code(r["name"]) or "EN"
+        counts[code] = counts.get(code, 0) + 1
     return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])
 
 
