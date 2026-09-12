@@ -208,6 +208,48 @@ def test_provider_movie_retry_succeeds_then_series_runs(monkeypatch):
     assert ("series", 20) in events, "successful retry must unblock this provider's series phase"
     progress = vod_importer.get_enrich_progress()
     assert progress.get("providers_incomplete", []) == []
+    # Regression (2026-09-12, live: movies_done reached 101538 against a
+    # movies_total of 62854): movie id 10 goes through _enrich_one twice
+    # (initial failure + retry success) but must only ever be counted once
+    # in movies_done, since it's the same item, not two items.
+    assert progress["movies_done"] == 2, "ids 10 and 11 are each counted once despite 10's retry"
+
+
+def test_provider_retry_does_not_double_count_already_succeeded_items(monkeypatch):
+    """A provider's movie phase can fail overall while some of its OTHER
+    items already succeeded on the first pass (phase ok=False just means AT
+    LEast one item failed/backed off, not that every item did). The retry
+    re-runs the provider's FULL id list, so those already-succeeded items go
+    through _enrich_one a second time -- movies_done must not double-count
+    them, and must never exceed movies_total."""
+    call_count = {"movie10": 0}
+
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+        if movie_id == 10:
+            call_count["movie10"] += 1
+            if call_count["movie10"] == 1:
+                raise RuntimeError("transient failure")
+        return True
+
+    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+        return {"fetched": True, "reason": None}
+
+    monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
+    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX")])
+    monkeypatch.setattr(
+        vod_importer.vod_db, "list_all_movie_ids",
+        lambda provider_id=None, **kw: [10, 11, 12],
+    )
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda provider_id=None, **kw: [])
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movie_by_tmdb", lambda movie_id: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb", lambda series_id: None)
+
+    asyncio.run(asyncio.wait_for(vod_importer.bulk_enrich_all(concurrency=8), timeout=5))
+
+    progress = vod_importer.get_enrich_progress()
+    assert progress["movies_total"] == 3
+    assert progress["movies_done"] == 3, "each of the 3 distinct movie ids should be counted exactly once"
 
 
 def test_provider_movie_retry_fails_again_flags_incomplete_and_skips_series(monkeypatch):

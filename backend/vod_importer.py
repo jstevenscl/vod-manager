@@ -1172,6 +1172,16 @@ _ENRICH_PROGRESS: dict = {
     "providers_incomplete": [],
 }
 
+# Item ids already counted into movies_done/series_done this run. The
+# single-retry pass (bulk_enrich_all) re-runs a failed provider's ENTIRE
+# id list, not just the items that actually failed/backed off, which means
+# an item that already succeeded on the first pass goes through
+# _enrich_one again on retry -- without this dedup, its "done" would get
+# counted twice, which is exactly how movies_done reached 101538 against a
+# movies_total of 62854 on 2026-09-12 (live, WOBO/WarpTV retry storm).
+# Reset at the start of every bulk_enrich_all run.
+_ENRICH_DONE_IDS: dict[str, set] = {"movie": set(), "series": set()}
+
 
 def get_enrich_progress() -> dict:
     progress = dict(_ENRICH_PROGRESS)
@@ -1229,11 +1239,25 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
             # (real user log 2026-09-05: hundreds of these per bulk-enrich
             # run, one per 404/429). tmdb_sync._redact is this same fix for
             # TMDB's own api_key query param.
-            logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, _redact_upstream_url(str(exc)))
+            # str(exc) is often empty for httpx's timeout/connect exceptions
+            # (they're frequently raised with no message) -- fall back to the
+            # exception's class name so these lines stay diagnosable instead
+            # of rendering as "failed: " with nothing after the colon (real
+            # log 2026-09-12: WOBO backoff investigation, ConnectTimeout/
+            # ReadTimeout all logged blank).
+            detail = _redact_upstream_url(str(exc)) or type(exc).__name__
+            logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, detail)
             _ENRICH_PROGRESS[f"{prefix}_errors"] += 1
             return False
         finally:
-            _ENRICH_PROGRESS[f"{prefix}_done"] += 1
+            # Only count each item id once toward *_done, even if this same
+            # id is enriched again later (the single-retry pass re-runs a
+            # failed provider's FULL id list, so an already-succeeded item
+            # can hit this function a second time) -- see _ENRICH_DONE_IDS.
+            done_ids = _ENRICH_DONE_IDS[kind]
+            if item_id not in done_ids:
+                done_ids.add(item_id)
+                _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
 async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
@@ -1345,6 +1369,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     # call), and a provider added mid-run should still get merged.
     merged_movie_ids: set = set()
     merged_series_ids: set = set()
+    _ENRICH_DONE_IDS["movie"].clear()
+    _ENRICH_DONE_IDS["series"].clear()
     _ENRICH_PROGRESS.update({
         "running": True,
         "movies_total": len(movie_ids_all), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
