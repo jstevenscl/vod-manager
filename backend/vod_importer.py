@@ -797,10 +797,13 @@ def _apply_field_rules(content_type: str, fields: dict) -> dict:
     return result
 
 
-async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
+async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: bool = False) -> bool:
     """Fetch get_vod_info for this movie's best source and persist detail
     fields. Returns False without a network call if already fresh (unless
-    force=True) — the on-demand-and-cache pattern from the module docstring."""
+    force=True) — the on-demand-and-cache pattern from the module docstring.
+    skip_auto_merge=True (used only by bulk_enrich_all's per-provider
+    orchestration, beads-f7e/beads-sw9) defers the tmdb_id auto-merge to that
+    caller's own end-of-phase sweep instead of running it inline here."""
     if not force and not await asyncio.to_thread(vod_db.movie_needs_enrichment, movie_id):
         return False
 
@@ -871,7 +874,8 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
                 release_date=tmdb_detail.get("release_date"),
                 content_rating=tmdb_detail.get("content_rating"),
             )
-            await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
+            if not skip_auto_merge:
+                await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
         # fall through to the provider so this movie still gets enriched.
@@ -922,11 +926,12 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
     bitrate = _coerce_int(detail.get("bitrate"))
     if bitrate is not None:
         await asyncio.to_thread(vod_db.set_movie_source_bitrate, source["id"], bitrate)
-    await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
+    if not skip_auto_merge:
+        await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
     return True
 
 
-async def enrich_series(series_id: int, *, force: bool = False) -> dict:
+async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge: bool = False) -> dict:
     """Fetch get_series_info -- this is the only source of episodes (most
     real XC panels' bulk get_series list already carries full series detail,
     see bulk_import_series, but never episodes), so this call is
@@ -1139,8 +1144,10 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
         # tmdb_id could actually have been (re)confirmed this pass (detail_
         # written implies the TMDB-bearing provider's detail fetch
         # succeeded). Gated on the same duplicate_finder_auto_merge_tmdb
-        # config flag as movies.
-        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
+        # config flag as movies. skip_auto_merge=True (bulk_enrich_all only)
+        # defers this to that caller's end-of-phase sweep instead.
+        if not skip_auto_merge:
+            await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
 
     return {"fetched": True, "reason": None}
 
@@ -1157,6 +1164,12 @@ _ENRICH_PROGRESS: dict = {
     "movies_total": 0, "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
     "series_total": 0, "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
     "started_at": None, "finished_at": None,
+    # Populated by bulk_enrich_all's per-provider sequencing (beads-f7e/
+    # beads-sw9 redesign) when a provider's movie or series phase never
+    # succeeded even after the single allotted retry -- see that function's
+    # docstring for the full sequencing/retry rules. Each entry:
+    # {"provider_id": int, "provider_name": str, "phase": "movies"|"series"}.
+    "providers_incomplete": [],
 }
 
 
@@ -1184,14 +1197,20 @@ def get_enrich_progress() -> dict:
 _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralizes to itself, not "seriess"
 
 
-async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bool) -> None:
+async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *, skip_auto_merge: bool = False) -> bool:
+    """Returns True iff this item's enrichment call actually succeeded (no
+    exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
+    per-provider phase orchestration to tell "this provider's phase is
+    genuinely failing" apart from "some items 404'd but the provider itself
+    is fine", the same way a single _enrich_one call always could not."""
     prefix = _PROGRESS_PREFIX[kind]
     async with sem:
         try:
             if kind == "movie":
-                await enrich_movie(item_id, force=force)
+                await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
             else:
-                await enrich_series(item_id, force=force)
+                await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
+            return True
         except ProviderBackoffError:
             # Not a real failure -- deliberately skipped, no request sent,
             # because that item's provider is already known to be
@@ -1200,6 +1219,7 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
             # and gets picked up again on the next bulk-enrich run (or later
             # in this same run, once the provider's backoff expires).
             _ENRICH_PROGRESS[f"{prefix}_backoff_skipped"] += 1
+            return False
         except Exception as exc:
             # httpx.HTTPStatusError/ConnectError's own str() embeds the full
             # request URL -- real, working provider credentials included --
@@ -1211,67 +1231,196 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
             # TMDB's own api_key query param.
             logger.warning("[vod_importer] bulk enrich %s=%s failed: %s", kind, item_id, _redact_upstream_url(str(exc)))
             _ENRICH_PROGRESS[f"{prefix}_errors"] += 1
+            return False
         finally:
             _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
-async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
-    """Enriches every movie and series in the pool, movies and series running
-    CONCURRENTLY -- each kind gets its own `concurrency`-sized semaphore, so
-    a large movie catalog can never starve series out of running entirely.
+async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
+    """Runs one provider's movie phase to completion. Returns (ok, movie_ids)
+    where ok is True iff every item in this provider's movie phase completed
+    without raising (ProviderBackoffError counts as non-raising/ok, same as
+    _enrich_one's existing semantics -- a backed-off item isn't a provider
+    failure, it's deliberately deferred)."""
+    movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
+    ok = True
+    for outcome in await asyncio.gather(
+        *(_enrich_one("movie", sem, mid, force, skip_auto_merge=True) for mid in movie_ids),
+        return_exceptions=True,
+    ):
+        if isinstance(outcome, BaseException) or outcome is False:
+            ok = False
+    return ok, movie_ids
 
-    Used to run movies-to-completion, then series, as two sequential
-    gather() batches. Real bug found live 2026-08-20: a large movie catalog
-    (230k+ movies) took long enough -- especially with a flaky provider
-    throwing periodic 502s/connection failures along the way -- that the
-    process restarted before the movie batch ever finished, so the series
-    batch never even started. Every series enrich_series() call is also
-    where a series' episodes come from (see that function's docstring), so
-    this wasn't just delayed metadata -- it meant zero episodes for the
-    entire TV library, indefinitely, until a single enrich run survived
-    long enough to get all the way through movies first."""
+
+async def _run_provider_series_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
+    """Runs one provider's series phase to completion. Same ok semantics as
+    _run_provider_movie_phase."""
+    series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
+    ok = True
+    for outcome in await asyncio.gather(
+        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True) for sid in series_ids),
+        return_exceptions=True,
+    ):
+        if isinstance(outcome, BaseException) or outcome is False:
+            ok = False
+    return ok, series_ids
+
+
+async def _run_provider_enrichment(
+    provider: dict, movie_sem: asyncio.Semaphore, series_sem: asyncio.Semaphore, force: bool,
+) -> dict:
+    """Per-provider orchestrator implementing the beads-f7e/beads-sw9
+    sequencing/retry rules for exactly ONE provider: that provider's own
+    movies enrich, then that SAME provider's own series enrich after -- but
+    this coroutine never waits on any other provider, so provider A's slow
+    or failing movie phase can never block provider B's series (the bug this
+    redesign replaces: a flat single asyncio.gather() piled every provider's
+    movies AND series onto shared semaphores with no per-provider isolation,
+    so one provider misbehaving could trip another's shared backoff
+    threshold).
+
+    A failed movie phase does NOT retry inline here -- it's reported back to
+    bulk_enrich_all as pending-retry, which the caller retries only after
+    every OTHER provider has already finished, per the spec ("after ALL
+    other providers finish, retry the failed provider's movies exactly
+    once"). Returns a dict describing what still needs to happen:
+      {"movie_ok": bool, "movie_ids": [...], "series_ran": bool,
+       "series_ok": bool, "series_ids": [...]}
+    """
+    movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force)
+    if not movie_ok:
+        return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
+
+    series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force)
+    return {"movie_ok": True, "movie_ids": movie_ids, "series_ran": True, "series_ok": series_ok, "series_ids": series_ids}
+
+
+async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
+    """Enriches every movie and series in the pool, sequenced PER PROVIDER
+    (beads-f7e/beads-sw9 redesign, 2026-09-12): each provider's own movies
+    enrich, then that same provider's own series -- but different providers
+    never block each other, so provider A stuck on a slow/failing movie
+    phase can't delay provider B's series at all.
+
+    Replaces the old flat design (movies-then-series globally, or before
+    that, all movies+series in one shared-semaphore gather()) after live
+    incidents on WOBO/WarpTV where one provider's failures piled onto a
+    globally-shared backoff/semaphore budget and starved or throttled
+    completely unrelated, healthy providers (see this module's test
+    tests/test_bulk_enrich_provider_sequencing.py for the full spec this
+    implements).
+
+    Per-provider failure isolation, exactly one retry:
+      - A provider's movie phase failing skips that provider entirely (no
+        series either) while every OTHER provider continues unaffected.
+      - Once every OTHER provider has finished, the failed provider's movies
+        get retried exactly once. Retry succeeds -> that provider's series
+        proceed normally. Retry fails again -> flag that provider's movie
+        enrichment incomplete (_ENRICH_PROGRESS["providers_incomplete"]) and
+        never attempt its series -- no third attempt.
+      - A provider's series phase failing (movies already succeeded) is
+        never retried -- just flagged incomplete. Never reruns movies, never
+        blocks anything else.
+
+    Auto-merge (auto_merge_movie_by_tmdb/auto_merge_series_by_tmdb) moves
+    from per-item inline calls to two end-of-phase sweeps here: one movie
+    sweep after every provider has resolved its movie phase (success or
+    failed-after-retry), one series sweep after every provider has resolved
+    its series phase. enrich_movie/enrich_series are always called with
+    skip_auto_merge=True from this function so the inline per-item merge
+    never double-runs during a bulk pass -- single on-demand enrich (outside
+    bulk_enrich_all) keeps its immediate inline merge unchanged."""
     if _ENRICH_PROGRESS["running"]:
         return
 
-    movie_ids  = await asyncio.to_thread(vod_db.list_all_movie_ids)
-    series_ids = await asyncio.to_thread(vod_db.list_all_series_ids)
+    providers = await asyncio.to_thread(vod_db.list_providers)
+    movie_ids_all = await asyncio.to_thread(vod_db.list_all_movie_ids)
+    series_ids_all = await asyncio.to_thread(vod_db.list_all_series_ids)
+    # Actual per-provider ids seen during this run (populated below) --
+    # used for the end-of-phase merge sweeps instead of movie_ids_all/
+    # series_ids_all, since a provider isn't guaranteed to have been listed
+    # via the exact same query the global counts above came from (e.g. tests
+    # mock list_all_movie_ids(provider_id=...) distinctly from the no-arg
+    # call), and a provider added mid-run should still get merged.
+    merged_movie_ids: set = set()
+    merged_series_ids: set = set()
     _ENRICH_PROGRESS.update({
         "running": True,
-        "movies_total": len(movie_ids), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
-        "series_total": len(series_ids), "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
+        "movies_total": len(movie_ids_all), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
+        "series_total": len(series_ids_all), "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
         "started_at": time.time(), "finished_at": None,
+        "providers_incomplete": [],
     })
-    logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, concurrency=%d",
-                len(movie_ids), len(series_ids), concurrency)
+    logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, %d providers, concurrency=%d",
+                len(movie_ids_all), len(series_ids_all), len(providers), concurrency)
 
     # Separate semaphores -- movies and series shouldn't compete with each
     # other for the same `concurrency` slots (that would just reproduce the
     # starvation this is fixing, only softer), each kind gets its own
-    # provider-request budget.
+    # provider-request budget. Shared across all providers, same as before --
+    # only the SEQUENCING is now per-provider, not the concurrency budget.
     movie_sem = asyncio.Semaphore(concurrency)
     series_sem = asyncio.Semaphore(concurrency)
     try:
-        # return_exceptions=True: _enrich_one already catches everything it can
-        # anticipate, but a single unanticipated exception must not abort the
-        # rest of the batch (gather() without this re-raises immediately on
-        # the first failure, leaving every other in-flight task orphaned).
-        await asyncio.gather(
-            *(_enrich_one("movie", movie_sem, mid, force) for mid in movie_ids),
-            *(_enrich_one("series", series_sem, sid, force) for sid in series_ids),
-            return_exceptions=True,
+        results = await asyncio.gather(
+            *(_run_provider_enrichment(p, movie_sem, series_sem, force) for p in providers),
         )
+        for result in results:
+            merged_movie_ids.update(result["movie_ids"])
+            if result["series_ran"]:
+                merged_series_ids.update(result["series_ids"])
+
+        # Retry pass: only for providers whose movie phase failed on the
+        # first attempt, and only after every OTHER provider has already
+        # finished both phases (spec: "after ALL other providers finish").
+        needs_retry = [(p, r) for p, r in zip(providers, results) if not r["movie_ok"]]
+        for provider, _first_result in needs_retry:
+            movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force)
+            merged_movie_ids.update(movie_ids)
+            if not movie_ok:
+                _ENRICH_PROGRESS["providers_incomplete"].append(
+                    {"provider_id": provider["id"], "provider_name": provider.get("name"), "phase": "movies"}
+                )
+                continue
+            series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force)
+            merged_series_ids.update(series_ids)
+            if not series_ok:
+                _ENRICH_PROGRESS["providers_incomplete"].append(
+                    {"provider_id": provider["id"], "provider_name": provider.get("name"), "phase": "series"}
+                )
+
+        # A provider whose movies succeeded on the first attempt but whose
+        # series phase then failed gets no retry at all -- just flagged.
+        for provider, result in zip(providers, results):
+            if result["movie_ok"] and result["series_ran"] and not result["series_ok"]:
+                _ENRICH_PROGRESS["providers_incomplete"].append(
+                    {"provider_id": provider["id"], "provider_name": provider.get("name"), "phase": "series"}
+                )
+
+        # End-of-phase auto-merge sweeps -- moved here from enrich_movie/
+        # enrich_series's own inline per-item calls (which bulk_enrich_all
+        # now suppresses via skip_auto_merge=True) so a bulk run merges once
+        # per item after its whole phase resolves, not mid-phase per item.
+        await asyncio.gather(*(
+            asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, mid) for mid in merged_movie_ids
+        ))
+        await asyncio.gather(*(
+            asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, sid) for sid in merged_series_ids
+        ))
     finally:
         _ENRICH_PROGRESS["running"] = False
         _ENRICH_PROGRESS["finished_at"] = time.time()
         elapsed = _ENRICH_PROGRESS["finished_at"] - _ENRICH_PROGRESS["started_at"]
         logger.info(
             "[vod_importer] bulk enrich done in %.1fs: movies %d/%d (%d errors, %d backoff-skipped), "
-            "series %d/%d (%d errors, %d backoff-skipped)",
+            "series %d/%d (%d errors, %d backoff-skipped), %d provider phase(s) incomplete",
             elapsed,
             _ENRICH_PROGRESS["movies_done"], _ENRICH_PROGRESS["movies_total"], _ENRICH_PROGRESS["movies_errors"],
             _ENRICH_PROGRESS["movies_backoff_skipped"],
             _ENRICH_PROGRESS["series_done"], _ENRICH_PROGRESS["series_total"], _ENRICH_PROGRESS["series_errors"],
             _ENRICH_PROGRESS["series_backoff_skipped"],
+            len(_ENRICH_PROGRESS["providers_incomplete"]),
         )
 
 
