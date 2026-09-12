@@ -1099,6 +1099,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "language", "TEXT"),
         ("series_sources", "language", "TEXT"),
         ("episode_sources", "language", "TEXT"),
+        # series_source_needs_enrichment used to read last_seen_at, but that
+        # column is ALSO stamped by bulk_import_series's cheap catalog-list
+        # upsert (no episode data at all) on every provider refresh -- which
+        # runs far more often than a full bulk enrich. That made a source
+        # look "recently enriched" and get skipped even when its episodes
+        # had never once been successfully fetched (all-XC-provider 0-episode
+        # bug, reported 2026-09-12; confirmed live across WOBO and AMBER
+        # BABY). This column is written ONLY by set_series_source_enrichment
+        # on a genuine successful episode fetch, never by the catalog
+        # import, so the two meanings ("source still exists in the catalog"
+        # vs "episodes were actually fetched") can't collide again. Starts
+        # NULL for every existing row -- _is_stale(None) is True, so the
+        # very next enrichment pass naturally re-attempts every series
+        # source once; no backfill needed.
+        ("series_sources", "episodes_last_enriched_at", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5904,20 +5919,27 @@ def series_source_needs_enrichment(source: dict) -> bool:
     """Per-source TTL check -- the simple v1 alternative to migrating
     series.provider_last_modified/episodes_synced_last_modified (which stay
     scalar/single-provider, unchanged) to a per-source table. Every source
-    is just attempted again once its own last_seen_at goes stale, same
-    _is_stale TTL movies/series already use elsewhere -- no per-provider
-    last_modified comparison, by explicit user decision (2026-09-09) to
-    keep the first multi-provider-series cut small."""
-    return _is_stale(source.get("last_seen_at"))
+    is just attempted again once its own episodes_last_enriched_at goes
+    stale, same _is_stale TTL movies/series already use elsewhere -- no
+    per-provider last_modified comparison, by explicit user decision
+    (2026-09-09) to keep the first multi-provider-series cut small.
+
+    Deliberately reads episodes_last_enriched_at, NOT last_seen_at --
+    last_seen_at is also stamped by bulk_import_series's cheap catalog-list
+    refresh (no episode data), which runs far more often than a full bulk
+    enrich and would otherwise make a never-actually-fetched source look
+    fresh forever. See episodes_last_enriched_at's migration comment."""
+    return _is_stale(source.get("episodes_last_enriched_at"))
 
 
 def set_series_source_enrichment(series_id: int, provider_id: int, provider_series_id: str) -> None:
     with _WRITE_LOCK:
         conn = _connect()
         conn.execute(
-            "UPDATE series_sources SET last_seen_at=?, consecutive_failures=0, last_failed_at=NULL "
+            "UPDATE series_sources SET last_seen_at=?, episodes_last_enriched_at=?, "
+            "consecutive_failures=0, last_failed_at=NULL "
             "WHERE series_id=? AND provider_id=? AND provider_series_id=?",
-            (_now(), series_id, provider_id, provider_series_id),
+            (_now(), _now(), series_id, provider_id, provider_series_id),
         )
         _commit_with_retry(conn)
         conn.close()
