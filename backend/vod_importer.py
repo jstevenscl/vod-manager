@@ -41,7 +41,7 @@ def _current_lang_settings() -> dict:
 
 def _should_exclude_from_import(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
-    exclude_uncategorized: bool = False, lang: dict | None = None,
+    exclude_uncategorized: bool = False, lang: dict | None = None, raw_name: str | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -78,7 +78,24 @@ def _should_exclude_from_import(
     movies with no category attached at all -- the category-name check below
     can never catch that (there's no name to compare), so this is a
     dedicated switch, checked only when the item truly has no category,
-    never as a substitute for an actual category-name match."""
+    never as a substitute for an actual category-name match.
+
+    raw_name (2026-09-12 fix -- discussed previously but never actually
+    landed): the language-prefix check below MUST run against the
+    provider's untouched raw name, not `name`. By the time callers compute
+    `name`, it has already gone through parse_name_year and
+    vod_db.apply_rules_to_value(movie_name_rules) -- and the built-in
+    Title & Metadata Rules commonly include a rule stripping exactly this
+    kind of leading "CODE - " language prefix for display purposes (e.g.
+    "ES - 3 días en Malay (2023)" -> "3 días en Malay (2023)"). Checking
+    the prefix code on the already-stripped `name` meant it always fell
+    back to the "EN" default and passed the enabled_languages gate no
+    matter what language the item actually was -- while vod_db.
+    _source_language(raw_name) (run separately, later, when storing the
+    row) correctly used the untouched raw_name and tagged the row's true
+    language. Result: excluded-language content was tagged correctly in
+    the DB yet was never actually excluded at import. Falls back to `name`
+    when no raw_name is supplied (existing direct callers/tests)."""
     lang = lang if lang is not None else _current_lang_settings()
     # _source_language's default applies here too: a name with no recognized
     # prefix is untagged EN/ES-convention content, not "unknown" -- without
@@ -94,10 +111,10 @@ def _should_exclude_from_import(
     # list already used query-time by vod_db._enabled_languages_clause). Any
     # language not currently enabled for playback is now excluded at import
     # time too, with no separate exclude list to keep in sync.
-    code = vod_db._name_prefix_code(name) or "EN"
+    code = vod_db._name_prefix_code(raw_name if raw_name is not None else name) or "EN"
     if code not in lang["enabled_languages"]:
         return True
-    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
+    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(raw_name if raw_name is not None else name):
         return True
     if provider_category_name:
         if provider_category_name in provider_exclude_categories:
@@ -501,7 +518,9 @@ async def _import_movies_for_provider(
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
         category_name = category_names.get(str(s.get("category_id")))
-        if _should_exclude_from_import(name, category_name, exclude_categories, exclude_uncategorized, lang):
+        if _should_exclude_from_import(
+            name, category_name, exclude_categories, exclude_uncategorized, lang, raw_name=s.get("name") or "",
+        ):
             continue
         movie_items.append({
             "name": name,
@@ -561,7 +580,9 @@ async def _import_series_for_provider(
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         category_name = series_category_names.get(str(s.get("category_id")))
-        if _should_exclude_from_import(name, category_name, exclude_categories, exclude_uncategorized, lang):
+        if _should_exclude_from_import(
+            name, category_name, exclude_categories, exclude_uncategorized, lang, raw_name=s.get("name") or "",
+        ):
             continue
         series_items.append({
             "name": name,
