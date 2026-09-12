@@ -8642,7 +8642,14 @@ _KNOWN_LANGUAGE_CODES = {
 # (Italian); add further entries here if another known code ever turns out
 # to collide with a real title.
 _LANG_PREFIX_COLON_EXCEPTIONS = {"it: chapter two"}
-_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = set()
+# KNM: added 2026-09-11 -- "HI" (2014 Telugu/Bollywood horror-comedy) and
+# "PK" (2014 Aamir Khan Bollywood comedy) are real bare titles; WarpTV tags
+# them "HI - 2014" / "PK - 2014" (title + year, no separate title text),
+# which the dash-prefix pattern misreads as a language-tagged foreign title.
+# Matched as a startswith prefix (like the colon exceptions) so a real
+# language-tagged title using the same bare code plus more text still
+# detects correctly -- see test_real_hi/pk_language_prefix_still_detected.
+_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = {"hi - 2014", "pk - 2014"}
 
 
 def _colon_prefix_code(name: str) -> str | None:
