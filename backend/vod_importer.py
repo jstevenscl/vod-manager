@@ -258,6 +258,19 @@ def _record_provider_failure(provider_id: int, provider_name: str) -> None:
                 "backing off enrichment requests to it for %.0fs",
                 provider_name, state["failures"], delay,
             )
+        # WOBO case (beads-j6q, 2026-09-12): ~11K movie backoff-skips in one
+        # run, cycling through repeated 3-failures/15s-backoff/recover. The
+        # persistent per-provider client (_get_provider_client) was never
+        # torn down across that cycle, so every retry after cooldown resumed
+        # through the exact same connection pool/TLS session identity WOBO
+        # had just rate-limited seconds earlier -- indistinguishable from the
+        # traffic that tripped the backoff in the first place if WOBO's
+        # blocking keys on anything beyond raw request rate. Evict it here
+        # (once per trip, not on every failure) so the next call after
+        # cooldown opens a genuinely fresh connection instead.
+        stale_client = _PROVIDER_CLIENTS.pop(provider_id, None)
+        if stale_client is not None:
+            _CLIENTS_PENDING_CLOSE.append(stale_client)
 
 
 def _record_provider_success(provider_id: int) -> None:
@@ -350,19 +363,34 @@ def _get_provider_limiter(provider_id: int) -> _AdaptiveLimiter:
 # the process lifetime, same as _PROVIDER_LIMITERS/_PROVIDER_BACKOFF.
 _PROVIDER_CLIENTS: dict[int, httpx.AsyncClient] = {}
 
+# Clients evicted by _record_provider_failure on a backoff trip, waiting to be
+# closed. Eviction happens from sync code (_record_provider_failure has sync
+# callers), but httpx.AsyncClient.aclose() is a coroutine -- queuing here and
+# draining from the async call path (_call, right before issuing the next
+# request) avoids making _record_provider_failure async just to close a socket.
+_CLIENTS_PENDING_CLOSE: list[httpx.AsyncClient] = []
+
+
+async def _drain_closed_clients() -> None:
+    while _CLIENTS_PENDING_CLOSE:
+        await _CLIENTS_PENDING_CLOSE.pop().aclose()
+
 
 def _get_provider_client(provider_id: int, headers: dict) -> httpx.AsyncClient:
     client = _PROVIDER_CLIENTS.get(provider_id)
     if client is None:
-        # keepalive pool sized to _PROVIDER_MAX_CONCURRENCY -- the adaptive
-        # limiter never lets more than that many calls to this provider run
-        # at once, so every concurrent slot can hold its own warm reused
-        # connection instead of racing to open a new socket.
+        # Pool sized to the adaptive limiter's CURRENT cap, not always
+        # _PROVIDER_MAX_CONCURRENCY -- a provider that's already been halved
+        # down to e.g. 4 by _AdaptiveLimiter.note_failure() should get a
+        # physical pool that actually enforces that narrower ceiling too,
+        # otherwise the pool would still allow more concurrent sockets than
+        # the logical limiter is granting.
+        cap = _PROVIDER_LIMITERS[provider_id].cap if provider_id in _PROVIDER_LIMITERS else _PROVIDER_MAX_CONCURRENCY
         client = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
             headers=headers,
-            limits=httpx.Limits(max_connections=_PROVIDER_MAX_CONCURRENCY, max_keepalive_connections=_PROVIDER_MAX_CONCURRENCY),
+            limits=httpx.Limits(max_connections=cap, max_keepalive_connections=cap),
         )
         _PROVIDER_CLIENTS[provider_id] = client
     return client
@@ -434,6 +462,8 @@ class XCProviderClient:
         finally:
             if limiter is not None:
                 await limiter.release()
+            if _CLIENTS_PENDING_CLOSE:
+                await _drain_closed_clients()
 
     async def auth(self) -> dict:
         return await self._call()
