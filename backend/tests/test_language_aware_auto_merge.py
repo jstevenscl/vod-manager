@@ -32,6 +32,7 @@ def _import_movie(db, provider_id, name, year, stream_id, raw_name, tmdb_id):
 
 def test_auto_merge_movie_skips_same_tmdb_id_different_language(db):
     config.save_duplicate_finder_auto_merge_tmdb(True)
+    config.save_enabled_languages(["EN", "FR"])  # both sides enabled -> real mismatch
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
 
     en_movie = _import_movie(db, provider_id, "Amelie", 2001, "en-1", "EN - Amelie", tmdb_id=194)
@@ -89,6 +90,7 @@ def test_auto_merge_movie_merges_when_one_side_untagged(db):
 
 def test_auto_merge_series_skips_same_tmdb_id_different_language(db):
     config.save_duplicate_finder_auto_merge_tmdb(True)
+    config.save_enabled_languages(["EN", "DE"])  # both sides enabled -> real mismatch
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
 
     db.bulk_import_series(provider_id, [
@@ -104,6 +106,65 @@ def test_auto_merge_series_skips_same_tmdb_id_different_language(db):
 
     remaining = [s for s in db.list_series(limit=1000) if "Dark" in s["name"]]
     assert len(remaining) == 2
+
+
+def test_auto_merge_movie_merges_when_other_side_language_is_disabled(db):
+    """User report (2026-09-12): only EN is enabled in Enabled Playback
+    Languages, and ES is excluded from future imports too -- yet an
+    already-imported ES-tagged variant still blocked the merge of its EN
+    sibling, because the gate compared raw detected languages with no
+    awareness of config.get_enabled_languages() at all. A source whose
+    language isn't enabled for playback is already invisible everywhere
+    else (_best_source_cte); the merge gate should treat it as no obstacle
+    too, not as a legitimate distinct-language sibling worth preserving."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    config.save_enabled_languages(["EN"])
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+
+    en_movie = _import_movie(db, provider_id, "Amelie", 2001, "en-1", "EN - Amelie", tmdb_id=194)
+    es_movie = _import_movie(db, provider_id, "ES - Amelie", 2001, "es-1", "ES - Amelie", tmdb_id=194)
+
+    db.auto_merge_movie_by_tmdb(en_movie["id"])
+
+    survivors = [mid for mid in (en_movie["id"], es_movie["id"]) if db.get_movie(mid)]
+    assert len(survivors) == 1
+
+
+def test_auto_merge_movie_still_skips_two_enabled_different_languages(db):
+    """The enabled-languages relaxation must not swallow the original
+    beads-974 protection: if BOTH sides' languages are enabled for
+    playback, a real mismatch must still block the merge."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    config.save_enabled_languages(["EN", "FR"])
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+
+    en_movie = _import_movie(db, provider_id, "Amelie", 2001, "en-1", "EN - Amelie", tmdb_id=194)
+    fr_movie = _import_movie(db, provider_id, "FR - Amelie", 2001, "fr-1", "FR - Amelie", tmdb_id=194)
+
+    db.auto_merge_movie_by_tmdb(en_movie["id"])
+
+    assert db.get_movie(en_movie["id"]) is not None
+    assert db.get_movie(fr_movie["id"]) is not None
+
+
+def test_auto_merge_series_merges_when_other_side_language_is_disabled(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    config.save_enabled_languages(["EN"])
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+
+    db.bulk_import_series(provider_id, [
+        {"name": "Dark", "year": 2017, "provider_series_id": "en-s1", "raw_name": "EN - Dark", "tmdb_id": 77, "_has_detail": True}
+    ])
+    db.bulk_import_series(provider_id, [
+        {"name": "ES - Dark", "year": 2017, "provider_series_id": "es-s1", "raw_name": "ES - Dark", "tmdb_id": 77, "_has_detail": True}
+    ])
+    rows = [s for s in db.list_series(limit=1000) if "Dark" in s["name"]]
+    assert len(rows) == 2
+
+    db.auto_merge_series_by_tmdb(rows[0]["id"])
+
+    remaining = [s for s in db.list_series(limit=1000) if "Dark" in s["name"]]
+    assert len(remaining) == 1
 
 
 def test_auto_merge_series_merges_same_tmdb_id_same_language(db):

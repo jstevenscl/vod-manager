@@ -8186,6 +8186,24 @@ def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: s
     return {row["lang"] for row in rows} or {"EN"}
 
 
+def _enabled_source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> set[str]:
+    """_source_languages filtered to config.get_enabled_languages() (KNM:
+    added 2026-09-12, user report). A source whose language isn't enabled
+    for playback is already invisible everywhere else (_best_source_cte)
+    -- the auto-merge language gate must agree, or a disabled-language
+    variant (e.g. an ES dub sitting around with only EN enabled) keeps
+    blocking the merge of its enabled-language sibling forever, even
+    though nothing about it is actually reachable by playback.
+
+    Can return an empty set when EVERY detected language is disabled --
+    callers must treat that as "no constraint" (compatible with anything),
+    not as "shares nothing", since an all-disabled side poses zero
+    wrong-language-playback risk (see beads-974) either way."""
+    langs = _source_languages(conn, sources_table, fk_column, row_id)
+    enabled = set(get_enabled_languages())
+    return langs & enabled
+
+
 def _shares_a_language(conn: sqlite3.Connection, sources_table: str, fk_column: str, id_a: int, id_b: int) -> bool:
     """True if the two rows' source-language sets overlap at all (beads-974).
     Overlap, not equality: a card can legitimately carry sources in more than
@@ -8284,11 +8302,11 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
         # backward-compatible for the common no-language-tag case.
         gate_conn = _connect()
         try:
-            row_langs = _source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
-            movie_langs = _source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
+            row_langs = _enabled_source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
+            movie_langs = _enabled_source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
         finally:
             gate_conn.close()
-        if not (row_langs & movie_langs):
+        if row_langs and movie_langs and not (row_langs & movie_langs):
             logger.warning(
                 "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
                 "(languages: %s vs %s)",
@@ -8460,11 +8478,11 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
         # own default, so this stays backward-compatible for untagged feeds.
         gate_conn = _connect()
         try:
-            row_langs = _source_languages(gate_conn, "series_sources", "series_id", row["id"])
-            series_langs = _source_languages(gate_conn, "series_sources", "series_id", series_id)
+            row_langs = _enabled_source_languages(gate_conn, "series_sources", "series_id", row["id"])
+            series_langs = _enabled_source_languages(gate_conn, "series_sources", "series_id", series_id)
         finally:
             gate_conn.close()
-        if not (row_langs & series_langs):
+        if row_langs and series_langs and not (row_langs & series_langs):
             logger.warning(
                 "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
                 "(languages: %s vs %s)",
@@ -8671,7 +8689,10 @@ _LANG_PREFIX_COLON_EXCEPTIONS = {"it: chapter two"}
 # Matched as a startswith prefix (like the colon exceptions) so a real
 # language-tagged title using the same bare code plus more text still
 # detects correctly -- see test_real_hi/pk_language_prefix_still_detected.
-_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = {"hi - 2014", "pk - 2014"}
+# KNM: added 2026-09-12 -- "SC - 3 Bed, 2 Bath, 1 Ghost (2023)" is a real EN
+# title colliding with SC (Seychellois Creole); same class of bug, found via
+# DB aggregate language counts. See test_sc_title_collision.py.
+_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = {"hi - 2014", "pk - 2014", "sc - 3 bed, 2 bath, 1 ghost"}
 
 
 def _colon_prefix_code(name: str) -> str | None:
