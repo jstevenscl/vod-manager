@@ -20,6 +20,16 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-13
 
+- ✅ Fixed a regression (introduced earlier today) where the automatic
+  TMDB-ID merge could merge a movie or series with its different-language
+  sibling (e.g. an EN card and its ES card) whenever that other language
+  wasn't in your enabled playback languages. This is what was causing the
+  "Movie language split" maintenance tool to keep finding thousands of
+  movies to fix every single day even after running it — the auto-merge was
+  quietly re-merging them right back. Existing content that was already
+  incorrectly merged by this bug is not automatically un-merged; use the
+  Duplicate Finder / language-split maintenance tool to split any titles
+  that still show up mixed-language after updating.
 - ✅🔀 Movies and series that end up sharing the same TMDB ID after enrichment
   are now merged automatically, instead of sitting side-by-side as duplicates
   until someone merges them by hand in the Duplicate Finder.
