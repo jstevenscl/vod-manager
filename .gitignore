@@ -57,3 +57,9 @@ Thumbs.db
 
 # local-only working notes, never pushed (other users don't have bd access)
 PR_DESCRIPTION.md
+
+# Claude session tooling / hookify rules -- these can carry real
+# infra details (IPs, ssh aliases, key paths) and must never be committed
+# to a public repo. See .claude/CLAUDE.md for the local, untracked copies.
+.claude/hookify.*.local.md
+.claude/settings.local.json
