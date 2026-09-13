@@ -8239,24 +8239,6 @@ def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: s
     return {row["lang"] for row in rows} or {"EN"}
 
 
-def _enabled_source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> set[str]:
-    """_source_languages filtered to config.get_enabled_languages() (KNM:
-    added 2026-09-12, user report). A source whose language isn't enabled
-    for playback is already invisible everywhere else (_best_source_cte)
-    -- the auto-merge language gate must agree, or a disabled-language
-    variant (e.g. an ES dub sitting around with only EN enabled) keeps
-    blocking the merge of its enabled-language sibling forever, even
-    though nothing about it is actually reachable by playback.
-
-    Can return an empty set when EVERY detected language is disabled --
-    callers must treat that as "no constraint" (compatible with anything),
-    not as "shares nothing", since an all-disabled side poses zero
-    wrong-language-playback risk (see beads-974) either way."""
-    langs = _source_languages(conn, sources_table, fk_column, row_id)
-    enabled = set(get_enabled_languages())
-    return langs & enabled
-
-
 def _shares_a_language(conn: sqlite3.Connection, sources_table: str, fk_column: str, id_a: int, id_b: int) -> bool:
     """True if the two rows' source-language sets overlap at all (beads-974).
     Overlap, not equality: a card can legitimately carry sources in more than
@@ -8353,10 +8335,23 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
         # stream (see _best_source_cte). Untagged sources read as EN (same
         # default _source_language uses at write time), so this stays
         # backward-compatible for the common no-language-tag case.
+        #
+        # Deliberately the UNFILTERED source languages, not
+        # config.get_enabled_languages() (KNM: reverted 2026-09-13, user
+        # report -- a 2026-09-12 attempt to filter this to enabled-only
+        # languages made "enabled for playback", a live/orthogonal/user-
+        # configurable query-time setting, silently stand in for "shares no
+        # actual language" whenever a side's only real language wasn't
+        # currently enabled. That let real EN/ES (etc.) variants of the same
+        # tmdb_id merge every enrichment cycle, which is exactly what the
+        # daily language-split maintenance tool exists to undo. Merge safety
+        # must be judged on what language a source actually carries, same as
+        # _shares_a_language already does at import time -- never on whether
+        # that language happens to be enabled for playback right now.
         gate_conn = _connect()
         try:
-            row_langs = _enabled_source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
-            movie_langs = _enabled_source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
+            row_langs = _source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
+            movie_langs = _source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
         finally:
             gate_conn.close()
         if row_langs and movie_langs and not (row_langs & movie_langs):
@@ -8526,13 +8521,15 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
 
         # beads-974: tmdb_id equality alone used to be sufficient -- now also
         # require the two candidates to share at least one source language
-        # (see auto_merge_movie_by_tmdb's identical gate for the full
-        # rationale). Untagged sources read as EN, same as _source_language's
-        # own default, so this stays backward-compatible for untagged feeds.
+        # (see auto_merge_movie_by_tmdb's identical gate, including its note
+        # on why this must stay the UNFILTERED source languages rather than
+        # config.get_enabled_languages(), for the full rationale). Untagged
+        # sources read as EN, same as _source_language's own default, so this
+        # stays backward-compatible for untagged feeds.
         gate_conn = _connect()
         try:
-            row_langs = _enabled_source_languages(gate_conn, "series_sources", "series_id", row["id"])
-            series_langs = _enabled_source_languages(gate_conn, "series_sources", "series_id", series_id)
+            row_langs = _source_languages(gate_conn, "series_sources", "series_id", row["id"])
+            series_langs = _source_languages(gate_conn, "series_sources", "series_id", series_id)
         finally:
             gate_conn.close()
         if row_langs and series_langs and not (row_langs & series_langs):

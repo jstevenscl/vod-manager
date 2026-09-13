@@ -108,15 +108,21 @@ def test_auto_merge_series_skips_same_tmdb_id_different_language(db):
     assert len(remaining) == 2
 
 
-def test_auto_merge_movie_merges_when_other_side_language_is_disabled(db):
-    """User report (2026-09-12): only EN is enabled in Enabled Playback
-    Languages, and ES is excluded from future imports too -- yet an
-    already-imported ES-tagged variant still blocked the merge of its EN
-    sibling, because the gate compared raw detected languages with no
-    awareness of config.get_enabled_languages() at all. A source whose
-    language isn't enabled for playback is already invisible everywhere
-    else (_best_source_cte); the merge gate should treat it as no obstacle
-    too, not as a legitimate distinct-language sibling worth preserving."""
+def test_auto_merge_movie_skips_when_other_side_language_is_disabled(db):
+    """Regression (2026-09-13, user report): the merge gate briefly (2026-09-12
+    commit 2c681a3) compared source languages filtered down to
+    config.get_enabled_languages(), so that a real, actually-spoken language
+    that just isn't currently enabled for playback (e.g. ES with only EN
+    enabled) read as an empty set and silently disabled the language-overlap
+    check altogether -- letting an EN card and its ES sibling merge every
+    enrichment cycle even though they share no language at all. This
+    recreated exactly what the daily language-split maintenance tool exists
+    to undo. "Enabled for playback" is a live, orthogonal, user-configurable
+    query-time filter (config.get_enabled_languages) -- it says nothing about
+    what language a source actually carries, so merge-safety must be judged
+    on the unfiltered, real source languages regardless of the playback
+    config, exactly like _shares_a_language (used at import time) already
+    does."""
     config.save_duplicate_finder_auto_merge_tmdb(True)
     config.save_enabled_languages(["EN"])
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
@@ -126,8 +132,9 @@ def test_auto_merge_movie_merges_when_other_side_language_is_disabled(db):
 
     db.auto_merge_movie_by_tmdb(en_movie["id"])
 
-    survivors = [mid for mid in (en_movie["id"], es_movie["id"]) if db.get_movie(mid)]
-    assert len(survivors) == 1
+    # Different real languages must stay split even though ES isn't enabled.
+    assert db.get_movie(en_movie["id"]) is not None
+    assert db.get_movie(es_movie["id"]) is not None
 
 
 def test_auto_merge_movie_still_skips_two_enabled_different_languages(db):
@@ -147,7 +154,8 @@ def test_auto_merge_movie_still_skips_two_enabled_different_languages(db):
     assert db.get_movie(fr_movie["id"]) is not None
 
 
-def test_auto_merge_series_merges_when_other_side_language_is_disabled(db):
+def test_auto_merge_series_skips_when_other_side_language_is_disabled(db):
+    """Series twin of test_auto_merge_movie_skips_when_other_side_language_is_disabled."""
     config.save_duplicate_finder_auto_merge_tmdb(True)
     config.save_enabled_languages(["EN"])
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
@@ -164,7 +172,7 @@ def test_auto_merge_series_merges_when_other_side_language_is_disabled(db):
     db.auto_merge_series_by_tmdb(rows[0]["id"])
 
     remaining = [s for s in db.list_series(limit=1000) if "Dark" in s["name"]]
-    assert len(remaining) == 1
+    assert len(remaining) == 2
 
 
 def test_auto_merge_series_merges_same_tmdb_id_same_language(db):
