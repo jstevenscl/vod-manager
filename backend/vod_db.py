@@ -7440,6 +7440,34 @@ def merge_movie(from_id: int, into_id: int) -> None:
         conn.close()
 
 
+def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> set[str]:
+    """Distinct COALESCE(language,'EN') values across a movie's/series'
+    _sources rows (beads-974) -- the merge-gate's view of "what language(s)
+    does this card actually carry", since movies/series themselves have no
+    language column of their own. COALESCE-to-EN matches _source_language's
+    own untagged-source default, so a row with no sources yet (or only
+    untagged ones) reads as {"EN"}, same as a freshly-tagged EN source --
+    this is what makes an untagged variant merge-compatible with an
+    explicit EN variant per the untagged-defaults-to-EN rule."""
+    rows = conn.execute(
+        f"SELECT DISTINCT COALESCE(language, 'EN') AS lang FROM {sources_table} WHERE {fk_column}=?",
+        (row_id,),
+    ).fetchall()
+    return {row["lang"] for row in rows} or {"EN"}
+
+
+def _shares_a_language(conn: sqlite3.Connection, sources_table: str, fk_column: str, id_a: int, id_b: int) -> bool:
+    """True if the two rows' source-language sets overlap at all (beads-974).
+    Overlap, not equality: a card can legitimately carry sources in more than
+    one language already (e.g. two providers both tagged EN plus one tagged
+    ES) -- the merge should only be blocked when two candidates share NO
+    language at all, not whenever their sets aren't identical."""
+    return bool(
+        _source_languages(conn, sources_table, fk_column, id_a)
+        & _source_languages(conn, sources_table, fk_column, id_b)
+    )
+
+
 def auto_merge_movie_by_tmdb(movie_id: int) -> None:
     """Called right after enrichment confirms/refreshes `movie_id`'s tmdb_id
     (see vod_importer.enrich_movie) -- every OTHER movie row sharing that
@@ -7494,6 +7522,59 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
     for row in other_rows:
         signature = _duplicate_ignore_signature([movie_id, row["id"]])
         if signature in ignored_sigs:
+            continue
+
+        # beads-3qf: other_rows was snapshotted above -- if this tmdb_id
+        # cluster has 3+ variants, a DIFFERENT concurrent/prior
+        # auto_merge_movie_by_tmdb call for another member of the same
+        # cluster can have already deleted or re-pointed movie_id or
+        # row["id"] by the time we get here (each variant's own enrichment
+        # independently triggers this function). Merging a stale id causes
+        # a merge cycle (A merges into B while B is simultaneously merging
+        # into A) and a FOREIGN KEY constraint failure. Re-check both rows
+        # still exist immediately before merging, not just at the top of
+        # this function.
+        if not get_movie(movie_id) or not get_movie(row["id"]):
+            logger.warning(
+                "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
+                "(already merged by a concurrent auto-merge in this cluster)",
+                tmdb_id, row["id"], movie_id,
+            )
+            continue
+
+        # beads-974: tmdb_id equality alone used to be sufficient -- now also
+        # require the two candidates to share at least one source language.
+        # Without this, provider language/dub variants (the exact case this
+        # function was built to merge) collapse into one card whose playback
+        # failover can silently switch the user to an unwanted-language
+        # stream (see _best_source_cte). Untagged sources read as EN (same
+        # default _source_language uses at write time), so this stays
+        # backward-compatible for the common no-language-tag case.
+        #
+        # Deliberately the UNFILTERED source languages, not
+        # config.get_enabled_languages() (KNM: reverted 2026-09-13, user
+        # report -- a 2026-09-12 attempt to filter this to enabled-only
+        # languages made "enabled for playback", a live/orthogonal/user-
+        # configurable query-time setting, silently stand in for "shares no
+        # actual language" whenever a side's only real language wasn't
+        # currently enabled. That let real EN/ES (etc.) variants of the same
+        # tmdb_id merge every enrichment cycle, which is exactly what the
+        # daily language-split maintenance tool exists to undo. Merge safety
+        # must be judged on what language a source actually carries, same as
+        # _shares_a_language already does at import time -- never on whether
+        # that language happens to be enabled for playback right now.
+        gate_conn = _connect()
+        try:
+            row_langs = _source_languages(gate_conn, "movie_sources", "movie_id", row["id"])
+            movie_langs = _source_languages(gate_conn, "movie_sources", "movie_id", movie_id)
+        finally:
+            gate_conn.close()
+        if row_langs and movie_langs and not (row_langs & movie_langs):
+            logger.warning(
+                "[auto_merge_movie_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
+                "(languages: %s vs %s)",
+                tmdb_id, row["id"], movie_id, sorted(row_langs), sorted(movie_langs),
+            )
             continue
 
         other_year = row["year"]
@@ -7649,6 +7730,27 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
                 "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- one side no longer exists "
                 "(already merged by a concurrent auto-merge in this cluster)",
                 tmdb_id, row["id"], series_id,
+            )
+            continue
+
+        # beads-974: tmdb_id equality alone used to be sufficient -- now also
+        # require the two candidates to share at least one source language
+        # (see auto_merge_movie_by_tmdb's identical gate, including its note
+        # on why this must stay the UNFILTERED source languages rather than
+        # config.get_enabled_languages(), for the full rationale). Untagged
+        # sources read as EN, same as _source_language's own default, so this
+        # stays backward-compatible for untagged feeds.
+        gate_conn = _connect()
+        try:
+            row_langs = _source_languages(gate_conn, "series_sources", "series_id", row["id"])
+            series_langs = _source_languages(gate_conn, "series_sources", "series_id", series_id)
+        finally:
+            gate_conn.close()
+        if row_langs and series_langs and not (row_langs & series_langs):
+            logger.warning(
+                "[auto_merge_series_by_tmdb] tmdb_id=%s skipping id=%s -> id=%s -- no shared source language "
+                "(languages: %s vs %s)",
+                tmdb_id, row["id"], series_id, sorted(row_langs), sorted(series_langs),
             )
             continue
 
