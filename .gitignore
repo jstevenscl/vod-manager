@@ -61,8 +61,14 @@ HANDOFF.md
 CLAUDE.md
 AGENTS.md
 
-# Claude session tooling / hookify rules -- these can carry real
-# infra details (IPs, ssh aliases, key paths) and must never be committed
-# to a public repo. See .claude/CLAUDE.md for the local, untracked copies.
-.claude/hookify.*.local.md
-.claude/settings.local.json
+# AI agent session tooling (Claude/Codex/etc.) -- bd/beads workflow wiring,
+# hook configs, and per-machine settings. bd itself lives in a private repo,
+# not here -- none of this belongs in the public fork. Can carry real infra
+# details (IPs, ssh aliases, key paths) too, so treat as never-commit.
+.claude/
+.codex/
+.agents/
+
+# per-machine local state
+.local_version
+backup/
