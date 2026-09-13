@@ -28,6 +28,9 @@ screenshots — installation, connecting Dispatcharr (single or multiple
 instances), security hardening, and every curation tool. This README is a
 concise technical reference for people already up and running.
 
+**What's actually in this build?** See [CHANGELOG.md](CHANGELOG.md) for
+what's changed in this fork's image, release by release.
+
 ## Requirements
 
 - Docker + Docker Compose
