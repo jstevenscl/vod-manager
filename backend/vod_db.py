@@ -9462,6 +9462,75 @@ def purge_excluded_archived_content(provider_exclusions: dict[int, tuple[list[st
     return {"movies_deleted": movies_deleted, "series_deleted": series_deleted}
 
 
+def archive_disabled_language_content() -> dict:
+    """KNM: added 2026-09-13, user report -- one-time (repeatable) catch-up
+    for deployments that were already running before the same-day auto-merge
+    language gate fix (see the merge gate's own comment in
+    auto_merge_movie_by_tmdb/auto_merge_series_by_tmdb). While that bug was
+    live, real different-language tmdb_id siblings kept getting silently
+    re-merged every enrichment cycle instead of staying split, so nothing
+    ever flagged them for review -- they just sat at review_excluded=0,
+    invisible to playback only because _enabled_languages_clause filters
+    them out of _best_source_cte at query time. On a fresh install (merge
+    gate correct from the start), this should have nothing to do; this
+    exists to clean up the backlog on instances upgrading from before the
+    fix.
+
+    Unlike purge_excluded_archived_content (which deletes rows matching an
+    active import-time exclusion rule), this ARCHIVES rather than deletes --
+    the user's explicit direction was that this is legitimately-imported
+    content the user just doesn't currently want for playback, not content
+    that should never have been stored. A row is archived only when NONE of
+    its source languages (the unfiltered _source_languages set, same
+    authority the merge gate uses) are in config.get_enabled_languages(); a
+    row with even one eligible-language source is left alone, mirroring the
+    merge gate's "shares at least one language" standard. A human's manual
+    archive/unarchive (review_excluded_manual=1) is never touched in either
+    direction, same protection every other auto-archive path in this file
+    already gives that flag -- and re-enabling a language later un-archives
+    the same rows it archived, since the check re-evaluates review_excluded
+    both ways instead of only ever setting it."""
+    enabled = set(get_enabled_languages())
+    conn = _connect()
+
+    movies_archived = 0
+    movies_unarchived = 0
+    for row in conn.execute(
+        "SELECT id, review_excluded FROM movies WHERE review_excluded_manual=0"
+    ).fetchall():
+        langs = _source_languages(conn, "movie_sources", "movie_id", row["id"])
+        eligible = bool(langs & enabled)
+        if not eligible and not row["review_excluded"]:
+            conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (row["id"],))
+            movies_archived += 1
+        elif eligible and row["review_excluded"]:
+            conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (row["id"],))
+            movies_unarchived += 1
+
+    series_archived = 0
+    series_unarchived = 0
+    for row in conn.execute(
+        "SELECT id, review_excluded FROM series WHERE review_excluded_manual=0"
+    ).fetchall():
+        langs = _source_languages(conn, "series_sources", "series_id", row["id"])
+        eligible = bool(langs & enabled)
+        if not eligible and not row["review_excluded"]:
+            conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (row["id"],))
+            series_archived += 1
+        elif eligible and row["review_excluded"]:
+            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
+            series_unarchived += 1
+
+    _commit_with_retry(conn)
+    conn.close()
+    return {
+        "movies_archived": movies_archived,
+        "movies_unarchived": movies_unarchived,
+        "series_archived": series_archived,
+        "series_unarchived": series_unarchived,
+    }
+
+
 def _group_by_provider(rows) -> list[tuple[int, list]]:
     grouped: dict[int, list] = {}
     for r in rows:

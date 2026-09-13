@@ -705,6 +705,28 @@ async def import_provider_catalog(provider_id: int) -> dict:
         logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
                     provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
 
+    # KNM: added 2026-09-13, user report -- catch-up companion to the
+    # same-day auto-merge language gate fix (see vod_db.
+    # archive_disabled_language_content's docstring). Runs here, on the
+    # same cadence as the purge above, so deployments upgrading from before
+    # the fix get their legacy disabled-language backlog (rows the merge
+    # bug kept silently re-merging instead of leaving flagged for review)
+    # cleaned up without a separate manual step. Not scoped to this
+    # provider_id like the purge call above -- it evaluates every movie/
+    # series row's source languages regardless of which provider(s) they
+    # came from, since the check isn't provider-specific.
+    archive_result = await asyncio.to_thread(vod_db.archive_disabled_language_content)
+    if archive_result["movies_archived"] or archive_result["series_archived"]:
+        logger.info(
+            "[vod_importer] archived %d movie(s)/%d series with no source in an enabled language",
+            archive_result["movies_archived"], archive_result["series_archived"],
+        )
+    if archive_result["movies_unarchived"] or archive_result["series_unarchived"]:
+        logger.info(
+            "[vod_importer] un-archived %d movie(s)/%d series after a previously-disabled language was re-enabled",
+            archive_result["movies_unarchived"], archive_result["series_unarchived"],
+        )
+
     if provider.get("auto_create_categories"):
         try:
             created = await asyncio.to_thread(

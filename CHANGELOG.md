@@ -30,6 +30,15 @@ proposed to the upstream project, the entry links to that pull request —
   incorrectly merged by this bug is not automatically un-merged; use the
   Duplicate Finder / language-split maintenance tool to split any titles
   that still show up mixed-language after updating.
+- ✅ Movies/series whose content isn't in any of your enabled playback
+  languages are now automatically archived (not deleted) instead of just
+  quietly hidden from playback while still showing up everywhere else.
+  This is a one-time catch-up for anyone who was already running before
+  today's language-merge fix above — those titles had been accumulating
+  without ever getting flagged for review. Runs automatically after each
+  provider scan; re-enabling a language later automatically un-archives
+  anything that qualifies again. A title you've manually archived or
+  unarchived yourself is never touched by this.
 - ✅🔀 Movies and series that end up sharing the same TMDB ID after enrichment
   are now merged automatically, instead of sitting side-by-side as duplicates
   until someone merges them by hand in the Duplicate Finder.
