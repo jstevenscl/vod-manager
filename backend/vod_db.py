@@ -8115,6 +8115,181 @@ def bulk_set_poster_url(content_type: str, ids: list[int], poster_url: str) -> i
     return len(ids)
 
 
+def _row_excluded_by_rule(
+    name: str, category_names: set[str], provider_exclude_categories: list[str],
+    exclude_uncategorized: bool, lang: dict,
+) -> bool:
+    """Same rule vod_importer._should_exclude_from_import applies per-item at
+    import time, adapted for purge_excluded_archived_content's already-in-DB
+    rows: category_names is every provider_category_name seen across a row's
+    sources (movie_sources/series_sources) rather than one item's single
+    category, since a row can carry sources from more than one provider.
+
+    2026-09-11: lang["enabled_languages"] (an include-list, from
+    config.get_enabled_languages()) replaces lang["exclude_prefixes"] (an
+    explicit exclude-list) for the language-prefix gate -- see
+    vod_importer._should_exclude_from_import's identical change for the full
+    rationale. Keep in sync with that function's identical EN fallback --
+    purge and import-time filtering must agree on what "EN" means, or a
+    purge could leave behind (or delete) rows the import-time filter would
+    treat differently."""
+    code = _name_prefix_code(name) or "EN"
+    if code not in lang["enabled_languages"]:
+        return True
+    if lang["exclude_non_latin"] and _is_non_latin_name(name):
+        return True
+    if category_names:
+        if category_names & set(provider_exclude_categories):
+            return True
+    elif exclude_uncategorized:
+        return True
+    return False
+
+
+def purge_excluded_archived_content(provider_exclusions: dict[int, tuple[list[str], bool]], lang: dict) -> dict:
+    """One-time (repeatable) cleanup companion to the skip-at-import change:
+    deletes movies/series rows that are currently auto-archived
+    (review_excluded=1, review_excluded_manual=0) AND still match a currently
+    active exclusion rule -- content that, under the new "skip at import,
+    never store" model (see vod_importer._should_exclude_from_import), should
+    never have been imported in the first place. A human's manual archive
+    (review_excluded_manual=1, see bulk_set_review_excluded) is never
+    touched -- same protection every other auto-archive path in this file
+    already gives that flag.
+
+    provider_exclusions: {provider_id: (exclude_categories, exclude_uncategorized)},
+    one entry per provider currently configured with import exclusions --
+    callers build this from providers.import_exclude_categories/
+    import_exclude_uncategorized (see vod_importer.import_provider_catalog).
+    A row is only ever evaluated against the exclusion rule(s) of the
+    provider(s) it actually has a source from, mirroring the per-provider
+    scoping _should_exclude_from_import already has at import time."""
+    conn = _connect()
+    movie_rows = conn.execute(
+        "SELECT id, name FROM movies WHERE review_excluded=1 AND review_excluded_manual=0"
+    ).fetchall()
+    movies_deleted = 0
+    for row in movie_rows:
+        sources = conn.execute(
+            "SELECT provider_id, provider_category_name FROM movie_sources WHERE movie_id=?", (row["id"],)
+        ).fetchall()
+        excluded = False
+        for provider_id, group in _group_by_provider(sources):
+            rule = provider_exclusions.get(provider_id)
+            if not rule:
+                continue
+            exclude_categories, exclude_uncategorized = rule
+            category_names = {s["provider_category_name"] for s in group if s["provider_category_name"]}
+            if _row_excluded_by_rule(row["name"], category_names, exclude_categories, exclude_uncategorized, lang):
+                excluded = True
+                break
+        if excluded:
+            conn.execute("DELETE FROM movies WHERE id=?", (row["id"],))
+            movies_deleted += 1
+
+    series_rows = conn.execute(
+        "SELECT id, name FROM series WHERE review_excluded=1 AND review_excluded_manual=0"
+    ).fetchall()
+    series_deleted = 0
+    for row in series_rows:
+        sources = conn.execute(
+            "SELECT provider_id, provider_category_name FROM series_sources WHERE series_id=?", (row["id"],)
+        ).fetchall()
+        excluded = False
+        for provider_id, group in _group_by_provider(sources):
+            rule = provider_exclusions.get(provider_id)
+            if not rule:
+                continue
+            exclude_categories, exclude_uncategorized = rule
+            category_names = {s["provider_category_name"] for s in group if s["provider_category_name"]}
+            if _row_excluded_by_rule(row["name"], category_names, exclude_categories, exclude_uncategorized, lang):
+                excluded = True
+                break
+        if excluded:
+            conn.execute("DELETE FROM series WHERE id=?", (row["id"],))
+            series_deleted += 1
+
+    _commit_with_retry(conn)
+    conn.close()
+    return {"movies_deleted": movies_deleted, "series_deleted": series_deleted}
+
+
+def archive_disabled_language_content() -> dict:
+    """KNM: added 2026-09-13, user report -- one-time (repeatable) catch-up
+    for deployments that were already running before the same-day auto-merge
+    language gate fix (see the merge gate's own comment in
+    auto_merge_movie_by_tmdb/auto_merge_series_by_tmdb). While that bug was
+    live, real different-language tmdb_id siblings kept getting silently
+    re-merged every enrichment cycle instead of staying split, so nothing
+    ever flagged them for review -- they just sat at review_excluded=0,
+    invisible to playback only because _enabled_languages_clause filters
+    them out of _best_source_cte at query time. On a fresh install (merge
+    gate correct from the start), this should have nothing to do; this
+    exists to clean up the backlog on instances upgrading from before the
+    fix.
+
+    Unlike purge_excluded_archived_content (which deletes rows matching an
+    active import-time exclusion rule), this ARCHIVES rather than deletes --
+    the user's explicit direction was that this is legitimately-imported
+    content the user just doesn't currently want for playback, not content
+    that should never have been stored. A row is archived only when NONE of
+    its source languages (the unfiltered _source_languages set, same
+    authority the merge gate uses) are in config.get_enabled_languages(); a
+    row with even one eligible-language source is left alone, mirroring the
+    merge gate's "shares at least one language" standard. A human's manual
+    archive/unarchive (review_excluded_manual=1) is never touched in either
+    direction, same protection every other auto-archive path in this file
+    already gives that flag -- and re-enabling a language later un-archives
+    the same rows it archived, since the check re-evaluates review_excluded
+    both ways instead of only ever setting it."""
+    enabled = set(get_enabled_languages())
+    conn = _connect()
+
+    movies_archived = 0
+    movies_unarchived = 0
+    for row in conn.execute(
+        "SELECT id, review_excluded FROM movies WHERE review_excluded_manual=0"
+    ).fetchall():
+        langs = _source_languages(conn, "movie_sources", "movie_id", row["id"])
+        eligible = bool(langs & enabled)
+        if not eligible and not row["review_excluded"]:
+            conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (row["id"],))
+            movies_archived += 1
+        elif eligible and row["review_excluded"]:
+            conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (row["id"],))
+            movies_unarchived += 1
+
+    series_archived = 0
+    series_unarchived = 0
+    for row in conn.execute(
+        "SELECT id, review_excluded FROM series WHERE review_excluded_manual=0"
+    ).fetchall():
+        langs = _source_languages(conn, "series_sources", "series_id", row["id"])
+        eligible = bool(langs & enabled)
+        if not eligible and not row["review_excluded"]:
+            conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (row["id"],))
+            series_archived += 1
+        elif eligible and row["review_excluded"]:
+            conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
+            series_unarchived += 1
+
+    _commit_with_retry(conn)
+    conn.close()
+    return {
+        "movies_archived": movies_archived,
+        "movies_unarchived": movies_unarchived,
+        "series_archived": series_archived,
+        "series_unarchived": series_unarchived,
+    }
+
+
+def _group_by_provider(rows) -> list[tuple[int, list]]:
+    grouped: dict[int, list] = {}
+    for r in rows:
+        grouped.setdefault(r["provider_id"], []).append(r)
+    return list(grouped.items())
+
+
 def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) -> int:
     """Archives/unarchives items out of (or back into) every review queue --
     Missing Artwork, Needs Review, Duplicate Finder -- without touching the
