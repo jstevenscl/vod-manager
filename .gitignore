@@ -59,6 +59,7 @@ Thumbs.db
 PR_DESCRIPTION.md
 HANDOFF.md
 CLAUDE.md
+AGENTS.md
 
 # Claude session tooling / hookify rules -- these can carry real
 # infra details (IPs, ssh aliases, key paths) and must never be committed
