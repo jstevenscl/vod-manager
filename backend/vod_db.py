@@ -3291,9 +3291,60 @@ def _normalize_title_for_dedup(name: str) -> str:
 # plain leading-word match, not a colon-anchored one.
 _QUALITY_PREFIX_RE = re.compile(r"^(4k|uhd|fhd)\s+")
 
+# Compound quality+country prefix ("4K-DE - Severance", "UHD-AR - Title") --
+# a provider naming convention distinct from the bare "4K: Title" form above.
+# Must be matched on the RAW name, before _normalize_title_for_dedup strips
+# the dash that anchors it (post-normalization "4kde severance" has no
+# boundary left to split on). Reuses _KNOWN_LANGUAGE_CODES so this can never
+# fire on an unrelated leading word -- same false-positive concern as
+# _LANG_PREFIX_DASH_RE (KNM: added 2026-09-09, see that comment for why
+# fuzzy-matching any leading token is unsafe here).
+_QUALITY_LANG_DASH_RE = re.compile(r"^(4k|uhd|fhd)-([A-Za-z]{2,6})\s*-\s+", re.IGNORECASE)
+
+
+def _strip_quality_lang_prefix_for_dedup(name: str) -> str:
+    """Strips a leading "<4K/UHD/FHD>-<lang code> - " prefix from a RAW
+    (not yet normalized) title, when the code is a known language code --
+    e.g. "4K-DE - Severance (2022)" -> "Severance (2022)". Falls back to the
+    existing bare dash-prefix code (_dash_prefix_code's allowlist) for
+    country-only prefixes with no quality tag ("IR - Severance")."""
+    m = _QUALITY_LANG_DASH_RE.match(name)
+    if m and m.group(2).upper() in _KNOWN_LANGUAGE_CODES:
+        return name[m.end():].strip()
+    stripped = _strip_one_lang_prefix(name)
+    return stripped if stripped is not None else name
+
 
 def _strip_quality_prefix_for_dedup(normalized_name: str) -> str:
     return _QUALITY_PREFIX_RE.sub("", normalized_name, count=1)
+
+
+# Trailing origin-country tag ("Severance (2022) (US)", "Title (UK)") --
+# a separate provider convention from the leading language/quality prefixes
+# above (measured on live data: US, GB, ES, FR, CA, AU, KR, IT, DE, MX, TR,
+# SE, BR, PL, JP, NO, IN, ZA, CO, AR, DK, BE, IL, NL, IE, NZ, FI, TH, IS, PT
+# are the common ones). Allowlist-only, same reasoning as _KNOWN_LANGUAGE_
+# CODES: a real title can legitimately end in "(Something)" (a subtitle,
+# an edition tag), so only a code on this list is ever stripped -- never
+# any 2-4 capital letters.
+_KNOWN_COUNTRY_SUFFIX_CODES = {
+    "US", "GB", "UK", "ES", "FR", "CA", "AU", "KR", "IT", "DE", "MX", "TR",
+    "SE", "BR", "PL", "JP", "NO", "IN", "ZA", "CO", "AR", "DK", "BE", "IL",
+    "NL", "IE", "NZ", "FI", "TH", "IS", "PT",
+}
+_COUNTRY_SUFFIX_RE = re.compile(r"\s*\(([A-Za-z]{2,4})\)\s*$")
+
+
+def _strip_country_suffix_for_dedup(name: str) -> str:
+    """Strips a single trailing "(<known country code>)" tag, e.g.
+    "Severance (2022) (US)" -> "Severance (2022)". Only removes ONE layer
+    -- a title with two stacked tags is not a pattern seen in the data, and
+    stripping repeatedly would raise the risk of eating a legitimate
+    trailing parenthetical."""
+    m = _COUNTRY_SUFFIX_RE.search(name)
+    if m and m.group(1).upper() in _KNOWN_COUNTRY_SUFFIX_CODES:
+        return name[:m.start()].rstrip()
+    return name
 
 
 def _duplicate_ignore_signature(item_ids: list[int]) -> str:
@@ -3330,8 +3381,8 @@ def _split_by_year_proximity(items: list[dict]) -> list[list[dict]]:
     films that happen to share a title, so they never cluster together at
     all. A 1-year gap still clusters (the real-world pattern: a provider
     mislabels a film's year by one). Every item here is guaranteed to have
-    a real year -- find_duplicate_groups only ever feeds this year IS NOT
-    NULL rows."""
+    a real year -- find_duplicate_groups only ever feeds this its `dated`
+    subset; null-year rows are handled separately via tmdb_id matching."""
     sorted_items = sorted(items, key=lambda i: i["year"])
     clusters: list[list[dict]] = []
     current: list[dict] = []
@@ -3371,32 +3422,54 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     second real pool entry instead of matching the existing one; (2) within
     that, same-year or adjacent-year, never 2+ years apart (see
     _split_by_year_proximity); (3) within that, split apart again by any
-    CONFIRMED tmdb_id conflict (see _split_by_tmdb_conflict). Only years
-    we're confident about (year IS NOT NULL) -- pairing on name alone would
+    CONFIRMED tmdb_id conflict (see _split_by_tmdb_conflict). Only rows with
+    a real year feed the year-proximity pass -- pairing on name alone would
     be a much weaker signal and belongs to needs_year_review instead, not
     this scan. A cluster a human already reviewed and dismissed (see
     duplicate_ignores) never resurfaces.
 
     Pass (1)'s normalization also strips a leading "4K:"/"UHD:"/"FHD:"
-    quality-tier prefix when config.get_duplicate_finder_quality_prefix_
-    matching() is on (opt-in, default off -- see that setting's own
-    docstring) -- so "4K: Predator" and "Predator" surface as one candidate
-    group instead of two permanently-separate pool entries. Grouping only;
-    the actual merge still goes through the normal review/confirm flow
-    below, same as any other candidate this function surfaces."""
+    quality-tier prefix, separately a compound quality+country prefix
+    ("4K-DE - ") or a bare known-language-code dash prefix ("IR - ", reusing
+    _KNOWN_LANGUAGE_CODES), and a trailing known-country-code parenthetical
+    ("Severance (2022) (US)" -> "Severance (2022)", see
+    _KNOWN_COUNTRY_SUFFIX_CODES) when config.get_duplicate_finder_quality_
+    prefix_matching() is on (opt-in, default off -- see that setting's own
+    docstring) -- so "4K: Predator", "4K-DE - Predator", "Predator (US)",
+    and "Predator" all surface as one candidate group instead of
+    permanently-separate pool entries. All of the country/language
+    stripping is allowlist-only (same pattern as _KNOWN_LANGUAGE_CODES +
+    exception-set guard used by _strip_lang_prefixes) so it never fires on
+    an unrelated leading or trailing word. Grouping only; the actual merge
+    still goes through the normal review/confirm flow below, same as any
+    other candidate this function surfaces.
+
+    A same-name row with NO year (year IS NULL) never enters the
+    year-proximity pass -- there's no year to compare. But if it shares a
+    tmdb_id with a row that DID make it into a cluster, that shared id is
+    already proof (same standard _split_by_tmdb_conflict uses to split
+    clusters apart), so it's folded into that cluster after the fact rather
+    than silently dropped. This is exactly the real case that motivated it:
+    a provider's "12 Strong" row importing with no year sitting right next
+    to a dated "12 Strong (2018)" row, both same tmdb_id, never clustering
+    because the null-year row never got as far as the year-proximity check."""
     table = "movies" if content_type == "movie" else "series"
     id_col = "movie_id" if content_type == "movie" else "series_id"
     placements_table = "movie_category_placements" if content_type == "movie" else "series_category_placements"
 
     conn = _connect()
     rows = conn.execute(
-        f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE year IS NOT NULL AND review_excluded=0"
+        f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE review_excluded=0"
     ).fetchall()
 
     match_quality_prefixes = get_duplicate_finder_quality_prefix_matching()
     by_name: dict[str, list[dict]] = {}
     for r in rows:
-        key = _normalize_title_for_dedup(r["name"])
+        raw_name = r["name"]
+        if match_quality_prefixes:
+            raw_name = _strip_quality_lang_prefix_for_dedup(raw_name)
+            raw_name = _strip_country_suffix_for_dedup(raw_name)
+        key = _normalize_title_for_dedup(raw_name)
         if match_quality_prefixes:
             key = _strip_quality_prefix_for_dedup(key)
         by_name.setdefault(key, []).append({
@@ -3407,15 +3480,36 @@ def find_duplicate_groups(content_type: str) -> list[dict]:
     ignored = set(list_ignored_duplicate_signatures(content_type))
     candidate_groups: list[list[dict]] = []
     for items in by_name.values():
-        if len(items) < 2:
+        dated = [i for i in items if i["year"] is not None]
+        undated_by_tmdb: dict[str, list[dict]] = {}
+        for i in items:
+            if i["year"] is None and i.get("tmdb_id"):
+                undated_by_tmdb.setdefault(i["tmdb_id"], []).append(i)
+
+        if len(dated) < 2 and not undated_by_tmdb:
             continue
-        for year_cluster in _split_by_year_proximity(items):
+
+        for year_cluster in _split_by_year_proximity(dated):
             for sub in _split_by_tmdb_conflict(year_cluster):
+                cluster_tmdb_ids = {i["tmdb_id"] for i in sub if i.get("tmdb_id")}
+                for tid in cluster_tmdb_ids:
+                    sub = sub + undated_by_tmdb.pop(tid, [])
                 if len(sub) < 2:
                     continue
                 if _duplicate_ignore_signature([i["id"] for i in sub]) in ignored:
                     continue
                 candidate_groups.append(sub)
+
+        # Undated rows whose tmdb_id never matched a dated cluster above
+        # (e.g. every row sharing that name has no year) still cluster with
+        # each other on tmdb_id alone -- same proof standard, just with no
+        # dated row to attach to.
+        for tid, leftover in undated_by_tmdb.items():
+            if len(leftover) < 2:
+                continue
+            if _duplicate_ignore_signature([i["id"] for i in leftover]) in ignored:
+                continue
+            candidate_groups.append(leftover)
 
     if not candidate_groups:
         conn.close()
@@ -5066,10 +5160,24 @@ def place_movie_in_category(movie_id: int, category_id: int) -> int:
     (name, year) dedup treats each as a distinct catalog entry.
     """
     conn = _connect()
-    flagged = conn.execute("SELECT needs_year_review FROM movies WHERE id=?", (movie_id,)).fetchone()
+    flagged = conn.execute("SELECT needs_year_review, review_excluded FROM movies WHERE id=?", (movie_id,)).fetchone()
     if flagged and flagged["needs_year_review"]:
         conn.close()
         raise ValueError(f"movie {movie_id} needs year review before it can be placed in a category")
+    if flagged and flagged["review_excluded"]:
+        # Archiving a movie doesn't hide it directly -- it only removes it
+        # from listings and strips its existing category placements at the
+        # moment it's set (see evaluate_smart_category's docstring). Actual
+        # visibility is governed entirely by category placement, so placing
+        # an archived row here would silently re-surface it in listings
+        # while it still reads as archived everywhere else, with no
+        # review_excluded flag change to explain why. evaluate_smart_category
+        # and bulk_place_movies_in_category already exclude archived rows
+        # from their candidate pool before ever getting here -- this closes
+        # the same gap for this function's other callers (the single-item
+        # placement endpoint, DVR backfill call sites).
+        conn.close()
+        raise ValueError(f"movie {movie_id} is archived and cannot be placed in a category")
     existing = conn.execute(
         "SELECT export_stream_id FROM movie_category_placements WHERE movie_id=? AND category_id=?",
         (movie_id, category_id),
@@ -5756,10 +5864,14 @@ def remove_series_from_all_categories(series_id: int) -> None:
 def place_series_in_category(series_id: int, category_id: int) -> int:
     """Same virtual-file mechanism as place_movie_in_category, scoped to series."""
     conn = _connect()
-    flagged = conn.execute("SELECT needs_year_review FROM series WHERE id=?", (series_id,)).fetchone()
+    flagged = conn.execute("SELECT needs_year_review, review_excluded FROM series WHERE id=?", (series_id,)).fetchone()
     if flagged and flagged["needs_year_review"]:
         conn.close()
         raise ValueError(f"series {series_id} needs year review before it can be placed in a category")
+    if flagged and flagged["review_excluded"]:
+        # See place_movie_in_category's identical guard/comment.
+        conn.close()
+        raise ValueError(f"series {series_id} is archived and cannot be placed in a category")
     existing = conn.execute(
         "SELECT export_series_id FROM series_category_placements WHERE series_id=? AND category_id=?",
         (series_id, category_id),
@@ -6209,13 +6321,47 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                 if candidates:
                                     did_flag = True
                         else:
-                            cur = conn.execute(
-                                "INSERT INTO movies (name, year, is_adult, review_excluded, created_at) VALUES (?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), int(should_archive), now),
-                            )
-                            movie_id = cur.lastrowid
-                            did_create = True
-                            did_archive = should_archive
+                            # No exact (name, year) row exists, but a provider
+                            # formatting the same title slightly differently
+                            # (punctuation, casing, a "4K:"-style quality
+                            # prefix) shouldn't spawn a permanent second row --
+                            # that's exactly what find_duplicate_groups' pass
+                            # (1)+(2) recognize after the fact (see there).
+                            # Apply the same normalized-title + year-proximity
+                            # matching here, at import time, so identical real
+                            # titles land on one row instead of needing a
+                            # later manual merge. Exactly one same-normalized-
+                            # title candidate within 1 year -> treat as the
+                            # same row; anything more ambiguous (0 or 2+
+                            # candidates) falls back to a plain insert, same
+                            # as before -- Duplicate Finder remains the safety
+                            # net for whatever this doesn't catch.
+                            target_key = _normalize_title_for_dedup(name)
+                            nearby_rows = conn.execute(
+                                "SELECT id, name, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                                "FROM movies WHERE year IS NOT NULL AND ABS(year - ?) <= 1", (year,),
+                            ).fetchall()
+                            fuzzy_candidates = [r for r in nearby_rows if _normalize_title_for_dedup(r["name"]) == target_key]
+                            if len(fuzzy_candidates) == 1:
+                                movie_id = fuzzy_candidates[0]["id"]
+                                did_match = True
+                                if category_looks_adult and not fuzzy_candidates[0]["is_adult"] and not fuzzy_candidates[0]["is_adult_manual"]:
+                                    conn.execute("UPDATE movies SET is_adult=1 WHERE id=?", (movie_id,))
+                                if should_archive and not fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
+                                    conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
+                                    did_archive = True
+                                elif not should_archive and fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
+                                    did_unarchive = True
+                            else:
+                                cur = conn.execute(
+                                    "INSERT INTO movies (name, year, is_adult, review_excluded, created_at) VALUES (?,?,?,?,?)",
+                                    (name, year, int(category_looks_adult), int(should_archive), now),
+                                )
+                                movie_id = cur.lastrowid
+                                did_create = True
+                                did_archive = should_archive
                     if item.get("tmdb_id"):
                         # Some providers' bulk get_vod_streams list already
                         # includes "tmdb" (confirmed live 2026-09-05: 3 of 5
@@ -6477,13 +6623,44 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_flag = True
                                 series_id_for_detail = cur.lastrowid
                         else:
-                            cur = conn.execute(
-                                "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                                (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
-                            )
-                            did_create = True
-                            did_archive = should_archive
-                            series_id_for_detail = cur.lastrowid
+                            # Same normalized-title + year-proximity fallback
+                            # as bulk_import_movies' identical branch above --
+                            # a provider formatting the same title slightly
+                            # differently shouldn't spawn a permanent second
+                            # row. Exactly one same-normalized-title candidate
+                            # within 1 year -> treat as the same row.
+                            target_key = _normalize_title_for_dedup(name)
+                            nearby_rows = conn.execute(
+                                "SELECT id, name, import_provider_id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                                "FROM series WHERE year IS NOT NULL AND ABS(year - ?) <= 1", (year,),
+                            ).fetchall()
+                            fuzzy_candidates = [r for r in nearby_rows if _normalize_title_for_dedup(r["name"]) == target_key]
+                            if len(fuzzy_candidates) == 1:
+                                did_match = True
+                                series_id_for_detail = fuzzy_candidates[0]["id"]
+                                conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), series_id_for_detail))
+                                if fuzzy_candidates[0]["import_provider_id"] is None:
+                                    conn.execute(
+                                        "UPDATE series SET import_provider_id=?, import_provider_series_id=? WHERE id=?",
+                                        (provider_id, item.get("provider_series_id"), series_id_for_detail),
+                                    )
+                                if category_looks_adult and not fuzzy_candidates[0]["is_adult"] and not fuzzy_candidates[0]["is_adult_manual"]:
+                                    conn.execute("UPDATE series SET is_adult=1 WHERE id=?", (series_id_for_detail,))
+                                if should_archive and not fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id_for_detail,))
+                                    conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id_for_detail,))
+                                    did_archive = True
+                                elif not should_archive and fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
+                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id_for_detail,))
+                                    did_unarchive = True
+                            else:
+                                cur = conn.execute(
+                                    "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                    (name, year, int(category_looks_adult), int(should_archive), provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), now),
+                                )
+                                did_create = True
+                                did_archive = should_archive
+                                series_id_for_detail = cur.lastrowid
                     if series_id_for_detail is not None and item.get("_has_detail"):
                         conn.execute(
                             "UPDATE series SET genre=?, description=?, cast_list=?, director=?, poster_url=?, "
@@ -7463,6 +7640,11 @@ _LANG_PREFIX_PIPE_RE = re.compile(r"^([A-Z]{2,6})\|")
 # real titles as language-tagged across every feature that reuses this
 # (duplicate-sibling detection, missing-artwork/library-language filtering).
 _LANG_PREFIX_COLON_RE = re.compile(r"^([A-Z]{2,6}):\s")
+# Dash-style prefixes ("FR - Movie Title") -- same whitelist-only reasoning
+# as colon below: a bare dash is common enough in real titles ("Spider-Man",
+# "Stars 80, la suite") that fuzzy-matching any 2-6 capital letters would
+# misdetect them, so this only fires for a KNOWN language code too.
+_LANG_PREFIX_DASH_RE = re.compile(r"^([A-Z]{2,6})\s-\s")
 _KNOWN_LANGUAGE_CODES = {
     "EN", "AR", "FR", "ES", "DE", "IT", "PT", "BR", "RU", "TR", "PL", "NL",
     "GR", "HU", "BG", "RO", "SE", "NO", "DK", "FI", "CZ", "SK", "HR", "SR",
@@ -7470,12 +7652,14 @@ _KNOWN_LANGUAGE_CODES = {
     "ID", "MY", "HE", "FA", "UR", "BN", "TA", "TE", "PK", "AF", "SW", "ALB",
     "EXYU", "LT", "LV", "EE", "GE", "AM", "AZ", "KZ", "SC",
 }
-# Real titles that happen to start with "<known code>: " -- checked against
-# the colon match specifically (never the pipe match, which no real title
-# ever collides with). Confirmed against TMDB: "IT: Chapter Two" (2019) is
-# the only real title colliding with "IT" (Italian); add further entries
-# here if another known code ever turns out to collide with a real title.
+# Real titles that happen to start with "<known code>: " or "<known code> - "
+# -- checked against the colon/dash matches specifically (never the pipe
+# match, which no real title ever collides with). Confirmed against TMDB:
+# "IT: Chapter Two" (2019) is the only real title colliding with "IT"
+# (Italian); add further entries here if another known code ever turns out
+# to collide with a real title.
 _LANG_PREFIX_COLON_EXCEPTIONS = {"it: chapter two"}
+_LANG_PREFIX_DASH_EXCEPTIONS: set[str] = set()
 
 
 def _colon_prefix_code(name: str) -> str | None:
@@ -7488,21 +7672,37 @@ def _colon_prefix_code(name: str) -> str | None:
     return m.group(1)
 
 
+def _dash_prefix_code(name: str) -> str | None:
+    m = _LANG_PREFIX_DASH_RE.match(name)
+    if not m or m.group(1) not in _KNOWN_LANGUAGE_CODES:
+        return None
+    lowered = name.strip().lower()
+    if any(lowered.startswith(exc) for exc in _LANG_PREFIX_DASH_EXCEPTIONS):
+        return None
+    return m.group(1)
+
+
 def _name_prefix_code(name: str) -> str | None:
     m = _LANG_PREFIX_PIPE_RE.match(name)
     if m:
         return m.group(1)
-    return _colon_prefix_code(name)
+    code = _colon_prefix_code(name)
+    if code:
+        return code
+    return _dash_prefix_code(name)
 
 
 def _strip_one_lang_prefix(name: str) -> str | None:
     """One leading language-style prefix removed, or None if there isn't
-    one -- see _name_prefix_code for why colon-matching is whitelist-only."""
+    one -- see _name_prefix_code for why colon/dash-matching is
+    whitelist-only."""
     m = _LANG_PREFIX_PIPE_RE.match(name)
     if m:
         return name[m.end():].strip()
     if _colon_prefix_code(name):
         return _LANG_PREFIX_COLON_RE.sub("", name, count=1).strip()
+    if _dash_prefix_code(name):
+        return _LANG_PREFIX_DASH_RE.sub("", name, count=1).strip()
     return None
 
 

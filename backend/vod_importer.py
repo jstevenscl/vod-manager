@@ -27,7 +27,7 @@ from xc_server import _redact_upstream_url
 
 def _should_auto_archive(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
-    exclude_uncategorized: bool = False,
+    exclude_uncategorized: bool = False, lang: dict | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -50,8 +50,16 @@ def _should_auto_archive(
     movies with no category attached at all -- the category-name check below
     can never catch that (there's no name to compare), so this is a
     dedicated switch, checked only when the item truly has no category,
-    never as a substitute for an actual category-name match."""
-    lang = config.get_import_language_exclusion()
+    never as a substitute for an actual category-name match.
+
+    lang is optional so any caller that doesn't pre-fetch it keeps working --
+    falls back to the original per-call read below. Import callers
+    (import_provider_catalog, plex_importer.py, emby_vod_importer.py) fetch
+    it once per provider-import call and pass it through instead of
+    re-reading it (a disk read + JSON parse) once per catalog item -- against
+    a real ~275k-item catalog this cut ~274,600 redundant reads to 1 per
+    import run."""
+    lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
         code = vod_db._name_prefix_code(name)
         if code and code in lang["exclude_prefixes"]:
@@ -387,6 +395,7 @@ class XCProviderClient:
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
+    lang: dict,
 ) -> tuple[dict, int]:
     streams = await client.get_vod_streams()
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
@@ -410,7 +419,7 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -427,6 +436,7 @@ async def _import_movies_for_provider(
 async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
+    lang: dict,
 ) -> tuple[dict, int]:
     series_list = await client.get_series()
     series_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
@@ -455,7 +465,7 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -529,11 +539,16 @@ async def import_provider_catalog(provider_id: int) -> dict:
     # tables) rather than trying to make one shared lock fair -- not worth
     # the added complexity unless this import path is ever shown to be a
     # real bottleneck for someone.
+    # Fetched once per provider-import call, not once per catalog item -- see
+    # _should_auto_archive's docstring for why (a disk read + JSON parse
+    # repeated ~274,600 times in a real large-catalog import cycle).
+    lang = config.get_import_language_exclusion()
+
     movie_result, streams_total = await _import_movies_for_provider(
-        client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized,
+        client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized, lang,
     )
     series_result, series_total = await _import_series_for_provider(
-        client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized,
+        client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized, lang,
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)

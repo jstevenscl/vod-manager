@@ -2052,7 +2052,15 @@ async def resolve_missing_episode(series_id: int, body: MissingEpisodeResolveReq
                 await dispatcharr_dvr_importer._apply_download_backfill(match, body.provider_id)
             else:
                 await dispatcharr_dvr_importer._apply_pointer_backfill(match)
-            if target_category_id:
+            # Checked before calling placement, not caught via the ValueError
+            # place_series_in_category now raises for an archived row (see
+            # its docstring) -- the pointer/download transfer above already
+            # succeeded, so an archived pool match should still count as
+            # resolved/handled, not surface as "backfill failed" via the
+            # broad except below just because its category placement was
+            # skipped.
+            series_row = vod_db.get_series(match["series_id"])
+            if target_category_id and series_row and not series_row.get("review_excluded"):
                 vod_db.place_series_in_category(match["series_id"], target_category_id)
         except Exception as exc:
             raise HTTPException(502, detail=f"Found in the pool but backfill failed: {exc}")
@@ -2202,7 +2210,12 @@ async def backfill_series_past_seasons(series_id: int, provider_id: int, schedul
                 else:
                     await dispatcharr_dvr_importer._apply_pointer_backfill(match)
                 target_category_id = (rule or {}).get("target_series_category_id")
-                if target_category_id:
+                # See resolve_missing_episode's identical comment -- the
+                # backfill above already succeeded, so an archived pool
+                # match should still count as resolved rather than a skipped
+                # placement surfacing as a failure via the except below.
+                match_series = vod_db.get_series(match["series_id"])
+                if target_category_id and match_series and not match_series.get("review_excluded"):
                     vod_db.place_series_in_category(match["series_id"], target_category_id)
                 vod_db.clear_unresolved_missing_episode(series_id, season, episode)
                 results.append({"season_number": season, "episode_number": episode, "name": name, "status": "already_in_pool"})
@@ -3125,7 +3138,10 @@ async def move_movie_source(movie_id: int, source_id: int, body: MoveMovieSource
 async def place_movie_in_category(movie_id: int, body: PlacementRequest):
     if not vod_db.get_movie(movie_id):
         raise HTTPException(404, detail="movie not found")
-    export_stream_id = vod_db.place_movie_in_category(movie_id, body.category_id)
+    try:
+        export_stream_id = vod_db.place_movie_in_category(movie_id, body.category_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
     return {"export_stream_id": export_stream_id}
 
 
@@ -3221,26 +3237,41 @@ async def bulk_apply_tmdb_title_movies(after_id: int = 0, limit: int = 100):
     loops, passing back the highest id seen, until has_more is false."""
     candidates = await asyncio.to_thread(vod_db.list_movies_with_tmdb_id, after_id, limit)
     if not candidates:
-        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+        return {"checked": 0, "renamed": 0, "no_change": 0, "errors": 0, "error_samples": [], "has_more": False, "last_id": after_id, "total_in_db": vod_db.count_movies()}
     try:
         details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "movie")
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     renamed = 0
+    no_change = 0
+    errors = 0
+    error_samples: list[str] = []
     for c in candidates:
         detail = details.get(c["tmdb_id"], {})
         title = detail.get("title")
         year = detail.get("year") or c["year"]
         if not title or (title == c["name"] and year == c["year"]):
+            no_change += 1
             continue
         try:
             result = vod_db.rename_item("movie", c["id"], title, year)
-        except ValueError:
+        except ValueError as exc:
+            errors += 1
+            if len(error_samples) < 10:
+                error_samples.append(f"{c['name']}: {exc}")
             continue
         if "merged_into" in result:
             vod_db.backfill_tmdb_id_if_missing("movie", result["merged_into"], c["tmdb_id"])
         renamed += 1
-    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
+    has_more = len(candidates) == limit
+    result = {
+        "checked": len(candidates), "renamed": renamed, "no_change": no_change,
+        "errors": errors, "error_samples": error_samples,
+        "has_more": has_more, "last_id": candidates[-1]["id"],
+    }
+    if not has_more:
+        result["total_in_db"] = vod_db.count_movies()
+    return result
 
 
 @router.delete("/movies/{movie_id}/", dependencies=_GUARDS)
@@ -3379,7 +3410,10 @@ async def remove_series_provider_sources(series_id: int, provider_id: int):
 async def place_series_in_category(series_id: int, body: PlacementRequest):
     if not vod_db.get_series(series_id):
         raise HTTPException(404, detail="series not found")
-    export_series_id = vod_db.place_series_in_category(series_id, body.category_id)
+    try:
+        export_series_id = vod_db.place_series_in_category(series_id, body.category_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
     return {"export_series_id": export_series_id}
 
 
@@ -3464,26 +3498,41 @@ async def bulk_apply_tmdb_title_series(after_id: int = 0, limit: int = 100):
     """See bulk_apply_tmdb_title_movies' identical docstring -- same reasoning."""
     candidates = await asyncio.to_thread(vod_db.list_series_with_tmdb_id, after_id, limit)
     if not candidates:
-        return {"checked": 0, "renamed": 0, "has_more": False, "last_id": after_id}
+        return {"checked": 0, "renamed": 0, "no_change": 0, "errors": 0, "error_samples": [], "has_more": False, "last_id": after_id, "total_in_db": vod_db.count_series()}
     try:
         details = await tmdb_sync.get_tmdb_details_for_ids([c["tmdb_id"] for c in candidates], "series")
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     renamed = 0
+    no_change = 0
+    errors = 0
+    error_samples: list[str] = []
     for c in candidates:
         detail = details.get(c["tmdb_id"], {})
         title = detail.get("title")
         year = detail.get("year") or c["year"]
         if not title or (title == c["name"] and year == c["year"]):
+            no_change += 1
             continue
         try:
             result = vod_db.rename_item("series", c["id"], title, year)
-        except ValueError:
+        except ValueError as exc:
+            errors += 1
+            if len(error_samples) < 10:
+                error_samples.append(f"{c['name']}: {exc}")
             continue
         if "merged_into" in result:
             vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], c["tmdb_id"])
         renamed += 1
-    return {"checked": len(candidates), "renamed": renamed, "has_more": len(candidates) == limit, "last_id": candidates[-1]["id"]}
+    has_more = len(candidates) == limit
+    result = {
+        "checked": len(candidates), "renamed": renamed, "no_change": no_change,
+        "errors": errors, "error_samples": error_samples,
+        "has_more": has_more, "last_id": candidates[-1]["id"],
+    }
+    if not has_more:
+        result["total_in_db"] = vod_db.count_series()
+    return result
 
 
 @router.delete("/series/{series_id}/", dependencies=_GUARDS)

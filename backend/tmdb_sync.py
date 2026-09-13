@@ -25,7 +25,17 @@ import vod_db
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
-_YEAR_LOOKUP_CONCURRENCY = 6
+_YEAR_LOOKUP_CONCURRENCY = 10
+
+# Process-wide cap on concurrent TMDB requests, shared across every caller in
+# this module (list sync, search_title, episode lookups, year lookups). Each
+# caller already bounds its OWN concurrency, but nothing previously stopped
+# two features running at once (e.g. a provider import's tmdb_id shortcut
+# path alongside a Duplicate Finder scan) from stacking their concurrency
+# against the same TMDB API key's shared rate limit. Kept comfortably under
+# TMDB's ~50 req/s limit even if every caller is maxed out simultaneously.
+_GLOBAL_TMDB_CONCURRENCY = 20
+_tmdb_semaphore = asyncio.Semaphore(_GLOBAL_TMDB_CONCURRENCY)
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
 
@@ -54,7 +64,8 @@ async def fetch_list_items(list_id: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         page = 1
         while True:
-            r = await client.get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key, "page": page})
+            async with _tmdb_semaphore:
+                r = await client.get(f"{_API_BASE}/list/{list_id}", params={"api_key": api_key, "page": page})
             r.raise_for_status()
             data = r.json()
             page_items = data.get("items", [])
@@ -135,10 +146,11 @@ async def search_title(query: str, content_type: str) -> list[dict]:
 
     endpoint = "movie" if content_type == "movie" else "tv"
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        r = await client.get(
-            f"{_API_BASE}/search/{endpoint}",
-            params={"api_key": api_key, "query": query},
-        )
+        async with _tmdb_semaphore:
+            r = await client.get(
+                f"{_API_BASE}/search/{endpoint}",
+                params={"api_key": api_key, "query": query},
+            )
         r.raise_for_status()
         data = r.json()
 
@@ -157,10 +169,11 @@ async def search_title(query: str, content_type: str) -> list[dict]:
                 "cast": [],
             }
             try:
-                dr = await client.get(
-                    f"{_API_BASE}/{endpoint}/{item['id']}",
-                    params={"api_key": api_key, "append_to_response": "credits"},
-                )
+                async with _tmdb_semaphore:
+                    dr = await client.get(
+                        f"{_API_BASE}/{endpoint}/{item['id']}",
+                        params={"api_key": api_key, "append_to_response": "credits"},
+                    )
                 dr.raise_for_status()
                 dd = dr.json()
                 if content_type == "series":
@@ -199,13 +212,15 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
     if not api_key:
         raise ValueError("TMDB API key not configured")
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        r = await client.get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key})
+        async with _tmdb_semaphore:
+            r = await client.get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key})
         r.raise_for_status()
         seasons = [s["season_number"] for s in r.json().get("seasons", []) if s.get("season_number")]
 
         async def _season(season_number: int) -> list[dict]:
             try:
-                sr = await client.get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
+                async with _tmdb_semaphore:
+                    sr = await client.get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
                 sr.raise_for_status()
                 return [
                     {
@@ -265,7 +280,7 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
     semaphore = asyncio.Semaphore(_YEAR_LOOKUP_CONCURRENCY)
 
     async def _fetch(client: httpx.AsyncClient, tmdb_id: str) -> tuple[str, dict]:
-        async with semaphore:
+        async with semaphore, _tmdb_semaphore:
             try:
                 r = await client.get(f"{_API_BASE}/{endpoint}/{tmdb_id}", params={"api_key": api_key})
                 r.raise_for_status()

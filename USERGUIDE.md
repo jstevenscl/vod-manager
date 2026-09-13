@@ -230,9 +230,10 @@ titles currently carry it, so you're picking from what's really there instead
 of guessing codes. Search, **Select visible** / **Deselect visible**, and
 shift-click to select a range all work the same way as the provider category
 picker below. Codes are recognized whether a provider tags titles with a pipe
-(`AR| Movie Title`) or a colon (`AR: Movie Title`) — colon-style matching only
-ever applies to a known language code, never any two-to-six-letter prefix, so
-it won't misfire on a real title like *Kill Bill: Volume 1* or *CSI: Miami*.
+(`AR| Movie Title`), a colon (`AR: Movie Title`), or a dash (`FR - Movie
+Title`) — colon/dash-style matching only ever applies to a known language
+code, never any two-to-six-letter prefix, so it won't misfire on a real title
+like *Kill Bill: Volume 1*, *CSI: Miami*, or *Spider-Man*.
 There's also a toggle to exclude any title with non-Latin-script characters in
 its name.
 
@@ -927,7 +928,12 @@ each with a **list** or **grid** (poster wall) mode.
   touches items with an already-confirmed match; it doesn't go looking for
   new matches itself. Large libraries process in bounded batches, so this
   can take a little while — the button's label updates with a running "N
-  renamed" count as it works.
+  renamed, N checked" count as it works, and finishes with a summary
+  breaking out how many were renamed vs. needed no change vs. hit an error
+  (hover the summary for the first few error reasons). If a batch fails
+  partway through (e.g. a slow TMDB round-trip timing out), a **Resume**
+  button appears next to the error and picks up from where it left off
+  instead of restarting the whole library from the beginning.
 - **Client Title Format** (Curation & Maintenance) is a separate, ongoing
   setting rather than a one-time rename: *Append year to titles served to
   clients* controls what Dispatcharr/TiviMate/etc. actually display for
@@ -1237,7 +1243,11 @@ three ways at once:
 - **Adjacent-year mislabeling** — the same name with years one apart (a
   provider getting a release year wrong by one is a common, real pattern).
   A gap of two or more years never clusters — that's almost always two
-  different films that happen to share a title, not a duplicate.
+  different films that happen to share a title, not a duplicate. A same-name
+  row with **no year at all** (a common provider pattern) still joins the
+  group when it shares a confirmed TMDB id with a dated row already in it —
+  the same proof standard used to split conflicting matches apart, just
+  applied the other way to join a matching one.
 - **A shared TMDB id** — when two candidates carry the same TMDB id, that's
   confirmed proof they're the same real title, even across a bigger year
   gap than the rule above alone would allow. A *conflicting* TMDB id is
@@ -1246,12 +1256,16 @@ three ways at once:
 
 There's also an **opt-in fourth check, off by default**: a checkbox above the
 scan button groups a quality-tagged title with its plain version — e.g.
-"4K: Predator" with "Predator" — as candidates too. Leave it off and those
-stay two separate, unrelated pool entries, same as today. Turn it on, merge
-the group, and Stream Priority's "quality" mode (Configuration) then picks
-whichever source is actually the best quality automatically — this is purely
-about getting split rows *grouped* for review; nothing merges on its own just
-from turning the checkbox on.
+"4K: Predator" with "Predator", "4K-DE - Severance (2022) (US)" with
+"Severance (2022)" (a compound quality+country prefix and trailing
+country-code suffix, both allowlist-only against known codes so a real title
+that happens to end in a parenthetical is never mistaken for one) — as
+candidates too. Leave it off and those stay two separate, unrelated pool
+entries, same as today. Turn it on, merge the group, and Stream Priority's
+"quality" mode (Configuration) then picks whichever source is actually the
+best quality automatically — this is purely about getting split rows
+*grouped* for review; nothing merges on its own just from turning the
+checkbox on.
 
 Each candidate shows its poster, a **same TMDB match** badge when a shared id
 confirms the group, and a per-candidate **true match**/**year mismatch** badge
