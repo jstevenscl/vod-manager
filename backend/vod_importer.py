@@ -740,6 +740,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
                 release_date=tmdb_detail.get("release_date"),
                 content_rating=tmdb_detail.get("content_rating"),
             )
+            await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
         # fall through to the provider so this movie still gets enriched.
@@ -790,6 +791,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False) -> bool:
     bitrate = _coerce_int(detail.get("bitrate"))
     if bitrate is not None:
         await asyncio.to_thread(vod_db.set_movie_source_bitrate, source["id"], bitrate)
+    await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
     return True
 
 
@@ -928,6 +930,13 @@ async def enrich_series(series_id: int, *, force: bool = False) -> dict:
             episode_bitrate = _coerce_int((ep.get("info") or {}).get("bitrate"))
             if episode_bitrate is not None:
                 await asyncio.to_thread(vod_db.set_episode_source_bitrate, episode_source_id, episode_bitrate)
+
+    if series_tmdb_id:
+        # Mirrors enrich_movie's auto_merge_movie_by_tmdb call sites -- fires
+        # once per series, after enrichment, and only when a tmdb_id could
+        # actually have been (re)confirmed this pass. Gated on the same
+        # duplicate_finder_auto_merge_tmdb config flag as movies.
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
 
     return {"fetched": True, "reason": None}
 
