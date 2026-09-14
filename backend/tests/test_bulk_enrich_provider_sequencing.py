@@ -65,12 +65,12 @@ def test_each_providers_series_wait_for_that_same_providers_movies(monkeypatch):
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA")])
     monkeypatch.setattr(vod_importer.vod_db, "list_all_movie_ids", lambda **kw: [10])
     monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda **kw: [20])
@@ -99,14 +99,14 @@ def test_one_providers_movies_do_not_block_another_providers_series(monkeypatch)
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         events.append(("series", series_id))
         if series_id == 21:  # Provider B's series
             provider_b_series_done.set()
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA"), _provider(2, "ProvB")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -140,12 +140,12 @@ def test_provider_whose_movies_fail_is_skipped_while_others_continue(monkeypatch
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX"), _provider(2, "ProvY")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -183,12 +183,12 @@ def test_provider_movie_retry_succeeds_then_series_runs(monkeypatch):
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX"), _provider(2, "ProvY")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -231,11 +231,11 @@ def test_provider_retry_does_not_double_count_already_succeeded_items(monkeypatc
                 raise RuntimeError("transient failure")
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -263,12 +263,12 @@ def test_provider_movie_retry_fails_again_flags_incomplete_and_skips_series(monk
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX"), _provider(2, "ProvY")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -298,14 +298,14 @@ def test_provider_series_failure_does_not_rerun_movies_or_block_others(monkeypat
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         if series_id == 20:
             raise RuntimeError("series phase stalled")
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvX"), _provider(2, "ProvY")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",
@@ -338,14 +338,14 @@ def test_movie_auto_merge_runs_once_after_all_providers_resolve_movies(monkeypat
         assert skip_auto_merge is True, "bulk enrich must suppress the inline per-item merge"
         return True
 
-    async def fake_enrich_series(series_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
         return {"fetched": True, "reason": None}
 
     def fake_auto_merge_movie(movie_id):
         merge_calls.append(movie_id)
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
-    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA"), _provider(2, "ProvB")])
     monkeypatch.setattr(
         vod_importer.vod_db, "list_all_movie_ids",

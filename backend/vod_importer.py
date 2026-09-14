@@ -1066,135 +1066,13 @@ async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge:
     last_reason = "already up to date"
 
     for source in sources:
-        if not force and not await asyncio.to_thread(vod_db.series_source_needs_enrichment, source):
-            continue
-
-        provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
-        if not provider:
-            last_reason = "a provider this series was imported from no longer exists"
-            continue
-
-        if provider.get("provider_type") == "plex":
-            # Same reasoning as enrich_movie: Plex already gave us full
-            # detail and every episode at import time (plex_importer.py) —
-            # episodes aren't lazily discovered here the way XC's are.
-            await asyncio.to_thread(
-                vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
-            )
+        outcome = await _enrich_one_series_source(series_id, series, source, force=force)
+        if outcome["fetched"]:
             any_fetched = True
-            continue
-
-        client = XCProviderClient(provider)
-        try:
-            info = _as_dict(await client.get_series_info(str(source["provider_series_id"])))
-        except Exception:
-            await asyncio.to_thread(
-                vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
-            )
-            last_reason = f"get_series_info failed for provider {provider.get('name') or provider['id']}"
-            continue
-
-        detail = _as_dict(info.get("info"))
-
-        if not detail_written and detail:
-            # See enrich_movie's identical comment -- safe as of 2026-07-29's
-            # bulk_import_series rewrite, which now matches primarily by
-            # (import_provider_id, import_provider_series_id), not by
-            # re-deriving identity from (name, year) every pass.
-            name_fields = {}
-            if detail.get("name"):
-                name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
-                name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
-
-            # This provider sends the series' TMDB id under "tmdb", not
-            # "tmdb_id" (unlike its own movie endpoint, which does use
-            # "tmdb_id") -- check both since key naming isn't consistent
-            # even within one provider, let alone across others.
-            series_tmdb_id = _clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id"))
-
-            # Best-effort content-rating-only TMDB call -- deliberately
-            # narrow (not a full series-detail fetch, see tmdb_sync.
-            # get_tv_content_rating's docstring) since is_adult only ever
-            # flags literal porn, never general violence/maturity, leaving
-            # no real way for a "kids" smart category to keep out R/TV-MA-
-            # rated content without this.
-            content_rating = None
-            if series_tmdb_id:
-                content_rating = await tmdb_sync.get_tv_content_rating(str(series_tmdb_id))
-
-            await asyncio.to_thread(
-                vod_db.set_series_enrichment,
-                series_id,
-                **name_fields,
-                **_apply_field_rules("series", {
-                    "genre": detail.get("genre") or None,
-                    "description": detail.get("plot") or None,
-                    "cast_list": detail.get("cast") or None,
-                    "director": detail.get("director") or None,
-                    "country": detail.get("country") or None,
-                }),
-                tmdb_id=series_tmdb_id,
-                poster_url=detail.get("cover") or None,
-                rating=detail.get("rating") or None,
-                release_date=detail.get("releasedate") or None,
-                content_rating=content_rating,
-                # Snapshot of what bulk_import_series last saw for this
-                # series -- series_needs_enrichment compares the two on the
-                # next pass to know whether this (expensive, per-series)
-                # call is worth making again.
-                episodes_synced_last_modified=series.get("provider_last_modified"),
-            )
-            detail_written = True
-
-        # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
-        # (standard XC shape), but at least one real provider returns a plain
-        # list of per-season lists instead — [[ep,...], [ep,...]].
-        # Each episode also carries its own "season" field regardless of shape, so
-        # trust that over the dict key / list index, falling back to the latter
-        # only if a provider omits it.
-        episodes_raw = info.get("episodes") or {}
-        season_groups = episodes_raw.items() if isinstance(episodes_raw, dict) else enumerate(episodes_raw)
-
-        # Collected in-memory and written in one batched transaction (see
-        # vod_db.enrich_series_episodes_batch) instead of the old per-episode
-        # add_episode/add_episode_source/set_episode_source_bitrate calls -- each
-        # of those independently took the process-wide write lock and did a full
-        # fsync-backed commit, which made a 20-episode series up to 40 serialized
-        # lock+fsync round-trips contended against every other concurrently-
-        # enriching series (beads-3po: series enriched ~37x slower than movies,
-        # root-caused to exactly this).
-        episode_batch = []
-        for season_key, episodes in season_groups:
-            for ep in episodes:
-                season_number = ep.get("season", season_key)
-                episode_batch.append({
-                    "season_number": int(season_number),
-                    "episode_number": int(ep.get("episode_num", 0)),
-                    "name": ep.get("title") or f"Episode {ep.get('episode_num', '?')}",
-                    "description": (ep.get("info") or {}).get("plot") or None,
-                    "duration_secs": (ep.get("info") or {}).get("duration_secs") or None,
-                    "provider_stream_id": str(ep["id"]),
-                    "container_extension": ep.get("container_extension") or "mp4",
-                    "raw_name": ep.get("title") or None,
-                    # XC only reports category at the series level, not per-
-                    # episode -- bulk_import_series stamped it onto this
-                    # source's series_sources row for exactly this moment,
-                    # since episodes weren't known yet back at that earlier,
-                    # cheap bulk-list stage. Real bug found live 2026-07-29:
-                    # this was never threaded through at all, so provider_
-                    # category-based series matching (evaluate_smart_
-                    # category, auto-create-categories) had no data to work
-                    # with for any provider, ever.
-                    "provider_category_name": source.get("provider_category_name"),
-                    "bitrate": _coerce_int((ep.get("info") or {}).get("bitrate")),
-                })
-
-        await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_batch)
-
-        await asyncio.to_thread(
-            vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
-        )
-        any_fetched = True
+            if outcome["detail_written"]:
+                detail_written = True
+        else:
+            last_reason = outcome["reason"]
 
     if not any_fetched:
         return {"fetched": False, "reason": last_reason}
@@ -1212,6 +1090,192 @@ async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge:
             await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
 
     return {"fetched": True, "reason": None}
+
+
+async def _enrich_one_series_source(series_id: int, series: dict, source: dict, *, force: bool = False) -> dict:
+    """Fetches and persists exactly ONE series_sources row's episodes/detail.
+    Extracted from enrich_series's original single-source-at-a-time loop body
+    (plan-doc follow-up "make a provider lane fetch only that provider's
+    series source", 2026-09-14) so the bulk path (enrich_series_source_only,
+    via _run_provider_series_phase) can call it for ONE known provider's
+    source without looping every other provider's source the way
+    enrich_series itself still does for its on-demand/UI callers.
+
+    Returns {"fetched": bool, "reason": str | None, "detail_written": bool}."""
+    if not force and not await asyncio.to_thread(vod_db.series_source_needs_enrichment, source):
+        return {"fetched": False, "reason": "already up to date", "detail_written": False}
+
+    provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
+    if not provider:
+        return {
+            "fetched": False,
+            "reason": "a provider this series was imported from no longer exists",
+            "detail_written": False,
+        }
+
+    if provider.get("provider_type") == "plex":
+        # Same reasoning as enrich_movie: Plex already gave us full
+        # detail and every episode at import time (plex_importer.py) —
+        # episodes aren't lazily discovered here the way XC's are.
+        await asyncio.to_thread(
+            vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
+        )
+        return {"fetched": True, "reason": None, "detail_written": False}
+
+    client = XCProviderClient(provider)
+    try:
+        info = _as_dict(await client.get_series_info(str(source["provider_series_id"])))
+    except Exception:
+        await asyncio.to_thread(
+            vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
+        )
+        return {
+            "fetched": False,
+            "reason": f"get_series_info failed for provider {provider.get('name') or provider['id']}",
+            "detail_written": False,
+        }
+
+    detail = _as_dict(info.get("info"))
+    detail_written = False
+
+    if detail:
+        # See enrich_movie's identical comment -- safe as of 2026-07-29's
+        # bulk_import_series rewrite, which now matches primarily by
+        # (import_provider_id, import_provider_series_id), not by
+        # re-deriving identity from (name, year) every pass.
+        name_fields = {}
+        if detail.get("name"):
+            name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+            name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
+
+        # This provider sends the series' TMDB id under "tmdb", not
+        # "tmdb_id" (unlike its own movie endpoint, which does use
+        # "tmdb_id") -- check both since key naming isn't consistent
+        # even within one provider, let alone across others.
+        series_tmdb_id = _clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id"))
+
+        # Best-effort content-rating-only TMDB call -- deliberately
+        # narrow (not a full series-detail fetch, see tmdb_sync.
+        # get_tv_content_rating's docstring) since is_adult only ever
+        # flags literal porn, never general violence/maturity, leaving
+        # no real way for a "kids" smart category to keep out R/TV-MA-
+        # rated content without this.
+        content_rating = None
+        if series_tmdb_id:
+            content_rating = await tmdb_sync.get_tv_content_rating(str(series_tmdb_id))
+
+        await asyncio.to_thread(
+            vod_db.set_series_enrichment,
+            series_id,
+            **name_fields,
+            **_apply_field_rules("series", {
+                "genre": detail.get("genre") or None,
+                "description": detail.get("plot") or None,
+                "cast_list": detail.get("cast") or None,
+                "director": detail.get("director") or None,
+                "country": detail.get("country") or None,
+            }),
+            tmdb_id=series_tmdb_id,
+            poster_url=detail.get("cover") or None,
+            rating=detail.get("rating") or None,
+            release_date=detail.get("releasedate") or None,
+            content_rating=content_rating,
+            # Snapshot of what bulk_import_series last saw for this
+            # series -- series_needs_enrichment compares the two on the
+            # next pass to know whether this (expensive, per-series)
+            # call is worth making again.
+            episodes_synced_last_modified=series.get("provider_last_modified"),
+        )
+        detail_written = True
+
+    # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
+    # (standard XC shape), but at least one real provider returns a plain
+    # list of per-season lists instead — [[ep,...], [ep,...]].
+    # Each episode also carries its own "season" field regardless of shape, so
+    # trust that over the dict key / list index, falling back to the latter
+    # only if a provider omits it.
+    episodes_raw = info.get("episodes") or {}
+    season_groups = episodes_raw.items() if isinstance(episodes_raw, dict) else enumerate(episodes_raw)
+
+    # Collected in-memory and written in one batched transaction (see
+    # vod_db.enrich_series_episodes_batch) instead of the old per-episode
+    # add_episode/add_episode_source/set_episode_source_bitrate calls -- each
+    # of those independently took the process-wide write lock and did a full
+    # fsync-backed commit, which made a 20-episode series up to 40 serialized
+    # lock+fsync round-trips contended against every other concurrently-
+    # enriching series (beads-3po: series enriched ~37x slower than movies,
+    # root-caused to exactly this).
+    episode_batch = []
+    for season_key, episodes in season_groups:
+        for ep in episodes:
+            season_number = ep.get("season", season_key)
+            episode_batch.append({
+                "season_number": int(season_number),
+                "episode_number": int(ep.get("episode_num", 0)),
+                "name": ep.get("title") or f"Episode {ep.get('episode_num', '?')}",
+                "description": (ep.get("info") or {}).get("plot") or None,
+                "duration_secs": (ep.get("info") or {}).get("duration_secs") or None,
+                "provider_stream_id": str(ep["id"]),
+                "container_extension": ep.get("container_extension") or "mp4",
+                "raw_name": ep.get("title") or None,
+                # XC only reports category at the series level, not per-
+                # episode -- bulk_import_series stamped it onto this
+                # source's series_sources row for exactly this moment,
+                # since episodes weren't known yet back at that earlier,
+                # cheap bulk-list stage. Real bug found live 2026-07-29:
+                # this was never threaded through at all, so provider_
+                # category-based series matching (evaluate_smart_
+                # category, auto-create-categories) had no data to work
+                # with for any provider, ever.
+                "provider_category_name": source.get("provider_category_name"),
+                "bitrate": _coerce_int((ep.get("info") or {}).get("bitrate")),
+            })
+
+    await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_batch)
+
+    await asyncio.to_thread(
+        vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
+    )
+    return {"fetched": True, "reason": None, "detail_written": detail_written}
+
+
+async def enrich_series_source_only(
+    series_id: int, provider_id: int, *, force: bool = False, skip_auto_merge: bool = False,
+) -> dict:
+    """Provider-scoped counterpart to enrich_series (plan-doc follow-up "make
+    a provider lane fetch only that provider's series source", 2026-09-14).
+
+    enrich_series(series_id) loops EVERY series_sources row for a series,
+    which is correct for its on-demand/UI callers (a "refresh this item"
+    button has no single provider in mind) but wrong for
+    _run_provider_series_phase's bulk lane: that lane already selects
+    series_ids scoped to ONE provider (list_all_series_ids(provider_id=...)),
+    so handing each id to enrich_series let Provider A's lane also fetch
+    Provider B/C's source for the same series -- weakening the per-provider
+    request/concurrency isolation bulk_enrich_all's whole per-provider-phase
+    design exists to provide, and risking duplicate get_series_info calls
+    before each source's own freshness stamp is written.
+
+    Fetches and persists ONLY the one series_sources row matching
+    provider_id, via the same per-source logic enrich_series uses (shared
+    through _enrich_one_series_source) -- so the fetch/write behavior for
+    that single source is unchanged, only the "which sources does this call
+    touch" scope is narrowed."""
+    series = await asyncio.to_thread(vod_db.get_series, series_id)
+    if not series:
+        return {"fetched": False, "reason": "series not found"}
+
+    sources = await asyncio.to_thread(vod_db.list_series_sources, series_id)
+    source = next((s for s in sources if s["provider_id"] == provider_id), None)
+    if not source:
+        return {"fetched": False, "reason": "no source recorded for this series from this provider"}
+
+    outcome = await _enrich_one_series_source(series_id, series, source, force=force)
+
+    if outcome["fetched"] and outcome["detail_written"] and not skip_auto_merge:
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
+
+    return {"fetched": outcome["fetched"], "reason": outcome["reason"]}
 
 
 # ── Bulk enrichment ──────────────────────────────────────────────────────────
@@ -1271,7 +1335,7 @@ _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralize
 
 async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
-    skip_auto_merge: bool = False, movie_batch: list | None = None,
+    skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
 ) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
@@ -1296,6 +1360,8 @@ async def _enrich_one(
                         movie_batch.append(result)
                 else:
                     await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
+            elif provider_id is not None:
+                await enrich_series_source_only(item_id, provider_id, force=force, skip_auto_merge=skip_auto_merge)
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
             return True
@@ -1392,7 +1458,7 @@ async def _run_provider_series_phase(provider: dict, sem: asyncio.Semaphore, for
     series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
     ok = True
     for outcome in await asyncio.gather(
-        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True) for sid in series_ids),
+        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"]) for sid in series_ids),
         return_exceptions=True,
     ):
         if isinstance(outcome, BaseException) or outcome is False:

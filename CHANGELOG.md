@@ -41,6 +41,12 @@ proposed to the upstream project, the entry links to that pull request —
   thread-scheduling overhead at full-catalog scale. Merges now run
   sequentially in a single background task; total merge sweep work is
   unchanged, just without the thread pile-up.
+- ✅ Fixed a provider's bulk series-enrichment lane also fetching series
+  metadata from OTHER providers whenever a series was carried by more than
+  one provider (e.g. matched by name/year across two catalogs). This
+  weakened each provider's intended request/concurrency isolation and
+  backoff handling during a bulk run. Each provider's lane now fetches only
+  its own series source.
 
 ## 2026-09-13
 
