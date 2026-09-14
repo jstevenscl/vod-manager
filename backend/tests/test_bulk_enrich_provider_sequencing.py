@@ -65,7 +65,7 @@ def test_each_providers_series_wait_for_that_same_providers_movies(monkeypatch):
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
@@ -99,7 +99,7 @@ def test_one_providers_movies_do_not_block_another_providers_series(monkeypatch)
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         events.append(("series", series_id))
         if series_id == 21:  # Provider B's series
             provider_b_series_done.set()
@@ -140,7 +140,7 @@ def test_provider_whose_movies_fail_is_skipped_while_others_continue(monkeypatch
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
@@ -183,7 +183,7 @@ def test_provider_movie_retry_succeeds_then_series_runs(monkeypatch):
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
@@ -231,7 +231,7 @@ def test_provider_retry_does_not_double_count_already_succeeded_items(monkeypatc
                 raise RuntimeError("transient failure")
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         return {"fetched": True, "reason": None}
 
     monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
@@ -263,7 +263,7 @@ def test_provider_movie_retry_fails_again_flags_incomplete_and_skips_series(monk
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         events.append(("series", series_id))
         return {"fetched": True, "reason": None}
 
@@ -298,7 +298,7 @@ def test_provider_series_failure_does_not_rerun_movies_or_block_others(monkeypat
         events.append(("movie", movie_id))
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         if series_id == 20:
             raise RuntimeError("series phase stalled")
         events.append(("series", series_id))
@@ -338,7 +338,7 @@ def test_movie_auto_merge_runs_once_after_all_providers_resolve_movies(monkeypat
         assert skip_auto_merge is True, "bulk enrich must suppress the inline per-item merge"
         return True
 
-    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_series(series_id, provider_id, *, force=False, skip_auto_merge=False, write_queue=None):
         return {"fetched": True, "reason": None}
 
     def fake_auto_merge_movie(movie_id):

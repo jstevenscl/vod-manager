@@ -1092,7 +1092,9 @@ async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge:
     return {"fetched": True, "reason": None}
 
 
-async def _enrich_one_series_source(series_id: int, series: dict, source: dict, *, force: bool = False) -> dict:
+async def _enrich_one_series_source(
+    series_id: int, series: dict, source: dict, *, force: bool = False, write_queue: "asyncio.Queue | None" = None,
+) -> dict:
     """Fetches and persists exactly ONE series_sources row's episodes/detail.
     Extracted from enrich_series's original single-source-at-a-time loop body
     (plan-doc follow-up "make a provider lane fetch only that provider's
@@ -1231,7 +1233,15 @@ async def _enrich_one_series_source(series_id: int, series: dict, source: dict, 
                 "bitrate": _coerce_int((ep.get("info") or {}).get("bitrate")),
             })
 
-    await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_batch)
+    if write_queue is not None:
+        done = asyncio.Event()
+        await write_queue.put({
+            "kind": "series", "series_id": series_id, "provider_id": provider["id"],
+            "episodes": episode_batch, "done": done,
+        })
+        await done.wait()
+    else:
+        await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_batch)
 
     await asyncio.to_thread(
         vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
@@ -1241,6 +1251,7 @@ async def _enrich_one_series_source(series_id: int, series: dict, source: dict, 
 
 async def enrich_series_source_only(
     series_id: int, provider_id: int, *, force: bool = False, skip_auto_merge: bool = False,
+    write_queue: "asyncio.Queue | None" = None,
 ) -> dict:
     """Provider-scoped counterpart to enrich_series (plan-doc follow-up "make
     a provider lane fetch only that provider's series source", 2026-09-14).
@@ -1270,7 +1281,7 @@ async def enrich_series_source_only(
     if not source:
         return {"fetched": False, "reason": "no source recorded for this series from this provider"}
 
-    outcome = await _enrich_one_series_source(series_id, series, source, force=force)
+    outcome = await _enrich_one_series_source(series_id, series, source, force=force, write_queue=write_queue)
 
     if outcome["fetched"] and outcome["detail_written"] and not skip_auto_merge:
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
@@ -1336,6 +1347,7 @@ _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralize
 async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
     skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
+    write_queue: "asyncio.Queue | None" = None,
 ) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
@@ -1361,7 +1373,9 @@ async def _enrich_one(
                 else:
                     await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
             elif provider_id is not None:
-                await enrich_series_source_only(item_id, provider_id, force=force, skip_auto_merge=skip_auto_merge)
+                await enrich_series_source_only(
+                    item_id, provider_id, force=force, skip_auto_merge=skip_auto_merge, write_queue=write_queue,
+                )
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
             return True
@@ -1407,7 +1421,9 @@ async def _enrich_one(
 _MOVIE_BATCH_CHUNK_SIZE = 25  # matches the plan doc's original batch-size choice
 
 
-async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
+async def _run_provider_movie_phase(
+    provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
+) -> tuple[bool, list]:
     """Runs one provider's movie phase to completion. Returns (ok, movie_ids)
     where ok is True iff every item in this provider's movie phase completed
     without raising (ProviderBackoffError counts as non-raising/ok, same as
@@ -1419,21 +1435,40 @@ async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, forc
     independently acquiring vod_db._WRITE_LOCK via set_movie_enrichment --
     same class of lock contention beads-3po already fixed for series via
     enrich_series_episodes_batch, just at movie-count scale. Flushed in
-    _MOVIE_BATCH_CHUNK_SIZE-item chunks via vod_db.apply_movie_enrichment_batch
-    as enrichment completes (so one giant provider catalog doesn't hold one
-    single enormous uncommitted transaction), with a final flush for
-    whatever's left once every item has resolved -- this phase does not
-    return until every movie's write has actually been flushed, so the
-    caller's end-of-run auto_merge_movie_by_tmdb sweep never runs against a
-    tmdb_id that's still sitting unflushed in memory."""
+    _MOVIE_BATCH_CHUNK_SIZE-item chunks as enrichment completes (so one giant
+    provider catalog doesn't hold one single enormous uncommitted
+    transaction), with a final flush for whatever's left once every item has
+    resolved -- this phase does not return until every movie's write has
+    actually been committed, so the caller's end-of-run
+    auto_merge_movie_by_tmdb sweep never runs against a tmdb_id that's still
+    unwritten.
+
+    write_queue (plan-doc follow-up "one global writer", 2026-09-14): when
+    given, each chunk is put() on this run-wide queue and awaited via a
+    per-chunk asyncio.Event instead of calling
+    vod_db.apply_movie_enrichment_batch directly -- so this phase's writes
+    are serialized against every OTHER concurrently-running provider phase's
+    writes (movie or series) through the one _run_global_writer task
+    draining the queue, instead of each phase independently reaching its own
+    batch-commit point at the same time. When write_queue is None (no
+    bulk_enrich_all run in progress), behavior is unchanged: this phase
+    writes its own chunks directly."""
     movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
     ok = True
     movie_batch: list = []
 
+    async def _flush_chunk(chunk: list) -> None:
+        if write_queue is not None:
+            done = asyncio.Event()
+            await write_queue.put({"kind": "movie", "items": chunk, "done": done})
+            await done.wait()
+        else:
+            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, chunk)
+
     async def _flush_full_chunks() -> None:
         while len(movie_batch) >= _MOVIE_BATCH_CHUNK_SIZE:
             chunk, movie_batch[:_MOVIE_BATCH_CHUNK_SIZE] = movie_batch[:_MOVIE_BATCH_CHUNK_SIZE], []
-            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, chunk)
+            await _flush_chunk(chunk)
 
     tasks = [asyncio.create_task(_enrich_one("movie", sem, mid, force, skip_auto_merge=True, movie_batch=movie_batch))
              for mid in movie_ids]
@@ -1447,18 +1482,25 @@ async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, forc
         await _flush_full_chunks()
 
     if movie_batch:
-        await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, movie_batch)
+        await _flush_chunk(movie_batch)
 
     return ok, movie_ids
 
 
-async def _run_provider_series_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
+async def _run_provider_series_phase(
+    provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
+) -> tuple[bool, list]:
     """Runs one provider's series phase to completion. Same ok semantics as
-    _run_provider_movie_phase."""
+    _run_provider_movie_phase. write_queue: see _run_provider_movie_phase's
+    docstring -- threaded down to enrich_series_source_only/
+    _enrich_one_series_source so this phase's episode-batch writes are
+    serialized through the same run-wide writer as every other provider's
+    movie/series writes."""
     series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
     ok = True
     for outcome in await asyncio.gather(
-        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"]) for sid in series_ids),
+        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue)
+          for sid in series_ids),
         return_exceptions=True,
     ):
         if isinstance(outcome, BaseException) or outcome is False:
@@ -1468,6 +1510,7 @@ async def _run_provider_series_phase(provider: dict, sem: asyncio.Semaphore, for
 
 async def _run_provider_enrichment(
     provider: dict, movie_sem: asyncio.Semaphore, series_sem: asyncio.Semaphore, force: bool,
+    write_queue: "asyncio.Queue | None" = None,
 ) -> dict:
     """Per-provider orchestrator implementing the beads-f7e/beads-sw9
     sequencing/retry rules for exactly ONE provider: that provider's own
@@ -1486,13 +1529,43 @@ async def _run_provider_enrichment(
     once"). Returns a dict describing what still needs to happen:
       {"movie_ok": bool, "movie_ids": [...], "series_ran": bool,
        "series_ok": bool, "series_ids": [...]}
-    """
-    movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force)
+
+    write_queue: threaded to both phase calls -- see _run_global_writer."""
+    movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, write_queue=write_queue)
     if not movie_ok:
         return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
 
-    series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force)
+    series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force, write_queue=write_queue)
     return {"movie_ok": True, "movie_ids": movie_ids, "series_ran": True, "series_ok": series_ok, "series_ids": series_ids}
+
+
+async def _run_global_writer(queue: "asyncio.Queue") -> None:
+    """Plan-doc follow-up "one global writer" (2026-09-14): the ONLY coroutine
+    that ever calls vod_db.apply_movie_enrichment_batch or
+    vod_db.enrich_series_episodes_batch during a bulk_enrich_all run. Every
+    concurrently-running provider lane (movie phase or series phase, any
+    provider) put()s its batch payload onto this one run-wide queue instead
+    of writing directly, so no two batch-commit calls to SQLite are ever in
+    flight at the same time, regardless of how many provider lanes are
+    enriching concurrently.
+
+    Drains `queue` until it receives the shutdown sentinel (None). Each item
+    is a dict with "kind" ("movie" or "series") plus that kind's payload and
+    a "done" asyncio.Event the producer is awaiting -- set after the write
+    commits so the producing phase knows its data is durably written before
+    it returns (preserving the existing guarantee that a phase's writes are
+    flushed before the caller's end-of-phase merge sweep runs)."""
+    while True:
+        item = await queue.get()
+        if item is None:
+            return
+        if item["kind"] == "movie":
+            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, item["items"])
+        else:
+            await asyncio.to_thread(
+                vod_db.enrich_series_episodes_batch, item["series_id"], item["provider_id"], item["episodes"],
+            )
+        item["done"].set()
 
 
 async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
@@ -1563,9 +1636,18 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     # only the SEQUENCING is now per-provider, not the concurrency budget.
     movie_sem = asyncio.Semaphore(concurrency)
     series_sem = asyncio.Semaphore(concurrency)
+
+    # One run-wide queue + one background writer task (plan-doc follow-up
+    # "one global writer", 2026-09-14) -- every provider lane's movie/series
+    # batch write, across the WHOLE run, funnels through here instead of
+    # each lane independently reaching its own commit point. Bounded so a
+    # writer that falls behind applies backpressure to producers rather than
+    # letting unbounded in-memory payloads pile up.
+    write_queue: "asyncio.Queue" = asyncio.Queue(maxsize=32)
+    writer_task = asyncio.create_task(_run_global_writer(write_queue))
     try:
         results = await asyncio.gather(
-            *(_run_provider_enrichment(p, movie_sem, series_sem, force) for p in providers),
+            *(_run_provider_enrichment(p, movie_sem, series_sem, force, write_queue=write_queue) for p in providers),
         )
         for result in results:
             merged_movie_ids.update(result["movie_ids"])
@@ -1577,14 +1659,14 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         # finished both phases (spec: "after ALL other providers finish").
         needs_retry = [(p, r) for p, r in zip(providers, results) if not r["movie_ok"]]
         for provider, _first_result in needs_retry:
-            movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force)
+            movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, write_queue=write_queue)
             merged_movie_ids.update(movie_ids)
             if not movie_ok:
                 _ENRICH_PROGRESS["providers_incomplete"].append(
                     {"provider_id": provider["id"], "provider_name": provider.get("name"), "phase": "movies"}
                 )
                 continue
-            series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force)
+            series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force, write_queue=write_queue)
             merged_series_ids.update(series_ids)
             if not series_ok:
                 _ENRICH_PROGRESS["providers_incomplete"].append(
@@ -1598,6 +1680,12 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
                 _ENRICH_PROGRESS["providers_incomplete"].append(
                     {"provider_id": provider["id"], "provider_name": provider.get("name"), "phase": "series"}
                 )
+
+        # Shut the writer down and wait for it to exit before the merge
+        # sweeps below -- they must never read against data the writer
+        # hasn't actually committed yet.
+        await write_queue.put(None)
+        await writer_task
 
         # End-of-phase auto-merge sweeps -- moved here from enrich_movie/
         # enrich_series's own inline per-item calls (which bulk_enrich_all
@@ -1614,6 +1702,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         await asyncio.to_thread(vod_db.auto_merge_movies_by_tmdb_batch, merged_movie_ids)
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, merged_series_ids)
     finally:
+        if not writer_task.done():
+            writer_task.cancel()
         _ENRICH_PROGRESS["running"] = False
         _ENRICH_PROGRESS["finished_at"] = time.time()
         elapsed = _ENRICH_PROGRESS["finished_at"] - _ENRICH_PROGRESS["started_at"]

@@ -47,6 +47,14 @@ proposed to the upstream project, the entry links to that pull request —
   weakened each provider's intended request/concurrency isolation and
   backoff handling during a bulk run. Each provider's lane now fetches only
   its own series source.
+- ✅ Bulk enrichment now serializes every movie/series database write for
+  the whole run through one background writer task instead of each
+  provider's movie or series phase independently reaching its own
+  batch-commit point. Since different providers' phases run concurrently by
+  design, two providers could previously flush to SQLite at the same
+  instant; now only one write is ever in flight at a time, regardless of
+  how many provider lanes are enriching concurrently. Single/on-demand
+  enrich calls outside a bulk run are unaffected.
 
 ## 2026-09-13
 
