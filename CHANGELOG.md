@@ -18,6 +18,22 @@ running this build.
 proposed to the upstream project, the entry links to that pull request —
 🔀 = open/under review upstream, not yet merged.
 
+## 2026-09-14
+
+- ✅ Fixed bulk enrichment writing every movie's enrichment result to the
+  database in its own transaction, which could stall other providers'
+  enrichment lanes with "database is locked" errors during a full bulk run.
+  Movie writes are now batched (25 per transaction) instead of one write per
+  movie. Verified with a full-catalog live dry-run (56,978 movies, 5
+  providers, concurrency 8): zero lock errors, zero enrichment errors.
+- ✅ Fixed bulk series enrichment silently under-processing a provider's
+  series: a newly imported series wasn't selected for that provider's
+  enrichment phase until it had already been enriched by that provider at
+  least once, which meant series that most needed enrichment could be
+  permanently skipped by every bulk run. The per-provider series list now
+  uses the provider-membership data recorded at import time instead of
+  requiring prior episode data to already exist.
+
 ## 2026-09-13
 
 - ✅ Fixed a regression (introduced earlier today) where the automatic

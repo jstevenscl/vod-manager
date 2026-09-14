@@ -5838,13 +5838,13 @@ def _series_filter_clause(
         where.append("s.id IN (SELECT series_id FROM series_category_placements WHERE category_id=?)")
         params.append(category_id)
     if provider_id is not None:
-        # At least one episode actually sourced from this provider — not
-        # import_provider_id, which only reflects whoever created the series
-        # row and undercounts providers that later merged episodes in.
-        where.append("""s.id IN (
-            SELECT e.series_id FROM episode_sources es JOIN episodes e ON e.id = es.episode_id
-            WHERE es.provider_id=?
-        )""")
+        # series_sources, not episode_sources: a newly imported series has no
+        # episode_sources row until get_series_info succeeds, so filtering on
+        # episode_sources excluded it from the very provider phase meant to
+        # enrich it. series_sources is written at catalog-import time and
+        # reflects every provider a series is known to belong to, including
+        # ones that haven't been detail-enriched yet.
+        where.append("s.id IN (SELECT series_id FROM series_sources WHERE provider_id=?)")
         params.append(provider_id)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return clause, params

@@ -80,3 +80,30 @@ def test_set_series_source_enrichment_clears_the_need(db):
 
     sources = db.list_series_sources(series_id)
     assert db.series_source_needs_enrichment(sources[0]) is False
+
+
+def test_provider_series_selection_includes_series_with_no_episodes_yet(db):
+    """Live dry-run (2026-09-14, beads-ds8) found series_done permanently
+    short of series_total (8531/9905). Root cause: list_all_series_ids(
+    provider_id=...) filtered through episode_sources, which only gets a row
+    after get_series_info/episode fetch succeeds at least once. A newly
+    imported series has a series_sources row (it's known to belong to this
+    provider) but zero episode_sources rows -- so it was excluded from that
+    provider's own enrichment phase for the very reason it needs enrichment."""
+    provider_id = db.upsert_provider("XC-Test", "http://xc.example.com", "user", "pass", provider_type="xc")
+    db.bulk_import_series(provider_id, [{
+        "name": "Never Enriched Show", "year": 2020, "provider_series_id": "1",
+        "provider_category_name": None, "raw_name": "Never Enriched Show", "_has_detail": True,
+        "genre": None, "description": None, "cast_list": None, "director": None,
+        "poster_url": None, "rating": None, "release_date": None, "tmdb_id": None,
+        "provider_last_modified": None,
+    }])
+    series_id = db.list_series(limit=10)[0]["id"]
+
+    assert db.list_series_sources(series_id), "series must have a series_sources row from the import"
+
+    assert series_id in db.list_all_series_ids(provider_id=provider_id), (
+        "a newly imported series with a series_sources row for this provider, but no "
+        "episodes fetched yet, must still be selected for that provider's first "
+        "enrichment pass"
+    )
