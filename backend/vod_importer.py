@@ -1479,10 +1479,23 @@ async def _run_provider_movie_phase(
     draining the queue, instead of each phase independently reaching its own
     batch-commit point at the same time. When write_queue is None (no
     bulk_enrich_all run in progress), behavior is unchanged: this phase
-    writes its own chunks directly."""
+    writes its own chunks directly.
+
+    CPU-spike follow-up (2026-09-14, user-supplied analysis): this used to
+    asyncio.create_task() one item PER movie id up front (a list
+    comprehension over every id in the provider's catalog), even though
+    `sem` only ever let `sem._value` of them run at once -- against a full
+    catalog that's tens of thousands of live Task objects queued in the
+    event loop for no added parallelism. Now a fixed pool of `sem`-sized
+    long-lived workers pulls one id at a time off a plain asyncio.Queue,
+    so at most `sem`'s original capacity worth of ids are ever "live" as
+    real coroutines/Tasks; the rest sit as plain ints in the queue until
+    their turn. Throughput/concurrency is unchanged -- only the up-front
+    Task pile-up is removed."""
     movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
     ok = True
     movie_batch: list = []
+    worker_count = sem._value or 1  # sem starts un-acquired, so this is its full configured capacity
 
     async def _flush_chunk(chunk: list) -> None:
         if write_queue is not None:
@@ -1497,16 +1510,26 @@ async def _run_provider_movie_phase(
             chunk, movie_batch[:_MOVIE_BATCH_CHUNK_SIZE] = movie_batch[:_MOVIE_BATCH_CHUNK_SIZE], []
             await _flush_chunk(chunk)
 
-    tasks = [asyncio.create_task(_enrich_one("movie", sem, mid, force, skip_auto_merge=True, movie_batch=movie_batch))
-             for mid in movie_ids]
-    for task in tasks:
-        try:
-            outcome = await task
-        except BaseException:
-            outcome = False
-        if outcome is False:
-            ok = False
-        await _flush_full_chunks()
+    queue: asyncio.Queue = asyncio.Queue()
+    for mid in movie_ids:
+        queue.put_nowait(mid)
+
+    async def _worker() -> None:
+        nonlocal ok
+        while True:
+            try:
+                mid = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                outcome = await _enrich_one("movie", sem, mid, force, skip_auto_merge=True, movie_batch=movie_batch)
+            except BaseException:
+                outcome = False
+            if outcome is False:
+                ok = False
+            await _flush_full_chunks()
+
+    await asyncio.gather(*(_worker() for _ in range(min(worker_count, len(movie_ids) or 1))))
 
     if movie_batch:
         await _flush_chunk(movie_batch)
@@ -1522,16 +1545,42 @@ async def _run_provider_series_phase(
     docstring -- threaded down to enrich_series_source_only/
     _enrich_one_series_source so this phase's episode-batch writes are
     serialized through the same run-wide writer as every other provider's
-    movie/series writes."""
+    movie/series writes.
+
+    CPU-spike follow-up (2026-09-14, user-supplied analysis): this used to
+    asyncio.gather() over a generator expression covering EVERY series id
+    up front -- gather() fully materializes that generator into live
+    Task/coroutine objects before any of them run, same up-front pile-up
+    problem as the movie phase's old create_task list comprehension (see
+    that phase's docstring). Now uses the same bounded worker-pool
+    pattern: a fixed pool of `sem`-sized workers pulls one id at a time
+    off a plain asyncio.Queue. Throughput/concurrency is unchanged."""
     series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
     ok = True
-    for outcome in await asyncio.gather(
-        *(_enrich_one("series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue)
-          for sid in series_ids),
-        return_exceptions=True,
-    ):
-        if isinstance(outcome, BaseException) or outcome is False:
-            ok = False
+    worker_count = sem._value or 1  # sem starts un-acquired, so this is its full configured capacity
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for sid in series_ids:
+        queue.put_nowait(sid)
+
+    async def _worker() -> None:
+        nonlocal ok
+        while True:
+            try:
+                sid = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                outcome = await _enrich_one(
+                    "series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue,
+                )
+            except BaseException:
+                outcome = False
+            if outcome is False:
+                ok = False
+
+    await asyncio.gather(*(_worker() for _ in range(min(worker_count, len(series_ids) or 1))))
+
     return ok, series_ids
 
 

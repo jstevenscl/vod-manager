@@ -20,6 +20,15 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ Bulk enrichment no longer creates a task for every movie/series in a
+  provider's catalog up front. It used to launch all of them at once (a
+  full-catalog provider could mean tens of thousands queued simultaneously)
+  even though only a handful actually run at a time — the rest just sat in
+  memory adding scheduling overhead. Enrichment now uses a fixed-size pool
+  of workers (matching the existing concurrency limit) that pull items one
+  at a time from a queue. Same enrichment speed and same number of items
+  running at once, just without the up-front pile-up.
+
 - ✅ Fixed bulk enrichment writing every movie's enrichment result to the
   database in its own transaction, which could stall other providers'
   enrichment lanes with "database is locked" errors during a full bulk run.
