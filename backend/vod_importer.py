@@ -393,6 +393,33 @@ async def _drain_closed_clients() -> None:
         await _CLIENTS_PENDING_CLOSE.pop().aclose()
 
 
+async def evict_provider_client(provider_id: int) -> None:
+    """Plan-doc follow-up "provider HTTP-client lifecycle" (2026-09-14):
+    explicit cleanup for a single provider, called when that provider is
+    deleted or its connection settings (base_url/username/password/
+    custom_user_agent) change -- so a stale pooled client (old credentials/
+    headers, or a provider that no longer exists) doesn't keep getting
+    reused until an unrelated backoff trip happens to evict it (which might
+    never happen for a deleted provider). Also drops the limiter/backoff
+    in-memory state, since both are keyed by a provider_id that may now
+    refer to nothing, or to a provider under a different identity."""
+    client = _PROVIDER_CLIENTS.pop(provider_id, None)
+    if client is not None:
+        _CLIENTS_PENDING_CLOSE.append(client)
+    _PROVIDER_LIMITERS.pop(provider_id, None)
+    _PROVIDER_BACKOFF.pop(provider_id, None)
+    await _drain_closed_clients()
+
+
+async def close_all_provider_clients() -> None:
+    """Plan-doc follow-up "provider HTTP-client lifecycle" (2026-09-14):
+    called from main.py's lifespan shutdown so no pooled provider socket/TLS
+    session outlives the process, instead of relying on OS process teardown
+    to reclaim them."""
+    for provider_id in list(_PROVIDER_CLIENTS):
+        await evict_provider_client(provider_id)
+
+
 def _get_provider_client(provider_id: int, headers: dict) -> httpx.AsyncClient:
     client = _PROVIDER_CLIENTS.get(provider_id)
     if client is None:

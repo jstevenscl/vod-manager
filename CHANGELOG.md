@@ -55,6 +55,12 @@ proposed to the upstream project, the entry links to that pull request —
   instant; now only one write is ever in flight at a time, regardless of
   how many provider lanes are enriching concurrently. Single/on-demand
   enrich calls outside a bulk run are unaffected.
+- ✅ Pooled per-provider HTTP connections are now explicitly closed at
+  application shutdown, and whenever a provider is deleted or its connection
+  settings (base URL, username/password, custom user agent) change. Before,
+  a stale pooled connection could keep being reused under old credentials
+  (or against a provider that no longer exists) until an unrelated failure
+  happened to evict it, which might never happen for a deleted provider.
 
 ## 2026-09-13
 

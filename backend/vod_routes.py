@@ -1208,6 +1208,10 @@ async def upsert_provider(body: ProviderRequest):
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
     )
+    # Connection settings (base_url/username/password) may have just changed;
+    # evict any pooled client built under the old ones so the next call opens
+    # a genuinely fresh connection instead of reusing stale credentials.
+    await vod_importer.evict_provider_client(provider_id)
 
     sync_error = None
     try:
@@ -1248,6 +1252,7 @@ async def set_provider_base_url(provider_id: int, base_url: str):
     if not base_url:
         raise HTTPException(400, detail="base_url cannot be empty")
     vod_db.set_provider_base_url(provider_id, base_url)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
@@ -1460,6 +1465,7 @@ async def set_provider_custom_user_agent(provider_id: int, custom_user_agent: Op
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
     vod_db.set_provider_custom_user_agent(provider_id, custom_user_agent.strip() if custom_user_agent else None)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
@@ -1569,6 +1575,7 @@ async def delete_provider(provider_id: int):
     # indexes -- off the event loop so it doesn't stall every other request
     # (including the Activity poll) while it runs.
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
