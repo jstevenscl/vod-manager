@@ -33,6 +33,14 @@ proposed to the upstream project, the entry links to that pull request —
   permanently skipped by every bulk run. The per-provider series list now
   uses the provider-membership data recorded at import time instead of
   requiring prior episode data to already exist.
+- ✅ Fixed bulk enrichment's end-of-run duplicate-merge sweep spiking host
+  CPU to 1200%+ (near-total saturation on a 14-core host) for the duration
+  of the sweep. It was launching one background thread per affected title
+  instead of merging sequentially, which added no real speed (every merge
+  already had to wait its turn for the database anyway) but generated heavy
+  thread-scheduling overhead at full-catalog scale. Merges now run
+  sequentially in a single background task; total merge sweep work is
+  unchanged, just without the thread pile-up.
 
 ## 2026-09-13
 

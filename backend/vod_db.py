@@ -8626,6 +8626,30 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
             series_id = keep_id
 
 
+def auto_merge_movies_by_tmdb_batch(movie_ids) -> None:
+    """Bulk-enrich's end-of-run merge sweep (see vod_importer.bulk_enrich_all)
+    used to fan out one asyncio.to_thread(auto_merge_movie_by_tmdb, id) task
+    per affected id via asyncio.gather -- against a full-catalog run that's
+    thousands of OS threads submitted to the executor at once. Each merge is
+    already fully serialized by _WRITE_LOCK internally (merge_movie), so that
+    fan-out bought zero real parallelism -- it only added thread-scheduling
+    and per-call _connect() overhead, which is what drove the live CPU spike
+    to 1200%+/near-total host saturation during the 2026-09-14 dry-run (see
+    the plan doc's "Follow-up: final SQLite contention work"). Looping
+    sequentially in one thread does the identical merges in the identical
+    order with none of that overhead."""
+    for movie_id in movie_ids:
+        auto_merge_movie_by_tmdb(movie_id)
+
+
+def auto_merge_series_by_tmdb_batch(series_ids) -> None:
+    """Series counterpart to auto_merge_movies_by_tmdb_batch -- same
+    single-thread-sequential fix for the same per-id asyncio.gather fan-out
+    problem, see that function's docstring."""
+    for series_id in series_ids:
+        auto_merge_series_by_tmdb(series_id)
+
+
 def list_needs_year_review(content_type: str | None = None) -> dict:
     conn = _connect()
     out: dict = {}

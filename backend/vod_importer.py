@@ -1537,12 +1537,16 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         # enrich_series's own inline per-item calls (which bulk_enrich_all
         # now suppresses via skip_auto_merge=True) so a bulk run merges once
         # per item after its whole phase resolves, not mid-phase per item.
-        await asyncio.gather(*(
-            asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, mid) for mid in merged_movie_ids
-        ))
-        await asyncio.gather(*(
-            asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, sid) for sid in merged_series_ids
-        ))
+        #
+        # One asyncio.to_thread call each, not one per id: every merge is
+        # already fully serialized by vod_db._WRITE_LOCK internally, so
+        # fanning out via asyncio.gather bought no real parallelism -- against
+        # a full-catalog run it meant thousands of OS threads submitted to
+        # the executor at once, which is what drove host CPU to 1200%+/near-
+        # total saturation during the 2026-09-14 dry-run. See
+        # auto_merge_movies_by_tmdb_batch's docstring in vod_db.py.
+        await asyncio.to_thread(vod_db.auto_merge_movies_by_tmdb_batch, merged_movie_ids)
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, merged_series_ids)
     finally:
         _ENRICH_PROGRESS["running"] = False
         _ENRICH_PROGRESS["finished_at"] = time.time()

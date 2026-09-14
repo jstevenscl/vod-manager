@@ -192,3 +192,50 @@ def test_auto_merge_series_merges_same_tmdb_id_same_language(db):
 
     remaining = [s for s in db.list_series(limit=1000) if "Dark" in s["name"]]
     assert len(remaining) == 1
+
+
+def test_auto_merge_movies_by_tmdb_batch_merges_each_id_sequentially(db):
+    """2026-09-14 CPU-spike fix: bulk enrich's end-of-run sweep used to fan
+    out one asyncio.to_thread(auto_merge_movie_by_tmdb, id) task per affected
+    id -- thousands of OS threads submitted at once against a full catalog,
+    even though every merge is already serialized by _WRITE_LOCK. The batch
+    helper must produce the identical merge outcome as calling
+    auto_merge_movie_by_tmdb once per id in a loop."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+
+    a = _import_movie(db, provider_id, "Movie A", 2001, "a-1", "Movie A", tmdb_id=501)
+    a_dup = _import_movie(db, provider_id, "Movie A Dup", 2001, "a-2", "Movie A Dup", tmdb_id=501)
+    b = _import_movie(db, provider_id, "Movie B", 2005, "b-1", "Movie B", tmdb_id=502)
+    b_dup = _import_movie(db, provider_id, "Movie B Dup", 2005, "b-2", "Movie B Dup", tmdb_id=502)
+
+    db.auto_merge_movies_by_tmdb_batch([a["id"], b["id"]])
+
+    assert db.get_movie(a["id"]) is not None
+    assert db.get_movie(a_dup["id"]) is None
+    assert db.get_movie(b["id"]) is not None
+    assert db.get_movie(b_dup["id"]) is None
+
+
+def test_auto_merge_series_by_tmdb_batch_merges_each_id_sequentially(db):
+    """Series counterpart to test_auto_merge_movies_by_tmdb_batch_merges_each_id_sequentially."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+
+    db.bulk_import_series(provider_id, [
+        {"name": "Show A", "year": 2010, "provider_series_id": "a-1", "raw_name": "Show A",
+         "tmdb_id": 601, "_has_detail": True, "provider_category_name": None, "genre": None,
+         "description": None, "cast_list": None, "director": None, "poster_url": None,
+         "rating": None, "release_date": None, "provider_last_modified": None},
+        {"name": "Show A Dup", "year": 2010, "provider_series_id": "a-2", "raw_name": "Show A Dup",
+         "tmdb_id": 601, "_has_detail": True, "provider_category_name": None, "genre": None,
+         "description": None, "cast_list": None, "director": None, "poster_url": None,
+         "rating": None, "release_date": None, "provider_last_modified": None},
+    ])
+    rows = [s for s in db.list_series(limit=1000) if s["name"] in ("Show A", "Show A Dup")]
+    assert len(rows) == 2
+
+    db.auto_merge_series_by_tmdb_batch([rows[0]["id"]])
+
+    remaining = [s for s in db.list_series(limit=1000) if s["name"] in ("Show A", "Show A Dup")]
+    assert len(remaining) == 1
