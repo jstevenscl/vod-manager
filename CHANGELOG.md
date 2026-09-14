@@ -20,6 +20,14 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ XC movie catalog imports now retain the provider's bulk artwork URL
+  (`stream_icon`) immediately, matching the existing series-cover behavior.
+  Movie cards no longer need an expensive per-title enrichment request merely
+  to display a poster; enrichment and TMDB remain fallbacks for missing or
+  improved artwork. The importer keeps the first usable poster for a
+  canonical movie, so alternate source variants cannot cause artwork to
+  flip on later refreshes.
+
 - ✅ Bulk enrichment no longer creates a task for every movie/series in a
   provider's catalog up front. It used to launch all of them at once (a
   full-catalog provider could mean tens of thousands queued simultaneously)

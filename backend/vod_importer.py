@@ -341,10 +341,19 @@ class _AdaptiveLimiter:
             self._in_use -= 1
             self._cond.notify_all()
 
-    async def note_failure(self) -> None:
+    async def note_failure(self, provider_name: str = "", reason: str = "") -> None:
+        # Log cap reductions so a provider's visible throttling state has
+        # evidence alongside the binary _PROVIDER_BACKOFF warning (which only
+        # fires after its own consecutive-failure threshold).
         async with self._cond:
             self._streak = 0
-            self.cap = max(_PROVIDER_MIN_CONCURRENCY, self.cap // 2)
+            new_cap = max(_PROVIDER_MIN_CONCURRENCY, self.cap // 2)
+            if new_cap != self.cap:
+                logger.warning(
+                    "[vod_importer] provider=%s reducing concurrency %d -> %d after %s",
+                    provider_name or "?", self.cap, new_cap, reason or "unspecified error",
+                )
+            self.cap = new_cap
 
     async def note_success(self) -> None:
         async with self._cond:
@@ -488,15 +497,17 @@ class XCProviderClient:
                 # started failing with opaque timeouts that didn't happen
                 # run sequentially -- moving the parse off the loop fixed it.
                 result = await asyncio.to_thread(r.json)
-            except _BACKOFF_EXCEPTION_TYPES:
+            except _BACKOFF_EXCEPTION_TYPES as exc:
                 if self.provider_id is not None:
                     _record_provider_failure(self.provider_id, self.provider_name)
-                    await limiter.note_failure()
+                    await limiter.note_failure(provider_name=self.provider_name, reason=type(exc).__name__)
                 raise
             except httpx.HTTPStatusError as exc:
                 if self.provider_id is not None and exc.response.status_code in _BACKOFF_STATUS_CODES:
                     _record_provider_failure(self.provider_id, self.provider_name)
-                    await limiter.note_failure()
+                    await limiter.note_failure(
+                        provider_name=self.provider_name, reason=f"HTTP {exc.response.status_code}"
+                    )
                 raise
             else:
                 if self.provider_id is not None:
@@ -571,6 +582,16 @@ async def _import_movies_for_provider(
             # plot in this endpoint though (unlike get_series), so nothing
             # else is worth capturing here.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
+            # XC movie-list responses conventionally expose their free bulk
+            # artwork as stream_icon.
+            # A few nonstandard panels use one of the later names instead,
+            # so retain those as harmless fallbacks. This avoids an expensive
+            # get_vod_info request for every movie merely to populate cards;
+            # enrichment/TMDB still fills or improves any missing artwork.
+            "poster_url": (
+                s.get("stream_icon") or s.get("cover") or
+                s.get("cover_big") or s.get("movie_image") or None
+            ),
         })
     db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
@@ -1450,6 +1471,7 @@ _MOVIE_BATCH_CHUNK_SIZE = 25  # matches the plan doc's original batch-size choic
 
 async def _run_provider_movie_phase(
     provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
+    provider_count: int = 1,
 ) -> tuple[bool, list]:
     """Runs one provider's movie phase to completion. Returns (ok, movie_ids)
     where ok is True iff every item in this provider's movie phase completed
@@ -1469,6 +1491,23 @@ async def _run_provider_movie_phase(
     actually been committed, so the caller's end-of-run
     auto_merge_movie_by_tmdb sweep never runs against a tmdb_id that's still
     unwritten.
+
+    provider_count: `sem` is ONE semaphore shared across every provider's
+    movie phase running
+    concurrently in bulk_enrich_all (created once, passed into all of them).
+    worker_count used to be `sem._value` outright -- each provider's phase
+    claiming the semaphore's FULL configured capacity as its OWN worker
+    count, so with N providers running at once, N*sem._value long-lived
+    workers all contended for the same sem._value slots. Each provider's own
+    workers loop straight back to re-acquire sem the instant they release
+    it, so whichever provider's workers start winning slots tends to keep
+    winning them in a tight self-reinforcing burst -- unlike the old
+    per-item create_task/gather pattern (see below) where task-creation
+    order naturally interleaved slot wins across all providers. Passing the
+    actual concurrently-running provider_count down lets this phase divide
+    the shared semaphore's capacity fairly (min 1 worker) instead of
+    claiming it whole; default of 1 preserves existing single-provider
+    direct-call behavior/tests unchanged.
 
     write_queue (plan-doc follow-up "one global writer", 2026-09-14): when
     given, each chunk is put() on this run-wide queue and awaited via a
@@ -1495,7 +1534,10 @@ async def _run_provider_movie_phase(
     movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
     ok = True
     movie_batch: list = []
-    worker_count = sem._value or 1  # sem starts un-acquired, so this is its full configured capacity
+    # sem is shared across provider_count concurrently-running providers'
+    # phases -- divide its capacity fairly instead of each phase
+    # claiming sem._value (the semaphore's full capacity) for itself alone.
+    worker_count = max(1, (sem._value or 1) // max(1, provider_count))
 
     async def _flush_chunk(chunk: list) -> None:
         if write_queue is not None:
@@ -1539,13 +1581,16 @@ async def _run_provider_movie_phase(
 
 async def _run_provider_series_phase(
     provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
+    provider_count: int = 1,
 ) -> tuple[bool, list]:
     """Runs one provider's series phase to completion. Same ok semantics as
     _run_provider_movie_phase. write_queue: see _run_provider_movie_phase's
     docstring -- threaded down to enrich_series_source_only/
     _enrich_one_series_source so this phase's episode-batch writes are
     serialized through the same run-wide writer as every other provider's
-    movie/series writes.
+    movie/series writes. provider_count: see _run_provider_movie_phase's
+    docstring -- same shared-semaphore fair-share fix, default 1 preserves
+    existing single-provider direct-call behavior/tests unchanged.
 
     CPU-spike follow-up (2026-09-14, user-supplied analysis): this used to
     asyncio.gather() over a generator expression covering EVERY series id
@@ -1557,7 +1602,7 @@ async def _run_provider_series_phase(
     off a plain asyncio.Queue. Throughput/concurrency is unchanged."""
     series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
     ok = True
-    worker_count = sem._value or 1  # sem starts un-acquired, so this is its full configured capacity
+    worker_count = max(1, (sem._value or 1) // max(1, provider_count))
 
     queue: asyncio.Queue = asyncio.Queue()
     for sid in series_ids:
@@ -1586,7 +1631,7 @@ async def _run_provider_series_phase(
 
 async def _run_provider_enrichment(
     provider: dict, movie_sem: asyncio.Semaphore, series_sem: asyncio.Semaphore, force: bool,
-    write_queue: "asyncio.Queue | None" = None,
+    write_queue: "asyncio.Queue | None" = None, provider_count: int = 1,
 ) -> dict:
     """Per-provider orchestrator implementing the beads-f7e/beads-sw9
     sequencing/retry rules for exactly ONE provider: that provider's own
@@ -1606,12 +1651,20 @@ async def _run_provider_enrichment(
       {"movie_ok": bool, "movie_ids": [...], "series_ran": bool,
        "series_ok": bool, "series_ids": [...]}
 
-    write_queue: threaded to both phase calls -- see _run_global_writer."""
-    movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, write_queue=write_queue)
+    write_queue: threaded to both phase calls -- see _run_global_writer.
+    provider_count: how many providers are running this concurrently via the
+    caller's asyncio.gather -- threaded to both phases so each divides
+    movie_sem/series_sem's shared capacity fairly (see
+    _run_provider_movie_phase's docstring)."""
+    movie_ok, movie_ids = await _run_provider_movie_phase(
+        provider, movie_sem, force, write_queue=write_queue, provider_count=provider_count,
+    )
     if not movie_ok:
         return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
 
-    series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force, write_queue=write_queue)
+    series_ok, series_ids = await _run_provider_series_phase(
+        provider, series_sem, force, write_queue=write_queue, provider_count=provider_count,
+    )
     return {"movie_ok": True, "movie_ids": movie_ids, "series_ran": True, "series_ok": series_ok, "series_ids": series_ids}
 
 
@@ -1723,7 +1776,12 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     writer_task = asyncio.create_task(_run_global_writer(write_queue))
     try:
         results = await asyncio.gather(
-            *(_run_provider_enrichment(p, movie_sem, series_sem, force, write_queue=write_queue) for p in providers),
+            *(
+                _run_provider_enrichment(
+                    p, movie_sem, series_sem, force, write_queue=write_queue, provider_count=len(providers),
+                )
+                for p in providers
+            ),
         )
         for result in results:
             merged_movie_ids.update(result["movie_ids"])

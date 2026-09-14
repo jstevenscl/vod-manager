@@ -6702,10 +6702,11 @@ def _looks_adult(*category_names) -> bool:
 
 def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...],
-    optionally carrying tmdb_id -- some providers' bulk get_vod_streams list
-    already includes it (unlike genre/cast/plot, which never appear there;
-    see bulk_import_series's identical-but-richer capture for series). Only
-    ever upgrades via COALESCE, never overwrites an id already known.
+    optionally carrying tmdb_id and poster_url. Some providers' bulk
+    get_vod_streams list already includes these (unlike genre/cast/plot,
+    which never appear there; see bulk_import_series's identical-but-richer
+    capture for series). Both only fill a missing canonical value, never
+    overwrite an already-known value.
 
     Adult-content auto-detection runs on every import pass (not just first
     creation) so a provider re-categorizing something later still gets
@@ -6884,7 +6885,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
             movie_updates_archive: list[tuple] = []
             movie_updates_unarchive: list[tuple] = []
             movie_updates_tmdb: list[tuple] = []
-            movie_inserts: list[tuple] = []  # (name, year, is_adult, needs_year_review, review_excluded, created_at)
+            movie_inserts: list[tuple] = []  # (name, year, is_adult, needs_year_review, review_excluded, poster_url, created_at)
             movie_source_upserts: list[tuple] = []
             # Each entry resolved below either already has a real movie_id
             # (matched an existing row) or is a pending insert referenced by
@@ -6935,7 +6936,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     elif not name.strip():
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
                         insert_index = len(movie_inserts)
-                        movie_inserts.append((placeholder, year, int(category_looks_adult), 1, int(should_archive), now))
+                        movie_inserts.append((placeholder, year, int(category_looks_adult), 1, int(should_archive), item.get("poster_url"), now))
                         did_create = True
                         did_flag = True
                         did_archive = should_archive
@@ -6985,7 +6986,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                 # language-filtered one, so a language mismatch
                                 # alone doesn't spuriously flag an otherwise
                                 # unambiguous title for review.
-                                movie_inserts.append((name, year, int(category_looks_adult), 1 if all_candidates else 0, int(should_archive), now))
+                                movie_inserts.append((name, year, int(category_looks_adult), 1 if all_candidates else 0, int(should_archive), item.get("poster_url"), now))
                                 did_create = True
                                 did_archive = should_archive
                                 if all_candidates:
@@ -7010,7 +7011,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             # code's separate 5-column INSERT (no needs_year_review
                             # column, defaulting to its schema default of 0) for
                             # this exact branch.
-                            movie_inserts.append((name, year, int(category_looks_adult), 0, int(should_archive), now))
+                            movie_inserts.append((name, year, int(category_looks_adult), 0, int(should_archive), item.get("poster_url"), now))
                             did_create = True
                             did_archive = should_archive
                             # Same same-chunk-visibility fix as the year=None
@@ -7044,7 +7045,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     insert_id_map: dict[int, int] = {}
                     for idx, row in enumerate(movie_inserts):
                         cur = conn.execute(
-                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?,?)",
                             row,
                         )
                         insert_id_map[idx] = cur.lastrowid
@@ -7080,6 +7081,20 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             conn.execute(
                                 "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
                                 (item["tmdb_id"], entry["movie_id"]),
+                            )
+                        if item.get("poster_url"):
+                            # A canonical card can have several source variants
+                            # from this (or other) providers. Keep the first
+                            # usable bulk poster rather than letting a later
+                            # variant flip artwork on every catalog refresh.
+                            conn.execute(
+                                """UPDATE movies
+                                   SET poster_url=CASE
+                                       WHEN poster_url IS NULL OR TRIM(poster_url)='' THEN ?
+                                       ELSE poster_url
+                                   END
+                                   WHERE id=?""",
+                                (item["poster_url"], entry["movie_id"]),
                             )
                         conn.execute(
                             """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, added_at, last_seen_at)
