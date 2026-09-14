@@ -840,13 +840,28 @@ def _apply_field_rules(content_type: str, fields: dict) -> dict:
     return result
 
 
-async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: bool = False) -> bool:
+async def enrich_movie(
+    movie_id: int, *, force: bool = False, skip_auto_merge: bool = False, skip_write: bool = False,
+) -> bool | dict:
     """Fetch get_vod_info for this movie's best source and persist detail
     fields. Returns False without a network call if already fresh (unless
     force=True) — the on-demand-and-cache pattern from the module docstring.
     skip_auto_merge=True (used only by bulk_enrich_all's per-provider
     orchestration, beads-f7e/beads-sw9) defers the tmdb_id auto-merge to that
-    caller's own end-of-phase sweep instead of running it inline here."""
+    caller's own end-of-phase sweep instead of running it inline here.
+
+    skip_write=True (used only by _run_provider_movie_phase, beads-ds8)
+    returns the computed {"movie_id", "fields", "source_id", "bitrate"}
+    payload instead of writing it via vod_db.set_movie_enrichment/
+    set_movie_source_bitrate -- the caller collects these across many
+    concurrently-enriching movies and writes them via one
+    vod_db.apply_movie_enrichment_batch call per chunk, instead of each
+    movie independently acquiring vod_db._WRITE_LOCK. A single/on-demand
+    call (skip_write's default, False) keeps writing inline immediately --
+    same as enrich_series's unchanged single-item path. Still returns True/
+    False (not a payload) when nothing needs enriching or no fields resulted
+    (e.g. Plex's TTL-bump path skip_write=True hits below), since there's
+    nothing for the caller's batch writer to do in that case."""
     if not force and not await asyncio.to_thread(vod_db.movie_needs_enrichment, movie_id):
         return False
 
@@ -862,6 +877,8 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
         # Plex's library listing already hands back full detail at import
         # time (see plex_importer.py) — nothing more to lazily fetch here,
         # just refresh the TTL stamp so the scheduler leaves it alone.
+        if skip_write:
+            return {"movie_id": movie_id, "fields": {}, "source_id": None, "bitrate": None}
         await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id)
         return True
 
@@ -874,13 +891,13 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
         async with emby_vod_client.EmbyVodClient(provider) as client:
             item = await client.get_movie_people(source["provider_stream_id"])
         fields = emby_vod_client.extract_common_fields(item)
-        await asyncio.to_thread(
-            vod_db.set_movie_enrichment, movie_id,
-            **_apply_field_rules("movie", {
-                "director": fields["director"],
-                "cast_list": fields["cast_list"],
-            }),
-        )
+        movie_fields = _apply_field_rules("movie", {
+            "director": fields["director"],
+            "cast_list": fields["cast_list"],
+        })
+        if skip_write:
+            return {"movie_id": movie_id, "fields": movie_fields, "source_id": None, "bitrate": None}
+        await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **movie_fields)
         return True
 
     # If this movie already carries a confirmed tmdb_id (set by a previous
@@ -899,9 +916,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
             if tmdb_detail.get("name"):
                 name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
                 name_fields["name"] = vod_db.apply_rules_to_value(tmdb_detail["name"], name_rules)
-            await asyncio.to_thread(
-                vod_db.set_movie_enrichment,
-                movie_id,
+            movie_fields = {
                 **name_fields,
                 **_apply_field_rules("movie", {
                     "genre": tmdb_detail.get("genre"),
@@ -910,13 +925,16 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
                     "director": tmdb_detail.get("director"),
                     "country": tmdb_detail.get("country"),
                 }),
-                tmdb_id=existing_tmdb_id,
-                poster_url=tmdb_detail.get("poster_url"),
-                duration_secs=tmdb_detail.get("duration_secs"),
-                rating=tmdb_detail.get("rating"),
-                release_date=tmdb_detail.get("release_date"),
-                content_rating=tmdb_detail.get("content_rating"),
-            )
+                "tmdb_id": existing_tmdb_id,
+                "poster_url": tmdb_detail.get("poster_url"),
+                "duration_secs": tmdb_detail.get("duration_secs"),
+                "rating": tmdb_detail.get("rating"),
+                "release_date": tmdb_detail.get("release_date"),
+                "content_rating": tmdb_detail.get("content_rating"),
+            }
+            if skip_write:
+                return {"movie_id": movie_id, "fields": movie_fields, "source_id": None, "bitrate": None}
+            await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **movie_fields)
             if not skip_auto_merge:
                 await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
@@ -943,9 +961,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
         name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
         name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
 
-    await asyncio.to_thread(
-        vod_db.set_movie_enrichment,
-        movie_id,
+    movie_fields = {
         **name_fields,
         **_apply_field_rules("movie", {
             "genre": detail.get("genre") or None,
@@ -954,19 +970,22 @@ async def enrich_movie(movie_id: int, *, force: bool = False, skip_auto_merge: b
             "director": detail.get("director") or None,
             "country": detail.get("country") or None,
         }),
-        tmdb_id=_clean_tmdb_id(detail.get("tmdb_id")),
-        poster_url=detail.get("cover_big") or detail.get("movie_image") or None,
-        duration_secs=detail.get("duration_secs") or None,
+        "tmdb_id": _clean_tmdb_id(detail.get("tmdb_id")),
+        "poster_url": detail.get("cover_big") or detail.get("movie_image") or None,
+        "duration_secs": detail.get("duration_secs") or None,
         # rating/release_date not run through _apply_field_rules -- those
         # regex find/replace rules exist for cleaning up freeform text
         # (titles, descriptions), not for a numeric rating or an ISO date.
-        rating=detail.get("rating") or None,
-        release_date=detail.get("releasedate") or None,
-    )
+        "rating": detail.get("rating") or None,
+        "release_date": detail.get("releasedate") or None,
+    }
     # bitrate is per-SOURCE (see vod_db.set_movie_source_bitrate's docstring),
     # not per-movie -- this get_vod_info call was made against this specific
     # source, so it's the only one this bitrate value is actually true for.
     bitrate = _coerce_int(detail.get("bitrate"))
+    if skip_write:
+        return {"movie_id": movie_id, "fields": movie_fields, "source_id": source["id"], "bitrate": bitrate}
+    await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **movie_fields)
     if bitrate is not None:
         await asyncio.to_thread(vod_db.set_movie_source_bitrate, source["id"], bitrate)
     if not skip_auto_merge:
@@ -1250,17 +1269,33 @@ def get_enrich_progress() -> dict:
 _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralizes to itself, not "seriess"
 
 
-async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *, skip_auto_merge: bool = False) -> bool:
+async def _enrich_one(
+    kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
+    skip_auto_merge: bool = False, movie_batch: list | None = None,
+) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
     per-provider phase orchestration to tell "this provider's phase is
     genuinely failing" apart from "some items 404'd but the provider itself
-    is fine", the same way a single _enrich_one call always could not."""
+    is fine", the same way a single _enrich_one call always could not.
+
+    movie_batch (kind == "movie" only, beads-ds8): when given, enrich_movie
+    is called with skip_write=True and its returned payload (if any fields
+    resulted) is appended here instead of being written immediately --
+    _run_provider_movie_phase owns flushing this list via
+    vod_db.apply_movie_enrichment_batch in chunks, so many concurrently-
+    enriching movies share one write-lock acquisition per chunk instead of
+    each independently acquiring it."""
     prefix = _PROGRESS_PREFIX[kind]
     async with sem:
         try:
             if kind == "movie":
-                await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
+                if movie_batch is not None:
+                    result = await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge, skip_write=True)
+                    if isinstance(result, dict):
+                        movie_batch.append(result)
+                else:
+                    await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
             return True
@@ -1303,20 +1338,51 @@ async def _enrich_one(kind: str, sem: asyncio.Semaphore, item_id: int, force: bo
                 _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
+_MOVIE_BATCH_CHUNK_SIZE = 25  # matches the plan doc's original batch-size choice
+
+
 async def _run_provider_movie_phase(provider: dict, sem: asyncio.Semaphore, force: bool) -> tuple[bool, list]:
     """Runs one provider's movie phase to completion. Returns (ok, movie_ids)
     where ok is True iff every item in this provider's movie phase completed
     without raising (ProviderBackoffError counts as non-raising/ok, same as
     _enrich_one's existing semantics -- a backed-off item isn't a provider
-    failure, it's deliberately deferred)."""
+    failure, it's deliberately deferred).
+
+    beads-ds8: movie writes are collected in-memory (movie_batch) across all
+    of this provider's concurrently-enriching movies instead of each one
+    independently acquiring vod_db._WRITE_LOCK via set_movie_enrichment --
+    same class of lock contention beads-3po already fixed for series via
+    enrich_series_episodes_batch, just at movie-count scale. Flushed in
+    _MOVIE_BATCH_CHUNK_SIZE-item chunks via vod_db.apply_movie_enrichment_batch
+    as enrichment completes (so one giant provider catalog doesn't hold one
+    single enormous uncommitted transaction), with a final flush for
+    whatever's left once every item has resolved -- this phase does not
+    return until every movie's write has actually been flushed, so the
+    caller's end-of-run auto_merge_movie_by_tmdb sweep never runs against a
+    tmdb_id that's still sitting unflushed in memory."""
     movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
     ok = True
-    for outcome in await asyncio.gather(
-        *(_enrich_one("movie", sem, mid, force, skip_auto_merge=True) for mid in movie_ids),
-        return_exceptions=True,
-    ):
-        if isinstance(outcome, BaseException) or outcome is False:
+    movie_batch: list = []
+
+    async def _flush_full_chunks() -> None:
+        while len(movie_batch) >= _MOVIE_BATCH_CHUNK_SIZE:
+            chunk, movie_batch[:_MOVIE_BATCH_CHUNK_SIZE] = movie_batch[:_MOVIE_BATCH_CHUNK_SIZE], []
+            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, chunk)
+
+    tasks = [asyncio.create_task(_enrich_one("movie", sem, mid, force, skip_auto_merge=True, movie_batch=movie_batch))
+             for mid in movie_ids]
+    for task in tasks:
+        try:
+            outcome = await task
+        except BaseException:
+            outcome = False
+        if outcome is False:
             ok = False
+        await _flush_full_chunks()
+
+    if movie_batch:
+        await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, movie_batch)
+
     return ok, movie_ids
 
 

@@ -60,7 +60,7 @@ def test_each_providers_series_wait_for_that_same_providers_movies(monkeypatch):
     movies finish -- the core per-provider sequencing rule."""
     events = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         await asyncio.sleep(0.01)
         events.append(("movie", movie_id))
         return True
@@ -92,7 +92,7 @@ def test_one_providers_movies_do_not_block_another_providers_series(monkeypatch)
     provider_a_movie_started = asyncio.Event()
     provider_b_series_done = asyncio.Event()
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         if movie_id == 10:  # Provider A's movie -- deliberately slow
             provider_a_movie_started.set()
             await provider_b_series_done.wait()
@@ -134,7 +134,7 @@ def test_provider_whose_movies_fail_is_skipped_while_others_continue(monkeypatch
     for the later single retry."""
     events = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         if movie_id == 10:  # Provider X (id=1) -- always fails
             raise RuntimeError("provider X movie enrichment stalled")
         events.append(("movie", movie_id))
@@ -175,7 +175,7 @@ def test_provider_movie_retry_succeeds_then_series_runs(monkeypatch):
     call_count = {"movie10": 0}
     events = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         if movie_id == 10:
             call_count["movie10"] += 1
             if call_count["movie10"] == 1:
@@ -224,7 +224,7 @@ def test_provider_retry_does_not_double_count_already_succeeded_items(monkeypatc
     them, and must never exceed movies_total."""
     call_count = {"movie10": 0}
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         if movie_id == 10:
             call_count["movie10"] += 1
             if call_count["movie10"] == 1:
@@ -257,7 +257,7 @@ def test_provider_movie_retry_fails_again_flags_incomplete_and_skips_series(monk
     flagged incomplete and its series must NEVER be attempted."""
     events = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         if movie_id == 10:
             raise RuntimeError("still broken")
         events.append(("movie", movie_id))
@@ -294,7 +294,7 @@ def test_provider_series_failure_does_not_rerun_movies_or_block_others(monkeypat
     re-run that provider's movies, and must not affect any other provider."""
     events = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         events.append(("movie", movie_id))
         return True
 
@@ -334,7 +334,7 @@ def test_movie_auto_merge_runs_once_after_all_providers_resolve_movies(monkeypat
     movie phase has resolved (not per-item, not per-provider)."""
     merge_calls = []
 
-    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False):
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
         assert skip_auto_merge is True, "bulk enrich must suppress the inline per-item merge"
         return True
 

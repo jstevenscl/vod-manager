@@ -5331,6 +5331,54 @@ def set_movie_source_bitrate(source_id: int, bitrate: int | None) -> None:
         conn.close()
 
 
+def apply_movie_enrichment_batch(items: list[dict]) -> None:
+    """Writes every movie from one bulk_enrich_all movie-phase chunk under a
+    single connection/lock/commit, instead of vod_importer.enrich_movie's old
+    per-movie set_movie_enrichment (+ conditional set_movie_source_bitrate)
+    calls, which each independently acquired _WRITE_LOCK, opened a
+    connection, and did a full fsync-backed commit -- the same
+    per-item-lock-contention problem beads-3po already fixed for series via
+    enrich_series_episodes_batch (see that function's docstring), just at
+    movie-count scale (bulk_enrich_all's movie concurrency is 8) instead of
+    episode-count scale. See beads-ds8.
+
+    One held connection + one _item_savepoint per movie (so one malformed
+    item -- e.g. an unknown field name -- can't lose the rest of the chunk)
+    + one _commit_with_retry at the end preserves the same per-movie upsert
+    correctness while paying the lock-acquisition and fsync cost once per
+    chunk instead of once per movie.
+
+    `items` is a list of dicts: {"movie_id": int, "fields": dict (may be
+    empty -- set_movie_enrichment's own **fields shape, e.g. genre/
+    description/cast_list/director/country/tmdb_id/poster_url/duration_secs/
+    rating/release_date/content_rating), "source_id": int | None (movie_sources
+    row to stamp bitrate onto), "bitrate": int | None}."""
+    if not items:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        for item in items:
+            movie_id = item["movie_id"]
+            try:
+                with _item_savepoint(conn):
+                    fields = dict(item.get("fields") or {})
+                    fields["last_enriched_at"] = _now()
+                    sets = ", ".join(f"{k}=?" for k in fields)
+                    conn.execute(f"UPDATE movies SET {sets} WHERE id=?", (*fields.values(), movie_id))
+                    source_id = item.get("source_id")
+                    if source_id is not None and item.get("bitrate") is not None:
+                        conn.execute(
+                            "UPDATE movie_sources SET bitrate=? WHERE id=?",
+                            (item["bitrate"], source_id),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "[apply_movie_enrichment_batch] skipped movie_id=%s: %s", movie_id, exc,
+                )
+        _commit_with_retry(conn)
+        conn.close()
+
+
 def set_episode_source_bitrate(source_id: int, bitrate: int | None) -> None:
     with _WRITE_LOCK:
         conn = _connect()
