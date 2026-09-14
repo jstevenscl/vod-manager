@@ -3660,6 +3660,12 @@ async def enrich_all_status():
     return vod_importer.get_enrich_progress()
 
 
+@router.get("/enrich-tmdb/status/", dependencies=_GUARDS)
+async def enrich_tmdb_status():
+    """Progress for automatic provider-free metadata ingestion."""
+    return vod_importer.get_tmdb_enrich_progress()
+
+
 # ── Metadata rewrite rules ───────────────────────────────────────────────────
 
 @router.get("/metadata-rules/", dependencies=_GUARDS)

@@ -789,12 +789,17 @@ async def import_provider_catalog(provider_id: int) -> dict:
         except Exception as exc:
             logger.warning("[vod_importer] provider=%s auto-create-categories failed: %s", provider["name"], exc)
 
+    scheduled = schedule_post_import_enrichment()
+    if scheduled:
+        logger.info("[vod_importer] queued post-import TMDB/fallback enrichment")
+
     return {
         "provider": provider["name"],
         "movie_categories": len(categories),
         "series_categories": len(series_categories),
         **movie_result,
         **series_result,
+        "post_import_enrichment_queued": scheduled,
     }
 
 
@@ -888,6 +893,38 @@ def _apply_field_rules(content_type: str, fields: dict) -> dict:
     return result
 
 
+async def _tmdb_movie_enrichment_payload(movie_id: int, tmdb_id: str) -> dict | None:
+    """Fetch TMDB fields for a known movie identity without provider fallback."""
+    tmdb_detail = await tmdb_sync.get_movie_full_details(tmdb_id)
+    if not tmdb_detail:
+        return None
+    name_fields = {}
+    if tmdb_detail.get("name"):
+        name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+        name_fields["name"] = vod_db.apply_rules_to_value(tmdb_detail["name"], name_rules)
+    return {
+        "movie_id": movie_id,
+        "fields": {
+            **name_fields,
+            **_apply_field_rules("movie", {
+                "genre": tmdb_detail.get("genre"),
+                "description": tmdb_detail.get("description"),
+                "cast_list": tmdb_detail.get("cast_list"),
+                "director": tmdb_detail.get("director"),
+                "country": tmdb_detail.get("country"),
+            }),
+            "tmdb_id": tmdb_id,
+            "poster_url": tmdb_detail.get("poster_url"),
+            "duration_secs": tmdb_detail.get("duration_secs"),
+            "rating": tmdb_detail.get("rating"),
+            "release_date": tmdb_detail.get("release_date"),
+            "content_rating": tmdb_detail.get("content_rating"),
+        },
+        "source_id": None,
+        "bitrate": None,
+    }
+
+
 async def enrich_movie(
     movie_id: int, *, force: bool = False, skip_auto_merge: bool = False, skip_write: bool = False,
 ) -> bool | dict:
@@ -958,31 +995,11 @@ async def enrich_movie(
     movie_row = await asyncio.to_thread(vod_db.get_movie, movie_id)
     existing_tmdb_id = movie_row.get("tmdb_id") if movie_row else None
     if existing_tmdb_id:
-        tmdb_detail = await tmdb_sync.get_movie_full_details(existing_tmdb_id)
-        if tmdb_detail:
-            name_fields = {}
-            if tmdb_detail.get("name"):
-                name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
-                name_fields["name"] = vod_db.apply_rules_to_value(tmdb_detail["name"], name_rules)
-            movie_fields = {
-                **name_fields,
-                **_apply_field_rules("movie", {
-                    "genre": tmdb_detail.get("genre"),
-                    "description": tmdb_detail.get("description"),
-                    "cast_list": tmdb_detail.get("cast_list"),
-                    "director": tmdb_detail.get("director"),
-                    "country": tmdb_detail.get("country"),
-                }),
-                "tmdb_id": existing_tmdb_id,
-                "poster_url": tmdb_detail.get("poster_url"),
-                "duration_secs": tmdb_detail.get("duration_secs"),
-                "rating": tmdb_detail.get("rating"),
-                "release_date": tmdb_detail.get("release_date"),
-                "content_rating": tmdb_detail.get("content_rating"),
-            }
+        payload = await _tmdb_movie_enrichment_payload(movie_id, existing_tmdb_id)
+        if payload:
             if skip_write:
-                return {"movie_id": movie_id, "fields": movie_fields, "source_id": None, "bitrate": None}
-            await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **movie_fields)
+                return payload
+            await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **payload["fields"])
             if not skip_auto_merge:
                 await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
@@ -1344,6 +1361,90 @@ async def enrich_series_source_only(
 # need for anything heavier) and polled from the UI rather than blocking a
 # single request for what can be a multi-minute run across a large pool.
 
+_TMDB_ENRICH_PROGRESS: dict = {
+    "running": False, "total": 0, "done": 0, "errors": 0,
+    "started_at": None, "finished_at": None,
+}
+_POST_IMPORT_ENRICH_TASK: asyncio.Task | None = None
+
+
+def get_tmdb_enrich_progress() -> dict:
+    return dict(_TMDB_ENRICH_PROGRESS)
+
+
+async def bulk_enrich_tmdb_movies(concurrency: int = 8) -> None:
+    """Resolve imported movie TMDB IDs without opening provider connections.
+
+    The import list already supplies identity for many movies.  Keeping this
+    as a distinct bounded worker makes that cheap, provider-free work visible
+    and prevents it from competing with episode discovery or fallback detail
+    calls.  Results are committed in batches to avoid SQLite write churn.
+    """
+    if _TMDB_ENRICH_PROGRESS["running"]:
+        return
+    ids = await asyncio.to_thread(vod_db.list_movie_ids_pending_tmdb_enrichment)
+    _TMDB_ENRICH_PROGRESS.update({
+        "running": True, "total": len(ids), "done": 0, "errors": 0,
+        "started_at": time.time(), "finished_at": None,
+    })
+    pending: list[dict] = []
+    succeeded: list[int] = []
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for movie_id in ids:
+        queue.put_nowait(movie_id)
+
+    async def worker() -> None:
+        while True:
+            try:
+                movie_id = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                movie = await asyncio.to_thread(vod_db.get_movie, movie_id)
+                payload = await _tmdb_movie_enrichment_payload(movie_id, movie["tmdb_id"]) if movie else None
+                if payload:
+                    pending.append(payload)
+                    succeeded.append(movie_id)
+                else:
+                    _TMDB_ENRICH_PROGRESS["errors"] += 1
+            except Exception:
+                logger.exception("[vod_importer] TMDB enrichment failed for movie_id=%s", movie_id)
+                _TMDB_ENRICH_PROGRESS["errors"] += 1
+            finally:
+                _TMDB_ENRICH_PROGRESS["done"] += 1
+
+    try:
+        await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(ids) or 1))))
+        for offset in range(0, len(pending), _MOVIE_BATCH_CHUNK_SIZE):
+            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, pending[offset:offset + _MOVIE_BATCH_CHUNK_SIZE])
+        if succeeded:
+            await asyncio.to_thread(vod_db.auto_merge_movies_by_tmdb_batch, succeeded)
+    finally:
+        _TMDB_ENRICH_PROGRESS["running"] = False
+        _TMDB_ENRICH_PROGRESS["finished_at"] = time.time()
+
+
+async def _post_import_enrichment() -> None:
+    """Run provider-free identity enrichment before provider-only fallback."""
+    try:
+        await bulk_enrich_tmdb_movies()
+        # Remaining new movies have no imported TMDB ID; bulk_enrich_all's
+        # movie phase now selects only those fallback rows.  Its series phase
+        # remains the deliberate provider-detail path for episode discovery.
+        await bulk_enrich_all(pending_only=True)
+    except Exception:
+        logger.exception("[vod_importer] post-import enrichment failed")
+
+
+def schedule_post_import_enrichment() -> bool:
+    """Queue one reconciliation pass; coalesce overlapping provider imports."""
+    global _POST_IMPORT_ENRICH_TASK
+    if _POST_IMPORT_ENRICH_TASK and not _POST_IMPORT_ENRICH_TASK.done():
+        return False
+    _POST_IMPORT_ENRICH_TASK = asyncio.create_task(_post_import_enrichment())
+    return True
+
+
 _ENRICH_PROGRESS: dict = {
     "running": False,
     "movies_total": 0, "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
@@ -1471,7 +1572,7 @@ _MOVIE_BATCH_CHUNK_SIZE = 25  # matches the plan doc's original batch-size choic
 
 async def _run_provider_movie_phase(
     provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
-    provider_count: int = 1,
+    provider_count: int = 1, pending_only: bool = False,
 ) -> tuple[bool, list]:
     """Runs one provider's movie phase to completion. Returns (ok, movie_ids)
     where ok is True iff every item in this provider's movie phase completed
@@ -1531,7 +1632,10 @@ async def _run_provider_movie_phase(
     real coroutines/Tasks; the rest sit as plain ints in the queue until
     their turn. Throughput/concurrency is unchanged -- only the up-front
     Task pile-up is removed."""
-    movie_ids = await asyncio.to_thread(vod_db.list_all_movie_ids, provider_id=provider["id"])
+    movie_ids = await asyncio.to_thread(
+        lambda: vod_db.list_movie_ids_pending_provider_enrichment(provider["id"])
+        if pending_only and not force else vod_db.list_all_movie_ids(provider_id=provider["id"])
+    )
     ok = True
     movie_batch: list = []
     # sem is shared across provider_count concurrently-running providers'
@@ -1631,7 +1735,7 @@ async def _run_provider_series_phase(
 
 async def _run_provider_enrichment(
     provider: dict, movie_sem: asyncio.Semaphore, series_sem: asyncio.Semaphore, force: bool,
-    write_queue: "asyncio.Queue | None" = None, provider_count: int = 1,
+    write_queue: "asyncio.Queue | None" = None, provider_count: int = 1, pending_only: bool = False,
 ) -> dict:
     """Per-provider orchestrator implementing the beads-f7e/beads-sw9
     sequencing/retry rules for exactly ONE provider: that provider's own
@@ -1656,9 +1760,10 @@ async def _run_provider_enrichment(
     caller's asyncio.gather -- threaded to both phases so each divides
     movie_sem/series_sem's shared capacity fairly (see
     _run_provider_movie_phase's docstring)."""
-    movie_ok, movie_ids = await _run_provider_movie_phase(
-        provider, movie_sem, force, write_queue=write_queue, provider_count=provider_count,
-    )
+    movie_kwargs = {"write_queue": write_queue, "provider_count": provider_count}
+    if pending_only:
+        movie_kwargs["pending_only"] = True
+    movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, **movie_kwargs)
     if not movie_ok:
         return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
 
@@ -1697,7 +1802,7 @@ async def _run_global_writer(queue: "asyncio.Queue") -> None:
         item["done"].set()
 
 
-async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
+async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_only: bool = False) -> None:
     """Enriches every movie and series in the pool, sequenced PER PROVIDER
     (beads-f7e/beads-sw9 redesign, 2026-09-12): each provider's own movies
     enrich, then that same provider's own series -- but different providers
@@ -1736,7 +1841,10 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         return
 
     providers = await asyncio.to_thread(vod_db.list_providers)
-    movie_ids_all = await asyncio.to_thread(vod_db.list_all_movie_ids)
+    movie_ids_all = await asyncio.to_thread(
+        vod_db.list_movie_ids_pending_provider_enrichment
+        if pending_only and not force else vod_db.list_all_movie_ids,
+    )
     series_ids_all = await asyncio.to_thread(vod_db.list_all_series_ids)
     # Actual per-provider ids seen during this run (populated below) --
     # used for the end-of-phase merge sweeps instead of movie_ids_all/
@@ -1778,7 +1886,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         results = await asyncio.gather(
             *(
                 _run_provider_enrichment(
-                    p, movie_sem, series_sem, force, write_queue=write_queue, provider_count=len(providers),
+                    p, movie_sem, series_sem, force, write_queue=write_queue,
+                    provider_count=len(providers), pending_only=pending_only,
                 )
                 for p in providers
             ),
@@ -1793,7 +1902,10 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         # finished both phases (spec: "after ALL other providers finish").
         needs_retry = [(p, r) for p, r in zip(providers, results) if not r["movie_ok"]]
         for provider, _first_result in needs_retry:
-            movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, write_queue=write_queue)
+            retry_kwargs = {"write_queue": write_queue}
+            if pending_only:
+                retry_kwargs["pending_only"] = True
+            movie_ok, movie_ids = await _run_provider_movie_phase(provider, movie_sem, force, **retry_kwargs)
             merged_movie_ids.update(movie_ids)
             if not movie_ok:
                 _ENRICH_PROGRESS["providers_incomplete"].append(

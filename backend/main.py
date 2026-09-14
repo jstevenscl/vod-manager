@@ -254,11 +254,12 @@ async def _watch_session_poller() -> None:
 
 
 async def _vod_enrichment_scheduler() -> None:
-    """Background task: periodically runs bulk_enrich_all so newly-imported or
-    stale (past ENRICHMENT_TTL_SECONDS) items get enriched without a manual
-    click. Cheap to run on this interval — anything still fresh is skipped
-    by enrich_movie/enrich_series's own TTL check, so most runs are a no-op
-    scan rather than a real re-fetch.
+    """Recover pending ingestion after startup without re-polling providers.
+
+    Normal catalog imports queue this immediately.  This delayed pass only
+    catches content that was already present during an upgrade/restart; the
+    per-item gates limit it to missing TMDB metadata, provider fallback, and
+    never-fetched episode sources.
 
     The due time is anchored to the last real run (persisted in config), not
     to when this process happened to start — otherwise every container
@@ -273,7 +274,7 @@ async def _vod_enrichment_scheduler() -> None:
         await asyncio.sleep(45)
     while True:
         try:
-            await vod_importer.bulk_enrich_all()
+            vod_importer.schedule_post_import_enrichment()
             save_last_enrichment_run(time.time())
         except Exception as exc:
             logger.warning("[vod_enrichment_scheduler] run failed: %s", exc)

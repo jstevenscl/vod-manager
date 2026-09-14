@@ -5116,6 +5116,47 @@ def list_all_movie_ids(
     return [r["id"] for r in rows]
 
 
+def list_movie_ids_pending_tmdb_enrichment() -> list[int]:
+    """Movies whose imported TMDB identity has not yet been resolved.
+
+    This deliberately keys off ``last_enriched_at IS NULL``, not the general
+    enrichment TTL.  A normal provider catalog refresh is a presence/new-item
+    reconciliation and must not turn into another full metadata crawl for
+    movies whose metadata is already complete.
+    """
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id FROM movies
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND last_enriched_at IS NULL
+        ORDER BY id
+    """).fetchall()
+    conn.close()
+    return [r["id"] for r in rows]
+
+
+def list_movie_ids_pending_provider_enrichment(provider_id: int | None = None) -> list[int]:
+    """New movies with no imported TMDB identity left for provider fallback."""
+    conn = _connect()
+    provider_clause = ""
+    params: tuple = ()
+    if provider_id is not None:
+        provider_clause = """AND EXISTS (
+            SELECT 1 FROM movie_sources ms
+            WHERE ms.movie_id=movies.id AND ms.provider_id=?
+        )"""
+        params = (provider_id,)
+    rows = conn.execute(f"""
+        SELECT id FROM movies
+        WHERE (tmdb_id IS NULL OR TRIM(tmdb_id) = '')
+          AND last_enriched_at IS NULL
+          {provider_clause}
+        ORDER BY id
+    """, params).fetchall()
+    conn.close()
+    return [r["id"] for r in rows]
+
+
 def list_movie_sources_for_ids(movie_ids: list[int]) -> dict[int, list[dict]]:
     """Bulk equivalent of list_movie_sources — one query for a whole page of
     movies instead of one query per movie (that N+1 pattern is what froze the
@@ -5234,7 +5275,12 @@ def _is_stale(last_enriched_at) -> bool:
 
 def movie_needs_enrichment(movie_id: int) -> bool:
     movie = get_movie(movie_id)
-    return bool(movie) and _is_stale(movie.get("last_enriched_at"))
+    # Metadata enrichment is ingestion work, not a daily provider poll.  A
+    # catalog refresh has already confirmed the source is still present; once
+    # rich metadata has been written, leave it alone unless a human explicitly
+    # requests a forced refresh.  This also keeps provider-detail fallback
+    # limited to genuinely new/unresolved movies.
+    return bool(movie) and not movie.get("last_enriched_at")
 
 
 def set_movie_enrichment(movie_id: int, **fields) -> None:
@@ -5994,20 +6040,25 @@ def list_series_sources(series_id: int) -> list[dict]:
 
 
 def series_source_needs_enrichment(source: dict) -> bool:
-    """Per-source TTL check -- the simple v1 alternative to migrating
-    series.provider_last_modified/episodes_synced_last_modified (which stay
-    scalar/single-provider, unchanged) to a per-source table. Every source
-    is just attempted again once its own episodes_last_enriched_at goes
-    stale, same _is_stale TTL movies/series already use elsewhere -- no
-    per-provider last_modified comparison, by explicit user decision
-    (2026-09-09) to keep the first multi-provider-series cut small.
+    """Per-source episode-discovery gate.
+
+    The import refresh is the presence reconciliation.  Once a source's
+    episode listing has been fetched, it stays clean until a future
+    provider-supplied source modification marker explicitly clears this
+    stamp (rather than re-fetching every listing on a blind TTL).
 
     Deliberately reads episodes_last_enriched_at, NOT last_seen_at --
     last_seen_at is also stamped by bulk_import_series's cheap catalog-list
     refresh (no episode data), which runs far more often than a full bulk
     enrich and would otherwise make a never-actually-fetched source look
     fresh forever. See episodes_last_enriched_at's migration comment."""
-    return _is_stale(source.get("episodes_last_enriched_at"))
+    # A catalog refresh already tells us whether the source still exists.
+    # Do not re-request its complete episode listing merely because a timer
+    # elapsed; only a newly discovered source (or an explicit force action)
+    # needs this expensive provider call.  A future per-source provider
+    # modification marker can deliberately clear this stamp when the panel
+    # reports a changed series.
+    return not source.get("episodes_last_enriched_at")
 
 
 def set_series_source_enrichment(series_id: int, provider_id: int, provider_series_id: str) -> None:

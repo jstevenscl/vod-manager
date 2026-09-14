@@ -146,9 +146,12 @@ def test_bulk_enrich_all_passes_provider_count_to_phases(monkeypatch):
     orig_movie_phase = vod_importer._run_provider_movie_phase
     orig_series_phase = vod_importer._run_provider_series_phase
 
-    async def spy_movie_phase(provider, sem, force, write_queue=None, provider_count=1):
+    async def spy_movie_phase(provider, sem, force, write_queue=None, provider_count=1, pending_only=False):
         captured_counts.append(("movie", provider_count))
-        return await orig_movie_phase(provider, sem, force, write_queue=write_queue, provider_count=provider_count)
+        return await orig_movie_phase(
+            provider, sem, force, write_queue=write_queue,
+            provider_count=provider_count, pending_only=pending_only,
+        )
 
     async def spy_series_phase(provider, sem, force, write_queue=None, provider_count=1):
         captured_counts.append(("series", provider_count))

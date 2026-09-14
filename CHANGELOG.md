@@ -20,6 +20,14 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ Imports now queue a provider-free TMDB metadata pass for movies that
+  already include a TMDB ID in the catalog list. It has its own visible
+  progress indicator and batch-writes results to reduce database contention.
+  Provider detail calls are deferred to genuinely unmatched new movies, while
+  series detail remains dedicated to episode discovery. Normal catalog
+  refreshes no longer re-fetch stable movie metadata or previously discovered
+  episode lists merely because a timer elapsed.
+
 - ✅ XC movie catalog imports now retain the provider's bulk artwork URL
   (`stream_icon`) immediately, matching the existing series-cover behavior.
   Movie cards no longer need an expensive per-title enrichment request merely

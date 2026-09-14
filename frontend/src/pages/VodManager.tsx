@@ -1330,6 +1330,12 @@ interface EnrichProgress {
   providers_throttled: { provider_id: number; concurrency: number; max_concurrency: number }[]
 }
 
+interface TmdbEnrichProgress {
+  running: boolean
+  total: number; done: number; errors: number
+  started_at: number | null; finished_at: number | null
+}
+
 interface Page<T> { items: T[]; total: number; limit: number; offset: number }
 
 // SectionCard/KpiTile/StatusPill/Chip/QuotaBar/inputCls moved to
@@ -4505,6 +4511,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/enrich-all/status/').then((r) => r.data),
     refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
   })
+  const tmdbEnrichProgressQuery = useQuery<TmdbEnrichProgress>({
+    queryKey: ['vod-tmdb-enrich-progress'],
+    queryFn: () => api.get('/vod/enrich-tmdb/status/').then((r) => r.data),
+    // Imports start this job server-side, so retain a light idle poll in
+    // order to notice work that was not launched by this browser tab.
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 10000),
+  })
   const xcCredentialsQuery = useQuery<XcCredentials>({
     queryKey: ['vod-xc-credentials'],
     queryFn:  () => api.get('/vod/xc-credentials/').then((r) => r.data),
@@ -4955,6 +4968,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
   })
   const enrichProgress = enrichProgressQuery.data
+  const tmdbEnrichProgress = tmdbEnrichProgressQuery.data
   const wasEnrichRunning = useRef(false)
   useEffect(() => {
     if (wasEnrichRunning.current && enrichProgress && !enrichProgress.running) {
@@ -7220,10 +7234,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
+      {tmdbEnrichProgress?.running && (
+        <div className="mb-3 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-200">
+          <span className="inline-flex items-center gap-1.5">
+            <Loader2 size={13} className="animate-spin" />
+            TMDB metadata {tmdbEnrichProgress.done.toLocaleString()} / {tmdbEnrichProgress.total.toLocaleString()}
+            {tmdbEnrichProgress.errors > 0 && ` · ${tmdbEnrichProgress.errors} unavailable`}
+          </span>
+          <span className="ml-2 text-muted-foreground">Provider catalog connections are not used for these titles.</span>
+        </div>
+      )}
       <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Fetches detail (genre, poster, description, cast) from each item's source provider for every movie
-          and series in the pool. Runs in the background — safe to navigate away while it works.
+          Imported TMDB IDs are resolved first without contacting providers. Provider detail is reserved for
+          unmatched movies and series episode discovery. Runs in the background — safe to navigate away while it works.
         </p>
         <div className="flex items-center gap-1.5">
           <Button size="sm" disabled={!!enrichProgress?.running || startBulkEnrich.isPending} onClick={() => startBulkEnrich.mutate(false)}>
