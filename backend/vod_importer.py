@@ -1316,7 +1316,7 @@ async def _enrich_one_series_source(
 
 async def enrich_series_source_only(
     series_id: int, provider_id: int, *, force: bool = False, skip_auto_merge: bool = False,
-    write_queue: "asyncio.Queue | None" = None,
+    write_queue: "asyncio.Queue | None" = None, source_id: int | None = None,
 ) -> dict:
     """Provider-scoped counterpart to enrich_series (plan-doc follow-up "make
     a provider lane fetch only that provider's series source", 2026-09-14).
@@ -1342,7 +1342,10 @@ async def enrich_series_source_only(
         return {"fetched": False, "reason": "series not found"}
 
     sources = await asyncio.to_thread(vod_db.list_series_sources, series_id)
-    source = next((s for s in sources if s["provider_id"] == provider_id), None)
+    source = next(
+        (s for s in sources if s["provider_id"] == provider_id and (source_id is None or s["id"] == source_id)),
+        None,
+    )
     if not source:
         return {"fetched": False, "reason": "no source recorded for this series from this provider"}
 
@@ -1496,7 +1499,7 @@ _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralize
 async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
     skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
-    write_queue: "asyncio.Queue | None" = None,
+    write_queue: "asyncio.Queue | None" = None, series_id: int | None = None,
 ) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
@@ -1522,9 +1525,12 @@ async def _enrich_one(
                 else:
                     await enrich_movie(item_id, force=force, skip_auto_merge=skip_auto_merge)
             elif provider_id is not None:
-                await enrich_series_source_only(
-                    item_id, provider_id, force=force, skip_auto_merge=skip_auto_merge, write_queue=write_queue,
-                )
+                series_kwargs = {
+                    "force": force, "skip_auto_merge": skip_auto_merge, "write_queue": write_queue,
+                }
+                if series_id is not None:
+                    series_kwargs["source_id"] = item_id
+                await enrich_series_source_only(series_id or item_id, provider_id, **series_kwargs)
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
             return True
@@ -1688,7 +1694,7 @@ async def _run_provider_movie_phase(
 
 async def _run_provider_series_phase(
     provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
-    provider_count: int = 1,
+    provider_count: int = 1, pending_only: bool = False,
 ) -> tuple[bool, list]:
     """Runs one provider's series phase to completion. Same ok semantics as
     _run_provider_movie_phase. write_queue: see _run_provider_movie_phase's
@@ -1707,25 +1713,36 @@ async def _run_provider_series_phase(
     that phase's docstring). Now uses the same bounded worker-pool
     pattern: a fixed pool of `sem`-sized workers pulls one id at a time
     off a plain asyncio.Queue. Throughput/concurrency is unchanged."""
-    series_ids = await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider["id"])
+    pending_sources = await asyncio.to_thread(
+        vod_db.list_pending_series_sources, provider["id"]
+    ) if pending_only else None
+    series_ids = [source["series_id"] for source in pending_sources] if pending_sources is not None else await asyncio.to_thread(
+        vod_db.list_all_series_ids, provider_id=provider["id"]
+    )
     ok = True
     worker_count = max(1, (sem._value or 1) // max(1, provider_count))
 
     queue: asyncio.Queue = asyncio.Queue()
-    for sid in series_ids:
-        queue.put_nowait(sid)
+    for item in pending_sources if pending_sources is not None else series_ids:
+        queue.put_nowait(item)
 
     async def _worker() -> None:
         nonlocal ok
         while True:
             try:
-                sid = queue.get_nowait()
+                item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             try:
-                outcome = await _enrich_one(
-                    "series", sem, sid, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue,
-                )
+                if pending_sources is not None:
+                    outcome = await _enrich_one(
+                        "series", sem, item["id"], force, skip_auto_merge=True, provider_id=provider["id"],
+                        write_queue=write_queue, series_id=item["series_id"],
+                    )
+                else:
+                    outcome = await _enrich_one(
+                        "series", sem, item, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue,
+                    )
             except BaseException:
                 outcome = False
             if outcome is False:
@@ -1733,7 +1750,7 @@ async def _run_provider_series_phase(
 
     await asyncio.gather(*(_worker() for _ in range(min(worker_count, len(series_ids) or 1))))
 
-    return ok, series_ids
+    return ok, list(dict.fromkeys(series_ids))
 
 
 async def _run_provider_enrichment(
@@ -1771,7 +1788,7 @@ async def _run_provider_enrichment(
         return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
 
     series_ok, series_ids = await _run_provider_series_phase(
-        provider, series_sem, force, write_queue=write_queue, provider_count=provider_count,
+        provider, series_sem, force, write_queue=write_queue, provider_count=provider_count, pending_only=pending_only,
     )
     return {"movie_ok": True, "movie_ids": movie_ids, "series_ran": True, "series_ok": series_ok, "series_ids": series_ids}
 
@@ -1849,7 +1866,9 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         vod_db.list_movie_ids_pending_provider_enrichment
         if pending_only and not force else vod_db.list_all_movie_ids,
     )
-    series_ids_all = await asyncio.to_thread(vod_db.list_all_series_ids)
+    series_ids_all = await asyncio.to_thread(
+        vod_db.list_pending_series_sources if pending_only and not force else vod_db.list_all_series_ids
+    )
     # Only providers that can actually perform work participate in the
     # fair-share calculation below.  Counting configured-but-empty providers
     # can turn concurrency=8 into one worker for the sole provider with

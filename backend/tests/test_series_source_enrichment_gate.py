@@ -84,6 +84,31 @@ def test_set_series_source_enrichment_clears_the_need(db):
     assert db.has_pending_series_source_enrichment(provider_id) is False
 
 
+def test_pending_series_selection_keeps_every_source_variant(db):
+    """One canonical series can retain several fallback source variants.
+
+    Automatic intake must select both variants, then leave only the source
+    whose episode discovery has not yet succeeded.
+    """
+    provider_id = db.upsert_provider("XC-Test", "http://xc.example.com", "user", "pass", provider_type="xc")
+    base = {
+        "name": "Variant Show", "year": 2020, "provider_category_name": None,
+        "raw_name": "Variant Show", "_has_detail": True, "genre": None,
+        "description": None, "cast_list": None, "director": None, "poster_url": None,
+        "rating": None, "release_date": None, "tmdb_id": None, "provider_last_modified": None,
+    }
+    db.bulk_import_series(provider_id, [{**base, "provider_series_id": "one"}, {**base, "provider_series_id": "two"}])
+    series_id = db.list_series(limit=10)[0]["id"]
+    sources = db.list_series_sources(series_id)
+
+    pending = db.list_pending_series_sources(provider_id)
+    assert {source["id"] for source in pending} == {source["id"] for source in sources}
+
+    db.set_series_source_enrichment(series_id, provider_id, "one")
+    pending = db.list_pending_series_sources(provider_id)
+    assert [source["id"] for source in pending] == [source["id"] for source in sources if source["provider_series_id"] == "two"]
+
+
 def test_provider_series_selection_includes_series_with_no_episodes_yet(db):
     """Live dry-run (2026-09-14, beads-ds8) found series_done permanently
     short of series_total (8531/9905). Root cause: list_all_series_ids(

@@ -6082,6 +6082,32 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
     return row is not None
 
 
+def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
+    """Lists unprocessed episode-discovery sources, not just canonical series.
+
+    A canonical series can retain several source variants from one provider.
+    Automatic intake must visit every unstamped source so each fallback has
+    its own episode stream rows.
+    """
+    conn = _connect()
+    provider_clause = ""
+    params: tuple = ()
+    if provider_id is not None:
+        provider_clause = "AND ss.provider_id=?"
+        params = (provider_id,)
+    rows = conn.execute(f"""
+        SELECT ss.id, ss.series_id, ss.provider_id
+        FROM series_sources ss
+        JOIN series s ON s.id=ss.series_id
+        WHERE ss.episodes_last_enriched_at IS NULL
+          AND s.review_excluded=0
+          {provider_clause}
+        ORDER BY ss.id
+    """, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def set_series_source_enrichment(series_id: int, provider_id: int, provider_series_id: str) -> None:
     with _WRITE_LOCK:
         conn = _connect()

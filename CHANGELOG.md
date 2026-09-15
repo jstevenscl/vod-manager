@@ -33,6 +33,12 @@ proposed to the upstream project, the entry links to that pull request —
   completed or review-excluded series no longer count as pending work; the
   remaining source-level episode work resumes normally after a restart.
 
+- ✅ Automatic series episode discovery now tracks and processes every
+  retained source variant, rather than stopping after the first source on a
+  canonical series card. This preserves episode-stream fallbacks when one
+  provider supplies multiple variants of the same show, and the progress
+  counter now reflects pending sources rather than only canonical titles.
+
 - ✅ The Curation page now notices the automatic handoff from the TMDB-ID
   metadata pass to provider fallback/series episode work without requiring a
   manual browser refresh. While idle it checks for server-started enrichment
