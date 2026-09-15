@@ -28,6 +28,11 @@ proposed to the upstream project, the entry links to that pull request —
   adaptive rate limiter, backoff handling, and isolated movie-then-series
   lanes.
 
+- ✅ Fixed automatic startup recovery for pending series episode discovery
+  after the active-provider concurrency change. Providers with already
+  completed or review-excluded series no longer count as pending work; the
+  remaining source-level episode work resumes normally after a restart.
+
 - ✅ The Curation page now notices the automatic handoff from the TMDB-ID
   metadata pass to provider fallback/series episode work without requiring a
   manual browser refresh. While idle it checks for server-started enrichment
