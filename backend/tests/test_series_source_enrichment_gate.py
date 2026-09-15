@@ -76,10 +76,12 @@ def test_set_series_source_enrichment_clears_the_need(db):
     series_id = db.list_series(limit=10)[0]["id"]
     sources = db.list_series_sources(series_id)
 
+    assert db.has_pending_series_source_enrichment(provider_id) is True
     db.set_series_source_enrichment(series_id, provider_id, "1")
 
     sources = db.list_series_sources(series_id)
     assert db.series_source_needs_enrichment(sources[0]) is False
+    assert db.has_pending_series_source_enrichment(provider_id) is False
 
 
 def test_provider_series_selection_includes_series_with_no_episodes_yet(db):

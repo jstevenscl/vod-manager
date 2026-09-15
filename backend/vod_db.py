@@ -6075,7 +6075,7 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
         JOIN series s ON s.id=ss.series_id
         WHERE ss.provider_id=?
           AND ss.episodes_last_enriched_at IS NULL
-          AND s.archived=0
+          AND s.review_excluded=0
         LIMIT 1
     """, (provider_id,)).fetchone()
     conn.close()
