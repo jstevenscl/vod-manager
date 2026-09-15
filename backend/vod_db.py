@@ -8976,6 +8976,36 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
     return out
 
 
+# KNM: added 2026-09-14 -- a missing provider TMDB ID/year is reviewable even
+# when it was never marked by the narrower ambiguous-year hold detector.
+def list_metadata_review(content_type: str | None = None) -> dict:
+    """Returns active pool items a person should identify in TMDB.
+
+    This deliberately includes more than the older ``needs_year_review``
+    hold queue: a provider can supply a title with neither a TMDB id nor a
+    year (the common duplicate-looking case), without ever having been
+    through the ambiguity detector.  These are still review-only; this
+    function never guesses or changes metadata itself.
+    """
+    conn = _connect()
+    out: dict = {}
+    for requested_type, table, key in (
+        ("movie", "movies", "movies"),
+        ("series", "series", "series"),
+    ):
+        if content_type not in (None, requested_type):
+            continue
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT * FROM {table}
+                WHERE review_excluded=0
+                  AND (needs_year_review=1 OR tmdb_id IS NULL OR year IS NULL)
+                ORDER BY needs_year_review DESC, name"""
+        ).fetchall()]
+        out[key] = rows
+    conn.close()
+    return out
+
+
 def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
     """Sets the correct year (and tmdb_id, if known) on a flagged item and
     clears the flag. If that year now exactly matches an existing item of

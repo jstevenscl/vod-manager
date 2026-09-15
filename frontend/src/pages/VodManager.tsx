@@ -274,6 +274,8 @@ interface NeedsReviewItem {
   id: number
   name: string
   year: number | null
+  tmdb_id?: string | null
+  needs_year_review?: number
   genre: string | null
   sample_episode_id?: number | null
   sample_source_id?: number | null
@@ -1430,6 +1432,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
       api.post(`/vod/needs-review/${contentType}/${item.id}/resolve/`, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -1472,6 +1475,8 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
         <span className="min-w-0 truncate flex items-center gap-1.5">
           <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} hlsUrl={hlsUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+          {!item.tmdb_id && <span className="text-amber-500">no TMDB ID</span>}
+          {!item.year && <span className="text-amber-500">no year</span>}
           {contentType === 'series' && !!item.imported_episode_count && (
             <span className="text-muted-foreground">
               — imported: {item.imported_season_count} season{item.imported_season_count === 1 ? '' : 's'}, {item.imported_episode_count} episode{item.imported_episode_count === 1 ? '' : 's'}
@@ -1527,12 +1532,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
           {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
           {!!suggestionsQuery.data?.length && (
             <div className="space-y-1.5">
-              {suggestionsQuery.data.map((s) => (
+              {suggestionsQuery.data.map((s) => {
+                const resolvedYear = s.year ?? item.year
+                return (
                 <button
                   key={s.tmdb_id}
-                  disabled={resolve.isPending}
-                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left"
-                  onClick={() => resolve.mutate({ year: s.year ?? 0, tmdb_id: s.tmdb_id })}
+                  disabled={resolve.isPending || resolvedYear == null}
+                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left disabled:opacity-50"
+                  title={resolvedYear == null ? 'This TMDB result has no release year; set a year manually instead.' : undefined}
+                  onClick={() => {
+                    if (resolvedYear != null) resolve.mutate({ year: resolvedYear, tmdb_id: s.tmdb_id })
+                  }}
                 >
                   <PosterThumb
                     url={s.poster_url}
@@ -1554,7 +1564,8 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
                     {s.overview && <p className="text-muted-foreground line-clamp-2">{s.overview}</p>}
                   </div>
                 </button>
-              ))}
+                )
+              })}
             </div>
           )}
           {suggestionsQuery.data && suggestionsQuery.data.length === 0 && (
@@ -4240,7 +4251,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'curation' | 'providers' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -4267,6 +4278,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
@@ -5762,6 +5774,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-needs-review'],
     queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
   })
+  const metadataReviewQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-metadata-review'],
+    queryFn:  () => api.get('/vod/metadata-review/').then((r) => r.data),
+    enabled: activeTab === 'metadata',
+  })
 
   // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
   const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
@@ -7231,6 +7248,59 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {diagnosticsBusy ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
           Download Diagnostic Logs
         </Button>
+      </SectionCard>
+      </>
+      )}
+
+      {activeTab === 'metadata' && (
+      <>
+      <SectionCard title="Metadata Review" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Fix titles the provider left without a TMDB identity or release year, plus the held ambiguous-year queue.
+          Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
+          identity already exists in the pool, its sources and categories merge into that existing title.
+        </p>
+        <div className="flex items-center gap-1.5 pt-1">
+          <Button
+            size="sm"
+            variant={metadataContentType === 'movie' ? 'default' : 'outline'}
+            onClick={() => setMetadataContentType('movie')}
+          >
+            Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
+          </Button>
+          <Button
+            size="sm"
+            variant={metadataContentType === 'series' ? 'default' : 'outline'}
+            onClick={() => setMetadataContentType('series')}
+          >
+            TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
+          </Button>
+          <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
+            {metadataReviewQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            <span className="ml-1">Refresh</span>
+          </Button>
+        </div>
+        {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queueâ€¦</p>}
+        {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
+        {metadataReviewQuery.data && (
+          <>
+            {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).length === 0 ? (
+              <p className="text-xs text-muted-foreground pt-1">Clean â€” no active titles need a TMDB ID or year review.</p>
+            ) : (
+              <ul className="divide-y divide-border/50">
+                {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).map((item) => (
+                  <NeedsReviewRow
+                    key={item.id}
+                    contentType={metadataContentType}
+                    item={item}
+                    qc={qc}
+                    xcCredentials={xcCredentialsQuery.data}
+                  />
+                ))}
+              </ul>
+            )}
+          </>
+        )}
       </SectionCard>
       </>
       )}
@@ -9686,8 +9756,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('movie')}>Manage Categories</Button>
-          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('movie')}>
-            Needs Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
+          <Button size="sm" variant="outline" onClick={() => { setMetadataContentType('movie'); setActiveTab('metadata') }}>
+            Metadata Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
           </Button>
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('movie')}>
             Missing Artwork{missingArtworkCountsQuery.data?.movies ? ` (${missingArtworkCountsQuery.data.movies})` : ''}
@@ -9860,8 +9930,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('series')}>Manage Categories</Button>
-          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('series')}>
-            Needs Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
+          <Button size="sm" variant="outline" onClick={() => { setMetadataContentType('series'); setActiveTab('metadata') }}>
+            Metadata Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
           </Button>
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('series')}>
             Missing Artwork{missingArtworkCountsQuery.data?.series ? ` (${missingArtworkCountsQuery.data.series})` : ''}

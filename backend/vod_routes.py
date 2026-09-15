@@ -2839,6 +2839,14 @@ async def year_review_suggestions(content_type: str, item_id: int, q: Optional[s
         raise HTTPException(502, detail=f"TMDB search failed: {exc}")
 
 
+@router.get("/metadata-review/", dependencies=_GUARDS)
+async def list_metadata_review(content_type: Optional[str] = None):
+    """Human-review queue for missing or ambiguous TMDB identity fields."""
+    if content_type not in (None, "movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.list_metadata_review(content_type)
+
+
 @router.get("/needs-review/{content_type}/{item_id}/ai-suggest/", dependencies=_GUARDS)
 async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[str] = None):
     """Asks Claude to pick the most likely correct match among the same TMDB
