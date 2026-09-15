@@ -1428,20 +1428,27 @@ async def bulk_enrich_tmdb_movies(concurrency: int = 8) -> None:
 async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     """Normalize known-TMDB series cards before provider episode discovery."""
     pending_series = await asyncio.to_thread(vod_db.list_series_pending_tmdb_metadata_enrichment)
-    queue: asyncio.Queue[dict] = asyncio.Queue()
+    # A multilingual catalog can deliberately retain several canonical cards
+    # for one real TMDB title. They must stay separate for language-aware
+    # playback/merge rules, but TMDB's title/rating is identical, so fetch it
+    # once and fan that immutable result back out to every card.
+    series_by_tmdb_id: dict[str, list[dict]] = {}
     for series in pending_series:
-        queue.put_nowait(series)
+        series_by_tmdb_id.setdefault(str(series["tmdb_id"]), []).append(series)
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for tmdb_id in series_by_tmdb_id:
+        queue.put_nowait(tmdb_id)
     resolved: list[dict] = []
     merged_ids: list[int] = []
 
     async def worker() -> None:
         while True:
             try:
-                series = queue.get_nowait()
+                tmdb_id = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             try:
-                detail = await tmdb_sync.get_tv_full_details(str(series["tmdb_id"]))
+                detail = await tmdb_sync.get_tv_full_details(tmdb_id)
                 if not detail:
                     continue
                 name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
@@ -1451,15 +1458,16 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
                 # A missing US rating must not erase a useful provider rating.
                 if detail.get("content_rating"):
                     fields["content_rating"] = detail["content_rating"]
-                resolved.append({
-                    "series_id": series["id"],
-                    "fields": fields,
-                })
-                merged_ids.append(series["id"])
+                for series in series_by_tmdb_id[tmdb_id]:
+                    resolved.append({
+                        "series_id": series["id"],
+                        "fields": fields,
+                    })
+                    merged_ids.append(series["id"])
             except Exception:
-                logger.exception("[vod_importer] TMDB series metadata failed for series_id=%s", series["id"])
+                logger.exception("[vod_importer] TMDB series metadata failed for tmdb_id=%s", tmdb_id)
 
-    await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(pending_series) or 1))))
+    await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(series_by_tmdb_id) or 1))))
     for offset in range(0, len(resolved), _MOVIE_BATCH_CHUNK_SIZE):
         await asyncio.to_thread(vod_db.apply_series_tmdb_metadata_batch, resolved[offset:offset + _MOVIE_BATCH_CHUNK_SIZE])
     if merged_ids:

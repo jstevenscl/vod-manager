@@ -72,3 +72,22 @@ def test_tmdb_series_pass_normalizes_card_name_but_preserves_raw_source(db, monk
     assert series["tmdb_metadata_enriched_at"] is not None
     assert source["raw_name"] == "30 Coins (ES)"
     assert db.list_series_pending_tmdb_metadata_enrichment() == []
+
+
+def test_tmdb_series_pass_reuses_one_lookup_for_shared_tmdb_id(db, monkeypatch):
+    first_id = db.upsert_series("English Card", 2020, tmdb_id="shared-id")
+    second_id = db.upsert_series("Spanish Card", 2020, tmdb_id="shared-id")
+    calls = []
+
+    async def fake_tmdb(tmdb_id):
+        calls.append(tmdb_id)
+        return {"name": "Canonical Card", "content_rating": None}
+
+    monkeypatch.setattr(tmdb_sync, "get_tv_full_details", fake_tmdb)
+    monkeypatch.setattr(vod_importer.vod_db, "get_active_rules_for_field", lambda *_: [])
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb_batch", lambda _: None)
+    asyncio.run(vod_importer.bulk_enrich_tmdb_series_metadata(concurrency=8))
+
+    assert calls == ["shared-id"]
+    assert db.get_series(first_id)["name"] == "Canonical Card"
+    assert db.get_series(second_id)["name"] == "Canonical Card"
