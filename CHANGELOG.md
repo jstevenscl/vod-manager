@@ -21,7 +21,7 @@ included.
 
 ## 2026-09-15
 
-- ✅ Provider-free TMDB enrichment for known series IDs now also records TMDB's
+- ✅🔀 Provider-free TMDB enrichment for known series IDs now also records TMDB's
   first-air year. A confirmed series no longer remains falsely held in
   **Metadata Review** merely because its provider omitted a year; the existing
   held records are safely picked up and backfilled on the next enrichment run.
@@ -32,6 +32,7 @@ included.
   variants and human decisions remain untouched. A reviewer-selected TMDB ID
   in Metadata Review now invokes that same safe merge path immediately rather
   than waiting for the next import.
+  ([#24](https://github.com/jstevenscl/vod-manager/pull/24))
 
 - ✅ Metadata Review now has an **Incorrect TMDB IDs** tab for titles whose
   stored ID receives a confirmed TMDB 404. It supports a pending-ID scan,
