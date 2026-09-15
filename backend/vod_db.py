@@ -8976,16 +8976,17 @@ def list_needs_year_review(content_type: str | None = None) -> dict:
     return out
 
 
-# KNM: added 2026-09-14 -- a missing provider TMDB ID/year is reviewable even
-# when it was never marked by the narrower ambiguous-year hold detector.
+# KNM: added 2026-09-14 -- a title missing both provider TMDB ID and year is
+# reviewable even when it was never marked by the narrower ambiguity detector.
 def list_metadata_review(content_type: str | None = None) -> dict:
     """Returns active pool items a person should identify in TMDB.
 
     This deliberately includes more than the older ``needs_year_review``
     hold queue: a provider can supply a title with neither a TMDB id nor a
     year (the common duplicate-looking case), without ever having been
-    through the ambiguity detector.  These are still review-only; this
-    function never guesses or changes metadata itself.
+    through the ambiguity detector.  A missing year *alone* is normal in
+    provider catalogs, so it is deliberately not a review condition. These
+    are still review-only; this function never guesses or changes metadata.
     """
     conn = _connect()
     out: dict = {}
@@ -8998,7 +8999,7 @@ def list_metadata_review(content_type: str | None = None) -> dict:
         rows = [dict(r) for r in conn.execute(
             f"""SELECT * FROM {table}
                 WHERE review_excluded=0
-                  AND (needs_year_review=1 OR tmdb_id IS NULL OR year IS NULL)
+                  AND (needs_year_review=1 OR (tmdb_id IS NULL AND year IS NULL))
                 ORDER BY needs_year_review DESC, name"""
         ).fetchall()]
         out[key] = rows

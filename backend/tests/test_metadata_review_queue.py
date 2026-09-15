@@ -1,4 +1,4 @@
-"""The metadata workspace must include unflagged, provider-incomplete rows."""
+"""The metadata workspace must include only actionable identity gaps."""
 
 
 def _movie(stream_id: str, name: str, year: int | None, tmdb_id: str | None = None) -> dict:
@@ -16,6 +16,7 @@ def _movie(stream_id: str, name: str, year: int | None, tmdb_id: str | None = No
 def test_metadata_review_includes_missing_identity_and_year_flags(db):
     provider_id = db.upsert_provider("Provider", "http://provider.invalid", "u", "p", provider_type="xc")
     db.bulk_import_movies(provider_id, [
+        _movie("missing-both", "No Identity", None),
         _movie("missing-id", "No TMDB", 2024),
         _movie("missing-year", "No Year", None, "123"),
         _movie("complete", "Complete", 2023, "456"),
@@ -28,5 +29,5 @@ def test_metadata_review_includes_missing_identity_and_year_flags(db):
 
     queue = db.list_metadata_review()
 
-    assert {row["name"] for row in queue["movies"]} == {"No TMDB", "No Year", "Complete"}
+    assert {row["name"] for row in queue["movies"]} == {"No Identity", "Complete"}
     assert queue["series"] == []

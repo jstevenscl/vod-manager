@@ -34,7 +34,7 @@ proposed to the upstream project, the entry links to that pull request —
 - ✅ **Shipped in beta image (`e9c40de`):** Added a dedicated **Metadata
   Review** workspace under Operations, so TMDB
   corrections no longer need to live in Curation or a library modal. It lists
-  active movies and TV shows missing a TMDB ID or release year, plus the
+  active movies and TV shows missing both a TMDB ID and release year, plus the
   existing ambiguous-year hold queue. A reviewer searches TMDB and explicitly
   selects the result; that records its ID/year and safely merges
   sources/categories only when the corrected pool identity already exists.

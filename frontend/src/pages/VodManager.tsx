@@ -7256,7 +7256,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Metadata Review" icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Fix titles the provider left without a TMDB identity or release year, plus the held ambiguous-year queue.
+          Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.
           Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
           identity already exists in the pool, its sources and categories merge into that existing title.
         </p>
@@ -7285,7 +7285,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         {metadataReviewQuery.data && (
           <>
             {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).length === 0 ? (
-              <p className="text-xs text-muted-foreground pt-1">Clean â€” no active titles need a TMDB ID or year review.</p>
+              <p className="text-xs text-muted-foreground pt-1">Clean â€” no active titles need identity review.</p>
             ) : (
               <ul className="divide-y divide-border/50">
                 {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).map((item) => (
