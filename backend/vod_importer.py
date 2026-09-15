@@ -499,6 +499,13 @@ async def _import_movies_for_provider(
             # plot in this endpoint though (unlike get_series), so nothing
             # else is worth capturing here.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
+            # XC movie lists commonly include artwork as stream_icon. Keep
+            # compatible panel-specific aliases as fallbacks so a card gets
+            # its free catalog poster without a per-title detail request.
+            "poster_url": (
+                s.get("stream_icon") or s.get("cover") or
+                s.get("cover_big") or s.get("movie_image") or None
+            ),
         })
     db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
