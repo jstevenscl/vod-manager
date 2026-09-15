@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 import ai_assist
 from backup import router as backup_router
-from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
+from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
@@ -261,17 +261,10 @@ async def _vod_enrichment_scheduler() -> None:
     per-item gates limit it to missing TMDB metadata, provider fallback, and
     never-fetched episode sources.
 
-    The due time is anchored to the last real run (persisted in config), not
-    to when this process happened to start — otherwise every container
-    restart resets the clock and fires a full pass ~45s later regardless of
-    how recently it last ran, which is exactly the kind of background write
-    load that competes with anything else the app is doing at that moment."""
-    last_run = get_last_enrichment_run()
-    if last_run is not None:
-        due_in = vod_db.get_enrichment_ttl_seconds() - (time.time() - last_run)
-        await asyncio.sleep(max(due_in, 45))
-    else:
-        await asyncio.sleep(45)
+    This is a pending-work check rather than a blanket provider re-fetch, so
+    it is safe to run shortly after every startup. Completed metadata and
+    episode sources are skipped by their ingestion gates."""
+    await asyncio.sleep(45)
     while True:
         try:
             vod_importer.schedule_post_import_enrichment()
