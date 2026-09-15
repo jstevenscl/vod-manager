@@ -12,6 +12,7 @@ bounded concurrency instead of a human clicking one movie at a time.
 
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -669,7 +670,59 @@ async def _import_series_for_provider(
     return series_result, len(series_list), {str(series["series_id"]) for series in series_list}
 
 
+# KNM: added 2026-09-15 -- imports and enrichment run server-side, so the
+# sidebar needs shared runtime state instead of relying on the browser that
+# happened to initiate a job.
+_IMPORT_PROGRESS: dict = {
+    "running": False, "provider_id": None, "provider_name": None,
+    "started_at": None, "finished_at": None, "error": None,
+}
+_CPU_SAMPLE: tuple[float, float] | None = None
+
+
+def get_import_progress() -> dict:
+    return dict(_IMPORT_PROGRESS)
+
+
+def get_process_cpu_percent() -> float | None:
+    """Best-effort CPU use for this container's Python process.
+
+    Linux exposes process CPU time without an extra dependency.  The first
+    sample establishes a baseline; later status polls return a one-core
+    percentage, which can exceed 100 when worker threads are busy.
+    """
+    global _CPU_SAMPLE
+    try:
+        fields = open("/proc/self/stat", encoding="utf-8").read().split()
+        cpu_seconds = (int(fields[13]) + int(fields[14])) / os.sysconf("SC_CLK_TCK")
+        now = time.monotonic()
+        previous = _CPU_SAMPLE
+        _CPU_SAMPLE = (now, cpu_seconds)
+        if previous is None or now <= previous[0]:
+            return None
+        return round(100 * (cpu_seconds - previous[1]) / (now - previous[0]), 1)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 async def import_provider_catalog(provider_id: int) -> dict:
+    """Run one XC catalog import and expose its lifecycle to the UI."""
+    provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
+    _IMPORT_PROGRESS.update({
+        "running": True, "provider_id": provider_id,
+        "provider_name": provider.get("name") if provider else f"provider {provider_id}",
+        "started_at": time.time(), "finished_at": None, "error": None,
+    })
+    try:
+        result = await _import_provider_catalog_impl(provider_id)
+    except Exception as exc:
+        _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
+        raise
+    _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+    return result
+
+
+async def _import_provider_catalog_impl(provider_id: int) -> dict:
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
     if not provider:
         raise ValueError(f"provider {provider_id} not found")

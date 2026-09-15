@@ -3666,6 +3666,17 @@ async def enrich_tmdb_status():
     return vod_importer.get_tmdb_enrich_progress()
 
 
+@router.get("/runtime-status/", dependencies=_GUARDS)
+async def runtime_status():
+    """Compact live state for the sidebar status indicator."""
+    return {
+        "import": vod_importer.get_import_progress(),
+        "enrichment": vod_importer.get_enrich_progress(),
+        "tmdb": vod_importer.get_tmdb_enrich_progress(),
+        "process_cpu_percent": vod_importer.get_process_cpu_percent(),
+    }
+
+
 # ── Metadata rewrite rules ───────────────────────────────────────────────────
 
 @router.get("/metadata-rules/", dependencies=_GUARDS)

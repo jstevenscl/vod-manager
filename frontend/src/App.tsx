@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  CalendarDays, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Activity, CalendarDays, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
@@ -38,6 +38,12 @@ interface NavItem {
 interface NavGroup {
   label: string
   items: NavItem[]
+}
+interface RuntimeStatus {
+  import: { running: boolean; provider_name: string | null; error: string | null }
+  enrichment: { running: boolean; movies_done: number; movies_total: number; series_done: number; series_total: number }
+  tmdb: { running: boolean; done: number; total: number }
+  process_cpu_percent: number | null
 }
 const NAV_GROUPS: NavGroup[] = [
   { label: 'VOD Library', items: [
@@ -115,6 +121,16 @@ export default function App() {
     queryFn:  () => api.get('/vod/hide-dvr-tab/').then((r) => r.data),
     enabled: authState === 'ready',
     staleTime: 30_000,
+  })
+  const runtimeStatusQuery = useQuery<RuntimeStatus>({
+    queryKey: ['vod-runtime-status'],
+    queryFn: () => api.get('/vod/runtime-status/').then((r) => r.data),
+    enabled: authState === 'ready',
+    refetchInterval: (query) => {
+      const status = query.state.data
+      return status?.import.running || status?.enrichment.running || status?.tmdb.running ? 2000 : 10_000
+    },
+    retry: false,
   })
   const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
 
@@ -225,6 +241,22 @@ export default function App() {
               })}
             </div>
           ))}
+          <div className="rounded-md border border-border bg-background/60 px-2.5 py-2 text-[11px] text-muted-foreground">
+            <div className="flex items-center gap-1.5 font-semibold text-foreground">
+              <Activity size={13} className={runtimeStatusQuery.data?.import.running || runtimeStatusQuery.data?.enrichment.running || runtimeStatusQuery.data?.tmdb.running ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
+              Status
+            </div>
+            {runtimeStatusQuery.data?.import.running ? (
+              <p className="mt-1">Importing {runtimeStatusQuery.data.import.provider_name ?? 'provider'}…</p>
+            ) : runtimeStatusQuery.data?.tmdb.running ? (
+              <p className="mt-1">TMDB: {runtimeStatusQuery.data.tmdb.done}/{runtimeStatusQuery.data.tmdb.total}</p>
+            ) : runtimeStatusQuery.data?.enrichment.running ? (
+              <p className="mt-1">Enriching: {runtimeStatusQuery.data.enrichment.movies_done}/{runtimeStatusQuery.data.enrichment.movies_total} movies · {runtimeStatusQuery.data.enrichment.series_done}/{runtimeStatusQuery.data.enrichment.series_total} series</p>
+            ) : (
+              <p className="mt-1">Idle</p>
+            )}
+            <p className="mt-1 text-[10px] text-muted-foreground/80">App CPU: {runtimeStatusQuery.data?.process_cpu_percent == null ? 'sampling…' : `${runtimeStatusQuery.data.process_cpu_percent}%`}</p>
+          </div>
         </nav>
       </aside>
 
