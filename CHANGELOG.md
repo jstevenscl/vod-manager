@@ -20,6 +20,14 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ Bulk enrichment now divides its request-concurrency budget among only
+  providers that actually have pending movies or series sources. Previously,
+  empty configured providers could consume a fairness share: with five
+  configured providers and only one needing work, an 8-request budget was
+  reduced to one request at a time. Active providers still retain their own
+  adaptive rate limiter, backoff handling, and isolated movie-then-series
+  lanes.
+
 - ✅ The Curation page now notices the automatic handoff from the TMDB-ID
   metadata pass to provider fallback/series episode work without requiring a
   manual browser refresh. While idle it checks for server-started enrichment

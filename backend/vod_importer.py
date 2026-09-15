@@ -1844,11 +1844,33 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         return
 
     providers = await asyncio.to_thread(vod_db.list_providers)
+    configured_provider_count = len(providers)
     movie_ids_all = await asyncio.to_thread(
         vod_db.list_movie_ids_pending_provider_enrichment
         if pending_only and not force else vod_db.list_all_movie_ids,
     )
     series_ids_all = await asyncio.to_thread(vod_db.list_all_series_ids)
+    # Only providers that can actually perform work participate in the
+    # fair-share calculation below.  Counting configured-but-empty providers
+    # can turn concurrency=8 into one worker for the sole provider with
+    # pending content (for example, five configured providers -> 8 // 5).
+    # Each selected provider still keeps its own movie-then-series lane,
+    # adaptive limiter, and backoff state.
+    active_providers: list[dict] = []
+    for provider in providers:
+        provider_id = provider["id"]
+        provider_movie_ids = await asyncio.to_thread(
+            lambda: vod_db.list_movie_ids_pending_provider_enrichment(provider_id)
+            if pending_only and not force else vod_db.list_all_movie_ids(provider_id=provider_id)
+        )
+        provider_has_series_work = await asyncio.to_thread(
+            vod_db.has_pending_series_source_enrichment, provider_id
+        ) if pending_only and not force else bool(
+            await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider_id)
+        )
+        if provider_movie_ids or provider_has_series_work:
+            active_providers.append(provider)
+    providers = active_providers
     # Actual per-provider ids seen during this run (populated below) --
     # used for the end-of-phase merge sweeps instead of movie_ids_all/
     # series_ids_all, since a provider isn't guaranteed to have been listed
@@ -1866,8 +1888,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         "started_at": time.time(), "finished_at": None,
         "providers_incomplete": [],
     })
-    logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, %d providers, concurrency=%d",
-                len(movie_ids_all), len(series_ids_all), len(providers), concurrency)
+    logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, %d active/%d configured providers, concurrency=%d",
+                len(movie_ids_all), len(series_ids_all), len(providers), configured_provider_count, concurrency)
 
     # Separate semaphores -- movies and series shouldn't compete with each
     # other for the same `concurrency` slots (that would just reproduce the

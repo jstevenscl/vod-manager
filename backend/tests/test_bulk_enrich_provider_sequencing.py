@@ -84,6 +84,40 @@ def test_each_providers_series_wait_for_that_same_providers_movies(monkeypatch):
     assert movie_index < series_index
 
 
+def test_empty_configured_providers_do_not_reduce_active_lane_concurrency(monkeypatch):
+    """Only providers with pending content should divide the shared budget.
+
+    Five configured providers with work at only one must pass provider_count=1
+    to that lane, rather than reducing concurrency=8 to a single worker.
+    """
+    seen = []
+
+    async def fake_run(provider, *args, provider_count, **kwargs):
+        seen.append((provider["id"], provider_count))
+        return {"movie_ok": True, "movie_ids": [10], "series_ran": True, "series_ok": True, "series_ids": [20]}
+
+    providers = [_provider(i, f"Prov{i}") for i in range(1, 6)]
+    monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: providers)
+    monkeypatch.setattr(
+        vod_importer.vod_db,
+        "list_movie_ids_pending_provider_enrichment",
+        lambda provider_id=None: [10] if provider_id in (None, 1) else [],
+    )
+    monkeypatch.setattr(
+        vod_importer.vod_db,
+        "has_pending_series_source_enrichment",
+        lambda provider_id: provider_id == 1,
+    )
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda provider_id=None, **kw: [20] if provider_id is None else [])
+    monkeypatch.setattr(vod_importer, "_run_provider_enrichment", fake_run)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movies_by_tmdb_batch", lambda ids: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb_batch", lambda ids: None)
+
+    asyncio.run(vod_importer.bulk_enrich_all(concurrency=8, pending_only=True))
+
+    assert seen == [(1, 1)]
+
+
 def test_one_providers_movies_do_not_block_another_providers_series(monkeypatch):
     """Provider B should be able to reach its series phase while Provider A
     is still working through a slow movie phase -- no GLOBAL movies-then-

@@ -6061,6 +6061,27 @@ def series_source_needs_enrichment(source: dict) -> bool:
     return not source.get("episodes_last_enriched_at")
 
 
+def has_pending_series_source_enrichment(provider_id: int) -> bool:
+    """Whether a provider has episode discovery work for pending ingestion.
+
+    This is intentionally source-scoped: a canonical series may have sources
+    from several providers, but only a source whose episodes were never
+    discovered should consume an automatic enrichment lane.
+    """
+    conn = _connect()
+    row = conn.execute("""
+        SELECT 1
+        FROM series_sources ss
+        JOIN series s ON s.id=ss.series_id
+        WHERE ss.provider_id=?
+          AND ss.episodes_last_enriched_at IS NULL
+          AND s.archived=0
+        LIMIT 1
+    """, (provider_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
 def set_series_source_enrichment(series_id: int, provider_id: int, provider_series_id: str) -> None:
     with _WRITE_LOCK:
         conn = _connect()
