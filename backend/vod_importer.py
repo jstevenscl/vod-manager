@@ -1211,7 +1211,9 @@ async def _enrich_one_series_source(
         # (import_provider_id, import_provider_series_id), not by
         # re-deriving identity from (name, year) every pass.
         name_fields = {}
-        if detail.get("name"):
+        # TMDB owns the visible title once the canonical pass has resolved
+        # this series. Provider text stays in series_sources.raw_name.
+        if detail.get("name") and not series.get("tmdb_metadata_enriched_at"):
             name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
             name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
 
@@ -1221,14 +1223,10 @@ async def _enrich_one_series_source(
         # even within one provider, let alone across others.
         series_tmdb_id = _clean_tmdb_id(detail.get("tmdb")) or _clean_tmdb_id(detail.get("tmdb_id"))
 
-        # Best-effort content-rating-only TMDB call -- deliberately
-        # narrow (not a full series-detail fetch, see tmdb_sync.
-        # get_tv_content_rating's docstring) since is_adult only ever
-        # flags literal porn, never general violence/maturity, leaving
-        # no real way for a "kids" smart category to keep out R/TV-MA-
-        # rated content without this.
+        # This is only for a TMDB id first exposed by provider detail during
+        # this call. Known IDs are handled earlier by the canonical pass.
         content_rating = None
-        if series_tmdb_id:
+        if series_tmdb_id and not series.get("tmdb_metadata_enriched_at"):
             content_rating = await tmdb_sync.get_tv_content_rating(str(series_tmdb_id))
 
         await asyncio.to_thread(
@@ -1427,10 +1425,53 @@ async def bulk_enrich_tmdb_movies(concurrency: int = 8) -> None:
         _TMDB_ENRICH_PROGRESS["finished_at"] = time.time()
 
 
+async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
+    """Normalize known-TMDB series cards before provider episode discovery."""
+    pending_series = await asyncio.to_thread(vod_db.list_series_pending_tmdb_metadata_enrichment)
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    for series in pending_series:
+        queue.put_nowait(series)
+    resolved: list[dict] = []
+    merged_ids: list[int] = []
+
+    async def worker() -> None:
+        while True:
+            try:
+                series = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                detail = await tmdb_sync.get_tv_full_details(str(series["tmdb_id"]))
+                if not detail:
+                    continue
+                name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+                fields = {
+                    "name": vod_db.apply_rules_to_value(detail["name"], name_rules),
+                }
+                # A missing US rating must not erase a useful provider rating.
+                if detail.get("content_rating"):
+                    fields["content_rating"] = detail["content_rating"]
+                resolved.append({
+                    "series_id": series["id"],
+                    "fields": fields,
+                })
+                merged_ids.append(series["id"])
+            except Exception:
+                logger.exception("[vod_importer] TMDB series metadata failed for series_id=%s", series["id"])
+
+    await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(pending_series) or 1))))
+    for offset in range(0, len(resolved), _MOVIE_BATCH_CHUNK_SIZE):
+        await asyncio.to_thread(vod_db.apply_series_tmdb_metadata_batch, resolved[offset:offset + _MOVIE_BATCH_CHUNK_SIZE])
+    if merged_ids:
+        # Same TMDB id remains insufficient to merge different-language cards.
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, merged_ids)
+
+
 async def _post_import_enrichment() -> None:
     """Run provider-free identity enrichment before provider-only fallback."""
     try:
         await bulk_enrich_tmdb_movies()
+        await bulk_enrich_tmdb_series_metadata()
         # Remaining new movies have no imported TMDB ID; bulk_enrich_all's
         # movie phase now selects only those fallback rows.  Its series phase
         # remains the deliberate provider-detail path for episode discovery.

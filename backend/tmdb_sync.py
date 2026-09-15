@@ -429,6 +429,37 @@ async def get_tv_content_rating(tmdb_id: str) -> str | None:
     return None
 
 
+async def get_tv_full_details(tmdb_id: str) -> dict | None:
+    """Canonical title and US rating for one known TV identity.
+
+    The bulk importer calls this once per canonical series before provider
+    episode discovery, avoiding a separate title lookup and rating request.
+    """
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+    try:
+        async with _tmdb_semaphore:
+            response = await _tmdb_get(
+                f"{_API_BASE}/tv/{tmdb_id}",
+                params={"api_key": api_key, "append_to_response": "content_ratings"},
+            )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("[tmdb_sync] failed to fetch TV detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        return None
+    data = response.json()
+    title = (data.get("name") or "").strip()
+    if not title:
+        return None
+    content_rating = None
+    for country in data.get("content_ratings", {}).get("results", []):
+        if country.get("iso_3166_1") == "US":
+            content_rating = (country.get("rating") or "").strip() or None
+            break
+    return {"name": title, "content_rating": content_rating}
+
+
 # sync_category/sync_all moved to vod_list_sync.py 2026-09-07, generalized
 # to support more than one list source per category (TMDB Lists + MDBList,
 # any mix) -- see that module for the current fetch/match/place logic.

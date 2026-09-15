@@ -134,7 +134,10 @@ def init_db() -> None:
             provider_category_name TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT,
-            last_enriched_at TEXT
+            last_enriched_at TEXT,
+            -- Separate from provider episode/detail enrichment: this marks
+            -- that the canonical TMDB record has supplied the visible title.
+            tmdb_metadata_enriched_at TEXT
         );
 
         -- Multi-provider support for series, mirroring movie_sources --
@@ -1114,6 +1117,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # very next enrichment pass naturally re-attempts every series
         # source once; no backfill needed.
         ("series_sources", "episodes_last_enriched_at", "TEXT"),
+        # Do not conflate provider episode/detail enrichment with canonical
+        # TMDB identity/title enrichment.
+        ("series", "tmdb_metadata_enriched_at", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5135,6 +5141,24 @@ def list_movie_ids_pending_tmdb_enrichment() -> list[int]:
     return [r["id"] for r in rows]
 
 
+def list_series_pending_tmdb_metadata_enrichment() -> list[dict]:
+    """Known-TMDB series awaiting their canonical TMDB title/detail pass.
+
+    This is canonical-series scoped, deliberately not source scoped: source
+    rows keep their raw provider title/language while the card gets one stable
+    TMDB name regardless of how many providers or variants carry it.
+    """
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id, tmdb_id FROM series
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND tmdb_metadata_enriched_at IS NULL
+        ORDER BY id
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def list_movie_ids_pending_provider_enrichment(provider_id: int | None = None) -> list[int]:
     """New movies with no imported TMDB identity left for provider fallback."""
     conn = _connect()
@@ -6017,6 +6041,33 @@ def set_series_enrichment(series_id: int, **fields) -> None:
         fields["last_enriched_at"] = _now()
         sets = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE series SET {sets} WHERE id=?", (*fields.values(), series_id))
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def apply_series_tmdb_metadata_batch(items: list[dict]) -> None:
+    """Persist canonical TMDB series metadata in one bounded transaction.
+
+    Only successful TMDB payloads reach this function. The marker is left
+    NULL for a bad or temporarily unavailable TMDB id, so a later import can
+    retry it; raw provider names remain solely on series_sources.
+    """
+    if not items:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        for item in items:
+            try:
+                with _item_savepoint(conn):
+                    fields = dict(item["fields"])
+                    fields["tmdb_metadata_enriched_at"] = _now()
+                    sets = ", ".join(f"{key}=?" for key in fields)
+                    conn.execute(
+                        f"UPDATE series SET {sets}, updated_at=? WHERE id=?",
+                        (*fields.values(), _now(), item["series_id"]),
+                    )
+            except Exception as exc:
+                logger.warning("[apply_series_tmdb_metadata_batch] skipped series_id=%s: %s", item["series_id"], exc)
         _commit_with_retry(conn)
         conn.close()
 

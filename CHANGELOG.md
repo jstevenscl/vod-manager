@@ -20,6 +20,14 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ Imports now run a TMDB-first canonical metadata pass for series with an
+  imported TMDB ID before provider episode discovery. It uses one bounded,
+  batched TMDB lookup per canonical series to set the user-visible TMDB title
+  and US content rating, while retaining every provider's original title in
+  its source row. Provider suffixes therefore stay available for provenance
+  without replacing clean card titles, and the existing language-aware merge
+  guard still keeps correctly classified EN/ES/IT siblings separate.
+
 - ✅ Bulk enrichment now divides its request-concurrency budget among only
   providers that actually have pending movies or series sources. Previously,
   empty configured providers could consume a fairness share: with five
