@@ -5837,9 +5837,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     enabled: activeTab === 'metadata',
   })
   const activeMetadataQuery = metadataQueue === 'identity' ? metadataReviewQuery : tmdbLookupFailuresQuery
-  const metadataItems = (metadataContentType === 'movie'
-    ? activeMetadataQuery.data?.movies : activeMetadataQuery.data?.series) ?? []
-  const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
+  const metadataMovieItems = activeMetadataQuery.data?.movies ?? []
+  const metadataSeriesItems = activeMetadataQuery.data?.series ?? []
+  const hideAdultsInMetadata = metadataQueue === 'identity' && metadataHideAdult
+  const visibleMetadataMovies = hideAdultsInMetadata ? metadataMovieItems.filter((item) => !item.is_adult) : metadataMovieItems
+  const visibleMetadataSeries = hideAdultsInMetadata ? metadataSeriesItems.filter((item) => !item.is_adult) : metadataSeriesItems
+  const metadataItems = metadataContentType === 'movie' ? metadataMovieItems : metadataSeriesItems
+  const filteredMetadataItems = metadataContentType === 'movie' ? visibleMetadataMovies : visibleMetadataSeries
+  const hiddenAdultMetadataCount = metadataItems.length - filteredMetadataItems.length
   const METADATA_PAGE_SIZE = 50
   const metadataPageItems = filteredMetadataItems.slice(metadataOffset, metadataOffset + METADATA_PAGE_SIZE)
   const metadataBulkAi = useBulkAiJob(
@@ -7353,26 +7358,31 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             ? 'Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.'
             : 'Correct stored TMDB IDs that TMDB confirmed no longer exist. Search TMDB, choose the exact match, or clear the invalid ID.'}
         </p>
-        <div className="flex items-center gap-1.5 pt-1">
-          <Button size="sm" variant={metadataQueue === 'identity' ? 'default' : 'outline'} onClick={() => { setMetadataQueue('identity'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
-            Missing identity
-          </Button>
-          <Button size="sm" variant={metadataQueue === 'invalid_tmdb' ? 'default' : 'outline'} onClick={() => { setMetadataQueue('invalid_tmdb'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
-            Incorrect TMDB IDs{tmdbLookupFailuresQuery.data?.movies.length || tmdbLookupFailuresQuery.data?.series.length ? ` (${(tmdbLookupFailuresQuery.data?.movies.length ?? 0) + (tmdbLookupFailuresQuery.data?.series.length ?? 0)})` : ''}
-          </Button>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-1">
+          <span className="text-[11px] font-medium text-muted-foreground">Review issue</span>
+          <div className="flex items-center gap-1.5">
+            <Button size="sm" variant={metadataQueue === 'identity' ? 'default' : 'outline'} title="Titles with no usable TMDB ID and no release year" onClick={() => { setMetadataQueue('identity'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+              Missing identity
+            </Button>
+            <Button size="sm" variant={metadataQueue === 'invalid_tmdb' ? 'default' : 'outline'} title="Stored TMDB IDs that TMDB returned as not found" onClick={() => { setMetadataQueue('invalid_tmdb'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+              Incorrect TMDB IDs{tmdbLookupFailuresQuery.data?.movies.length || tmdbLookupFailuresQuery.data?.series.length ? ` (${(tmdbLookupFailuresQuery.data?.movies.length ?? 0) + (tmdbLookupFailuresQuery.data?.series.length ?? 0)})` : ''}
+            </Button>
+          </div>
+          <span className="text-[11px] font-medium text-muted-foreground">Content type</span>
+          <div className="flex items-center gap-1.5">
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            Movies{activeMetadataQuery.data?.movies.length ? ` (${activeMetadataQuery.data.movies.length})` : ''}
+            Movies{` (${visibleMetadataMovies.length})`}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            TV Shows{activeMetadataQuery.data?.series.length ? ` (${activeMetadataQuery.data.series.length})` : ''}
+            TV Shows{` (${visibleMetadataSeries.length})`}
           </Button>
           <Button size="sm" variant="outline" disabled={activeMetadataQuery.isFetching} onClick={() => activeMetadataQuery.refetch()}>
             {activeMetadataQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
@@ -7382,22 +7392,27 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {scanTmdbFailures.isPending ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
             <span className="ml-1">Scan pending IDs</span>
           </Button>}
+          </div>
         </div>
-        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground rounded border border-border/60 bg-muted/20 px-2.5 py-2">
+          <span><strong className="text-foreground">Missing identity:</strong> no usable TMDB ID and no release year.</span>
+          <span><strong className="text-foreground">Incorrect TMDB IDs:</strong> stored IDs TMDB returned as not found.</span>
+        </div>
+        {metadataQueue === 'identity' && <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
           <input
             type="checkbox"
             checked={metadataHideAdult}
             onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           />
           Hide adult titles
-          {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
-        </label>
+          {metadataHideAdult && <span>({hiddenAdultMetadataCount} adult title{hiddenAdultMetadataCount === 1 ? '' : 's'} hidden; {filteredMetadataItems.length} shown of {metadataItems.length})</span>}
+        </label>}
         {activeMetadataQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queueâ€¦</p>}
         {activeMetadataQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
         {activeMetadataQuery.data && (
           <>
             {filteredMetadataItems.length === 0 ? (
-              <p className="text-xs text-muted-foreground pt-1">{metadataHideAdult ? 'No non-adult titles match this review queue.' : 'Clean â€” no active titles need identity review.'}</p>
+              <p className="text-xs text-muted-foreground pt-1">{hideAdultsInMetadata ? 'No non-adult titles match this review queue.' : 'Clean â€” no active titles need review.'}</p>
             ) : (
               <>
                 <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
