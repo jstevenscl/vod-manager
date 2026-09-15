@@ -18,6 +18,15 @@ running this build.
 proposed to the upstream project, the entry links to that pull request —
 🔀 = open/under review upstream, not yet merged.
 
+## 2026-09-15
+
+- ✅ Provider catalog refreshes now reconcile removed content as well as new
+  content: a source that is no longer advertised by a provider is removed,
+  while the same movie or series remains available whenever another provider
+  still has a source. Stale episode streams are also removed only after that
+  provider has no remaining source for the series, preserving valid fallback
+  playback.
+
 ## 2026-09-14
 
 - ✅ Imports now run a TMDB-first canonical metadata pass for series with an
