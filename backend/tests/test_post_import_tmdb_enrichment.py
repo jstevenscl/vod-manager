@@ -99,6 +99,17 @@ def test_tmdb_series_pass_backfills_year_and_clears_review_hold(db, monkeypatch)
     assert db.list_series_pending_tmdb_metadata_enrichment() == []
 
 
+def test_metadata_review_resolution_merges_same_tmdb_series_alias(db):
+    """A reviewer-confirmed ID must not wait for a later import to merge."""
+    existing_id = db.upsert_series("Canonical Series", 2020, tmdb_id="900")
+    review_id = db.upsert_series("Provider Alias", None)
+
+    db.resolve_year_review("series", review_id, 2020, "900")
+
+    survivors = [db.get_series(series_id) for series_id in (existing_id, review_id)]
+    assert len([series for series in survivors if series is not None]) == 1
+
+
 def test_tmdb_series_pass_reuses_one_lookup_for_shared_tmdb_id(db, monkeypatch):
     first_id = db.upsert_series("English Card", 2020, tmdb_id="shared-id")
     second_id = db.upsert_series("Spanish Card", 2020, tmdb_id="shared-id")

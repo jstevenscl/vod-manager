@@ -9176,7 +9176,10 @@ def list_tmdb_lookup_failures(content_type: str | None = None) -> dict:
 def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
     """Sets the correct year (and tmdb_id, if known) on a flagged item and
     clears the flag. If that year now exactly matches an existing item of
-    the same name, merges into it instead of leaving two rows around."""
+    the same name, merges into it instead of leaving two rows around. A
+    reviewer-selected TMDB ID also immediately takes the normal safe
+    same-TMDB merge path, so a provider alias with a different card name
+    does not wait for another import/enrichment cycle."""
     table = "movies" if content_type == "movie" else "series"
     conn = _connect()
     row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
@@ -9204,6 +9207,11 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
     conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
     _commit_with_retry(conn)
     conn.close()
+    if tmdb_id:
+        if content_type == "movie":
+            auto_merge_movie_by_tmdb(item_id)
+        else:
+            auto_merge_series_by_tmdb(item_id)
     return {"resolved_id": item_id}
 
 

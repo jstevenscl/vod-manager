@@ -29,7 +29,9 @@ included.
   collision groups directly from the database, so a card created during a
   coalesced import cannot be stranded in Duplicate Finder. It retains the
   existing same-language and explicit-ignore safeguards, so different-language
-  variants and human decisions remain untouched.
+  variants and human decisions remain untouched. A reviewer-selected TMDB ID
+  in Metadata Review now invokes that same safe merge path immediately rather
+  than waiting for the next import.
 
 - ✅ Metadata Review now has an **Incorrect TMDB IDs** tab for titles whose
   stored ID receives a confirmed TMDB 404. It supports a pending-ID scan,
