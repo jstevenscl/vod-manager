@@ -25,7 +25,9 @@ proposed to the upstream project, the entry links to that pull request —
   while the same movie or series remains available whenever another provider
   still has a source. Stale episode streams are also removed only after that
   provider has no remaining source for the series, preserving valid fallback
-  playback.
+  playback. Validated with isolated catalog snapshots covering removed,
+  retained alternate-provider, and stale-episode sources, plus a mocked
+  provider-import flow; no live provider catalog was modified for the test.
 
 ## 2026-09-14
 
