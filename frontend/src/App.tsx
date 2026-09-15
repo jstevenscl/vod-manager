@@ -43,6 +43,7 @@ interface RuntimeStatus {
   import: { running: boolean; provider_name: string | null; error: string | null }
   enrichment: { running: boolean; movies_done: number; movies_total: number; series_done: number; series_total: number }
   tmdb: { running: boolean; done: number; total: number }
+  bulk_ai: { running: boolean; done: number; total: number; jobs: number }
   process_cpu_percent: number | null
 }
 const NAV_GROUPS: NavGroup[] = [
@@ -129,7 +130,7 @@ export default function App() {
     enabled: authState === 'ready',
     refetchInterval: (query) => {
       const status = query.state.data
-      return status?.import.running || status?.enrichment.running || status?.tmdb.running ? 2000 : 10_000
+      return status?.import.running || status?.enrichment.running || status?.tmdb.running || status?.bulk_ai.running ? 2000 : 10_000
     },
     retry: false,
   })
@@ -244,11 +245,13 @@ export default function App() {
           ))}
           <div className="rounded-md border border-border bg-background/60 px-2.5 py-2 text-[11px] text-muted-foreground">
             <div className="flex items-center gap-1.5 font-semibold text-foreground">
-              <Activity size={13} className={runtimeStatusQuery.data?.import.running || runtimeStatusQuery.data?.enrichment.running || runtimeStatusQuery.data?.tmdb.running ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
+              <Activity size={13} className={runtimeStatusQuery.data?.import.running || runtimeStatusQuery.data?.enrichment.running || runtimeStatusQuery.data?.tmdb.running || runtimeStatusQuery.data?.bulk_ai.running ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
               Status
             </div>
             {runtimeStatusQuery.data?.import.running ? (
               <p className="mt-1">Importing {runtimeStatusQuery.data.import.provider_name ?? 'provider'}…</p>
+            ) : runtimeStatusQuery.data?.bulk_ai.running ? (
+              <p className="mt-1">AI review: {runtimeStatusQuery.data.bulk_ai.done}/{runtimeStatusQuery.data.bulk_ai.total}</p>
             ) : runtimeStatusQuery.data?.tmdb.running ? (
               <p className="mt-1">TMDB: {runtimeStatusQuery.data.tmdb.done}/{runtimeStatusQuery.data.tmdb.total}</p>
             ) : runtimeStatusQuery.data?.enrichment.running ? (

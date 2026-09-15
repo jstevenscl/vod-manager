@@ -3681,6 +3681,7 @@ async def runtime_status():
         "import": vod_importer.get_import_progress(),
         "enrichment": vod_importer.get_enrich_progress(),
         "tmdb": vod_importer.get_tmdb_enrich_progress(),
+        "bulk_ai": vod_bulk_ai_service.get_active_bulk_ai_status(),
         "process_cpu_percent": vod_importer.get_process_cpu_percent(),
     }
 
