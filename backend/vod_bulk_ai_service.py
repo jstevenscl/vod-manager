@@ -75,8 +75,12 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
     item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
     if not item:
         return {"id": item_id, "status": "error", "detail": "not found"}
-    if not item.get("needs_year_review"):
-        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs review"}
+    # Metadata Review also contains provider rows with no usable identity at
+    # all (both TMDB ID and year absent). They never passed through the older
+    # ambiguous-year detector, but a user-selected bulk AI run should be able
+    # to resolve them with the exact same high-confidence-only safeguards.
+    if not item.get("needs_year_review") and not (item.get("tmdb_id") is None and item.get("year") is None):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs identity review"}
 
     try:
         candidates = await tmdb_sync.search_title(item["name"], content_type)
@@ -98,6 +102,8 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
         }
 
     pick = candidates[idx]
+    if pick.get("year") is None or not pick.get("tmdb_id"):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "confident TMDB result has no usable ID/year"}
     try:
         result = vod_db.resolve_year_review(content_type, item_id, pick.get("year"), pick.get("tmdb_id"))
     except ValueError as exc:

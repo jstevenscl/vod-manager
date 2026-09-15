@@ -31,6 +31,14 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ **Shipped in beta image (next build):** Metadata Review now supports a
+  Hide adult titles filter, filtered Select all, Archive selected, and an explicit
+  Bulk resolve with AI action for both movies and TV shows. AI runs only on
+  the titles the reviewer selected and writes a TMDB ID/year only for a
+  high-confidence result; unresolved items remain for manual review. Each row
+  also accepts a direct TMDB ID, with an optional year for the safe
+  identity/merge path.
+
 - ✅ **Follow-up shipped in beta image (`4db93be`):** Corrected the initial
   Metadata Review filter to show only actionable no-identity records (both
   TMDB ID and release year absent), plus explicitly held ambiguous-year rows.

@@ -276,6 +276,7 @@ interface NeedsReviewItem {
   year: number | null
   tmdb_id?: string | null
   needs_year_review?: number
+  is_adult?: number
   genre: string | null
   sample_episode_id?: number | null
   sample_source_id?: number | null
@@ -1393,6 +1394,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
 }) {
   const [expanded, setExpanded] = useState(false)
   const [manualYear, setManualYear] = useState('')
+  const [manualTmdbId, setManualTmdbId] = useState('')
 
   // Movies preview directly off their own id; series need a specific episode
   // (see xc_server.py's /preview/series/ route) — sample_episode_id is the
@@ -1430,6 +1432,14 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
   const resolve = useMutation({
     mutationFn: (body: { year: number; tmdb_id?: string }) =>
       api.post(`/vod/needs-review/${contentType}/${item.id}/resolve/`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  const setTmdbId = useMutation({
+    mutationFn: (tmdbId: number) => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/set/`, { tmdb_id: tmdbId }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
@@ -1572,8 +1582,8 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
             <p className="text-muted-foreground">No TMDB matches found for this name.</p>
           )}
 
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted-foreground">or set year manually:</span>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-muted-foreground">or set manually:</span>
             <input
               className={inputCls('w-16')}
               type="number"
@@ -1581,12 +1591,25 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
               value={manualYear}
               onChange={(e) => setManualYear(e.target.value)}
             />
+            <input
+              className={inputCls('w-24')}
+              type="number"
+              placeholder="TMDB ID"
+              value={manualTmdbId}
+              onChange={(e) => setManualTmdbId(e.target.value)}
+            />
             <Button
               size="sm"
-              disabled={!manualYear || resolve.isPending}
-              onClick={() => resolve.mutate({ year: Number(manualYear) })}
+              disabled={(!manualYear && !manualTmdbId) || resolve.isPending || setTmdbId.isPending}
+              onClick={() => {
+                if (manualYear) {
+                  resolve.mutate({ year: Number(manualYear), tmdb_id: manualTmdbId || undefined })
+                } else if (manualTmdbId) {
+                  setTmdbId.mutate(Number(manualTmdbId))
+                }
+              }}
             >
-              Resolve
+              {resolve.isPending || setTmdbId.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Apply'}
             </Button>
           </div>
         </div>
@@ -4279,6 +4302,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
+  const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
+  const [metadataHideAdult, setMetadataHideAdult] = useState(false)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
@@ -5779,6 +5804,26 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/metadata-review/').then((r) => r.data),
     enabled: activeTab === 'metadata',
   })
+  const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
+  const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
+  const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  const archiveMetadata = useMutation({
+    mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
+    onSuccess: () => {
+      setMetadataSelected(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  useEffect(() => {
+    if (metadataBulkAi.job && !metadataBulkAi.job.running) {
+      setMetadataSelected(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metadataBulkAi.job?.running])
 
   // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
   const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
@@ -7264,14 +7309,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
-            onClick={() => setMetadataContentType('movie')}
+            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()) }}
           >
             Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
-            onClick={() => setMetadataContentType('series')}
+            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()) }}
           >
             TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
           </Button>
@@ -7280,24 +7325,77 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <span className="ml-1">Refresh</span>
           </Button>
         </div>
+        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            checked={metadataHideAdult}
+            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()) }}
+          />
+          Hide adult titles
+          {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
+        </label>
         {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queueâ€¦</p>}
         {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
         {metadataReviewQuery.data && (
           <>
-            {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).length === 0 ? (
-              <p className="text-xs text-muted-foreground pt-1">Clean â€” no active titles need identity review.</p>
+            {filteredMetadataItems.length === 0 ? (
+              <p className="text-xs text-muted-foreground pt-1">{metadataHideAdult ? 'No non-adult titles match this review queue.' : 'Clean â€” no active titles need identity review.'}</p>
             ) : (
-              <ul className="divide-y divide-border/50">
-                {(metadataContentType === 'movie' ? metadataReviewQuery.data.movies : metadataReviewQuery.data.series).map((item) => (
-                  <NeedsReviewRow
-                    key={item.id}
-                    contentType={metadataContentType}
-                    item={item}
-                    qc={qc}
-                    xcCredentials={xcCredentialsQuery.data}
-                  />
-                ))}
-              </ul>
+              <>
+                <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
+                  <button
+                    className="text-primary hover:underline"
+                    onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}
+                  >
+                    Select all
+                  </button>
+                  <button className="text-muted-foreground hover:underline" onClick={() => setMetadataSelected(new Set())}>Clear</button>
+                  <span className="text-muted-foreground">{metadataSelected.size} selected</span>
+                  <Button
+                    size="sm" variant="outline" className="h-7 text-xs ml-auto text-destructive"
+                    disabled={metadataSelected.size === 0 || archiveMetadata.isPending}
+                    onClick={() => askConfirm(
+                      `Archive ${metadataSelected.size} selected ${metadataContentType === 'movie' ? 'movie' : 'TV show'}${metadataSelected.size === 1 ? '' : 's'}? This removes them from categories and hides them from the active pool.`,
+                      () => archiveMetadata.mutate(Array.from(metadataSelected)),
+                    )}
+                  >
+                    {archiveMetadata.isPending ? <Loader2 size={11} className="animate-spin mr-1" /> : <Archive size={11} className="mr-1" />}
+                    Archive selected
+                  </Button>
+                  <Button
+                    size="sm" variant="outline" className="h-7 text-xs"
+                    disabled={metadataSelected.size === 0 || metadataBulkAi.starting || !!metadataBulkAi.job?.running}
+                    title="Searches TMDB for each selected title and applies a year + TMDB ID only when AI is highly confident. Other titles remain for manual review."
+                    onClick={() => metadataBulkAi.start({ content_type: metadataContentType, ids: Array.from(metadataSelected) })}
+                  >
+                    {metadataBulkAi.starting || metadataBulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+                    Resolve selected with AI ({metadataSelected.size})
+                  </Button>
+                </div>
+                {metadataBulkAi.startError && <p className="text-xs text-destructive">{metadataBulkAi.startError}</p>}
+                {metadataBulkAi.job && <BulkAiJobSummary job={metadataBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                <ul className="divide-y divide-border/50">
+                  {filteredMetadataItems.map((item) => (
+                    <Fragment key={item.id}>
+                      <li className="pt-1.5 -mb-1.5">
+                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={metadataSelected.has(item.id)}
+                            onChange={() => setMetadataSelected((selected) => {
+                              const next = new Set(selected)
+                              if (next.has(item.id)) next.delete(item.id); else next.add(item.id)
+                              return next
+                            })}
+                          />
+                          Select
+                        </label>
+                      </li>
+                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} />
+                    </Fragment>
+                  ))}
+                </ul>
+              </>
             )}
           </>
         )}
