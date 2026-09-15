@@ -733,6 +733,31 @@ def mark_import_queued(provider_id: int, provider_name: str, queue_position: int
     })
 
 
+def mark_import_running(provider_id: int, provider_name: str) -> None:
+    """Expose a non-XC manual import while its provider adapter is running.
+
+    XC imports update this state inside import_provider_catalog.  Plex, Emby,
+    Jellyfin, and DVR imports use different adapters, so the manual-import
+    worker marks their common lifecycle here instead of leaving the sidebar
+    permanently on "queued".
+    """
+    _IMPORT_PROGRESS.update({
+        "running": True, "queued": False, "queue_position": None,
+        "provider_id": provider_id, "provider_name": provider_name,
+        "started_at": time.time(), "finished_at": None, "error": None,
+    })
+
+
+def mark_import_finished(provider_id: int, error: str | None = None) -> None:
+    """Finish a non-XC manual import without overwriting a newer job's state."""
+    if _IMPORT_PROGRESS.get("provider_id") != provider_id:
+        return
+    _IMPORT_PROGRESS.update({
+        "running": False, "queued": False, "queue_position": None,
+        "finished_at": time.time(), "error": error,
+    })
+
+
 def get_process_cpu_percent() -> float | None:
     """Best-effort CPU use for this container's Python process.
 

@@ -1616,6 +1616,11 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise ValueError("provider not found")
+    # XC updates the shared sidebar lifecycle itself.  The other adapters do
+    # not, so publish their transition from queued -> running here.
+    track_lifecycle = provider.get("provider_type") != "xc"
+    if track_lifecycle:
+        vod_importer.mark_import_running(provider_id, provider["name"])
     try:
         if provider.get("provider_type") == "plex":
             result = await plex_importer.import_plex_library(provider_id)
@@ -1628,6 +1633,8 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
             # between two user-queued provider imports.
             result = await vod_importer.import_provider_catalog(provider_id, schedule_enrichment=False)
     except Exception as exc:
+        if track_lifecycle:
+            vod_importer.mark_import_finished(provider_id, type(exc).__name__)
         # exc_info: some failures here raise with an empty str() (e.g. a bare
         # TimeoutError), which used to log as "failed: " with nothing else
         # to go on -- the full traceback is the only way to actually
@@ -1646,6 +1653,8 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
         movie_ids = set(result.get("changed_movie_ids", [])) if "changed_movie_ids" in result else None
         series_ids = set(result.get("changed_series_ids", [])) if "changed_series_ids" in result else None
         await vod_importer.resweep_smart_categories(movie_ids, series_ids)
+    if track_lifecycle:
+        vod_importer.mark_import_finished(provider_id)
     return result
 
 

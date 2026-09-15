@@ -55,6 +55,28 @@ def test_xc_imports_are_serialized(monkeypatch):
     assert peak == 1
 
 
+def test_non_xc_import_lifecycle_updates_shared_sidebar_status():
+    previous = vod_importer.get_import_progress()
+    try:
+        vod_importer.mark_import_queued(42, "Plex", 1)
+        assert vod_importer.get_import_progress()["queued"] is True
+
+        vod_importer.mark_import_running(42, "Plex")
+        running = vod_importer.get_import_progress()
+        assert running["running"] is True
+        assert running["queued"] is False
+        assert running["provider_name"] == "Plex"
+
+        vod_importer.mark_import_finished(42)
+        finished = vod_importer.get_import_progress()
+        assert finished["running"] is False
+        assert finished["queued"] is False
+        assert finished["error"] is None
+    finally:
+        vod_importer._IMPORT_PROGRESS.clear()
+        vod_importer._IMPORT_PROGRESS.update(previous)
+
+
 def test_unchanged_sources_do_not_rewrite_movies_or_series(db):
     provider_id = db.upsert_provider("Provider", "http://provider.invalid", "u", "p", provider_type="xc")
     movie = {

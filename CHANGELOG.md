@@ -20,6 +20,11 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-15
 
+- ✅ Manual Plex, Emby, Jellyfin, and DVR imports now update the shared
+  sidebar lifecycle from queued to running and then finished/failed, matching
+  XC imports. This makes a queued non-XC import visibly confirm that its
+  background worker started instead of appearing to remain idle.
+
 - ✅ Metadata Review now renders its queue in 50-item pages instead of
   mounting every review row at once. This keeps the page responsive when a
   provider has a large adult or unresolved-title queue; switching Movies/TV
