@@ -1642,23 +1642,28 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     # a manual import's content shows up in Dispatcharr-visible categories
     # right away instead of up to a full refresh interval later.
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
-    await vod_importer.resweep_smart_categories()
+    if result.get("catalog_changed", True):
+        movie_ids = set(result.get("changed_movie_ids", [])) if "changed_movie_ids" in result else None
+        series_ids = set(result.get("changed_series_ids", [])) if "changed_series_ids" in result else None
+        await vod_importer.resweep_smart_categories(movie_ids, series_ids)
     return result
 
 
 async def _manual_import_worker() -> None:
     """Drain user-requested imports one at a time, then enrich once."""
     global _MANUAL_IMPORT_TASK
+    catalog_changed = False
     try:
         while _MANUAL_IMPORT_QUEUE:
             provider_id = _MANUAL_IMPORT_QUEUE.pop(0)
             try:
-                await _run_provider_catalog_import(provider_id)
+                result = await _run_provider_catalog_import(provider_id)
+                catalog_changed = catalog_changed or result.get("catalog_changed", True)
             except Exception:
                 # The import module records XC status for the sidebar; retain
                 # a traceback for the non-XC importer paths as well.
                 logger.exception("[vod_routes] queued provider import %s failed", provider_id)
-        if vod_importer.schedule_post_import_enrichment():
+        if catalog_changed and vod_importer.schedule_post_import_enrichment():
             logger.info("[vod_routes] queued post-import enrichment after manual import queue drained")
     finally:
         _MANUAL_IMPORT_TASK = None

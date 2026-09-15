@@ -135,14 +135,26 @@ async def _vod_catalog_refresher() -> None:
             ]
             if due:
                 logger.info("[vod_catalog_refresher] refreshing %d of %d active provider(s)…", len(due), len(providers))
+                changed_movie_ids: set[int] = set()
+                changed_series_ids: set[int] = set()
+                catalog_changed = False
+                requires_full_resweep = False
                 for p in due:
                     try:
                         if p.get("provider_type") == "plex":
                             result = await plex_importer.import_plex_library(p["id"])
+                            requires_full_resweep = True
                         elif p.get("provider_type") in ("emby", "jellyfin"):
                             result = await emby_vod_importer.import_emby_library(p["id"])
+                            requires_full_resweep = True
                         else:
-                            result = await vod_importer.import_provider_catalog(p["id"])
+                            # Defer enrichment until every due provider's
+                            # delta has landed; otherwise it competes with
+                            # the next refresh for SQLite's writer.
+                            result = await vod_importer.import_provider_catalog(p["id"], schedule_enrichment=False)
+                        catalog_changed = catalog_changed or result.get("catalog_changed", True)
+                        changed_movie_ids.update(result.get("changed_movie_ids", []))
+                        changed_series_ids.update(result.get("changed_series_ids", []))
                         await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                         logger.info("[vod_catalog_refresher] %s: %s", p["name"], result)
                     except Exception as exc:
@@ -155,7 +167,12 @@ async def _vod_catalog_refresher() -> None:
                 # reasoning). (Also called directly after a manual "Import
                 # catalog" click -- see vod_routes.py -- so that doesn't have
                 # to wait for this loop's next cycle either.)
-                await vod_importer.resweep_smart_categories()
+                if catalog_changed:
+                    if requires_full_resweep:
+                        await vod_importer.resweep_smart_categories()
+                    else:
+                        await vod_importer.resweep_smart_categories(changed_movie_ids, changed_series_ids)
+                    vod_importer.schedule_post_import_enrichment()
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 

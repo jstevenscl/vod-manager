@@ -114,12 +114,16 @@ def test_import_reconciles_against_raw_snapshot_not_filtered_payload(db, monkeyp
     )
     monkeypatch.setattr(
         vod_importer.vod_db, "archive_disabled_language_content",
-        lambda: {"movies_archived": 0, "series_archived": 0, "movies_unarchived": 0, "series_unarchived": 0},
+        lambda *_: {"movies_archived": 0, "series_archived": 0, "movies_unarchived": 0, "series_unarchived": 0},
     )
 
     asyncio.run(vod_importer.import_provider_catalog(provider_id))
+    unchanged = asyncio.run(vod_importer.import_provider_catalog(provider_id))
 
     assert db.get_movie_by_name_year("Shared Movie", 2020) is None
     assert db.get_series_by_name_year("Shared Series", 2020) is None
     assert db.get_movie_by_name_year("Keep Movie", 2020) is not None
     assert db.get_series_by_name_year("Keep Series", 2020) is not None
+    assert unchanged["catalog_changed"] is False
+    assert unchanged["movies_created"] == 0
+    assert unchanged["series_created"] == 0

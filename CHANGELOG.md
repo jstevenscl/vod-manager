@@ -20,6 +20,21 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-15
 
+- ✅ Metadata Review now renders its queue in 50-item pages instead of
+  mounting every review row at once. This keeps the page responsive when a
+  provider has a large adult or unresolved-title queue; switching Movies/TV
+  Shows and using Hide adult titles no longer creates thousands of row
+  components in one browser frame. Selection is intentionally scoped to the
+  visible page.
+
+- ✅ XC provider refreshes now apply a source-level catalog delta after fetching
+  the required full upstream snapshot. New, changed, and removed provider
+  sources still follow the normal import/reconciliation workflow, but an
+  unchanged source is no longer rewritten just to confirm it remains
+  available. Smart-category evaluation and post-import enrichment now run
+  only when a refresh actually changes the catalog, reducing SQLite writes,
+  CPU work, and contention during ordinary daily refreshes.
+
 - ✅ Provider catalog imports now queue in the background instead of holding
   the browser request open for the full catalog pass. Imports are serialized,
   their large record-normalization work no longer occupies the API event loop,

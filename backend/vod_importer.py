@@ -11,6 +11,8 @@ bounded concurrency instead of a human clicking one movie at a time.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -162,6 +164,18 @@ def _coerce_int(value) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _catalog_fingerprint(kind: str, item: dict, provider_category_name: str | None = None) -> str:
+    """Hash only provider-owned list fields that can change catalog state."""
+    fields = (
+        ("stream_id", "name", "category_id", "container_extension", "tmdb", "stream_icon", "cover", "cover_big", "movie_image")
+        if kind == "movie" else
+        ("series_id", "name", "year", "category_id", "genre", "plot", "cast", "director", "cover", "rating", "releaseDate", "release_date", "tmdb", "tmdb_id", "last_modified")
+    )
+    payload = {field: item.get(field) for field in fields}
+    payload["provider_category_name"] = provider_category_name
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
 def _coerce_year(value) -> int | None:
@@ -595,6 +609,7 @@ def _build_movie_import_items(streams, category_names, exclude_categories, exclu
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
+            "catalog_fingerprint": _catalog_fingerprint("movie", s, category_name),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -676,6 +691,7 @@ def _build_series_import_items(series_list, series_category_names, exclude_categ
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
+            "catalog_fingerprint": _catalog_fingerprint("series", s, category_name),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -757,7 +773,7 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
             _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
             raise
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
-    if schedule_enrichment:
+    if schedule_enrichment and result["catalog_changed"]:
         result["post_import_enrichment_queued"] = schedule_post_import_enrichment()
     return result
 
@@ -825,6 +841,8 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)
+    changed_movie_ids = set(movie_result.pop("changed_movie_ids", []))
+    changed_series_ids = set(series_result.pop("changed_series_ids", []))
 
     # Both list calls completed successfully, so these are authoritative full
     # catalog snapshots.  Remove only this provider's source rows that are no
@@ -836,7 +854,10 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
         provider_id,
         seen_movie_stream_ids=seen_movie_stream_ids,
         seen_series_ids=seen_series_ids,
+        include_affected_ids=True,
     )
+    changed_movie_ids.update(reconcile_result.pop("affected_movie_ids", []))
+    changed_series_ids.update(reconcile_result.pop("affected_series_ids", []))
     if any(reconcile_result.values()):
         logger.info(
             "[vod_importer] provider=%s reconciled %d stale movie source(s), %d stale series source(s), %d stale episode source(s)",
@@ -845,6 +866,8 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
             reconcile_result["series_sources_removed"],
             reconcile_result["episode_sources_removed"],
         )
+
+    catalog_changed = bool(changed_movie_ids or changed_series_ids or any(reconcile_result.values()))
 
     # Companion cleanup to the skip-at-import filtering above: content that
     # was imported-then-archived under the old behavior (before this
@@ -862,14 +885,15 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     # so any provider's catalog can always contain a language outside that
     # set. The purge scan now always runs (its own per-row work is cheap
     # when nothing currently matches any active rule).
-    lang = _current_lang_settings()
-    purge_result = await asyncio.to_thread(
-        vod_db.purge_excluded_archived_content,
-        {provider_id: (exclude_categories, exclude_uncategorized)}, lang,
-    )
-    if purge_result["movies_deleted"] or purge_result["series_deleted"]:
-        logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
-                    provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
+    if catalog_changed:
+        lang = _current_lang_settings()
+        purge_result = await asyncio.to_thread(
+            vod_db.purge_excluded_archived_content,
+            {provider_id: (exclude_categories, exclude_uncategorized)}, lang,
+        )
+        if purge_result["movies_deleted"] or purge_result["series_deleted"]:
+            logger.info("[vod_importer] provider=%s purged %d movie(s)/%d series matching current exclusion rules",
+                        provider["name"], purge_result["movies_deleted"], purge_result["series_deleted"])
 
     # KNM: added 2026-09-13, user report -- catch-up companion to the
     # same-day auto-merge language gate fix (see vod_db.
@@ -881,17 +905,20 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     # provider_id like the purge call above -- it evaluates every movie/
     # series row's source languages regardless of which provider(s) they
     # came from, since the check isn't provider-specific.
-    archive_result = await asyncio.to_thread(vod_db.archive_disabled_language_content)
-    if archive_result["movies_archived"] or archive_result["series_archived"]:
-        logger.info(
-            "[vod_importer] archived %d movie(s)/%d series with no source in an enabled language",
-            archive_result["movies_archived"], archive_result["series_archived"],
+    if catalog_changed:
+        archive_result = await asyncio.to_thread(
+            vod_db.archive_disabled_language_content, changed_movie_ids, changed_series_ids,
         )
-    if archive_result["movies_unarchived"] or archive_result["series_unarchived"]:
-        logger.info(
-            "[vod_importer] un-archived %d movie(s)/%d series after a previously-disabled language was re-enabled",
-            archive_result["movies_unarchived"], archive_result["series_unarchived"],
-        )
+        if archive_result["movies_archived"] or archive_result["series_archived"]:
+            logger.info(
+                "[vod_importer] archived %d movie(s)/%d series with no source in an enabled language",
+                archive_result["movies_archived"], archive_result["series_archived"],
+            )
+        if archive_result["movies_unarchived"] or archive_result["series_unarchived"]:
+            logger.info(
+                "[vod_importer] un-archived %d movie(s)/%d series after a previously-disabled language was re-enabled",
+                archive_result["movies_unarchived"], archive_result["series_unarchived"],
+            )
 
     if provider.get("auto_create_categories"):
         try:
@@ -913,6 +940,9 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
         "series_categories": len(series_categories),
         **movie_result,
         **series_result,
+        "catalog_changed": catalog_changed,
+        "changed_movie_ids": list(changed_movie_ids),
+        "changed_series_ids": list(changed_series_ids),
         "post_import_enrichment_queued": False,
     }
 
@@ -2173,7 +2203,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         )
 
 
-async def resweep_smart_categories() -> None:
+async def resweep_smart_categories(movie_ids: set[int] | None = None, series_ids: set[int] | None = None) -> None:
     """Re-evaluate every smart category with a rule configured (see
     vod_db.list_smart_category_ids_with_rules) so newly imported content
     actually shows up in them without a manual "evaluate" click -- broadened
@@ -2197,16 +2227,23 @@ async def resweep_smart_categories() -> None:
     install that ran import-time exclusion before that bug was fixed, so
     already-wrongly-placed rows actually get cleaned up here rather than
     needing a separate one-off action."""
-    try:
-        purge_result = await asyncio.to_thread(vod_db.purge_excluded_from_categories)
-        if purge_result["movies_removed"] or purge_result["series_removed"]:
-            logger.info("[vod_importer] purged already-excluded items from categories: %s", purge_result)
-    except Exception as exc:
-        logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
+    # A maintenance/manual full sweep keeps the historical global behavior.
+    # A provider delta refresh is intentionally scoped to changed IDs and
+    # does not turn a few new sources into a full-pool curation job.
+    is_full_sweep = movie_ids is None and series_ids is None
+    if is_full_sweep:
+        try:
+            purge_result = await asyncio.to_thread(vod_db.purge_excluded_from_categories)
+            if purge_result["movies_removed"] or purge_result["series_removed"]:
+                logger.info("[vod_importer] purged already-excluded items from categories: %s", purge_result)
+        except Exception as exc:
+            logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
 
     for category_id in await asyncio.to_thread(vod_db.list_smart_category_ids_with_rules):
         try:
-            result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
+            category = await asyncio.to_thread(vod_db.get_category, category_id)
+            ids = None if is_full_sweep else (movie_ids if category and category["content_type"] == "movie" else series_ids)
+            result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id, ids)
             logger.info("[vod_importer] smart category=%s: %s", category_id, result)
         except Exception as exc:
             logger.warning("[vod_importer] smart category=%s failed: %s", category_id, exc)

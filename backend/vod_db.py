@@ -14,6 +14,8 @@ resolving back to the same real provider source.
 
 from contextlib import contextmanager
 import datetime
+import hashlib
+import json
 import logging
 import re
 import secrets
@@ -108,6 +110,7 @@ def init_db() -> None:
             plex_rating_key TEXT,
             bitrate INTEGER,
             raw_name TEXT,
+            catalog_fingerprint TEXT,
             added_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
             UNIQUE(provider_id, provider_stream_id)
@@ -163,6 +166,7 @@ def init_db() -> None:
             provider_series_id TEXT NOT NULL,
             provider_category_name TEXT,
             raw_name TEXT,
+            catalog_fingerprint TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             last_failed_at TEXT,
             added_at TEXT NOT NULL,
@@ -1117,6 +1121,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # very next enrichment pass naturally re-attempts every series
         # source once; no backfill needed.
         ("series_sources", "episodes_last_enriched_at", "TEXT"),
+        # A stable fingerprint of the cheap provider-list fields used during
+        # catalog refresh. Once populated, an unchanged source needs no
+        # canonical/source rewrite merely to prove it is still advertised.
+        ("movie_sources", "catalog_fingerprint", "TEXT"),
+        ("series_sources", "catalog_fingerprint", "TEXT"),
         # Do not conflate provider episode/detail enrichment with canonical
         # TMDB identity/title enrichment.
         ("series", "tmdb_metadata_enriched_at", "TEXT"),
@@ -2899,16 +2908,17 @@ def set_provider_archive_new_categories(provider_id: int, enabled: bool) -> None
 def set_provider_known_import_categories(provider_id: int, category_names: list[str]) -> None:
     """Bookkeeping for archive_new_categories -- the full set of category
     names this provider has ever reported, so the next import can tell
-    which ones are genuinely new. Written unconditionally every import
-    (whether or not archive_new_categories is on) so turning the setting on
-    later doesn't retroactively treat the entire existing category list as
-    'new' and archive everything."""
+    which ones are genuinely new. Updating is conditional so an unchanged
+    provider snapshot does not create a provider-row write."""
     import json
     conn = _connect()
-    conn.execute(
-        "UPDATE providers SET known_import_categories=?, updated_at=? WHERE id=?",
-        (json.dumps(sorted({c.strip() for c in category_names if c.strip()})), _now(), provider_id),
-    )
+    value = json.dumps(sorted({c.strip() for c in category_names if c.strip()}))
+    current = conn.execute("SELECT known_import_categories FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if current and current["known_import_categories"] != value:
+        conn.execute(
+            "UPDATE providers SET known_import_categories=?, updated_at=? WHERE id=?",
+            (value, _now(), provider_id),
+        )
     _commit_with_retry(conn)
     conn.close()
 
@@ -3148,6 +3158,7 @@ def reconcile_provider_catalog_sources(
     *,
     seen_movie_stream_ids: set[str],
     seen_series_ids: set[str],
+    include_affected_ids: bool = False,
 ) -> dict[str, int]:
     """Remove this provider's sources absent from a successful full catalog.
 
@@ -3240,11 +3251,15 @@ def reconcile_provider_catalog_sources(
                     _purge_if_sourceless_series(conn, series_id, orphaned_provider_id=provider_id)
 
             _commit_with_retry(conn)
-            return {
+            result = {
                 "movie_sources_removed": len(stale_movie_rows),
                 "series_sources_removed": len(stale_series_rows),
                 "episode_sources_removed": len(episode_source_ids),
             }
+            if include_affected_ids:
+                result["affected_movie_ids"] = list({row["movie_id"] for row in stale_movie_rows})
+                result["affected_series_ids"] = list(stale_series_by_id)
+            return result
         finally:
             conn.close()
 
@@ -6957,6 +6972,17 @@ def _looks_adult(*category_names) -> bool:
     return False
 
 
+def _catalog_fingerprint_from_item(kind: str, item: dict) -> str:
+    """Fallback for direct/test callers that predate importer fingerprints."""
+    fields = (
+        ("provider_stream_id", "name", "year", "container_extension", "provider_category_name", "raw_name", "tmdb_id", "poster_url")
+        if kind == "movie" else
+        ("provider_series_id", "name", "year", "provider_category_name", "raw_name", "genre", "description", "cast_list", "director", "poster_url", "rating", "release_date", "tmdb_id", "provider_last_modified")
+    )
+    payload = {field: item.get(field) for field in fields}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...],
     optionally carrying tmdb_id and poster_url. Some providers' bulk
@@ -7000,6 +7026,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
         errors = 0
         archived = 0
         unarchived = 0
+        sources_changed = 0
+        changed_movie_ids: set[int] = set()
         lock_retry_items = []
         # Chunked at 1000 items/round-trip instead of the old one-SELECT-plus-
         # one-or-more-writes-PER-ITEM loop (up to 5 individual statements x
@@ -7039,7 +7067,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                 sub = stream_ids[i:i + 900]
                 placeholders = ",".join("?" * len(sub))
                 rows = conn.execute(
-                    f"SELECT provider_stream_id, movie_id FROM movie_sources "
+                    f"SELECT provider_stream_id, movie_id, catalog_fingerprint FROM movie_sources "
                     f"WHERE provider_id=? AND provider_stream_id IN ({placeholders})",
                     (provider_id, *sub),
                 ).fetchall()
@@ -7177,6 +7205,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
 
                     item_lang = _source_language(item.get("raw_name"))
                     existing_source = sources_by_stream_id.get(item["provider_stream_id"])
+                    source_fingerprint = item.get("catalog_fingerprint") or _catalog_fingerprint_from_item("movie", item)
+                    source_changed = not existing_source or existing_source["catalog_fingerprint"] != source_fingerprint
                     if existing_source and _movie_language_ok(existing_source["movie_id"], item_lang):
                         movie_id = existing_source["movie_id"]
                         did_match = True
@@ -7285,6 +7315,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         "item": item, "movie_id": movie_id, "insert_index": insert_index,
                         "did_create": did_create, "did_match": did_match, "did_flag": did_flag,
                         "did_archive": did_archive, "did_unarchive": did_unarchive,
+                        "source_fingerprint": source_fingerprint, "source_changed": source_changed,
                     })
                 except Exception as exc:
                     errors += 1
@@ -7320,6 +7351,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             entry["movie_id"] = insert_id_map[entry["insert_index"]]
                         elif entry["movie_id"] is not None:
                             entry["movie_id"] = _resolve(entry["movie_id"])
+                        if entry["source_changed"] or entry["did_archive"] or entry["did_unarchive"]:
+                            changed_movie_ids.add(entry["movie_id"])
                     movie_updates_adult = [(_resolve(mid),) for (mid,) in movie_updates_adult]
                     movie_updates_archive = [(_resolve(mid),) for (mid,) in movie_updates_archive]
                     movie_updates_unarchive = [(_resolve(mid),) for (mid,) in movie_updates_unarchive]
@@ -7334,12 +7367,12 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
 
                     for entry in pending:
                         item = entry["item"]
-                        if item.get("tmdb_id"):
+                        if entry["source_changed"] and item.get("tmdb_id"):
                             conn.execute(
                                 "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
                                 (item["tmdb_id"], entry["movie_id"]),
                             )
-                        if item.get("poster_url"):
+                        if entry["source_changed"] and item.get("poster_url"):
                             # A canonical card can have several source variants
                             # from this (or other) providers. Keep the first
                             # usable bulk poster rather than letting a later
@@ -7353,15 +7386,17 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                    WHERE id=?""",
                                 (item["poster_url"], entry["movie_id"]),
                             )
-                        conn.execute(
-                            """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, added_at, last_seen_at)
-                               VALUES (?,?,?,?,?,?,?,?,?)
-                               ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
-                                   movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
-                                   raw_name=excluded.raw_name, language=excluded.language""",
-                            (entry["movie_id"], provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                             item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), now, now),
-                        )
+                        if entry["source_changed"]:
+                            conn.execute(
+                                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, catalog_fingerprint, added_at, last_seen_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                                   ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
+                                       movie_id=excluded.movie_id, container_extension=excluded.container_extension, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
+                                       raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint""",
+                                (entry["movie_id"], provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
+                                 item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], now, now),
+                            )
+                            sources_changed += 1
                         created += entry["did_create"]
                         matched += entry["did_match"]
                         flagged += entry["did_flag"]
@@ -7400,10 +7435,12 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
         matched += retry_result["movies_matched"]
         archived += retry_result["movies_archived"]
         unarchived += retry_result["movies_unarchived"]
+        sources_changed += retry_result["sources_changed"]
+        changed_movie_ids.update(retry_result["changed_movie_ids"])
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
 
-    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "sources_changed": sources_changed, "changed_movie_ids": list(changed_movie_ids), "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
@@ -7451,6 +7488,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
         errors = 0
         archived = 0
         unarchived = 0
+        sources_changed = 0
+        changed_series_ids: set[int] = set()
         lock_retry_items = []
         # See bulk_import_movies's identical comment -- same fix, same reason.
         chunk_size = 1000
@@ -7465,6 +7504,17 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
             # join table for series).
             series_ids = [item.get("provider_series_id") for item in chunk]
             existing_by_series_id: dict[object, sqlite3.Row] = {}
+            source_fingerprints: dict[str, str | None] = {}
+            for i in range(0, len(series_ids), 900):
+                sub = series_ids[i:i + 900]
+                placeholders = ",".join("?" * len(sub))
+                rows = conn.execute(
+                    f"SELECT provider_series_id, catalog_fingerprint FROM series_sources "
+                    f"WHERE provider_id=? AND provider_series_id IN ({placeholders})",
+                    (provider_id, *sub),
+                ).fetchall()
+                for row in rows:
+                    source_fingerprints[row["provider_series_id"]] = row["catalog_fingerprint"]
             for i in range(0, len(series_ids), 900):
                 sub = series_ids[i:i + 900]
                 placeholders = ",".join("?" * len(sub))
@@ -7555,11 +7605,14 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     cat_update_needed = False
 
                     item_lang = _source_language(item.get("raw_name"))
+                    source_fingerprint = item.get("catalog_fingerprint") or _catalog_fingerprint_from_item("series", item)
+                    previous_fingerprint = source_fingerprints.get(item.get("provider_series_id"))
+                    source_changed = item.get("provider_series_id") not in source_fingerprints or previous_fingerprint != source_fingerprint
                     existing = existing_by_series_id.get(item.get("provider_series_id"))
                     if existing and _series_language_ok(existing["id"], item_lang):
                         series_id = existing["id"]
                         did_match = True
-                        cat_update_needed = True
+                        cat_update_needed = source_changed
                         if category_looks_adult and not existing["is_adult"] and not existing["is_adult_manual"]:
                             series_updates_adult.append((series_id,))
                         if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
@@ -7587,7 +7640,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         if row:
                             series_id = row["id"]
                             did_match = True
-                            cat_update_needed = True
+                            cat_update_needed = source_changed
                             if category_looks_adult and not row["is_adult"] and not row["is_adult_manual"]:
                                 series_updates_adult.append((series_id,))
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
@@ -7608,7 +7661,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             if len(candidates) == 1:
                                 series_id = candidates[0]["id"]
                                 did_match = True
-                                cat_update_needed = True
+                                cat_update_needed = source_changed
                                 if candidates[0]["import_provider_id"] is None:
                                     series_updates_import_provider.append((provider_id, item.get("provider_series_id"), series_id))
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
@@ -7654,6 +7707,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         "did_create": did_create, "did_match": did_match, "did_flag": did_flag,
                         "did_archive": did_archive, "did_unarchive": did_unarchive,
                         "cat_update_needed": cat_update_needed,
+                        "source_fingerprint": source_fingerprint, "source_changed": source_changed,
                     })
                 except Exception as exc:
                     errors += 1
@@ -7685,6 +7739,8 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             entry["series_id"] = insert_id_map[entry["insert_index"]]
                         elif entry["series_id"] is not None:
                             entry["series_id"] = _resolve(entry["series_id"])
+                        if entry["source_changed"] or entry["did_archive"] or entry["did_unarchive"]:
+                            changed_series_ids.add(entry["series_id"])
                     series_updates_adult = [(_resolve(sid),) for (sid,) in series_updates_adult]
                     series_updates_archive = [(_resolve(sid),) for (sid,) in series_updates_archive]
                     series_updates_unarchive = [(_resolve(sid),) for (sid,) in series_updates_unarchive]
@@ -7713,15 +7769,16 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # back to for a series multiple providers actually
                         # carry. Mirrors movie_sources' upsert in
                         # bulk_import_movies exactly.
-                        if item.get("provider_series_id") is not None:
+                        if entry["source_changed"] and item.get("provider_series_id") is not None:
                             conn.execute(
-                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, added_at, last_seen_at) "
-                                "VALUES (?,?,?,?,?,?,?,?) "
+                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, catalog_fingerprint, added_at, last_seen_at) "
+                                "VALUES (?,?,?,?,?,?,?,?,?) "
                                 "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
                                 "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
-                                "raw_name=excluded.raw_name, language=excluded.language, last_seen_at=excluded.last_seen_at",
-                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), now, now),
+                                "raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint, last_seen_at=excluded.last_seen_at",
+                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], now, now),
                             )
+                            sources_changed += 1
                         if entry["cat_update_needed"]:
                             # Real bug found live 2026-07-29: this value was captured
                             # in `item` on every single import pass but never
@@ -7741,7 +7798,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 "UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?",
                                 (item.get("provider_category_name"), item.get("raw_name"), series_id),
                             )
-                        if item.get("_has_detail"):
+                        if entry["source_changed"] and item.get("_has_detail"):
                             conn.execute(
                                 "UPDATE series SET genre=?, description=?, cast_list=?, director=?, poster_url=?, "
                                 "rating=?, release_date=?, provider_last_modified=?, tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
@@ -7787,10 +7844,12 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
         matched += retry_result["series_matched"]
         archived += retry_result["series_archived"]
         unarchived += retry_result["series_unarchived"]
+        sources_changed += retry_result["sources_changed"]
+        changed_series_ids.update(retry_result["changed_series_ids"])
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
 
-    return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "sources_changed": sources_changed, "changed_series_ids": list(changed_series_ids), "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at", "rating", "release_date")
@@ -9837,7 +9896,7 @@ def purge_excluded_archived_content(provider_exclusions: dict[int, tuple[list[st
     return {"movies_deleted": movies_deleted, "series_deleted": series_deleted}
 
 
-def archive_disabled_language_content() -> dict:
+def archive_disabled_language_content(movie_ids: set[int] | None = None, series_ids: set[int] | None = None) -> dict:
     """KNM: added 2026-09-13, user report -- one-time (repeatable) catch-up
     for deployments that were already running before the same-day auto-merge
     language gate fix (see the merge gate's own comment in
@@ -9870,8 +9929,16 @@ def archive_disabled_language_content() -> dict:
 
     movies_archived = 0
     movies_unarchived = 0
+    movie_where = "review_excluded_manual=0"
+    movie_params = []
+    if movie_ids is not None:
+        if not movie_ids:
+            movie_where += " AND 0"
+        else:
+            movie_where += f" AND id IN ({','.join('?' * len(movie_ids))})"
+            movie_params = list(movie_ids)
     for row in conn.execute(
-        "SELECT id, review_excluded FROM movies WHERE review_excluded_manual=0"
+        f"SELECT id, review_excluded FROM movies WHERE {movie_where}", movie_params
     ).fetchall():
         langs = _source_languages(conn, "movie_sources", "movie_id", row["id"])
         eligible = bool(langs & enabled)
@@ -9884,8 +9951,16 @@ def archive_disabled_language_content() -> dict:
 
     series_archived = 0
     series_unarchived = 0
+    series_where = "review_excluded_manual=0"
+    series_params = []
+    if series_ids is not None:
+        if not series_ids:
+            series_where += " AND 0"
+        else:
+            series_where += f" AND id IN ({','.join('?' * len(series_ids))})"
+            series_params = list(series_ids)
     for row in conn.execute(
-        "SELECT id, review_excluded FROM series WHERE review_excluded_manual=0"
+        f"SELECT id, review_excluded FROM series WHERE {series_where}", series_params
     ).fetchall():
         langs = _source_languages(conn, "series_sources", "series_id", row["id"])
         eligible = bool(langs & enabled)
@@ -10596,7 +10671,7 @@ def set_catchall_include_adult(include_adult: bool) -> list[dict]:
     return [evaluate_smart_category(cid) for cid in results]
 
 
-def evaluate_smart_category(category_id: int) -> dict:
+def evaluate_smart_category(category_id: int, item_ids: list[int] | set[int] | None = None) -> dict:
     """Evaluate a smart category's rule_json against the whole pool (movies or
     series, per the category's content_type) and auto-place every match.
     Never un-places existing matches — same additive semantics as manual
@@ -10623,24 +10698,42 @@ def evaluate_smart_category(category_id: int) -> dict:
     import json
     rule = json.loads(category["rule_json"])
 
+    ids = list(item_ids) if item_ids is not None else None
+    if ids == []:
+        return {"evaluated": 0, "matched": 0, "newly_placed": 0}
+
     conn = _connect()
+    rows = []
+    id_chunks = [ids[i:i + 900] for i in range(0, len(ids), 900)] if ids is not None else [None]
     if category["content_type"] == "movie":
-        rows = [dict(r) for r in conn.execute("""
-            SELECT m.*, (
-                SELECT GROUP_CONCAT(DISTINCT ms.provider_category_name) FROM movie_sources ms
-                WHERE ms.movie_id = m.id AND ms.provider_category_name IS NOT NULL
-            ) AS provider_category
-            FROM movies m WHERE m.review_excluded=0
-        """).fetchall()]
+        for chunk in id_chunks:
+            where = "m.review_excluded=0"
+            params = []
+            if chunk is not None:
+                where += f" AND m.id IN ({','.join('?' * len(chunk))})"
+                params = chunk
+            rows.extend(dict(r) for r in conn.execute(f"""
+                SELECT m.*, (
+                    SELECT GROUP_CONCAT(DISTINCT ms.provider_category_name) FROM movie_sources ms
+                    WHERE ms.movie_id = m.id AND ms.provider_category_name IS NOT NULL
+                ) AS provider_category
+                FROM movies m WHERE {where}
+            """, params).fetchall())
     else:
-        rows = [dict(r) for r in conn.execute("""
-            SELECT s.*, (
-                SELECT GROUP_CONCAT(DISTINCT es.provider_category_name) FROM episode_sources es
-                JOIN episodes e ON e.id = es.episode_id
-                WHERE e.series_id = s.id AND es.provider_category_name IS NOT NULL
-            ) AS provider_category
-            FROM series s WHERE s.review_excluded=0
-        """).fetchall()]
+        for chunk in id_chunks:
+            where = "s.review_excluded=0"
+            params = []
+            if chunk is not None:
+                where += f" AND s.id IN ({','.join('?' * len(chunk))})"
+                params = chunk
+            rows.extend(dict(r) for r in conn.execute(f"""
+                SELECT s.*, (
+                    SELECT GROUP_CONCAT(DISTINCT es.provider_category_name) FROM episode_sources es
+                    JOIN episodes e ON e.id = es.episode_id
+                    WHERE e.series_id = s.id AND es.provider_category_name IS NOT NULL
+                ) AS provider_category
+                FROM series s WHERE {where}
+            """, params).fetchall())
     conn.close()
 
     matched_ids = [row["id"] for row in rows if _rule_matches(row, rule)]

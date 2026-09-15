@@ -4304,6 +4304,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
   const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
   const [metadataHideAdult, setMetadataHideAdult] = useState(false)
+  const [metadataOffset, setMetadataOffset] = useState(0)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
@@ -5807,6 +5808,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
   const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
+  const METADATA_PAGE_SIZE = 50
+  const metadataPageItems = filteredMetadataItems.slice(metadataOffset, metadataOffset + METADATA_PAGE_SIZE)
   const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
   const archiveMetadata = useMutation({
     mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
@@ -7310,14 +7313,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
-            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()) }}
+            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
             Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
-            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()) }}
+            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
             TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
           </Button>
@@ -7330,7 +7333,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <input
             type="checkbox"
             checked={metadataHideAdult}
-            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()) }}
+            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           />
           Hide adult titles
           {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
@@ -7346,9 +7349,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
                   <button
                     className="text-primary hover:underline"
-                    onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}
+                    onClick={() => setMetadataSelected(new Set(metadataPageItems.map((i) => i.id)))}
                   >
-                    Select all
+                    Select this page
                   </button>
                   <button className="text-muted-foreground hover:underline" onClick={() => setMetadataSelected(new Set())}>Clear</button>
                   <span className="text-muted-foreground">{metadataSelected.size} selected</span>
@@ -7375,8 +7378,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 </div>
                 {metadataBulkAi.startError && <p className="text-xs text-destructive">{metadataBulkAi.startError}</p>}
                 {metadataBulkAi.job && <BulkAiJobSummary job={metadataBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                <Pager total={filteredMetadataItems.length} limit={METADATA_PAGE_SIZE} offset={metadataOffset} onOffset={setMetadataOffset} />
                 <ul className="divide-y divide-border/50">
-                  {filteredMetadataItems.map((item) => (
+                  {metadataPageItems.map((item) => (
                     <Fragment key={item.id}>
                       <li className="pt-1.5 -mb-1.5">
                         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">

@@ -53,3 +53,31 @@ def test_xc_imports_are_serialized(monkeypatch):
 
     asyncio.run(run())
     assert peak == 1
+
+
+def test_unchanged_sources_do_not_rewrite_movies_or_series(db):
+    provider_id = db.upsert_provider("Provider", "http://provider.invalid", "u", "p", provider_type="xc")
+    movie = {
+        "name": "Movie", "year": 2020, "provider_stream_id": "movie-1",
+        "container_extension": "mp4", "provider_category_name": "Movies",
+        "raw_name": "Movie (2020)", "catalog_fingerprint": "movie-v1",
+    }
+    series = {
+        "name": "Series", "year": 2020, "provider_series_id": "series-1",
+        "provider_category_name": "Series", "raw_name": "Series (2020)",
+        "catalog_fingerprint": "series-v1", "_has_detail": True,
+        "genre": "Drama", "description": "Description", "cast_list": None,
+        "director": None, "poster_url": None, "rating": None,
+        "release_date": None, "tmdb_id": None, "provider_last_modified": "100",
+    }
+
+    assert db.bulk_import_movies(provider_id, [movie])["sources_changed"] == 1
+    assert db.bulk_import_series(provider_id, [series])["sources_changed"] == 1
+
+    second_movies = db.bulk_import_movies(provider_id, [movie])
+    second_series = db.bulk_import_series(provider_id, [series])
+
+    assert second_movies["sources_changed"] == 0
+    assert second_movies["changed_movie_ids"] == []
+    assert second_series["sources_changed"] == 0
+    assert second_series["changed_series_ids"] == []
