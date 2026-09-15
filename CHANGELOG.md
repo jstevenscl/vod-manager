@@ -31,7 +31,7 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
-- ✅ **Shipped in beta image (`f0b9c0b`, pending deployment):** The sidebar Status card now
+- ✅ **Live on the server (`f0b9c0b`):** The sidebar Status card now
   reports active bulk AI review jobs (for example, `AI review: 13/55`) and
   switches to its live polling interval while they run, instead of incorrectly
   displaying Idle.
