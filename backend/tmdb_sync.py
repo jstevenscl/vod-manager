@@ -391,6 +391,43 @@ async def get_tv_content_rating(tmdb_id: str) -> str | None:
     return None
 
 
+async def get_tv_identity(tmdb_id: str) -> dict | None:
+    """Return the canonical identity for one known TV TMDB ID.
+
+    This deliberately avoids a provider ``get_series_info`` request when the
+    provider already supplied a usable TMDB ID but omitted its first-air year.
+    Episode discovery remains the provider enrichment path; this small call is
+    only for the identity fields needed to keep an otherwise-known title out
+    of Metadata Review.
+    """
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with _tmdb_semaphore:
+                response = await client.get(
+                    f"{_API_BASE}/tv/{tmdb_id}",
+                    params={"api_key": api_key, "append_to_response": "content_ratings"},
+                )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("[tmdb_sync] failed to fetch TV identity for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        return None
+    data = response.json()
+    name = (data.get("name") or "").strip()
+    first_air_date = data.get("first_air_date") or ""
+    year = int(first_air_date[:4]) if first_air_date[:4].isdigit() else None
+    if not name or year is None:
+        return None
+    content_rating = None
+    for country in data.get("content_ratings", {}).get("results", []):
+        if country.get("iso_3166_1") == "US":
+            content_rating = (country.get("rating") or "").strip() or None
+            break
+    return {"name": name, "year": year, "content_rating": content_rating}
+
+
 # sync_category/sync_all moved to vod_list_sync.py 2026-09-07, generalized
 # to support more than one list source per category (TMDB Lists + MDBList,
 # any mix) -- see that module for the current fetch/match/place logic.

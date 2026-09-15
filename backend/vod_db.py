@@ -6016,6 +6016,36 @@ def list_all_series_ids(
     return [r["id"] for r in rows]
 
 
+def list_known_series_missing_year() -> list[dict]:
+    """Known, non-adult TV identities whose provider omitted the year."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id, tmdb_id FROM series
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND year IS NULL AND is_adult=0 AND review_excluded=0
+        ORDER BY id
+    """).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def apply_series_tmdb_identity_batch(items: list[dict]) -> None:
+    """Write provider-free TV identity results without marking episodes fresh."""
+    if not items:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        for item in items:
+            fields = item["fields"]
+            sets = ", ".join(f"{key}=?" for key in fields)
+            conn.execute(
+                f"UPDATE series SET {sets}, updated_at=? WHERE id=?",
+                (*fields.values(), _now(), item["series_id"]),
+            )
+        _commit_with_retry(conn)
+        conn.close()
+
+
 def list_series_placements_for_ids(series_ids: list[int]) -> dict[int, list[dict]]:
     if not series_ids:
         return {}
@@ -8654,6 +8684,25 @@ def auto_merge_series_by_tmdb_batch(series_ids) -> None:
         auto_merge_series_by_tmdb(series_id)
 
 
+def auto_merge_series_tmdb_collisions() -> None:
+    """Reconcile every current exact-TMDB series collision safely."""
+    if not get_duplicate_finder_auto_merge_tmdb():
+        return
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id FROM series
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND tmdb_id IN (
+              SELECT tmdb_id FROM series
+              WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+              GROUP BY tmdb_id HAVING COUNT(*) > 1
+          )
+        ORDER BY tmdb_id, id
+    """).fetchall()
+    conn.close()
+    auto_merge_series_by_tmdb_batch([row["id"] for row in rows])
+
+
 def archive_disabled_language_content() -> dict:
     """One-time (repeatable) catch-up for deployments that were already
     running before the auto-merge language gate fix (see the merge gate's
@@ -8972,6 +9021,11 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
         conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
         _commit_with_retry(conn)
         conn.close()
+        if tmdb_id:
+            if content_type == "movie":
+                auto_merge_movie_by_tmdb(item_id)
+            else:
+                auto_merge_series_by_tmdb(item_id)
         return {"resolved_id": item_id}
 
 
