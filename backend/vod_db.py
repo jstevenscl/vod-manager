@@ -5293,7 +5293,14 @@ def list_series_pending_tmdb_metadata_enrichment() -> list[dict]:
         SELECT id, tmdb_id FROM series
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
           AND is_adult=0 AND review_excluded=0
-          AND tmdb_metadata_enriched_at IS NULL
+          AND (
+                tmdb_metadata_enriched_at IS NULL
+                -- Backfill an older successful identity lookup that predated
+                -- its first-air-year write.  This remains a tiny bounded set
+                -- (only cards still held for year review), not a recurring
+                -- full-catalog TMDB crawl.
+                OR (needs_year_review=1 AND year IS NULL)
+              )
         ORDER BY id
     """).fetchall()
     conn.close()
@@ -8997,6 +9004,33 @@ def auto_merge_series_by_tmdb_batch(series_ids) -> None:
     problem, see that function's docstring."""
     for series_id in series_ids:
         auto_merge_series_by_tmdb(series_id)
+
+
+def auto_merge_series_tmdb_collisions() -> None:
+    """Merge every *current* series TMDB-ID collision safely.
+
+    Normal bulk enrichment supplies the IDs it worked on to the batch helper.
+    A queued import can be coalesced with an already-running enrichment task,
+    though, leaving a newly-created exact-ID sibling outside that captured
+    list.  Discovering only groups that actually collide makes the final
+    reconciliation inexpensive while preserving auto_merge_series_by_tmdb's
+    language-overlap and explicit-ignore safeguards.
+    """
+    if not get_duplicate_finder_auto_merge_tmdb():
+        return
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id FROM series
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND tmdb_id IN (
+              SELECT tmdb_id FROM series
+              WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+              GROUP BY tmdb_id HAVING COUNT(*) > 1
+          )
+        ORDER BY tmdb_id, id
+    """).fetchall()
+    conn.close()
+    auto_merge_series_by_tmdb_batch([row["id"] for row in rows])
 
 
 def list_needs_year_review(content_type: str | None = None) -> dict:

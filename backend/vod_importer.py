@@ -1636,6 +1636,13 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
                 fields = {
                     "name": vod_db.apply_rules_to_value(detail["name"], name_rules),
                 }
+                # A valid TMDB detail response is authoritative for the
+                # first-air year.  Without carrying it over, an imported card
+                # can have a confirmed ID, title, artwork, and episode data
+                # yet remain incorrectly trapped in Metadata Review forever.
+                if detail.get("year") is not None:
+                    fields["year"] = detail["year"]
+                    fields["needs_year_review"] = 0
                 # A missing US rating must not erase a useful provider rating.
                 if detail.get("content_rating"):
                     fields["content_rating"] = detail["content_rating"]
@@ -1655,6 +1662,11 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     if merged_ids:
         # Same TMDB id remains insufficient to merge different-language cards.
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, merged_ids)
+    # The item list above is deliberately restricted to cards pending TMDB
+    # metadata.  Finish with a cheap DB-derived collision sweep so a card
+    # created while a coalesced import/enrichment run was already active
+    # cannot be stranded merely because it was absent from that item list.
+    await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
 async def _post_import_enrichment() -> None:
@@ -2223,6 +2235,11 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         # auto_merge_movies_by_tmdb_batch's docstring in vod_db.py.
         await asyncio.to_thread(vod_db.auto_merge_movies_by_tmdb_batch, merged_movie_ids)
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, merged_series_ids)
+        # Do not rely exclusively on the run's work lists: overlapping or
+        # coalesced catalog imports can create an exact-ID sibling after that
+        # list was assembled.  This queries only TMDB collision groups, not
+        # the whole catalog, and retains the normal language/ignore guards.
+        await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
     finally:
         if not writer_task.done():
             writer_task.cancel()

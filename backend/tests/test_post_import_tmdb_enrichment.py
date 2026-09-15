@@ -59,7 +59,7 @@ def test_tmdb_series_pass_normalizes_card_name_but_preserves_raw_source(db, monk
 
     async def fake_tmdb(tmdb_id):
         assert tmdb_id == "123"
-        return {"name": "30 Coins", "content_rating": "TV-MA"}
+        return {"name": "30 Coins", "content_rating": "TV-MA", "year": 2020}
 
     monkeypatch.setattr(tmdb_sync, "get_tv_full_details", fake_tmdb)
     monkeypatch.setattr(vod_importer.vod_db, "get_active_rules_for_field", lambda *_: [])
@@ -71,6 +71,31 @@ def test_tmdb_series_pass_normalizes_card_name_but_preserves_raw_source(db, monk
     assert series["content_rating"] == "TV-MA"
     assert series["tmdb_metadata_enriched_at"] is not None
     assert source["raw_name"] == "30 Coins (ES)"
+    assert db.list_series_pending_tmdb_metadata_enrichment() == []
+
+
+def test_tmdb_series_pass_backfills_year_and_clears_review_hold(db, monkeypatch):
+    provider_id = db.upsert_provider("Example Provider", "http://example.invalid", "user", "pass")
+    db.bulk_import_series(provider_id, [{
+        "name": "Undated Series", "year": None, "provider_series_id": "series-undated",
+        "provider_category_name": None, "raw_name": "Undated Series", "_has_detail": True,
+        "genre": None, "description": None, "cast_list": None, "director": None,
+        "poster_url": None, "rating": None, "release_date": None, "tmdb_id": "321",
+        "provider_last_modified": None,
+    }])
+    series_id = db.list_series(limit=10)[0]["id"]
+
+    async def fake_tmdb(tmdb_id):
+        assert tmdb_id == "321"
+        return {"name": "Undated Series", "content_rating": None, "year": 2018}
+
+    monkeypatch.setattr(tmdb_sync, "get_tv_full_details", fake_tmdb)
+    monkeypatch.setattr(vod_importer.vod_db, "get_active_rules_for_field", lambda *_: [])
+    asyncio.run(vod_importer.bulk_enrich_tmdb_series_metadata(concurrency=1))
+
+    series = db.get_series(series_id)
+    assert series["year"] == 2018
+    assert series["needs_year_review"] == 0
     assert db.list_series_pending_tmdb_metadata_enrichment() == []
 
 

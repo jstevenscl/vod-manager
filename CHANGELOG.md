@@ -21,6 +21,16 @@ included.
 
 ## 2026-09-15
 
+- ✅ Provider-free TMDB enrichment for known series IDs now also records TMDB's
+  first-air year. A confirmed series no longer remains falsely held in
+  **Metadata Review** merely because its provider omitted a year; the existing
+  held records are safely picked up and backfilled on the next enrichment run.
+  The final series reconciliation also discovers current exact-TMDB-ID
+  collision groups directly from the database, so a card created during a
+  coalesced import cannot be stranded in Duplicate Finder. It retains the
+  existing same-language and explicit-ignore safeguards, so different-language
+  variants and human decisions remain untouched.
+
 - ✅ Metadata Review now has an **Incorrect TMDB IDs** tab for titles whose
   stored ID receives a confirmed TMDB 404. It supports a pending-ID scan,
   per-title TMDB search and correction/clear actions, and high-confidence

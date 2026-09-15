@@ -239,3 +239,26 @@ def test_auto_merge_series_by_tmdb_batch_merges_each_id_sequentially(db):
 
     remaining = [s for s in db.list_series(limit=1000) if s["name"] in ("Show A", "Show A Dup")]
     assert len(remaining) == 1
+
+
+def test_collision_sweep_merges_exact_tmdb_series_omitted_from_work_list(db):
+    """A final DB-derived sweep catches siblings missed by a coalesced run."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    db.bulk_import_series(provider_id, [
+        {"name": "Canonical Show", "year": 2020, "provider_series_id": "canonical",
+         "raw_name": "Canonical Show", "tmdb_id": 602, "_has_detail": True,
+         "provider_category_name": None, "genre": None, "description": None, "cast_list": None,
+         "director": None, "poster_url": None, "rating": None, "release_date": None,
+         "provider_last_modified": None},
+        {"name": "Provider Alias", "year": 2020, "provider_series_id": "alias",
+         "raw_name": "Provider Alias", "tmdb_id": 602, "_has_detail": True,
+         "provider_category_name": None, "genre": None, "description": None, "cast_list": None,
+         "director": None, "poster_url": None, "rating": None, "release_date": None,
+         "provider_last_modified": None},
+    ])
+
+    db.auto_merge_series_tmdb_collisions()
+
+    remaining = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "602"]
+    assert len(remaining) == 1

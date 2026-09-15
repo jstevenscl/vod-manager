@@ -471,7 +471,17 @@ async def get_tv_full_details(tmdb_id: str) -> dict | None:
         if country.get("iso_3166_1") == "US":
             content_rating = (country.get("rating") or "").strip() or None
             break
-    return {"name": title, "content_rating": content_rating}
+    first_air_date = data.get("first_air_date") or None
+    year = int(first_air_date[:4]) if first_air_date and first_air_date[:4].isdigit() else None
+    return {
+        "name": title,
+        "content_rating": content_rating,
+        # A confirmed TV identity supplies the one missing part of a
+        # provider's otherwise-undated card.  Keep the full date available
+        # to callers too, but the pool's canonical identity uses its year.
+        "first_air_date": first_air_date,
+        "year": year,
+    }
 
 
 # sync_category/sync_all moved to vod_list_sync.py 2026-09-07, generalized
