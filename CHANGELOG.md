@@ -20,6 +20,18 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ The Curation page now notices the automatic handoff from the TMDB-ID
+  metadata pass to provider fallback/series episode work without requiring a
+  manual browser refresh. While idle it checks for server-started enrichment
+  every 10 seconds, then returns to its existing 2-second live progress
+  updates once work begins.
+
+- ✅ Bulk movie-enrichment writes now commit up to 250 completed movies per
+  SQLite transaction (previously 25). The single global writer, FIFO queue,
+  per-item savepoints, and bounded transactions remain in place, reducing
+  commit/fsync overhead on large imports without allowing concurrent database
+  writes or holding one catalog-sized transaction open.
+
 - ✅ Imports now queue a provider-free TMDB metadata pass for movies that
   already include a TMDB ID in the catalog list. It has its own visible
   progress indicator and batch-writes results to reduce database contention.

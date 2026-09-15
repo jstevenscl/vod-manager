@@ -4509,7 +4509,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const enrichProgressQuery = useQuery<EnrichProgress>({
     queryKey: ['vod-enrich-progress'],
     queryFn:  () => api.get('/vod/enrich-all/status/').then((r) => r.data),
-    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
+    // Automatic post-import work is started server-side after the TMDB pass.
+    // Keep a light idle poll so an already-open Curation page sees that
+    // handoff without requiring a browser refresh.
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 10000),
   })
   const tmdbEnrichProgressQuery = useQuery<TmdbEnrichProgress>({
     queryKey: ['vod-tmdb-enrich-progress'],

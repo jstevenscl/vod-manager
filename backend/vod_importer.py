@@ -1567,7 +1567,10 @@ async def _enrich_one(
                 _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
-_MOVIE_BATCH_CHUNK_SIZE = 25  # matches the plan doc's original batch-size choice
+# One global writer serializes these transactions.  250 keeps commits bounded
+# for SQLite readers/recovery while avoiding the overhead of 25-item commits
+# on large provider imports.
+_MOVIE_BATCH_CHUNK_SIZE = 250
 
 
 async def _run_provider_movie_phase(

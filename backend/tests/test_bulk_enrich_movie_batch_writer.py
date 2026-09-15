@@ -126,10 +126,10 @@ def test_bulk_movie_phase_calls_batch_writer_not_per_item_set_movie_enrichment(m
     assert len(batch_calls) >= 1
 
 
-def test_bulk_movie_phase_batches_in_chunks_of_25(monkeypatch):
-    """Matches the plan doc's original batch-size choice and
-    enrich_series_episodes_batch's one-connection-per-chunk cost model: a
-    large provider movie phase must split into multiple bounded-size
+def test_bulk_movie_phase_batches_in_chunks_of_250(monkeypatch):
+    """Uses bounded chunks while avoiding per-movie SQLite commits.
+
+    A large provider movie phase must split into multiple bounded-size
     transactions, not one single giant transaction for the whole provider
     (which would be just as bad a neighbor to concurrent readers/writers as
     the old one-connection-per-movie design was good, per _commit_with_retry's
@@ -149,18 +149,18 @@ def test_bulk_movie_phase_batches_in_chunks_of_25(monkeypatch):
     monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "apply_movie_enrichment_batch", fake_apply_batch)
     monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA")])
-    monkeypatch.setattr(vod_importer.vod_db, "list_all_movie_ids", lambda **kw: list(range(1, 61)))
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_movie_ids", lambda **kw: list(range(1, 601)))
     monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda **kw: [])
     monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movie_by_tmdb", lambda movie_id: None)
     monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb", lambda series_id: None)
 
     asyncio.run(asyncio.wait_for(vod_importer.bulk_enrich_all(concurrency=8), timeout=5))
 
-    assert len(batch_calls) >= 3, "60 movies at a 25-item chunk size should need at least 3 batch calls"
+    assert len(batch_calls) >= 3, "600 movies at a 250-item chunk size should need at least 3 batch calls"
     for call in batch_calls[:-1]:
-        assert len(call) <= 25
+        assert len(call) <= 250
     all_written_ids = {item["movie_id"] for call in batch_calls for item in call}
-    assert all_written_ids == set(range(1, 61))
+    assert all_written_ids == set(range(1, 601))
 
 
 def test_bulk_movie_phase_merge_sweep_only_runs_after_batch_writer_flushes(monkeypatch):
