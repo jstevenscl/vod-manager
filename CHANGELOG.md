@@ -31,6 +31,12 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
+- ✅ **Follow-up shipped in beta image (`4db93be`):** Corrected the initial
+  Metadata Review filter to show only actionable no-identity records (both
+  TMDB ID and release year absent), plus explicitly held ambiguous-year rows.
+  A provider omitting only a release year is common and is not a repair queue;
+  this prevents a normal catalog from producing thousands of false positives.
+
 - ✅ **Shipped in beta image (`e9c40de`):** Added a dedicated **Metadata
   Review** workspace under Operations, so TMDB
   corrections no longer need to live in Curation or a library modal. It lists
