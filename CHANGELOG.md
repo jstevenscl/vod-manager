@@ -154,13 +154,14 @@ included.
   refreshes no longer re-fetch stable movie metadata or previously discovered
   episode lists merely because a timer elapsed.
 
-- ✅ XC movie catalog imports now retain the provider's bulk artwork URL
+- ✅🔀 XC movie catalog imports now retain the provider's bulk artwork URL
   (`stream_icon`) immediately, matching the existing series-cover behavior.
   Movie cards no longer need an expensive per-title enrichment request merely
   to display a poster; enrichment and TMDB remain fallbacks for missing or
   improved artwork. The importer keeps the first usable poster for a
   canonical movie, so alternate source variants cannot cause artwork to
   flip on later refreshes.
+  ([#23](https://github.com/jstevenscl/vod-manager/pull/23))
 
 - ✅ Bulk enrichment no longer creates a task for every movie/series in a
   provider's catalog up front. It used to launch all of them at once (a
