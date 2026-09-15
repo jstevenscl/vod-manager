@@ -53,6 +53,17 @@ def get_bulk_ai_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def get_active_bulk_ai_status() -> dict:
+    """Small aggregate for the global sidebar, without exposing job results."""
+    active = [job for job in _jobs.values() if job.get("running")]
+    return {
+        "running": bool(active),
+        "done": sum(job["done"] for job in active),
+        "total": sum(job["total"] for job in active),
+        "jobs": len(active),
+    }
+
+
 def _finish_job(job_id: str) -> None:
     job = _jobs.get(job_id)
     if job is not None:

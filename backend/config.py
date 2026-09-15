@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.14"
+APP_VERSION = "0.2.15"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -259,6 +259,16 @@ def save_duplicate_finder_quality_prefix_matching(enabled: bool) -> None:
     _write_raw(data)
 
 
+def get_duplicate_finder_auto_merge_tmdb() -> bool:
+    return bool(_read_raw().get("duplicate_finder_auto_merge_tmdb", True))
+
+
+def save_duplicate_finder_auto_merge_tmdb(enabled: bool) -> None:
+    data = _read_raw()
+    data["duplicate_finder_auto_merge_tmdb"] = bool(enabled)
+    _write_raw(data)
+
+
 # ── AI provider selection ────────────────────────────────────────────────────
 # ai_assist.py can talk to any of these three -- a user might already have a
 # key for one and not another, or want to compare quality/cost, so the key
@@ -308,6 +318,29 @@ def save_import_language_exclusion(exclude_prefixes: list[str], exclude_non_lati
     data = _read_raw()
     data["import_exclude_language_prefixes"] = [p.strip().upper() for p in exclude_prefixes if p.strip()]
     data["import_exclude_non_latin"] = bool(exclude_non_latin)
+    _write_raw(data)
+
+
+def get_enabled_languages() -> list[str]:
+    """Which already-imported sources are eligible for playback/export/
+    failover (vod_db._enabled_languages_clause), independent of
+    get_import_language_exclusion above -- that one gates what gets
+    imported in the first place and only catches titles whose raw_name
+    carries a recognizable prefix, so it can't retroactively hide
+    foreign-tagged rows already sitting in the pool or ones tagged only by
+    category name. This is the backstop: a live query-time filter over
+    the `language` column already computed on every source row. Defaults
+    to English + Spanish, matching the original hardcoded behavior."""
+    data = _read_raw()
+    codes = data.get("enabled_playback_languages")
+    if not codes:
+        return ["EN", "ES"]
+    return [c.strip().upper() for c in codes if c.strip()]
+
+
+def save_enabled_languages(codes: list[str]) -> None:
+    data = _read_raw()
+    data["enabled_playback_languages"] = [c.strip().upper() for c in codes if c.strip()]
     _write_raw(data)
 
 

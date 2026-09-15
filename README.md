@@ -9,7 +9,9 @@ Same real content is often available from several sources at once (a movie
 on both an XC reseller and your own Plex library, or the same title from two
 different resellers). VOD & DVR Manager treats those as multiple *sources* for one
 pool entry rather than duplicate entries, and automatically fails over
-between them if one goes down or hits its connection limit.
+between them if one goes down or hits its connection limit — series
+included, pulling episodes from every provider that matches, not just
+whichever matched first.
 
 **New here?** See [USERGUIDE.md](USERGUIDE.md) for a full walkthrough with
 screenshots — installation, connecting Dispatcharr (single or multiple
@@ -336,16 +338,22 @@ Curation & Maintenance and the Movies/TV Shows toolbars host a set of
 catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
 language-aware filter and sibling-safe bulk archiving), **Language Filter**
 (the same language filtering over your whole library, not just
-poster-missing items), **Duplicate Finder** (matches on punctuation
-variants, adjacent-year mislabeling, and TMDB id, with one-click bulk merges
-for both fully-corroborated TMDB-confirmed matches and a second, separate
-tier where only one candidate carries a self-consistent TMDB id; an opt-in,
-off-by-default checkbox also groups a quality-tagged title like "4K: Movie"
-with its plain "Movie" as a candidate, for consolidating with Stream
-Priority's quality mode below), **Needs
-Review** (resolves year-ambiguous imports), and **Orphan Checker** (finds
-dead rows a provider deletion can leave behind — a series whose only source
-provider no longer exists, or movies/episodes with zero sources at all).
+poster-missing items), **Enabled Playback Languages** (a live,
+instantly-reversible playback/export filter by source language — separate
+from the import-time Language Exclusion above; nothing archived or deleted,
+just hidden from playback while unchecked), **Duplicate Finder** (matches on
+punctuation variants, adjacent-year mislabeling, and TMDB id, with one-click
+bulk merges for both fully-corroborated TMDB-confirmed matches and a second,
+separate tier where only one candidate carries a self-consistent TMDB id; an
+opt-in, off-by-default checkbox also groups a quality-tagged title like "4K:
+Movie" with its plain "Movie" as a candidate, for consolidating with Stream
+Priority's quality mode below — matches sharing a confirmed TMDB id merge
+automatically the moment enrichment confirms it, before ever reaching this
+queue), **Needs Review** and the broader sidebar **Metadata Review** (resolve
+year-ambiguous imports and titles a provider left without any TMDB identity
+at all), and **Orphan Checker** (finds dead rows a provider deletion can
+leave behind — a series whose only source provider no longer exists, or
+movies/episodes with zero sources at all).
 Every movie/series can also be manually renamed or have its year corrected
 from its own detail view, for whatever a provider's own catalog data got
 wrong with no other way to fix it — including setting its TMDB id directly

@@ -274,6 +274,9 @@ interface NeedsReviewItem {
   id: number
   name: string
   year: number | null
+  tmdb_id?: string | null
+  needs_year_review?: number
+  is_adult?: number
   genre: string | null
   sample_episode_id?: number | null
   sample_source_id?: number | null
@@ -1929,7 +1932,7 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
             <div className="flex-1 min-w-0">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="radio" checked={keepId === item.id} onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }} />
-                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name} ({item.year})</span>
+                <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}{item.year && !item.name.trim().endsWith(`(${item.year})`) ? ` (${item.year})` : ''}</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
                   {!!item.provider_names.length && <> ({item.provider_names.join(', ')})</>}
@@ -4234,7 +4237,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'curation' | 'providers' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -4261,6 +4264,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
+  const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
+  const [metadataHideAdult, setMetadataHideAdult] = useState(false)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
@@ -4657,6 +4663,49 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     }
     setLanguageDraft(next)
     setLanguageLastClickedIndex(index)
+  }
+  // Enabled Playback Languages -- separate from the exclusion picker above:
+  // that one gates future imports by raw_name prefix (archives on import,
+  // via _should_auto_archive); this is a live filter over the language
+  // already computed on every source row (see config.get_enabled_languages),
+  // so toggling it takes effect immediately on already-imported content in
+  // both directions (see vod_db.archive_disabled_language_content, which
+  // re-evaluates review_excluded both ways).
+  const enabledLanguagesQuery = useQuery<{ codes: string[] }>({
+    queryKey: ['vod-enabled-languages'],
+    queryFn:  () => api.get('/vod/enabled-languages/').then((r) => r.data),
+  })
+  const saveEnabledLanguages = useMutation({
+    mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
+  })
+  const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
+  const enabledLanguageDraftInitialized = useRef(false)
+  useEffect(() => {
+    if (enabledLanguageDraftInitialized.current || !enabledLanguagesQuery.data) return
+    enabledLanguageDraftInitialized.current = true
+    setEnabledLanguageDraft(new Set(enabledLanguagesQuery.data.codes))
+  }, [enabledLanguagesQuery.data])
+  // Same pool-prefix data source as the exclusion picker above -- these are
+  // the same per-source language codes, just gated by a different setting.
+  // EN/ES always shown even at zero count: they're the default-enabled
+  // pair (see config.get_enabled_languages), so a fresh install shouldn't
+  // have to hunt for them in an empty list.
+  const allEnabledLanguageCodes = (() => {
+    const counts = new Map((languagePrefixesQuery.data ?? []).map((p) => [p.code, p.count]))
+    for (const code of enabledLanguagesQuery.data?.codes ?? []) {
+      if (!counts.has(code)) counts.set(code, 0)
+    }
+    if (!counts.has('EN')) counts.set('EN', 0)
+    if (!counts.has('ES')) counts.set('ES', 0)
+    return [...counts.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
+  })()
+  function toggleEnabledLanguage(code: string) {
+    const next = new Set(enabledLanguageDraft)
+    if (next.has(code)) next.delete(code); else next.add(code)
+    setEnabledLanguageDraft(next)
   }
   const [applyExclusionsJobId, setApplyExclusionsJobId] = useState<string | null>(null)
   const applyImportExclusionsNow = useMutation({
@@ -5620,6 +5669,33 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-needs-review'],
     queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
   })
+  // ── Metadata review (broader queue: also covers no-tmdb_id+no-year titles
+  // that never triggered the ambiguity detector above) ──
+  const metadataReviewQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-metadata-review'],
+    queryFn:  () => api.get('/vod/metadata-review/').then((r) => r.data),
+    enabled: activeTab === 'metadata',
+  })
+  const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
+  const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
+  const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  const archiveMetadata = useMutation({
+    mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
+    onSuccess: () => {
+      setMetadataSelected(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  useEffect(() => {
+    if (metadataBulkAi.job && !metadataBulkAi.job.running) {
+      setMetadataSelected(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metadataBulkAi.job?.running])
 
   // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
   const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
@@ -5684,7 +5760,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // ── Duplicate finder (punctuation variants + adjacent-year mislabeling) ──
   const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
   const [duplicatesOffset, setDuplicatesOffset] = useState(0)
-  const DUPLICATES_PAGE_SIZE = 20
+  const DUPLICATES_PAGE_SIZE = 50
   const duplicatesQuery = useQuery<DuplicateGroup[]>({
     queryKey: ['vod-duplicates', duplicatesContentType],
     queryFn:  () => api.get('/vod/duplicates/', { params: { content_type: duplicatesContentType } }).then((r) => r.data),
@@ -7093,6 +7169,112 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </>
       )}
 
+      {activeTab === 'metadata' && (
+      <>
+      <SectionCard title="Metadata Review" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.
+          Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
+          identity already exists in the pool, its sources and categories merge into that existing title.
+        </p>
+        <div className="flex items-center gap-1.5 pt-1">
+          <Button
+            size="sm"
+            variant={metadataContentType === 'movie' ? 'default' : 'outline'}
+            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()) }}
+          >
+            Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
+          </Button>
+          <Button
+            size="sm"
+            variant={metadataContentType === 'series' ? 'default' : 'outline'}
+            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()) }}
+          >
+            TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
+          </Button>
+          <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
+            {metadataReviewQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            <span className="ml-1">Refresh</span>
+          </Button>
+        </div>
+        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            checked={metadataHideAdult}
+            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()) }}
+          />
+          Hide adult titles
+          {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
+        </label>
+        {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
+        {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
+        {metadataReviewQuery.data && (
+          <>
+            {filteredMetadataItems.length === 0 ? (
+              <p className="text-xs text-muted-foreground pt-1">{metadataHideAdult ? 'No non-adult titles match this review queue.' : 'Clean — no active titles need identity review.'}</p>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
+                  <button
+                    className="text-primary hover:underline"
+                    onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}
+                  >
+                    Select all
+                  </button>
+                  <button className="text-muted-foreground hover:underline" onClick={() => setMetadataSelected(new Set())}>Clear</button>
+                  <span className="text-muted-foreground">{metadataSelected.size} selected</span>
+                  <Button
+                    size="sm" variant="outline" className="h-7 text-xs ml-auto text-destructive"
+                    disabled={metadataSelected.size === 0 || archiveMetadata.isPending}
+                    onClick={() => askConfirm(
+                      `Archive ${metadataSelected.size} selected ${metadataContentType === 'movie' ? 'movie' : 'TV show'}${metadataSelected.size === 1 ? '' : 's'}? This removes them from categories and hides them from the active pool.`,
+                      () => archiveMetadata.mutate(Array.from(metadataSelected)),
+                    )}
+                  >
+                    {archiveMetadata.isPending ? <Loader2 size={11} className="animate-spin mr-1" /> : <Archive size={11} className="mr-1" />}
+                    Archive selected
+                  </Button>
+                  <Button
+                    size="sm" variant="outline" className="h-7 text-xs"
+                    disabled={metadataSelected.size === 0 || metadataBulkAi.starting || !!metadataBulkAi.job?.running}
+                    title="Searches TMDB for each selected title and applies a year + TMDB ID only when AI is highly confident. Other titles remain for manual review."
+                    onClick={() => metadataBulkAi.start({ content_type: metadataContentType, ids: Array.from(metadataSelected) })}
+                  >
+                    {metadataBulkAi.starting || metadataBulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+                    Resolve selected with AI ({metadataSelected.size})
+                  </Button>
+                </div>
+                {metadataBulkAi.startError && <p className="text-xs text-destructive">{metadataBulkAi.startError}</p>}
+                {metadataBulkAi.job && <BulkAiJobSummary job={metadataBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                <ul className="divide-y divide-border/50">
+                  {filteredMetadataItems.map((item) => (
+                    <Fragment key={item.id}>
+                      <li className="pt-1.5 -mb-1.5">
+                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={metadataSelected.has(item.id)}
+                            onChange={() => setMetadataSelected((selected) => {
+                              const next = new Set(selected)
+                              if (next.has(item.id)) next.delete(item.id); else next.add(item.id)
+                              return next
+                            })}
+                          />
+                          Select
+                        </label>
+                      </li>
+                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} />
+                    </Fragment>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        )}
+      </SectionCard>
+      </>
+      )}
+
       {activeTab === 'curation' && (
       <>
       <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
@@ -7804,6 +7986,38 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
+      <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Which source languages are allowed for playback/export, right now — a live filter, not an import-time rule
+          (that's "Import Language Exclusion" below). Unchecking a language immediately hides any movie/episode whose
+          only source is that language from playback and the exported catalog; nothing is deleted, and re-checking it
+          brings that content back instantly. A movie/series with at least one still-enabled-language source stays
+          fully visible.
+        </p>
+        <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+          {allEnabledLanguageCodes.map((c) => (
+            <label key={c.code} className="flex items-center gap-1.5 select-none">
+              <input
+                type="checkbox"
+                checked={enabledLanguageDraft.has(c.code)}
+                onChange={() => toggleEnabledLanguage(c.code)}
+              />
+              <span className="font-mono">{c.code}</span>
+              {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+              <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+            </label>
+          ))}
+          {allEnabledLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages detected yet.</p>}
+        </div>
+        <Button
+          size="sm"
+          disabled={saveEnabledLanguages.isPending}
+          onClick={() => saveEnabledLanguages.mutate([...enabledLanguageDraft])}
+        >
+          {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Save enabled languages
+        </Button>
+      </SectionCard>
       <SectionCard title="Import Language Exclusion" icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           Auto-archives matching movies/series the moment they're imported (or re-imported) — global across every

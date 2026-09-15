@@ -13,6 +13,7 @@ from config import (
     get_anthropic_api_key,
     get_default_categories_prompt_dismissed,
     get_duplicate_finder_quality_prefix_matching,
+    get_enabled_languages,
     get_gemini_api_key,
     get_hide_dvr_tab,
     get_import_language_exclusion,
@@ -28,6 +29,7 @@ from config import (
     save_ai_provider,
     save_anthropic_api_key,
     save_duplicate_finder_quality_prefix_matching,
+    save_enabled_languages,
     save_gemini_api_key,
     save_import_language_exclusion,
     save_lockout_settings,
@@ -110,6 +112,10 @@ class HideDvrTabRequest(BaseModel):
 class ImportLanguageExclusionRequest(BaseModel):
     exclude_prefixes: list[str] = []
     exclude_non_latin: bool = False
+
+
+class EnabledLanguagesRequest(BaseModel):
+    codes: list[str] = []
 
 
 class ProviderImportExcludeCategoriesRequest(BaseModel):
@@ -898,6 +904,17 @@ async def answer_default_categories_prompt(body: DefaultCategoriesAdultRequest):
     return {"ok": True, "results": results}
 
 
+@router.get("/enabled-languages/", dependencies=_GUARDS)
+async def get_enabled_languages_setting():
+    return {"codes": get_enabled_languages()}
+
+
+@router.post("/enabled-languages/", dependencies=_GUARDS)
+async def save_enabled_languages_setting(body: EnabledLanguagesRequest):
+    save_enabled_languages(body.codes)
+    return {"ok": True}
+
+
 @router.get("/import-language-exclusion/", dependencies=_GUARDS)
 async def get_import_language_exclusion_settings():
     return get_import_language_exclusion()
@@ -1218,6 +1235,7 @@ async def set_provider_base_url(provider_id: int, base_url: str):
     if not base_url:
         raise HTTPException(400, detail="base_url cannot be empty")
     vod_db.set_provider_base_url(provider_id, base_url)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
@@ -1430,6 +1448,7 @@ async def set_provider_custom_user_agent(provider_id: int, custom_user_agent: Op
     if not vod_db.get_provider(provider_id):
         raise HTTPException(404, detail="provider not found")
     vod_db.set_provider_custom_user_agent(provider_id, custom_user_agent.strip() if custom_user_agent else None)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
@@ -1539,6 +1558,7 @@ async def delete_provider(provider_id: int):
     # indexes -- off the event loop so it doesn't stall every other request
     # (including the Activity poll) while it runs.
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
+    await vod_importer.evict_provider_client(provider_id)
     return {"ok": True}
 
 
@@ -2600,6 +2620,14 @@ async def list_needs_year_review(content_type: Optional[str] = None):
     return vod_db.list_needs_year_review(content_type)
 
 
+@router.get("/metadata-review/", dependencies=_GUARDS)
+async def list_metadata_review(content_type: Optional[str] = None):
+    """Human-review queue for missing or ambiguous TMDB identity fields."""
+    if content_type not in (None, "movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return vod_db.list_metadata_review(content_type)
+
+
 # ── Orphan checker ───────────────────────────────────────────────────────────
 # Self-service scan/purge for dead rows a provider deletion (or a bug
 # elsewhere) can leave behind -- see vod_db.find_orphans/purge_orphans.
@@ -3555,6 +3583,15 @@ async def enrich_series(series_id: int, force: bool = False):
     except vod_importer.ProviderBackoffError as exc:
         raise HTTPException(503, detail=str(exc))
     series = vod_db.get_series(series_id)
+    if not series:
+        # Found live 2026-09-15: a concurrent auto-merge (see
+        # auto_merge_series_by_tmdb, which enrich_series above can itself
+        # trigger) can delete this exact series_id as a merge's from_id
+        # between the 404 check above and here -- the merge already moved
+        # its episodes/placements onto the survivor, so this isn't an
+        # error, just the same "no longer here" outcome as the pre-enrich
+        # check, surfaced consistently as 404 instead of a raw 500.
+        raise HTTPException(404, detail="series not found (merged into another series during enrichment)")
     series["episodes"] = vod_db.list_episodes(series_id)
     episode_sources_by_id = vod_db.list_episode_sources_for_episode_ids([e["id"] for e in series["episodes"]])
     for e in series["episodes"]:
@@ -3575,6 +3612,23 @@ async def enrich_all(force: bool = False, concurrency: int = 8):
 @router.get("/enrich-all/status/", dependencies=_GUARDS)
 async def enrich_all_status():
     return vod_importer.get_enrich_progress()
+
+
+@router.get("/runtime-status/", dependencies=_GUARDS)
+async def runtime_status():
+    """Compact live state for the sidebar status indicator. `tmdb` is a
+    placeholder (always idle) -- knmplace-main's separate provider-free TMDB
+    metadata pipeline (856a953) wasn't ported in this branch, so there's no
+    real progress to report there yet; kept in the shape so the frontend's
+    existing optional-chaining checks against it stay harmless rather than
+    needing a frontend change if/when that pipeline lands."""
+    return {
+        "import": vod_importer.get_import_progress(),
+        "enrichment": vod_importer.get_enrich_progress(),
+        "tmdb": {"running": False, "done": 0, "total": 0},
+        "bulk_ai": vod_bulk_ai_service.get_active_bulk_ai_status(),
+        "process_cpu_percent": vod_importer.get_process_cpu_percent(),
+    }
 
 
 # ── Metadata rewrite rules ───────────────────────────────────────────────────

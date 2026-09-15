@@ -73,6 +73,11 @@ Why this matters in practice:
   Manager treats those as multiple *sources* of one pool entry, not two
   separate catalog items — and automatically fails over between them if one
   goes down or hits its connection limit.
+- **Series get the same treatment.** A series matched by more than one
+  provider pulls episodes from every matching provider, not just whichever
+  one matched first — so a season missing from one reseller's catalog can
+  still play from another that has it, the same automatic failover movies
+  already got.
 - **Recommended deployment**: on the same host/stack as Dispatcharr, since
   the two talk to each other constantly. It's fully capable of running on
   its own separate host too — nothing about it requires colocation, it's
@@ -284,6 +289,27 @@ category list — e.g. exclude a "Music Videos" or "Home Videos" library the
 same way you'd exclude an XC category. **Archive new categories** and
 **Auto-create categories** remain XC-only for now — those need their own
 design pass for what "newly discovered" means for a library-based source.
+
+### Enabled Playback Languages
+
+A second, *separate* language control (Curation & Maintenance → **Enabled
+Playback Languages**), easy to confuse with Import Language Exclusion above
+but built for a different job: that one is a one-way, import-time archive
+rule; this one is a **live playback/export filter**, instantly reversible,
+that never archives or touches any row in your pool. A checkbox list of
+every source language detected across your catalog (English, French,
+Arabic, and so on), each with its own live title count. Unchecking a
+language immediately hides any movie or episode whose *only* source is that
+language from playback and the exported Dispatcharr catalog — nothing is
+deleted, and re-checking it brings that content back instantly. A
+movie/series with at least one source in a still-enabled language stays
+fully visible either way, even if it also has sources in languages you've
+unchecked.
+
+Use Import Language Exclusion when you never want a language cluttering
+your pool at all; use Enabled Playback Languages when you just want to
+narrow what's currently exported/playable without deciding anything
+permanent about content you might want back later.
 
 ### Multiple profiles on one subscription
 
@@ -843,6 +869,12 @@ it's reachable from the public internet at all — do these:
 
 ## 9. Browsing and managing your catalog
 
+A small **Status** widget in the sidebar (bottom-left, always visible) shows
+whether any background job — import, enrichment, bulk AI resolve — is
+currently running, plus the app's own process CPU usage, so you can tell at
+a glance whether something's actively working before digging into a
+specific tab's own progress display.
+
 Above the catalog itself, the dashboard always shows two live cards:
 
 - **Activity** — what's playing right now, across every viewer, refreshed
@@ -1235,8 +1267,17 @@ commit to it.
 
 ### Duplicate Finder
 
-Finds pool entries that look like the same real title split into two rows,
-three ways at once:
+Some duplicates now resolve themselves automatically, before you'd ever see
+them here: whenever enrichment confirms or refreshes a movie's or series'
+TMDB id, anything else in your pool sharing that exact id gets merged in
+right away — a shared TMDB id is unambiguous proof, so there's nothing for a
+human to review. This never merges on a fuzzy or heuristic match, only an
+exact shared id, and it still respects any pair you've already told the
+Duplicate Finder to **Ignore** (below) — a dismissed pair stays split even
+if it later shares an id. Auto-archiving disabled-language content (see
+[Enabled Playback Languages](#enabled-playback-languages) above) works the
+same automatic way. What's left for Duplicate Finder itself is everything
+that isn't (yet) that clear-cut, found three ways at once:
 
 - **Cosmetic punctuation** — a colon, a dash, quote style — the same title
   formatted slightly differently by different providers.
@@ -1329,6 +1370,22 @@ Items imported with no year, where more than one existing pool entry shares
 the same name — too ambiguous to auto-merge, so they're held out of every
 category until you (or the AI, as a suggestion) pick the right one, usually
 from a real TMDB match rather than having to research it yourself.
+
+### Metadata Review
+
+A broader, sidebar-level version of the same idea (**Metadata Review** nav
+item) — fixes titles a provider left without *both* a TMDB identity and a
+release year, plus the same ambiguous-year hold queue Needs Review covers
+above. A provider supplying neither a TMDB id nor a year never even entered
+the ambiguity detector Needs Review relies on, and is a common real cause of
+duplicate-looking titles that Duplicate Finder can't cleanly resolve on its
+own. Movies/TV Shows tabs, a **Hide adult titles** toggle, and bulk select
+with **Archive selected** and **Resolve selected with AI** (the same
+AI-assisted TMDB matching described in [§10](#10-ai-assisted-features), just
+scoped to this queue) — search TMDB and select the exact result to record a
+confirmed TMDB id and year; if the corrected identity already matches an
+existing pool entry, sources and categories merge into it automatically,
+same as everywhere else in the app.
 
 ### Orphan Checker
 

@@ -439,6 +439,7 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    await vod_importer.close_all_provider_clients()
 
 
 app = FastAPI(title="VOD & DVR Manager", version=APP_VERSION, lifespan=lifespan)
