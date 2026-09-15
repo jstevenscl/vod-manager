@@ -2914,6 +2914,29 @@ async def list_metadata_review(content_type: Optional[str] = None):
     return await asyncio.to_thread(vod_db.list_metadata_review, content_type)
 
 
+@router.get("/tmdb-lookup-failures/", dependencies=_GUARDS)
+async def list_tmdb_lookup_failures(content_type: Optional[str] = None):
+    if content_type not in (None, "movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return await asyncio.to_thread(vod_db.list_tmdb_lookup_failures, content_type)
+
+
+@router.post("/tmdb-lookup-failures/scan/", dependencies=_GUARDS, status_code=202)
+async def scan_tmdb_lookup_failures():
+    """Re-check pending known IDs to seed the Incorrect TMDB IDs queue."""
+    if not vod_importer.schedule_post_import_enrichment():
+        return {"started": False, "detail": "TMDB enrichment is already running"}
+    return {"started": True}
+
+
+@router.post("/tmdb-lookup-failures/bulk-resolve/", dependencies=_GUARDS, status_code=202)
+async def bulk_resolve_tmdb_lookup_failures(body: BulkAiResolveRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    job_id = await vod_bulk_ai_service.start_tmdb_lookup_failure_bulk_resolve(body.content_type, body.ids)
+    return {"job_id": job_id}
+
+
 @router.get("/needs-review/{content_type}/{item_id}/ai-suggest/", dependencies=_GUARDS)
 async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[str] = None):
     """Asks Claude to pick the most likely correct match among the same TMDB
@@ -2947,7 +2970,9 @@ async def resolve_year_review(content_type: str, item_id: int, body: ResolveYear
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     try:
-        return vod_db.resolve_year_review(content_type, item_id, body.year, body.tmdb_id)
+        result = vod_db.resolve_year_review(content_type, item_id, body.year, body.tmdb_id)
+        vod_db.clear_tmdb_lookup_failure(content_type, item_id)
+        return result
     except ValueError as exc:
         raise HTTPException(404, detail=str(exc))
 

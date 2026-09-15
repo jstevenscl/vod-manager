@@ -20,6 +20,13 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-15
 
+- ✅ Metadata Review now has an **Incorrect TMDB IDs** tab for titles whose
+  stored ID receives a confirmed TMDB 404. It supports a pending-ID scan,
+  per-title TMDB search and correction/clear actions, and high-confidence
+  bulk AI correction. Adult titles are hidden by default and excluded from
+  repeat pending-ID enrichment; Activity and Failed Streams no longer crowd
+  the Metadata Review page.
+
 - ✅ Manual Plex, Emby, Jellyfin, and DVR imports now update the shared
   sidebar lifecycle from queued to running and then finished/failed, matching
   XC imports. This makes a queued non-XC import visibly confirm that its

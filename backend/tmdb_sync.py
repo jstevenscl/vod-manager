@@ -44,6 +44,10 @@ _YEAR_LOOKUP_CONCURRENCY = 10
 _GLOBAL_TMDB_CONCURRENCY = 40
 _tmdb_semaphore = asyncio.Semaphore(_GLOBAL_TMDB_CONCURRENCY)
 
+
+class TmdbNotFoundError(Exception):
+    """The requested TMDB identity no longer exists (HTTP 404)."""
+
 # KNM: added 2026-09-09 -- one persistent client shared by every function in
 # this module instead of each opening/closing its own httpx.AsyncClient per
 # call (a fresh TCP+TLS handshake per single request). keepalive pool sized
@@ -357,6 +361,11 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
                 params={"api_key": api_key, "append_to_response": "credits,release_dates"},
             )
         r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        if exc.response.status_code == 404:
+            raise TmdbNotFoundError(tmdb_id) from exc
+        return None
     except Exception as exc:
         logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
         return None
@@ -445,6 +454,11 @@ async def get_tv_full_details(tmdb_id: str) -> dict | None:
                 params={"api_key": api_key, "append_to_response": "content_ratings"},
             )
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("[tmdb_sync] failed to fetch TV detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        if exc.response.status_code == 404:
+            raise TmdbNotFoundError(tmdb_id) from exc
+        return None
     except Exception as exc:
         logger.warning("[tmdb_sync] failed to fetch TV detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
         return None

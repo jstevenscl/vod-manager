@@ -1062,11 +1062,18 @@ def _apply_field_rules(content_type: str, fields: dict) -> dict:
     return result
 
 
-async def _tmdb_movie_enrichment_payload(movie_id: int, tmdb_id: str) -> dict | None:
+async def _tmdb_movie_enrichment_payload(movie_id: int, tmdb_id: str, *, track_not_found: bool = False) -> dict | None:
     """Fetch TMDB fields for a known movie identity without provider fallback."""
-    tmdb_detail = await tmdb_sync.get_movie_full_details(tmdb_id)
+    try:
+        tmdb_detail = await tmdb_sync.get_movie_full_details(tmdb_id)
+    except tmdb_sync.TmdbNotFoundError:
+        if track_not_found:
+            await asyncio.to_thread(vod_db.record_tmdb_lookup_failure, "movie", movie_id, tmdb_id)
+        return None
     if not tmdb_detail:
         return None
+    if track_not_found:
+        await asyncio.to_thread(vod_db.clear_tmdb_lookup_failure, "movie", movie_id)
     name_fields = {}
     if tmdb_detail.get("name"):
         name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
@@ -1571,7 +1578,7 @@ async def bulk_enrich_tmdb_movies(concurrency: int = 8) -> None:
                 return
             try:
                 movie = await asyncio.to_thread(vod_db.get_movie, movie_id)
-                payload = await _tmdb_movie_enrichment_payload(movie_id, movie["tmdb_id"]) if movie else None
+                payload = await _tmdb_movie_enrichment_payload(movie_id, movie["tmdb_id"], track_not_found=True) if movie else None
                 if payload:
                     pending.append(payload)
                     succeeded.append(movie_id)
@@ -1617,7 +1624,12 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
             except asyncio.QueueEmpty:
                 return
             try:
-                detail = await tmdb_sync.get_tv_full_details(tmdb_id)
+                try:
+                    detail = await tmdb_sync.get_tv_full_details(tmdb_id)
+                except tmdb_sync.TmdbNotFoundError:
+                    for series in series_by_tmdb_id[tmdb_id]:
+                        await asyncio.to_thread(vod_db.record_tmdb_lookup_failure, "series", series["id"], tmdb_id)
+                    continue
                 if not detail:
                     continue
                 name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
@@ -1633,6 +1645,7 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
                         "fields": fields,
                     })
                     merged_ids.append(series["id"])
+                    await asyncio.to_thread(vod_db.clear_tmdb_lookup_failure, "series", series["id"])
             except Exception:
                 logger.exception("[vod_importer] TMDB series metadata failed for tmdb_id=%s", tmdb_id)
 

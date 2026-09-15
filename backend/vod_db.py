@@ -588,6 +588,21 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- TMDB returned 404 for an identity already stored on a pool item.
+        -- This is intentionally distinct from the no-id/ambiguous-id review
+        -- queue: the item has an explicit identity, but it is no longer valid
+        -- upstream and must be corrected or cleared by a reviewer.
+        CREATE TABLE IF NOT EXISTS tmdb_lookup_failures (
+            content_type TEXT NOT NULL CHECK(content_type IN ('movie','series')),
+            item_id INTEGER NOT NULL,
+            tmdb_id TEXT NOT NULL,
+            last_error TEXT NOT NULL,
+            first_failed_at TEXT NOT NULL,
+            last_failed_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(content_type, item_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -610,6 +625,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
         CREATE INDEX IF NOT EXISTS idx_vod_stream_failures_created_at ON vod_stream_failures(created_at);
+        CREATE INDEX IF NOT EXISTS idx_tmdb_lookup_failures_type_time ON tmdb_lookup_failures(content_type, last_failed_at);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_accounts_provider_id ON provider_sub_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_account_live_accounts_sub_account_id ON provider_sub_account_live_accounts(sub_account_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
@@ -5257,6 +5273,7 @@ def list_movie_ids_pending_tmdb_enrichment() -> list[int]:
     rows = conn.execute("""
         SELECT id FROM movies
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND is_adult=0 AND review_excluded=0
           AND last_enriched_at IS NULL
         ORDER BY id
     """).fetchall()
@@ -5275,6 +5292,7 @@ def list_series_pending_tmdb_metadata_enrichment() -> list[dict]:
     rows = conn.execute("""
         SELECT id, tmdb_id FROM series
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND is_adult=0 AND review_excluded=0
           AND tmdb_metadata_enriched_at IS NULL
         ORDER BY id
     """).fetchall()
@@ -9066,6 +9084,61 @@ def list_metadata_review(content_type: str | None = None) -> dict:
     return out
 
 
+def record_tmdb_lookup_failure(content_type: str, item_id: int, tmdb_id: str, error: str = "TMDB returned 404 Not Found") -> None:
+    """Persist a confirmed invalid TMDB identity for reviewer correction."""
+    now = _now()
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            """INSERT INTO tmdb_lookup_failures
+               (content_type,item_id,tmdb_id,last_error,first_failed_at,last_failed_at,attempts)
+               VALUES (?,?,?,?,?,?,1)
+               ON CONFLICT(content_type,item_id) DO UPDATE SET
+                 tmdb_id=excluded.tmdb_id, last_error=excluded.last_error,
+                 last_failed_at=excluded.last_failed_at, attempts=tmdb_lookup_failures.attempts+1""",
+            (content_type, item_id, str(tmdb_id), error, now, now),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def clear_tmdb_lookup_failure(content_type: str, item_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM tmdb_lookup_failures WHERE content_type=? AND item_id=?", (content_type, item_id))
+    _commit_with_retry(conn)
+    conn.close()
+
+
+def list_tmdb_lookup_failures(content_type: str | None = None) -> dict:
+    """Reviewer queue for stored TMDB IDs that TMDB confirmed no longer exist."""
+    conn = _connect()
+    out: dict = {}
+    for requested_type, table, key in (("movie", "movies", "movies"), ("series", "series", "series")):
+        if content_type not in (None, requested_type):
+            continue
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT t.*, f.tmdb_id AS invalid_tmdb_id, f.last_error,
+                       f.last_failed_at, f.attempts
+                FROM {table} t JOIN tmdb_lookup_failures f
+                  ON f.content_type=? AND f.item_id=t.id
+                WHERE t.review_excluded=0
+                ORDER BY f.last_failed_at DESC, t.name""",
+            (requested_type,),
+        ).fetchall()]
+        for row in rows:
+            if requested_type == "movie":
+                src = conn.execute("SELECT id FROM movie_sources WHERE movie_id=? LIMIT 1", (row["id"],)).fetchone()
+                row["sample_source_id"] = src["id"] if src else None
+            else:
+                ep = conn.execute("SELECT id FROM episodes WHERE series_id=? ORDER BY season_number, episode_number LIMIT 1", (row["id"],)).fetchone()
+                row["sample_episode_id"] = ep["id"] if ep else None
+                src = conn.execute("SELECT id FROM episode_sources WHERE episode_id=? LIMIT 1", (ep["id"],)).fetchone() if ep else None
+                row["sample_episode_source_id"] = src["id"] if src else None
+        out[key] = rows
+    conn.close()
+    return out
+
+
 def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
     """Sets the correct year (and tmdb_id, if known) on a flagged item and
     clears the flag. If that year now exactly matches an existing item of
@@ -10312,6 +10385,7 @@ def clear_tmdb_id(content_type: str, item_id: int) -> dict:
     conn.execute(f"UPDATE {table} SET tmdb_id=NULL, updated_at=? WHERE id=?", (_now(), item_id))
     _commit_with_retry(conn)
     conn.close()
+    clear_tmdb_lookup_failure(content_type, item_id)
     logger.info("[clear_tmdb_id] %s id=%s (%r) tmdb_id %s -> NULL", content_type, item_id, row["name"], row["tmdb_id"])
     return {"cleared_id": item_id}
 
@@ -10336,6 +10410,7 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
     conn.close()
 
     if existing:
+        clear_tmdb_lookup_failure(content_type, item_id)
         if content_type == "movie":
             merge_movie(item_id, existing["id"])
         else:
@@ -10346,6 +10421,7 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
     conn.execute(f"UPDATE {table} SET tmdb_id=?, updated_at=? WHERE id=?", (tmdb_id, _now(), item_id))
     _commit_with_retry(conn)
     conn.close()
+    clear_tmdb_lookup_failure(content_type, item_id)
     logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
     return {"resolved_id": item_id}
 

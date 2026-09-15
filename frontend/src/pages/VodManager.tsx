@@ -283,6 +283,10 @@ interface NeedsReviewItem {
   sample_episode_source_id?: number | null
   imported_season_count?: number
   imported_episode_count?: number
+  invalid_tmdb_id?: string
+  last_error?: string
+  last_failed_at?: string
+  attempts?: number
 }
 
 interface NeedsReviewData {
@@ -1386,11 +1390,12 @@ function SeasonEpisodeMatch({ imported, candidate, label }: { imported?: number;
   )
 }
 
-function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
+function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identity' }: {
   contentType: 'movie' | 'series'
   item: NeedsReviewItem
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
+  queue?: 'identity' | 'invalid_tmdb'
 }) {
   const [expanded, setExpanded] = useState(false)
   const [manualYear, setManualYear] = useState('')
@@ -1435,6 +1440,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -1442,6 +1448,15 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
     mutationFn: (tmdbId: number) => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/set/`, { tmdb_id: tmdbId }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  const clearTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/clear/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
@@ -1485,6 +1500,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
         <span className="min-w-0 truncate flex items-center gap-1.5">
           <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} hlsUrl={hlsUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+          {queue === 'invalid_tmdb' && <span className="text-destructive">invalid TMDB #{item.invalid_tmdb_id ?? item.tmdb_id}</span>}
           {!item.tmdb_id && <span className="text-amber-500">no TMDB ID</span>}
           {!item.year && <span className="text-amber-500">no year</span>}
           {contentType === 'series' && !!item.imported_episode_count && (
@@ -1527,6 +1543,14 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
               {aiSuggest.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} className="mr-1" />Ask AI</>}
             </Button>
           </div>
+          {queue === 'invalid_tmdb' && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-muted-foreground">TMDB returned 404{item.last_failed_at ? ` · last checked ${new Date(item.last_failed_at).toLocaleString()}` : ''}</span>
+              <Button size="sm" variant="outline" className="h-7 text-xs text-destructive" disabled={clearTmdbId.isPending} onClick={() => clearTmdbId.mutate()}>
+                Clear invalid ID
+              </Button>
+            </div>
+          )}
           {aiSuggest.isError && (
             <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
           )}
@@ -4302,8 +4326,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
+  const [metadataQueue, setMetadataQueue] = useState<'identity' | 'invalid_tmdb'>('identity')
   const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
-  const [metadataHideAdult, setMetadataHideAdult] = useState(false)
+  const [metadataHideAdult, setMetadataHideAdult] = useState(true)
   const [metadataOffset, setMetadataOffset] = useState(0)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
@@ -5806,16 +5831,31 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/metadata-review/').then((r) => r.data),
     enabled: activeTab === 'metadata',
   })
-  const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
+  const tmdbLookupFailuresQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-tmdb-lookup-failures'],
+    queryFn: () => api.get('/vod/tmdb-lookup-failures/').then((r) => r.data),
+    enabled: activeTab === 'metadata',
+  })
+  const activeMetadataQuery = metadataQueue === 'identity' ? metadataReviewQuery : tmdbLookupFailuresQuery
+  const metadataItems = (metadataContentType === 'movie'
+    ? activeMetadataQuery.data?.movies : activeMetadataQuery.data?.series) ?? []
   const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
   const METADATA_PAGE_SIZE = 50
   const metadataPageItems = filteredMetadataItems.slice(metadataOffset, metadataOffset + METADATA_PAGE_SIZE)
-  const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  const metadataBulkAi = useBulkAiJob(
+    metadataQueue === 'identity' ? '/vod/needs-review/bulk-resolve/' : '/vod/tmdb-lookup-failures/bulk-resolve/',
+    metadataQueue === 'identity' ? '/vod/needs-review/bulk-resolve/' : '/vod/tmdb-lookup-failures/bulk-resolve/',
+  )
+  const scanTmdbFailures = useMutation({
+    mutationFn: () => api.post('/vod/tmdb-lookup-failures/scan/'),
+    onSuccess: () => setTimeout(() => qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] }), 2500),
+  })
   const archiveMetadata = useMutation({
     mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
     onSuccess: () => {
       setMetadataSelected(new Set())
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -5823,6 +5863,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     if (metadataBulkAi.job && !metadataBulkAi.job.running) {
       setMetadataSelected(new Set())
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
       qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     }
@@ -6254,6 +6295,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         </Modal>
       )}
+      {activeTab !== 'metadata' && <>
       <SectionCard title="Activity" icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
@@ -6369,6 +6411,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </>
         )}
       </SectionCard>
+
+      </>}
 
       {activeTab === 'config' && (
       <>
@@ -7305,29 +7349,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Metadata Review" icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.
-          Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
-          identity already exists in the pool, its sources and categories merge into that existing title.
+          {metadataQueue === 'identity'
+            ? 'Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.'
+            : 'Correct stored TMDB IDs that TMDB confirmed no longer exist. Search TMDB, choose the exact match, or clear the invalid ID.'}
         </p>
         <div className="flex items-center gap-1.5 pt-1">
+          <Button size="sm" variant={metadataQueue === 'identity' ? 'default' : 'outline'} onClick={() => { setMetadataQueue('identity'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+            Missing identity
+          </Button>
+          <Button size="sm" variant={metadataQueue === 'invalid_tmdb' ? 'default' : 'outline'} onClick={() => { setMetadataQueue('invalid_tmdb'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+            Incorrect TMDB IDs{tmdbLookupFailuresQuery.data?.movies.length || tmdbLookupFailuresQuery.data?.series.length ? ` (${(tmdbLookupFailuresQuery.data?.movies.length ?? 0) + (tmdbLookupFailuresQuery.data?.series.length ?? 0)})` : ''}
+          </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
+            Movies{activeMetadataQuery.data?.movies.length ? ` (${activeMetadataQuery.data.movies.length})` : ''}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
+            TV Shows{activeMetadataQuery.data?.series.length ? ` (${activeMetadataQuery.data.series.length})` : ''}
           </Button>
-          <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
-            {metadataReviewQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+          <Button size="sm" variant="outline" disabled={activeMetadataQuery.isFetching} onClick={() => activeMetadataQuery.refetch()}>
+            {activeMetadataQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             <span className="ml-1">Refresh</span>
           </Button>
+          {metadataQueue === 'invalid_tmdb' && <Button size="sm" variant="outline" disabled={scanTmdbFailures.isPending} onClick={() => scanTmdbFailures.mutate()}>
+            {scanTmdbFailures.isPending ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+            <span className="ml-1">Scan pending IDs</span>
+          </Button>}
         </div>
         <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
           <input
@@ -7338,9 +7392,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           Hide adult titles
           {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
         </label>
-        {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queueâ€¦</p>}
-        {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
-        {metadataReviewQuery.data && (
+        {activeMetadataQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queueâ€¦</p>}
+        {activeMetadataQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
+        {activeMetadataQuery.data && (
           <>
             {filteredMetadataItems.length === 0 ? (
               <p className="text-xs text-muted-foreground pt-1">{metadataHideAdult ? 'No non-adult titles match this review queue.' : 'Clean â€” no active titles need identity review.'}</p>
@@ -7353,6 +7407,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   >
                     Select this page
                   </button>
+                  {metadataQueue === 'invalid_tmdb' && filteredMetadataItems.length > metadataPageItems.length && (
+                    <button className="text-primary hover:underline" onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}>
+                      Select all {filteredMetadataItems.length}
+                    </button>
+                  )}
                   <button className="text-muted-foreground hover:underline" onClick={() => setMetadataSelected(new Set())}>Clear</button>
                   <span className="text-muted-foreground">{metadataSelected.size} selected</span>
                   <Button
@@ -7396,7 +7455,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           Select
                         </label>
                       </li>
-                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} />
+                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} queue={metadataQueue} />
                     </Fragment>
                   ))}
                 </ul>

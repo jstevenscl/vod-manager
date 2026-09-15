@@ -91,3 +91,26 @@ def test_tmdb_series_pass_reuses_one_lookup_for_shared_tmdb_id(db, monkeypatch):
     assert calls == ["shared-id"]
     assert db.get_series(first_id)["name"] == "Canonical Card"
     assert db.get_series(second_id)["name"] == "Canonical Card"
+
+
+def test_tmdb_404_is_persisted_for_incorrect_id_review(db, monkeypatch):
+    provider_id = db.upsert_provider("Example Provider", "http://example.invalid", "user", "pass")
+    db.bulk_import_movies(provider_id, [_movie("gone", "404")])
+    movie_id = db.list_movie_ids_pending_tmdb_enrichment()[0]
+
+    async def missing(_tmdb_id):
+        raise tmdb_sync.TmdbNotFoundError("404")
+
+    monkeypatch.setattr(tmdb_sync, "get_movie_full_details", missing)
+    asyncio.run(vod_importer.bulk_enrich_tmdb_movies(concurrency=1))
+
+    queued = db.list_tmdb_lookup_failures("movie")["movies"]
+    assert [(row["id"], row["invalid_tmdb_id"]) for row in queued] == [(movie_id, "404")]
+
+
+def test_adult_known_tmdb_ids_are_not_retried(db):
+    provider_id = db.upsert_provider("Example Provider", "http://example.invalid", "user", "pass")
+    db.bulk_import_movies(provider_id, [_movie("adult", "123")])
+    movie_id = db.list_movie_ids_pending_tmdb_enrichment()[0]
+    db.set_movie_adult(movie_id, True)
+    assert db.list_movie_ids_pending_tmdb_enrichment() == []
