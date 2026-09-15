@@ -31,7 +31,8 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
-- Added a dedicated **Metadata Review** workspace under Operations, so TMDB
+- ✅ **Shipped in beta image (`e9c40de`):** Added a dedicated **Metadata
+  Review** workspace under Operations, so TMDB
   corrections no longer need to live in Curation or a library modal. It lists
   active movies and TV shows missing a TMDB ID or release year, plus the
   existing ambiguous-year hold queue. A reviewer searches TMDB and explicitly
@@ -39,11 +40,16 @@ proposed to the upstream project, the entry links to that pull request —
   sources/categories only when the corrected pool identity already exists.
   The queue's selection criteria and existing reconciliation/enrichment
   regressions were validated in 7 automated tests; the frontend production
-  build also passed.
+  build also passed. Browser validation reached the first-run screen from a
+  static build; the authenticated, data-backed queue must be checked after
+  deployment.
 
-- The sidebar now includes a compact live Status card below Configuration. It
-  reports the importing provider, TMDB/enrichment progress, idle state, and
-  app-process CPU sampling without requiring users to leave their current page.
+- ✅ **Shipped in beta image (`245f6a0`):** The sidebar now includes a compact
+  live Status card below Configuration. It reports the importing provider,
+  TMDB/enrichment progress, idle state, and app-process CPU sampling without
+  requiring users to leave their current page. Python compilation, 6 focused
+  backend regression tests, and the frontend production build passed; live
+  workload states require an actual import/enrichment run to observe.
 
 - ✅ Imports now run a TMDB-first canonical metadata pass for series with an
   imported TMDB ID before provider episode discovery. It uses one bounded,
