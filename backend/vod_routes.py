@@ -68,6 +68,12 @@ router = APIRouter(prefix="/api/vod", tags=["vod-manager"])
 
 _GUARDS = [Depends(require_auth)]
 
+# Manual imports used to keep the HTTP request open for the entire catalog
+# pull.  Queue them instead: a browser can keep using the app, and large XC
+# providers never compete for SQLite's one writer.
+_MANUAL_IMPORT_QUEUE: list[int] = []
+_MANUAL_IMPORT_TASK: asyncio.Task | None = None
+
 vod_db.init_db()
 
 
@@ -1606,11 +1612,10 @@ async def sync_provider(provider_id: int):
     return {"results_by_connection": results}
 
 
-@router.post("/providers/{provider_id}/import/", dependencies=_GUARDS)
-async def import_provider_catalog(provider_id: int):
+async def _run_provider_catalog_import(provider_id: int) -> dict:
     provider = vod_db.get_provider(provider_id)
     if not provider:
-        raise HTTPException(404, detail="provider not found")
+        raise ValueError("provider not found")
     try:
         if provider.get("provider_type") == "plex":
             result = await plex_importer.import_plex_library(provider_id)
@@ -1619,14 +1624,16 @@ async def import_provider_catalog(provider_id: int):
         elif provider.get("provider_type") == "dispatcharr_dvr":
             result = await dispatcharr_dvr_importer.import_dvr_recordings(provider_id)
         else:
-            result = await vod_importer.import_provider_catalog(provider_id)
+            # The queue schedules post-import enrichment once it drains, not
+            # between two user-queued provider imports.
+            result = await vod_importer.import_provider_catalog(provider_id, schedule_enrichment=False)
     except Exception as exc:
         # exc_info: some failures here raise with an empty str() (e.g. a bare
         # TimeoutError), which used to log as "failed: " with nothing else
         # to go on -- the full traceback is the only way to actually
         # diagnose those.
         logger.error("[vod_routes] import_provider_catalog(%s) failed: %s", provider_id, exc, exc_info=True)
-        raise HTTPException(502, detail=str(exc) or repr(exc))
+        raise
     # Without this, the periodic catalog refresher (main.py) treats a
     # manually-imported provider as still "never refreshed" and redundantly
     # re-imports it again on its very next cycle -- a real, if minor, wasted
@@ -1637,6 +1644,49 @@ async def import_provider_catalog(provider_id: int):
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
     await vod_importer.resweep_smart_categories()
     return result
+
+
+async def _manual_import_worker() -> None:
+    """Drain user-requested imports one at a time, then enrich once."""
+    global _MANUAL_IMPORT_TASK
+    try:
+        while _MANUAL_IMPORT_QUEUE:
+            provider_id = _MANUAL_IMPORT_QUEUE.pop(0)
+            try:
+                await _run_provider_catalog_import(provider_id)
+            except Exception:
+                # The import module records XC status for the sidebar; retain
+                # a traceback for the non-XC importer paths as well.
+                logger.exception("[vod_routes] queued provider import %s failed", provider_id)
+        if vod_importer.schedule_post_import_enrichment():
+            logger.info("[vod_routes] queued post-import enrichment after manual import queue drained")
+    finally:
+        _MANUAL_IMPORT_TASK = None
+
+
+@router.post("/providers/{provider_id}/import/", dependencies=_GUARDS, status_code=202)
+async def import_provider_catalog(provider_id: int):
+    """Queue a catalog import and return immediately instead of holding UI HTTP open."""
+    global _MANUAL_IMPORT_TASK
+    provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
+    if not provider:
+        raise HTTPException(404, detail="provider not found")
+    if provider_id in _MANUAL_IMPORT_QUEUE or (
+        _MANUAL_IMPORT_TASK and not _MANUAL_IMPORT_TASK.done()
+        and vod_importer.get_import_progress().get("provider_id") == provider_id
+    ):
+        return {"queued": True, "already_queued": True, "provider": provider["name"]}
+
+    worker_running = _MANUAL_IMPORT_TASK is not None and not _MANUAL_IMPORT_TASK.done()
+    # Include the import currently in flight in the position shown to the
+    # caller, but don't replace its live sidebar status with a later queued
+    # provider. The worker switches the status when it actually starts each.
+    position = len(_MANUAL_IMPORT_QUEUE) + (1 if worker_running else 0) + 1
+    _MANUAL_IMPORT_QUEUE.append(provider_id)
+    if not worker_running:
+        vod_importer.mark_import_queued(provider_id, provider["name"], position)
+        _MANUAL_IMPORT_TASK = asyncio.create_task(_manual_import_worker())
+    return {"queued": True, "already_queued": False, "position": position, "provider": provider["name"]}
 
 
 # ── DVR recording profiles (Phase 2) ────────────────────────────────────────
@@ -2844,7 +2894,10 @@ async def list_metadata_review(content_type: Optional[str] = None):
     """Human-review queue for missing or ambiguous TMDB identity fields."""
     if content_type not in (None, "movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    return vod_db.list_metadata_review(content_type)
+    # Imports can hold SQLite's writer while reconciling a large catalog.
+    # Keep this read off the event loop so the rest of the API remains
+    # responsive even if the read has to wait briefly for the database.
+    return await asyncio.to_thread(vod_db.list_metadata_review, content_type)
 
 
 @router.get("/needs-review/{content_type}/{item_id}/ai-suggest/", dependencies=_GUARDS)

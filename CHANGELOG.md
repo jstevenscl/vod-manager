@@ -20,6 +20,13 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-15
 
+- ✅ Provider catalog imports now queue in the background instead of holding
+  the browser request open for the full catalog pass. Imports are serialized,
+  their large record-normalization work no longer occupies the API event loop,
+  and post-import enrichment waits until the manual import queue drains. The
+  sidebar reports queued/running work, so Metadata Review and other pages stay
+  usable while a provider refresh is underway.
+
 - ✅ Provider catalog refreshes now reconcile removed content as well as new
   content: a source that is no longer advertised by a provider is removed,
   while the same movie or series remains available whenever another provider

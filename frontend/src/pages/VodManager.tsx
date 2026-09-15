@@ -5636,16 +5636,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [importingId, setImportingId] = useState<number | null>(null)
   const [importResult, setImportResult] = useState<string | null>(null)
   const importCatalog = useMutation({
-    // Real bug found live: import is one synchronous backend call (network
-    // pull + per-item DB upsert for the whole catalog, no background-job/
-    // poll pattern), and a 100K+/50K+ movie/series library can genuinely
-    // take longer than a few minutes -- the old 180s cap turned a slow but
-    // successful import into a spurious "Import failed" every time on a
-    // catalog this size. 30 minutes is generous enough for even a very
-    // large library while still eventually giving up on something truly
-    // stuck, rather than removing the cap outright.
+    // The server queues catalog imports and returns immediately, so this
+    // browser can keep using Metadata Review while a provider refresh runs.
     mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 1_800_000 }) },
     onSuccess: (r) => {
+      if (r.data.queued) {
+      setImportResult(r.data.already_queued
+        ? `${r.data.provider ?? 'Provider'} is already queued for import.`
+        : `${r.data.provider ?? 'Provider'} import queued${r.data.position > 1 ? ` (position ${r.data.position})` : ''}. You can keep using the app; live progress appears in the sidebar.`)
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      } else {
       const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
       const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
       const skipped: { name: string; collection_type: string | null }[] = r.data.skipped_libraries ?? []
@@ -5661,6 +5661,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      }
     },
     onError: (e: any) => {
       // A client-side timeout doesn't mean the import actually failed --

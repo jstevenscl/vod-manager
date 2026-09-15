@@ -552,8 +552,27 @@ async def _import_movies_for_provider(
     fetch_elapsed = time.time() - fetch_started
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
     lang = _current_lang_settings()
+    movie_items, seen_stream_ids = await asyncio.to_thread(
+        _build_movie_import_items, streams, category_names, exclude_categories,
+        exclude_uncategorized, lang, movie_name_rules,
+    )
+    db_started = time.time()
+    movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
+    db_elapsed = time.time() - db_started
+    logger.info(
+        "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
+        provider["name"], movie_result, fetch_elapsed, db_elapsed, len(streams),
+    )
+    return movie_result, len(streams), seen_stream_ids
+
+
+def _build_movie_import_items(streams, category_names, exclude_categories, exclude_uncategorized, lang, movie_name_rules):
+    """CPU-only list normalization; deliberately runs outside FastAPI's loop."""
     movie_items = []
+    seen_stream_ids = set()
     for s in streams:
+        stream_id = str(s["stream_id"])
+        seen_stream_ids.add(stream_id)
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
         category_name = category_names.get(str(s.get("category_id")))
@@ -564,7 +583,7 @@ async def _import_movies_for_provider(
         movie_items.append({
             "name": name,
             "year": year,
-            "provider_stream_id": str(s["stream_id"]),
+            "provider_stream_id": stream_id,
             "container_extension": s.get("container_extension") or "mp4",
             "provider_category_name": category_name,
             # The provider's own unstripped name, before parse_name_year and
@@ -594,17 +613,10 @@ async def _import_movies_for_provider(
                 s.get("cover_big") or s.get("movie_image") or None
             ),
         })
-    db_started = time.time()
-    movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
-    db_elapsed = time.time() - db_started
-    logger.info(
-        "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
-        provider["name"], movie_result, fetch_elapsed, db_elapsed, len(streams),
-    )
     # Keep this raw snapshot separate from movie_items.  movie_items is
-    # intentionally filtered by local language/category policy, while source
-    # reconciliation needs to know what the provider actually advertised.
-    return movie_result, len(streams), {str(stream["stream_id"]) for stream in streams}
+    # intentionally filtered by local policy, while reconciliation needs the
+    # provider's complete advertised snapshot.
+    return movie_items, seen_stream_ids
 
 
 async def _import_series_for_provider(
@@ -627,8 +639,27 @@ async def _import_series_for_provider(
         for field in ("genre", "description", "cast_list", "director")
     }
     lang = _current_lang_settings()
+    series_items, seen_series_ids = await asyncio.to_thread(
+        _build_series_import_items, series_list, series_category_names,
+        exclude_categories, exclude_uncategorized, lang, series_name_rules, detail_rules,
+    )
+    db_started = time.time()
+    series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
+    db_elapsed = time.time() - db_started
+    logger.info(
+        "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
+        provider["name"], series_result, fetch_elapsed, db_elapsed, len(series_list),
+    )
+    return series_result, len(series_list), seen_series_ids
+
+
+def _build_series_import_items(series_list, series_category_names, exclude_categories, exclude_uncategorized, lang, series_name_rules, detail_rules):
+    """CPU-only list normalization; deliberately runs outside FastAPI's loop."""
     series_items = []
+    seen_series_ids = set()
     for s in series_list:
+        provider_series_id = str(s["series_id"])
+        seen_series_ids.add(provider_series_id)
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         category_name = series_category_names.get(str(s.get("category_id")))
@@ -639,7 +670,7 @@ async def _import_series_for_provider(
         series_items.append({
             "name": name,
             "year": year or _coerce_year(s.get("year")),
-            "provider_series_id": str(s["series_id"]),
+            "provider_series_id": provider_series_id,
             "provider_category_name": category_name,
             # See movie_items' identical raw_name field above -- the
             # provider's own unstripped name, before parse_name_year and
@@ -658,30 +689,32 @@ async def _import_series_for_provider(
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
             "provider_last_modified": s.get("last_modified") or None,
         })
-    db_started = time.time()
-    series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
-    db_elapsed = time.time() - db_started
-    logger.info(
-        "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
-        provider["name"], series_result, fetch_elapsed, db_elapsed, len(series_list),
-    )
-    # See _import_movies_for_provider: source presence is based on the raw
-    # provider snapshot, never the locally filtered import payload.
-    return series_result, len(series_list), {str(series["series_id"]) for series in series_list}
+    return series_items, seen_series_ids
 
 
 # KNM: added 2026-09-15 -- imports and enrichment run server-side, so the
 # sidebar needs shared runtime state instead of relying on the browser that
 # happened to initiate a job.
 _IMPORT_PROGRESS: dict = {
-    "running": False, "provider_id": None, "provider_name": None,
+    "running": False, "queued": False, "queue_position": None,
+    "provider_id": None, "provider_name": None,
     "started_at": None, "finished_at": None, "error": None,
 }
+_XC_IMPORT_LOCK = asyncio.Lock()
 _CPU_SAMPLE: tuple[float, float] | None = None
 
 
 def get_import_progress() -> dict:
     return dict(_IMPORT_PROGRESS)
+
+
+def mark_import_queued(provider_id: int, provider_name: str, queue_position: int) -> None:
+    """Expose a queued manual import before its worker starts it."""
+    _IMPORT_PROGRESS.update({
+        "running": False, "queued": True, "queue_position": queue_position,
+        "provider_id": provider_id, "provider_name": provider_name,
+        "started_at": None, "finished_at": None, "error": None,
+    })
 
 
 def get_process_cpu_percent() -> float | None:
@@ -705,20 +738,27 @@ def get_process_cpu_percent() -> float | None:
         return None
 
 
-async def import_provider_catalog(provider_id: int) -> dict:
+async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool = True) -> dict:
     """Run one XC catalog import and expose its lifecycle to the UI."""
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
-    _IMPORT_PROGRESS.update({
-        "running": True, "provider_id": provider_id,
-        "provider_name": provider.get("name") if provider else f"provider {provider_id}",
-        "started_at": time.time(), "finished_at": None, "error": None,
-    })
-    try:
-        result = await _import_provider_catalog_impl(provider_id)
-    except Exception as exc:
-        _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
-        raise
-    _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+    # SQLite has a single writer and catalog preparation itself is expensive.
+    # This lock makes periodic and manual XC imports wait their turn rather
+    # than competing for the writer and starving normal API reads.
+    async with _XC_IMPORT_LOCK:
+        _IMPORT_PROGRESS.update({
+            "running": True, "queued": False, "queue_position": None,
+            "provider_id": provider_id,
+            "provider_name": provider.get("name") if provider else f"provider {provider_id}",
+            "started_at": time.time(), "finished_at": None, "error": None,
+        })
+        try:
+            result = await _import_provider_catalog_impl(provider_id)
+        except Exception as exc:
+            _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
+            raise
+        _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+    if schedule_enrichment:
+        result["post_import_enrichment_queued"] = schedule_post_import_enrichment()
     return result
 
 
@@ -867,17 +907,13 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
         except Exception as exc:
             logger.warning("[vod_importer] provider=%s auto-create-categories failed: %s", provider["name"], exc)
 
-    scheduled = schedule_post_import_enrichment()
-    if scheduled:
-        logger.info("[vod_importer] queued post-import TMDB/fallback enrichment")
-
     return {
         "provider": provider["name"],
         "movie_categories": len(categories),
         "series_categories": len(series_categories),
         **movie_result,
         **series_result,
-        "post_import_enrichment_queued": scheduled,
+        "post_import_enrichment_queued": False,
     }
 
 
@@ -1914,9 +1950,10 @@ async def _run_provider_enrichment(
     if not movie_ok:
         return {"movie_ok": False, "movie_ids": movie_ids, "series_ran": False, "series_ok": None, "series_ids": []}
 
-    series_ok, series_ids = await _run_provider_series_phase(
-        provider, series_sem, force, write_queue=write_queue, provider_count=provider_count, pending_only=pending_only,
-    )
+    series_kwargs = {"write_queue": write_queue, "provider_count": provider_count}
+    if pending_only:
+        series_kwargs["pending_only"] = True
+    series_ok, series_ids = await _run_provider_series_phase(provider, series_sem, force, **series_kwargs)
     return {"movie_ok": True, "movie_ids": movie_ids, "series_ran": True, "series_ok": series_ok, "series_ids": series_ids}
 
 
