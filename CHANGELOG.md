@@ -31,12 +31,12 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
-- ✅ **Shipped in beta image (next build):** The sidebar Status card now
+- ✅ **Live on the server (`f0b9c0b`):** The sidebar Status card now
   reports active bulk AI review jobs (for example, `AI review: 13/55`) and
   switches to its live polling interval while they run, instead of incorrectly
   displaying Idle.
 
-- ✅ **Shipped in beta image (next build):** Metadata Review now supports a
+- ✅ **Live on the server (`a77d9fc`):** Metadata Review now supports a
   Hide adult titles filter, filtered Select all, Archive selected, and an explicit
   Bulk resolve with AI action for both movies and TV shows. AI runs only on
   the titles the reviewer selected and writes a TMDB ID/year only for a
