@@ -6875,10 +6875,10 @@ def _looks_adult(*category_names) -> bool:
 
 def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_stream_id, container_extension, provider_category_name, auto_archive}, ...],
-    optionally carrying tmdb_id -- some providers' bulk get_vod_streams list
-    already includes it (unlike genre/cast/plot, which never appear there;
-    see bulk_import_series's identical-but-richer capture for series). Only
-    ever upgrades via COALESCE, never overwrites an id already known.
+    optionally carrying tmdb_id and poster_url. Some providers' bulk
+    get_vod_streams lists already include these (unlike genre/cast/plot,
+    which never appear there; see bulk_import_series's richer capture for
+    series). Both only fill a missing canonical value, never overwrite one.
 
     Adult-content auto-detection runs on every import pass (not just first
     creation) so a provider re-categorizing something later still gets
@@ -6993,8 +6993,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         # this stream, so this is a genuinely new item.
                         placeholder = f"[Untitled] {(item.get('provider_category_name') or '').strip() or 'Unknown'} · stream {item['provider_stream_id']}"
                         cur = conn.execute(
-                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
-                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), now),
+                            "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?,?)",
+                            (placeholder, year, int(category_looks_adult), 1, int(should_archive), item.get("poster_url"), now),
                         )
                         movie_id = cur.lastrowid
                         did_create = True
@@ -7054,8 +7054,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_unarchive = True
                             else:
                                 cur = conn.execute(
-                                    "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, created_at) VALUES (?,?,?,?,?,?)",
-                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), now),
+                                    "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?,?)",
+                                    (name, year, int(category_looks_adult), 1 if candidates else 0, int(should_archive), item.get("poster_url"), now),
                                 )
                                 movie_id = cur.lastrowid
                                 did_create = True
@@ -7119,8 +7119,8 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                     did_unarchive = True
                             else:
                                 cur = conn.execute(
-                                    "INSERT INTO movies (name, year, is_adult, review_excluded, created_at) VALUES (?,?,?,?,?)",
-                                    (name, year, int(category_looks_adult), int(should_archive), now),
+                                    "INSERT INTO movies (name, year, is_adult, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?)",
+                                    (name, year, int(category_looks_adult), int(should_archive), item.get("poster_url"), now),
                                 )
                                 movie_id = cur.lastrowid
                                 did_create = True
@@ -7141,6 +7141,19 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         conn.execute(
                             "UPDATE movies SET tmdb_id=COALESCE(tmdb_id, ?) WHERE id=?",
                             (item["tmdb_id"], movie_id),
+                        )
+                    if item.get("poster_url"):
+                        # A canonical movie can have several provider
+                        # sources. Keep its first usable catalog poster so
+                        # later source variants cannot flip card artwork.
+                        conn.execute(
+                            """UPDATE movies
+                               SET poster_url=CASE
+                                   WHEN poster_url IS NULL OR TRIM(poster_url)='' THEN ?
+                                   ELSE poster_url
+                               END
+                               WHERE id=?""",
+                            (item["poster_url"], movie_id),
                         )
                     conn.execute(
                         """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, added_at, last_seen_at)
