@@ -14,9 +14,10 @@ grouped by date and describe what changed in the deployed image — not every
 internal commit, just additions and fixes worth knowing about if you're
 running this build.
 
-✅ = shipped and running in this fork's image. Where a change has also been
-proposed to the upstream project, the entry links to that pull request —
-🔀 = open/under review upstream, not yet merged.
+✅ = shipped and running in this fork only. Once work is proposed upstream,
+add its second status marker and link to the pull request: 🔀 = open/under
+review, 🔼 = included in an upstream release, ⛔ = closed without being
+included.
 
 ## 2026-09-15
 
@@ -67,12 +68,12 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-14
 
-- ✅ **Live on the server (`f0b9c0b`):** The sidebar Status card now
+- ✅🔼 **Live on the server (`f0b9c0b`):** The sidebar Status card now
   reports active bulk AI review jobs (for example, `AI review: 13/55`) and
   switches to its live polling interval while they run, instead of incorrectly
   displaying Idle.
 
-- ✅ **Live on the server (`a77d9fc`):** Metadata Review now supports a
+- ✅🔼 **Live on the server (`a77d9fc`):** Metadata Review now supports a
   Hide adult titles filter, filtered Select all, Archive selected, and an explicit
   Bulk resolve with AI action for both movies and TV shows. AI runs only on
   the titles the reviewer selected and writes a TMDB ID/year only for a
@@ -80,13 +81,13 @@ proposed to the upstream project, the entry links to that pull request —
   also accepts a direct TMDB ID, with an optional year for the safe
   identity/merge path.
 
-- ✅ **Follow-up shipped in beta image (`4db93be`):** Corrected the initial
+- ✅🔼 **Follow-up shipped in beta image (`4db93be`):** Corrected the initial
   Metadata Review filter to show only actionable no-identity records (both
   TMDB ID and release year absent), plus explicitly held ambiguous-year rows.
   A provider omitting only a release year is common and is not a repair queue;
   this prevents a normal catalog from producing thousands of false positives.
 
-- ✅ **Shipped in beta image (`e9c40de`):** Added a dedicated **Metadata
+- ✅🔼 **Shipped in beta image (`e9c40de`):** Added a dedicated **Metadata
   Review** workspace under Operations, so TMDB
   corrections no longer need to live in Curation or a library modal. It lists
   active movies and TV shows missing both a TMDB ID and release year, plus the
@@ -99,7 +100,7 @@ proposed to the upstream project, the entry links to that pull request —
   static build; the authenticated, data-backed queue must be checked after
   deployment.
 
-- ✅ **Shipped in beta image (`245f6a0`):** The sidebar now includes a compact
+- ✅🔼 **Shipped in beta image (`245f6a0`):** The sidebar now includes a compact
   live Status card below Configuration. It reports the importing provider,
   TMDB/enrichment progress, idle state, and app-process CPU sampling without
   requiring users to leave their current page. Python compilation, 6 focused
@@ -114,7 +115,7 @@ proposed to the upstream project, the entry links to that pull request —
   without replacing clean card titles, and the existing language-aware merge
   guard still keeps correctly classified EN/ES/IT siblings separate.
 
-- ✅ Bulk enrichment now divides its request-concurrency budget among only
+- ✅🔼 Bulk enrichment now divides its request-concurrency budget among only
   providers that actually have pending movies or series sources. Previously,
   empty configured providers could consume a fairness share: with five
   configured providers and only one needing work, an 8-request budget was
@@ -122,18 +123,18 @@ proposed to the upstream project, the entry links to that pull request —
   adaptive rate limiter, backoff handling, and isolated movie-then-series
   lanes.
 
-- ✅ Fixed automatic startup recovery for pending series episode discovery
+- ✅🔼 Fixed automatic startup recovery for pending series episode discovery
   after the active-provider concurrency change. Providers with already
   completed or review-excluded series no longer count as pending work; the
   remaining source-level episode work resumes normally after a restart.
 
-- ✅ Automatic series episode discovery now tracks and processes every
+- ✅🔼 Automatic series episode discovery now tracks and processes every
   retained source variant, rather than stopping after the first source on a
   canonical series card. This preserves episode-stream fallbacks when one
   provider supplies multiple variants of the same show, and the progress
   counter now reflects pending sources rather than only canonical titles.
 
-- ✅ The Curation page now notices the automatic handoff from the TMDB-ID
+- ✅🔼 The Curation page now notices the automatic handoff from the TMDB-ID
   metadata pass to provider fallback/series episode work without requiring a
   manual browser refresh. While idle it checks for server-started enrichment
   every 10 seconds, then returns to its existing 2-second live progress
@@ -176,14 +177,14 @@ proposed to the upstream project, the entry links to that pull request —
   Movie writes are now batched (25 per transaction) instead of one write per
   movie. Verified with a full-catalog live dry-run (56,978 movies, 5
   providers, concurrency 8): zero lock errors, zero enrichment errors.
-- ✅ Fixed bulk series enrichment silently under-processing a provider's
+- ✅🔼 Fixed bulk series enrichment silently under-processing a provider's
   series: a newly imported series wasn't selected for that provider's
   enrichment phase until it had already been enriched by that provider at
   least once, which meant series that most needed enrichment could be
   permanently skipped by every bulk run. The per-provider series list now
   uses the provider-membership data recorded at import time instead of
   requiring prior episode data to already exist.
-- ✅ Fixed bulk enrichment's end-of-run duplicate-merge sweep spiking host
+- ✅🔼 Fixed bulk enrichment's end-of-run duplicate-merge sweep spiking host
   CPU to 1200%+ (near-total saturation on a 14-core host) for the duration
   of the sweep. It was launching one background thread per affected title
   instead of merging sequentially, which added no real speed (every merge
@@ -191,13 +192,13 @@ proposed to the upstream project, the entry links to that pull request —
   thread-scheduling overhead at full-catalog scale. Merges now run
   sequentially in a single background task; total merge sweep work is
   unchanged, just without the thread pile-up.
-- ✅ Fixed a provider's bulk series-enrichment lane also fetching series
+- ✅🔼 Fixed a provider's bulk series-enrichment lane also fetching series
   metadata from OTHER providers whenever a series was carried by more than
   one provider (e.g. matched by name/year across two catalogs). This
   weakened each provider's intended request/concurrency isolation and
   backoff handling during a bulk run. Each provider's lane now fetches only
   its own series source.
-- ✅ Bulk enrichment now serializes every movie/series database write for
+- ✅🔼 Bulk enrichment now serializes every movie/series database write for
   the whole run through one background writer task instead of each
   provider's movie or series phase independently reaching its own
   batch-commit point. Since different providers' phases run concurrently by
@@ -205,7 +206,7 @@ proposed to the upstream project, the entry links to that pull request —
   instant; now only one write is ever in flight at a time, regardless of
   how many provider lanes are enriching concurrently. Single/on-demand
   enrich calls outside a bulk run are unaffected.
-- ✅ Pooled per-provider HTTP connections are now explicitly closed at
+- ✅🔼 Pooled per-provider HTTP connections are now explicitly closed at
   application shutdown, and whenever a provider is deleted or its connection
   settings (base URL, username/password, custom user agent) change. Before,
   a stale pooled connection could keep being reused under old credentials
@@ -214,7 +215,7 @@ proposed to the upstream project, the entry links to that pull request —
 
 ## 2026-09-13
 
-- ✅ Fixed a regression (introduced earlier today) where the automatic
+- ✅🔼 Fixed a regression (introduced earlier today) where the automatic
   TMDB-ID merge could merge a movie or series with its different-language
   sibling (e.g. an EN card and its ES card) whenever that other language
   wasn't in your enabled playback languages. This is what was causing the
@@ -224,7 +225,8 @@ proposed to the upstream project, the entry links to that pull request —
   incorrectly merged by this bug is not automatically un-merged; use the
   Duplicate Finder / language-split maintenance tool to split any titles
   that still show up mixed-language after updating.
-- ✅ Movies/series whose content isn't in any of your enabled playback
+  ([#21](https://github.com/jstevenscl/vod-manager/pull/21))
+- ✅🔼 Movies/series whose content isn't in any of your enabled playback
   languages are now automatically archived (not deleted) instead of just
   quietly hidden from playback while still showing up everywhere else.
   This is a one-time catch-up for anyone who was already running before
@@ -233,43 +235,52 @@ proposed to the upstream project, the entry links to that pull request —
   provider scan; re-enabling a language later automatically un-archives
   anything that qualifies again. A title you've manually archived or
   unarchived yourself is never touched by this.
-- ✅🔀 Movies and series that end up sharing the same TMDB ID after enrichment
+  ([#22](https://github.com/jstevenscl/vod-manager/pull/22))
+- ✅🔼 Movies and series that end up sharing the same TMDB ID after enrichment
   are now merged automatically, instead of sitting side-by-side as duplicates
   until someone merges them by hand in the Duplicate Finder.
   ([#20](https://github.com/jstevenscl/vod-manager/pull/20))
-- ✅🔀 Series metadata lookups can now fail over between multiple providers
+- ✅🔼 Series metadata lookups can now fail over between multiple providers
   instead of giving up when the primary provider doesn't have a match, the
   same way movie lookups already could.
   ([#19](https://github.com/jstevenscl/vod-manager/pull/19))
 
 ## 2026-09-10
 
-- ✅ Fixed a crash (`FOREIGN KEY constraint failure`) that could occur when
+- ✅🔼 Fixed a crash (`FOREIGN KEY constraint failure`) that could occur when
   auto-merge encountered a cycle of duplicate rows all sharing the same TMDB
   ID during a batch merge.
-- ✅ Fixed archived movies/series occasionally re-appearing in normal category
+  ([#18](https://github.com/jstevenscl/vod-manager/pull/18))
+- ✅🔼 Fixed archived movies/series occasionally re-appearing in normal category
   listings after being archived.
+  ([#17](https://github.com/jstevenscl/vod-manager/pull/17))
 
 ## 2026-09-09 – 2026-09-10
 
-- ✅ Duplicate Finder: fixed matches being missed when one of the two
+- ✅🔼 Duplicate Finder: fixed matches being missed when one of the two
   candidate rows has no release year, and fixed a blank `()` showing in the
   UI when a candidate has no year.
-- ✅ Duplicate Finder: improved name normalization to correctly strip
+  ([#16](https://github.com/jstevenscl/vod-manager/pull/16))
+- ✅🔼 Duplicate Finder: improved name normalization to correctly strip
   language/quality prefixes (e.g. `FR -`, `RU -`) and country suffixes before
   comparing titles, so more real duplicates are found and fewer false
   positives are flagged.
-- ✅ Fixed a rare false-archive of French/Russian-prefixed titles caused by
+  ([#16](https://github.com/jstevenscl/vod-manager/pull/16))
+- ✅🔼 Fixed a rare false-archive of French/Russian-prefixed titles caused by
   the dash-prefix detector, and added a guard against hitting TMDB's rate
   limit during bulk lookups.
+  ([#14](https://github.com/jstevenscl/vod-manager/pull/14))
 
 ## 2026-09-08
 
-- ✅ Added a "Bulk Apply TMDB Titles" action, plus better progress/resume
+- ✅🔼 Added a "Bulk Apply TMDB Titles" action, plus better progress/resume
   visibility and clearer error reporting during bulk operations.
-- ✅ Raised TMDB year-lookup concurrency for faster bulk enrichment.
-- ✅ Fixed high CPU usage during import and improved movie/series duplicate
+  ([#13](https://github.com/jstevenscl/vod-manager/pull/13))
+- ✅🔼 Raised TMDB year-lookup concurrency for faster bulk enrichment.
+  ([#12](https://github.com/jstevenscl/vod-manager/pull/12))
+- ✅🔼 Fixed high CPU usage during import and improved movie/series duplicate
   matching accuracy.
+  ([#11](https://github.com/jstevenscl/vod-manager/pull/11))
 - ✅ Reused persistent HTTP connections for provider/TMDB calls, raised TMDB
   request concurrency further, and added automatic backoff when TMDB starts
   rate-limiting.
