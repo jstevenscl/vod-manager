@@ -624,7 +624,60 @@ async def import_provider_catalog(provider_id: int) -> dict:
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
         raise
     _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+    schedule_known_series_identity_reconciliation()
     return result
+
+
+_KNOWN_SERIES_IDENTITY_TASK: asyncio.Task | None = None
+
+
+async def reconcile_known_series_identities(concurrency: int = 8) -> None:
+    """Resolve provider-omitted TV years from already-known TMDB IDs.
+
+    This runs separately from provider episode discovery, so it adds no
+    per-series provider traffic and does not stamp episode metadata fresh.
+    """
+    pending = await asyncio.to_thread(vod_db.list_known_series_missing_year)
+    by_tmdb_id: dict[str, list[int]] = {}
+    for series in pending:
+        by_tmdb_id.setdefault(str(series["tmdb_id"]), []).append(series["id"])
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for tmdb_id in by_tmdb_id:
+        queue.put_nowait(tmdb_id)
+    resolved: list[dict] = []
+
+    async def worker() -> None:
+        while True:
+            try:
+                tmdb_id = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            detail = await tmdb_sync.get_tv_identity(tmdb_id)
+            if not detail:
+                continue
+            name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+            fields = {
+                "name": vod_db.apply_rules_to_value(detail["name"], name_rules),
+                "year": detail["year"],
+                "needs_year_review": 0,
+            }
+            if detail.get("content_rating"):
+                fields["content_rating"] = detail["content_rating"]
+            for series_id in by_tmdb_id[tmdb_id]:
+                resolved.append({"series_id": series_id, "fields": fields})
+
+    await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(by_tmdb_id) or 1))))
+    await asyncio.to_thread(vod_db.apply_series_tmdb_identity_batch, resolved)
+    await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
+
+
+def schedule_known_series_identity_reconciliation() -> bool:
+    """Run one background provider-free identity pass after an import."""
+    global _KNOWN_SERIES_IDENTITY_TASK
+    if _KNOWN_SERIES_IDENTITY_TASK and not _KNOWN_SERIES_IDENTITY_TASK.done():
+        return False
+    _KNOWN_SERIES_IDENTITY_TASK = asyncio.create_task(reconcile_known_series_identities())
+    return True
 
 
 async def _import_provider_catalog_impl(provider_id: int) -> dict:
@@ -1414,6 +1467,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         # returned).
         await write_queue.put(None)
         await writer_task
+        await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
     finally:
         if not writer_task.done():
             writer_task.cancel()
