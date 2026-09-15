@@ -3141,6 +3141,114 @@ def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphan
         )
 
 
+# KNM: added 2026-09-14 -- catalog imports previously only upserted sources,
+# so content silently removed by a provider remained playable indefinitely.
+def reconcile_provider_catalog_sources(
+    provider_id: int,
+    *,
+    seen_movie_stream_ids: set[str],
+    seen_series_ids: set[str],
+) -> dict[str, int]:
+    """Remove this provider's sources absent from a successful full catalog.
+
+    The caller must pass IDs from the provider's raw catalog responses, before
+    import filtering.  That distinction prevents a source excluded by a local
+    language/category policy from being confused with one the provider no
+    longer advertises.  Canonical movies and series remain intact whenever
+    another provider still supplies a playable source.
+    """
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            movie_rows = conn.execute(
+                "SELECT id, movie_id, provider_stream_id FROM movie_sources WHERE provider_id=?",
+                (provider_id,),
+            ).fetchall()
+            stale_movie_rows = [row for row in movie_rows if row["provider_stream_id"] not in seen_movie_stream_ids]
+
+            series_rows = conn.execute(
+                "SELECT series_id, provider_series_id FROM series_sources WHERE provider_id=?",
+                (provider_id,),
+            ).fetchall()
+            stale_series_rows = [row for row in series_rows if row["provider_series_id"] not in seen_series_ids]
+
+            for start in range(0, len(stale_movie_rows), 900):
+                source_ids = [row["id"] for row in stale_movie_rows[start:start + 900]]
+                conn.execute(
+                    f"DELETE FROM movie_sources WHERE id IN ({','.join('?' * len(source_ids))})",
+                    source_ids,
+                )
+
+            stale_series_by_id: dict[int, set[str]] = {}
+            for row in stale_series_rows:
+                stale_series_by_id.setdefault(row["series_id"], set()).add(row["provider_series_id"])
+            for start in range(0, len(stale_series_rows), 900):
+                series_ids = [row["provider_series_id"] for row in stale_series_rows[start:start + 900]]
+                conn.execute(
+                    f"DELETE FROM series_sources WHERE provider_id=? AND provider_series_id IN ({','.join('?' * len(series_ids))})",
+                    (provider_id, *series_ids),
+                )
+
+            # episode_sources identify their provider but not the parent
+            # provider_series_id.  Remove them only when the provider no
+            # longer advertises *any* source for that canonical series; a
+            # retained sibling source may still be the origin of those rows.
+            series_without_provider_source = [
+                series_id for series_id in stale_series_by_id
+                if not conn.execute(
+                    "SELECT 1 FROM series_sources WHERE series_id=? AND provider_id=? LIMIT 1",
+                    (series_id, provider_id),
+                ).fetchone()
+            ]
+            episode_source_ids: list[int] = []
+            affected_episode_ids: set[int] = set()
+            for start in range(0, len(series_without_provider_source), 900):
+                ids = series_without_provider_source[start:start + 900]
+                rows = conn.execute(
+                    f"SELECT es.id, es.episode_id FROM episode_sources es "
+                    f"JOIN episodes e ON e.id=es.episode_id "
+                    f"WHERE es.provider_id=? AND e.series_id IN ({','.join('?' * len(ids))})",
+                    (provider_id, *ids),
+                ).fetchall()
+                episode_source_ids.extend(row["id"] for row in rows)
+                affected_episode_ids.update(row["episode_id"] for row in rows)
+            for start in range(0, len(episode_source_ids), 900):
+                ids = episode_source_ids[start:start + 900]
+                conn.execute(f"DELETE FROM episode_sources WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+            for movie_id in {row["movie_id"] for row in stale_movie_rows}:
+                _purge_if_sourceless_movie(conn, movie_id)
+            for episode_id in affected_episode_ids:
+                _purge_if_sourceless_episode(conn, episode_id)
+            for series_id in stale_series_by_id:
+                remaining_source = conn.execute(
+                    "SELECT provider_id, provider_series_id FROM series_sources "
+                    "WHERE series_id=? ORDER BY last_seen_at DESC LIMIT 1",
+                    (series_id,),
+                ).fetchone()
+                if remaining_source:
+                    # A retained source is enough to keep a series that has
+                    # not had episode discovery run yet.  If the vanished
+                    # provider was still the legacy detail pointer, repoint
+                    # it at the surviving source for compatibility.
+                    conn.execute(
+                        "UPDATE series SET import_provider_id=?, import_provider_series_id=? "
+                        "WHERE id=? AND import_provider_id=?",
+                        (remaining_source["provider_id"], remaining_source["provider_series_id"], series_id, provider_id),
+                    )
+                else:
+                    _purge_if_sourceless_series(conn, series_id, orphaned_provider_id=provider_id)
+
+            _commit_with_retry(conn)
+            return {
+                "movie_sources_removed": len(stale_movie_rows),
+                "series_sources_removed": len(stale_series_rows),
+                "episode_sources_removed": len(episode_source_ids),
+            }
+        finally:
+            conn.close()
+
+
 def delete_provider(provider_id: int) -> None:
     """Hard delete. movie_sources/episode_sources for this provider cascade
     via FK (ON DELETE CASCADE). Anything left with zero sources from any

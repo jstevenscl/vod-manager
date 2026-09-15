@@ -545,7 +545,7 @@ class XCProviderClient:
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-) -> tuple[dict, int]:
+) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     streams = await client.get_vod_streams()
     fetch_elapsed = time.time() - fetch_started
@@ -600,13 +600,16 @@ async def _import_movies_for_provider(
         "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
         provider["name"], movie_result, fetch_elapsed, db_elapsed, len(streams),
     )
-    return movie_result, len(streams)
+    # Keep this raw snapshot separate from movie_items.  movie_items is
+    # intentionally filtered by local language/category policy, while source
+    # reconciliation needs to know what the provider actually advertised.
+    return movie_result, len(streams), {str(stream["stream_id"]) for stream in streams}
 
 
 async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-) -> tuple[dict, int]:
+) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     series_list = await client.get_series()
     fetch_elapsed = time.time() - fetch_started
@@ -661,7 +664,9 @@ async def _import_series_for_provider(
         "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
         provider["name"], series_result, fetch_elapsed, db_elapsed, len(series_list),
     )
-    return series_result, len(series_list)
+    # See _import_movies_for_provider: source presence is based on the raw
+    # provider snapshot, never the locally filtered import payload.
+    return series_result, len(series_list), {str(series["series_id"]) for series in series_list}
 
 
 async def import_provider_catalog(provider_id: int) -> dict:
@@ -719,14 +724,34 @@ async def import_provider_catalog(provider_id: int) -> dict:
     # tables) rather than trying to make one shared lock fair -- not worth
     # the added complexity unless this import path is ever shown to be a
     # real bottleneck for someone.
-    movie_result, streams_total = await _import_movies_for_provider(
+    movie_result, streams_total, seen_movie_stream_ids = await _import_movies_for_provider(
         client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized,
     )
-    series_result, series_total = await _import_series_for_provider(
+    series_result, series_total, seen_series_ids = await _import_series_for_provider(
         client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized,
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)
+
+    # Both list calls completed successfully, so these are authoritative full
+    # catalog snapshots.  Remove only this provider's source rows that are no
+    # longer advertised; canonical records survive whenever another provider
+    # still has a source.  Do this before post-import enrichment so stale
+    # sources cannot be selected as fallback work.
+    reconcile_result = await asyncio.to_thread(
+        vod_db.reconcile_provider_catalog_sources,
+        provider_id,
+        seen_movie_stream_ids=seen_movie_stream_ids,
+        seen_series_ids=seen_series_ids,
+    )
+    if any(reconcile_result.values()):
+        logger.info(
+            "[vod_importer] provider=%s reconciled %d stale movie source(s), %d stale series source(s), %d stale episode source(s)",
+            provider["name"],
+            reconcile_result["movie_sources_removed"],
+            reconcile_result["series_sources_removed"],
+            reconcile_result["episode_sources_removed"],
+        )
 
     # Companion cleanup to the skip-at-import filtering above: content that
     # was imported-then-archived under the old behavior (before this
