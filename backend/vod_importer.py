@@ -506,9 +506,14 @@ async def _import_movies_for_provider(
                 s.get("stream_icon") or s.get("cover") or
                 s.get("cover_big") or s.get("movie_image") or None
             ),
+            # Some XC panels' bulk movie list already includes a trailer URL
+            # under one of these two field names -- captured for free here,
+            # same reasoning as poster_url above. See apply_provider_trailers.
+            "trailer": s.get("trailer") or s.get("youtube_trailer"),
         })
     db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
+    await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "movie", movie_items)
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
@@ -569,9 +574,12 @@ async def _import_series_for_provider(
             # enrich_series's identical comment for why both need checking.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
             "provider_last_modified": s.get("last_modified") or None,
+            # See movie_items' identical trailer field above.
+            "trailer": s.get("trailer") or s.get("youtube_trailer"),
         })
     db_started = time.time()
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
+    await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "series", series_items)
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
@@ -585,14 +593,58 @@ async def _import_series_for_provider(
 # a job -- same in-process/single-instance rationale as _ENRICH_PROGRESS
 # above.
 _IMPORT_PROGRESS: dict = {
-    "running": False, "provider_id": None, "provider_name": None,
+    "running": False, "queued": False, "queue_position": None,
+    "provider_id": None, "provider_name": None,
     "started_at": None, "finished_at": None, "error": None,
 }
+# SQLite has a single writer and catalog preparation itself is expensive --
+# this makes periodic and manual XC imports wait their turn rather than
+# competing for the writer and starving normal API reads (found live
+# 2026-09-15/16: concurrent imports were the dominant source of the
+# "database is locked" contention this session's write-lock audit fixed).
+_XC_IMPORT_LOCK = asyncio.Lock()
 _CPU_SAMPLE: tuple[float, float] | None = None
 
 
 def get_import_progress() -> dict:
     return dict(_IMPORT_PROGRESS)
+
+
+def mark_import_queued(provider_id: int, provider_name: str, queue_position: int) -> None:
+    """Expose a queued manual import before its worker starts it (see
+    vod_routes._manual_import_worker)."""
+    _IMPORT_PROGRESS.update({
+        "running": False, "queued": True, "queue_position": queue_position,
+        "provider_id": provider_id, "provider_name": provider_name,
+        "started_at": None, "finished_at": None, "error": None,
+    })
+
+
+def mark_import_running(provider_id: int, provider_name: str) -> None:
+    """Expose a non-XC manual import while its provider adapter is running.
+
+    XC imports update this state inside import_provider_catalog itself.
+    Plex/Emby/Jellyfin/DVR imports use different adapters that don't touch
+    _IMPORT_PROGRESS at all, so vod_routes._run_provider_catalog_import
+    marks their queued -> running transition here instead of leaving the
+    sidebar stuck on "queued" for the whole import."""
+    _IMPORT_PROGRESS.update({
+        "running": True, "queued": False, "queue_position": None,
+        "provider_id": provider_id, "provider_name": provider_name,
+        "started_at": time.time(), "finished_at": None, "error": None,
+    })
+
+
+def mark_import_finished(provider_id: int, error: str | None = None) -> None:
+    """Finish a non-XC manual import without clobbering a newer job's state
+    (e.g. the queue worker already moved on to the next provider by the
+    time this one's cleanup runs)."""
+    if _IMPORT_PROGRESS.get("provider_id") != provider_id:
+        return
+    _IMPORT_PROGRESS.update({
+        "running": False, "queued": False, "queue_position": None,
+        "finished_at": time.time(), "error": error,
+    })
 
 
 def get_process_cpu_percent() -> float | None:
@@ -615,23 +667,37 @@ def get_process_cpu_percent() -> float | None:
         return None
 
 
-async def import_provider_catalog(provider_id: int) -> dict:
+async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool = True) -> dict:
     """Runs one XC catalog import and exposes its lifecycle to the UI (see
     get_import_progress) -- the actual work is _import_provider_catalog_impl,
-    unchanged below; this wrapper only tracks start/finish/error state."""
+    unchanged below; this wrapper only tracks start/finish/error state.
+
+    _XC_IMPORT_LOCK serializes concurrent XC imports (periodic refresher +
+    a manual queue drain can otherwise overlap) so they queue in-process
+    instead of racing SQLite's single writer.
+
+    schedule_enrichment=False (vod_routes' manual-import queue, and
+    main.py's catalog refresher looping over several due providers) defers
+    the post-import identity reconciliation pass until every provider in
+    that batch has landed, instead of firing it once per provider and
+    having each new pass compete with the next provider's import for the
+    same writer."""
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
-    _IMPORT_PROGRESS.update({
-        "running": True, "provider_id": provider_id,
-        "provider_name": provider.get("name") if provider else f"provider {provider_id}",
-        "started_at": time.time(), "finished_at": None, "error": None,
-    })
-    try:
-        result = await _import_provider_catalog_impl(provider_id)
-    except Exception as exc:
-        _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
-        raise
-    _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
-    schedule_known_series_identity_reconciliation()
+    async with _XC_IMPORT_LOCK:
+        _IMPORT_PROGRESS.update({
+            "running": True, "queued": False, "queue_position": None,
+            "provider_id": provider_id,
+            "provider_name": provider.get("name") if provider else f"provider {provider_id}",
+            "started_at": time.time(), "finished_at": None, "error": None,
+        })
+        try:
+            result = await _import_provider_catalog_impl(provider_id)
+        except Exception as exc:
+            _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
+            raise
+        _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+    if schedule_enrichment:
+        schedule_known_series_identity_reconciliation()
     return result
 
 
@@ -679,7 +745,27 @@ async def _reconcile_known_series_identities_impl(concurrency: int) -> None:
                 tmdb_id = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            detail = await tmdb_sync.get_tv_identity(tmdb_id)
+            try:
+                detail = await tmdb_sync.get_tv_identity(tmdb_id)
+            except tmdb_sync.TmdbNotFoundError:
+                # See enrich_movie's identical handling -- a confirmed-bad
+                # stored id, surfaced in the Incorrect TMDB ID review queue
+                # for every series sharing it, not just silently skipped.
+                # Per-item try/except (same reasoning as
+                # _enrich_one_series_source's record_series_source_failure
+                # guard): this write can still occasionally hit 'database is
+                # locked' under sustained heavy load, and one id's failure
+                # here shouldn't take down every other worker/id still being
+                # processed by this same reconciliation pass.
+                for series_id in by_tmdb_id[tmdb_id]:
+                    try:
+                        await asyncio.to_thread(vod_db.record_tmdb_lookup_failure, "series", series_id, tmdb_id)
+                    except Exception:
+                        logger.exception(
+                            "[reconcile_known_series_identities] failed to record tmdb lookup failure "
+                            "for series_id=%s tmdb_id=%s", series_id, tmdb_id,
+                        )
+                continue
             if not detail:
                 continue
             name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
@@ -692,6 +778,7 @@ async def _reconcile_known_series_identities_impl(concurrency: int) -> None:
                 fields["content_rating"] = detail["content_rating"]
             for series_id in by_tmdb_id[tmdb_id]:
                 resolved.append({"series_id": series_id, "fields": fields})
+                await asyncio.to_thread(vod_db.clear_tmdb_lookup_failure, "series", series_id)
 
     await asyncio.gather(*(worker() for _ in range(min(max(1, concurrency), len(by_tmdb_id) or 1))))
     await asyncio.to_thread(vod_db.apply_series_tmdb_identity_batch, resolved)
@@ -1036,7 +1123,34 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
     movie_row = await asyncio.to_thread(vod_db.get_movie, movie_id)
     existing_tmdb_id = movie_row.get("tmdb_id") if movie_row else None
     if existing_tmdb_id:
-        tmdb_detail = await tmdb_sync.get_movie_full_details(existing_tmdb_id)
+        try:
+            tmdb_detail = await tmdb_sync.get_movie_full_details(existing_tmdb_id)
+        except tmdb_sync.TmdbNotFoundError:
+            # A confirmed-bad stored id (TMDB itself says it no longer
+            # exists) -- distinct from "lookup failed" below (no key, bad
+            # network, TMDB down), which is silently retryable. Surfaced in
+            # the Incorrect TMDB ID review queue instead of just falling
+            # through to the provider forever.
+            #
+            # Best-effort like _enrich_one_series_source's identical
+            # record_series_source_failure guard: this bookkeeping write is
+            # already _WRITE_LOCK-protected but can still occasionally hit
+            # 'database is locked' under sustained heavy load, and that
+            # secondary failure shouldn't crash the whole enrich call over a
+            # missed queue entry -- the confirmed-bad id is still handled
+            # correctly below (tmdb_detail=None), just not logged to the
+            # review queue this one time.
+            try:
+                await asyncio.to_thread(vod_db.record_tmdb_lookup_failure, "movie", movie_id, existing_tmdb_id)
+            except Exception:
+                logger.exception(
+                    "[enrich_movie] failed to record tmdb lookup failure for movie_id=%s tmdb_id=%s",
+                    movie_id, existing_tmdb_id,
+                )
+            tmdb_detail = None
+        else:
+            if tmdb_detail:
+                await asyncio.to_thread(vod_db.clear_tmdb_lookup_failure, "movie", movie_id)
         if tmdb_detail:
             name_fields = {}
             if tmdb_detail.get("name"):
@@ -1220,9 +1334,25 @@ async def _enrich_one_series_source(
     try:
         info = _as_dict(await client.get_series_info(str(source["provider_series_id"])))
     except Exception:
-        await asyncio.to_thread(
-            vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
-        )
+        # Found live 2026-09-16: record_series_source_failure is already
+        # _WRITE_LOCK-protected, but under sustained heavy concurrent write
+        # load it can still occasionally hit 'database is locked' itself
+        # (the same residual risk documented on _WRITE_LOCK's own
+        # definition) -- that secondary failure, raised while already
+        # handling the provider's own failure, wasn't caught, so it crashed
+        # the whole /enrich/ request with an opaque 500 instead of the
+        # caller ever seeing the real (and much more informative) provider
+        # error. Best-effort: log and move on if the bookkeeping write
+        # itself fails, rather than let it mask the original failure.
+        try:
+            await asyncio.to_thread(
+                vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
+            )
+        except Exception:
+            logger.exception(
+                "[_enrich_one_series_source] failed to record failure for series_id=%s provider_id=%s",
+                series_id, source["provider_id"],
+            )
         return {"fetched": False, "reason": f"get_series_info failed for provider {provider.get('name') or provider['id']}"}
 
     detail = _as_dict(info.get("info"))
@@ -1512,7 +1642,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         )
 
 
-async def resweep_smart_categories() -> None:
+async def resweep_smart_categories(movie_ids: set[int] | None = None, series_ids: set[int] | None = None) -> None:
     """Re-evaluate every smart category with a rule configured (see
     vod_db.list_smart_category_ids_with_rules) so newly imported content
     actually shows up in them without a manual "evaluate" click -- broadened
@@ -1535,17 +1665,35 @@ async def resweep_smart_categories() -> None:
     in a category (vod_db.purge_excluded_from_categories) -- covers an
     install that ran import-time exclusion before that bug was fixed, so
     already-wrongly-placed rows actually get cleaned up here rather than
-    needing a separate one-off action."""
-    try:
-        purge_result = await asyncio.to_thread(vod_db.purge_excluded_from_categories)
-        if purge_result["movies_removed"] or purge_result["series_removed"]:
-            logger.info("[vod_importer] purged already-excluded items from categories: %s", purge_result)
-    except Exception as exc:
-        logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
+    needing a separate one-off action.
+
+    movie_ids/series_ids: optional scoping to just-changed rows for a
+    cheaper delta resweep instead of the full evaluate_smart_category scan
+    -- both None (the default; every current caller passes nothing, same
+    as before this parameter existed) means "full sweep, every current
+    caller's existing behavior unchanged." A caller that knows exactly what
+    changed (e.g. a future provider-delta import path) can pass one or
+    both to scope the sweep down; evaluate_smart_category treats a not-None
+    ids collection as the candidate pool for that content type instead of
+    the whole table. The purge-already-excluded pass only makes sense as a
+    full-pool sweep, so it's skipped for a scoped call."""
+    is_full_sweep = movie_ids is None and series_ids is None
+    if is_full_sweep:
+        try:
+            purge_result = await asyncio.to_thread(vod_db.purge_excluded_from_categories)
+            if purge_result["movies_removed"] or purge_result["series_removed"]:
+                logger.info("[vod_importer] purged already-excluded items from categories: %s", purge_result)
+        except Exception as exc:
+            logger.warning("[vod_importer] purge_excluded_from_categories failed: %s", exc)
 
     for category_id in await asyncio.to_thread(vod_db.list_smart_category_ids_with_rules):
         try:
-            result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
+            if is_full_sweep:
+                ids = None
+            else:
+                category = await asyncio.to_thread(vod_db.get_category, category_id)
+                ids = movie_ids if category and category["content_type"] == "movie" else series_ids
+            result = await asyncio.to_thread(vod_db.evaluate_smart_category, category_id, ids)
             logger.info("[vod_importer] smart category=%s: %s", category_id, result)
         except Exception as exc:
             logger.warning("[vod_importer] smart category=%s failed: %s", category_id, exc)
