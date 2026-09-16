@@ -643,7 +643,27 @@ async def reconcile_known_series_identities(concurrency: int = 8) -> None:
 
     This runs separately from provider episode discovery, so it adds no
     per-series provider traffic and does not stamp episode metadata fresh.
-    """
+
+    Per-item merge failures inside auto_merge_series_tmdb_collisions are
+    already caught there (see auto_merge_series_by_tmdb_batch's docstring),
+    but this whole coroutine only ever runs as a fire-and-forget
+    asyncio.create_task (see schedule_known_series_identity_reconciliation)
+    with nothing else in the app ever awaiting or inspecting it -- an
+    exception that somehow still escapes (list_known_series_missing_year,
+    apply_series_tmdb_identity_batch, or a bug in a future change) would
+    otherwise vanish into Python's default "Task exception was never
+    retrieved" handler, which only logs when the task object itself is
+    later garbage-collected (i.e. whenever the next import happens to
+    replace it) -- easy to miss entirely in production. Caught and logged
+    loudly here instead, found live 2026-09-16 while diagnosing exactly
+    this silence."""
+    try:
+        await _reconcile_known_series_identities_impl(concurrency)
+    except Exception:
+        logger.exception("[reconcile_known_series_identities] pass failed")
+
+
+async def _reconcile_known_series_identities_impl(concurrency: int) -> None:
     pending = await asyncio.to_thread(vod_db.list_known_series_missing_year)
     by_tmdb_id: dict[str, list[int]] = {}
     for series in pending:

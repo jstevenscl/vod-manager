@@ -8671,17 +8671,35 @@ def auto_merge_movies_by_tmdb_batch(movie_ids) -> None:
     bought zero real parallelism -- it only added thread-scheduling and
     per-call _connect() overhead. Looping sequentially in one thread does
     the identical merges in the identical order with none of that
-    overhead."""
+    overhead.
+
+    Per-item try/except (found live 2026-09-16, via auto_merge_series_tmdb_
+    collisions' identical batch below hitting this live): a merge can still
+    hit 'database is locked' under sustained heavy concurrent write load
+    even with _WRITE_LOCK + a 60s busy_timeout -- confirmed via a 20+ minute
+    live test against a real ~160k-row catalog with several providers
+    importing/enriching at once. That's an isolated single-item failure,
+    not a reason to abandon every other id still queued in this batch --
+    the skipped pair simply stays split for now and gets picked up again on
+    the next enrichment cycle that touches either row, same as any other
+    transient miss."""
     for movie_id in movie_ids:
-        auto_merge_movie_by_tmdb(movie_id)
+        try:
+            auto_merge_movie_by_tmdb(movie_id)
+        except Exception:
+            logger.exception("[auto_merge_movies_by_tmdb_batch] skipped movie_id=%s", movie_id)
 
 
 def auto_merge_series_by_tmdb_batch(series_ids) -> None:
     """Series counterpart to auto_merge_movies_by_tmdb_batch -- same
     single-thread-sequential fix for the same per-id asyncio.gather fan-out
-    problem, see that function's docstring."""
+    problem, and the same per-item try/except, see that function's
+    docstring for both."""
     for series_id in series_ids:
-        auto_merge_series_by_tmdb(series_id)
+        try:
+            auto_merge_series_by_tmdb(series_id)
+        except Exception:
+            logger.exception("[auto_merge_series_by_tmdb_batch] skipped series_id=%s", series_id)
 
 
 def auto_merge_series_tmdb_collisions() -> None:
