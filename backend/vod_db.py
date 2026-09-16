@@ -7217,7 +7217,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     sub = ids[i:i + 900]
                     placeholders = ",".join("?" * len(sub))
                     rows = conn.execute(
-                        f"SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                        f"SELECT id, tmdb_id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
                         f"FROM movies WHERE id IN ({placeholders})", sub,
                     ).fetchall()
                     for row in rows:
@@ -7258,7 +7258,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                     sub = names[i:i + 900]
                     placeholders = ",".join("?" * len(sub))
                     rows = conn.execute(
-                        f"SELECT id, name, year, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                        f"SELECT id, name, year, tmdb_id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
                         f"FROM movies WHERE name IN ({placeholders})", sub,
                     ).fetchall()
                     for row in rows:
@@ -7390,7 +7390,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         elif year is None:
                             all_candidates = movies_by_name.get(match_key, [])
                             candidates = [c for c in all_candidates if _movie_language_ok(c["id"], item_lang)]
-                            if len(candidates) == 1:
+                            if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
@@ -7681,7 +7681,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     sub = names[i:i + 900]
                     placeholders = ",".join("?" * len(sub))
                     rows = conn.execute(
-                        f"SELECT id, name, year, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id "
+                        f"SELECT id, name, year, tmdb_id, is_adult, is_adult_manual, review_excluded, review_excluded_manual, import_provider_id "
                         f"FROM series WHERE name IN ({placeholders})", sub,
                     ).fetchall()
                     for row in rows:
@@ -7793,7 +7793,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         elif year is None:
                             all_candidates = series_by_name.get(match_key, [])
                             candidates = [c for c in all_candidates if _series_language_ok(c["id"], item_lang)]
-                            if len(candidates) == 1:
+                            if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 series_id = candidates[0]["id"]
                                 did_match = True
                                 cat_update_needed = source_changed

@@ -21,6 +21,12 @@ included.
 
 ## 2026-09-15
 
+- ✅ Undated cross-provider movie/series cards now inherit a confirmed TMDB
+  identity when exactly one normalized-title candidate already exists in the
+  pool. This prevents a second provider from creating a duplicate Metadata
+  Review row for an already-fixed title; ambiguous candidates remain manual.
+  Regression tests cover both safe inheritance and ambiguity protection.
+
 - ✅🔀 Provider-supplied `trailer`/`youtube_trailer` values are now preserved
   during movie and series imports and exposed through Dispatcharr list/detail
   responses. This avoids unnecessary TMDB/YouTube requests and keeps the
