@@ -364,6 +364,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "tmdb": row.get("tmdb_id") or "",
             "imdb_id": row.get("imdb_id") or "",
             "imdb": row.get("imdb_id") or "",
+            "youtube_trailer": row.get("trailer_key") or "",
         } for i, row in enumerate(rows)]
 
     if action == "get_vod_info":
@@ -395,6 +396,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "is_adult": "1" if row.get("is_adult") else "0",
                 "tmdb_id": row.get("tmdb_id") or "",
                 "imdb_id": row.get("imdb_id") or "",
+                "youtube_trailer": row.get("trailer_key") or "",
             },
             "movie_data": {
                 "stream_id": row["export_stream_id"],
@@ -404,6 +406,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "container_extension": row["container_extension"] or "mp4",
                 "tmdb_id": row.get("tmdb_id") or "",
                 "imdb_id": row.get("imdb_id") or "",
+                "youtube_trailer": row.get("trailer_key") or "",
             },
         }
 
@@ -433,7 +436,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
             "last_modified": str(int(time.time())),
             "category_id": str(row["category_id"]),
             "backdrop_path": [],
-            "youtube_trailer": "",
+            "youtube_trailer": row.get("trailer_key") or "",
             "episode_run_time": "",
             "year": row["year"],
             # See get_vod_streams' identical fields' comment -- without a
@@ -485,6 +488,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "year": row["year"],
                 "tmdb_id": row.get("tmdb_id") or "",
                 "imdb_id": row.get("imdb_id") or "",
+                "youtube_trailer": row.get("trailer_key") or "",
             },
             "episodes": episodes_by_season,
         }

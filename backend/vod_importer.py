@@ -1738,6 +1738,29 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
+async def bulk_enrich_missing_trailers(concurrency: int = 4, limit: int = 100) -> None:
+    """Low-priority TMDB-only trailer pass for known movie/series IDs."""
+    pending = await asyncio.to_thread(vod_db.list_pending_trailer_enrichment, limit)
+    if not pending:
+        return
+    sem = asyncio.Semaphore(max(1, concurrency))
+    async def check(item: dict) -> None:
+        async with sem:
+            try:
+                fetch = tmdb_sync.get_movie_trailer if item["content_type"] == "movie" else tmdb_sync.get_tv_trailer
+                result = await fetch(str(item["tmdb_id"]))
+                trailer = result.get("trailer") if result.get("ok") else None
+                await asyncio.to_thread(
+                    vod_db.record_trailer_result, item["content_type"], item["id"],
+                    key=trailer.get("key") if trailer else None,
+                    site=trailer.get("site") if trailer else None,
+                    error=None if result.get("ok") else result.get("error"),
+                )
+            except Exception as exc:
+                await asyncio.to_thread(vod_db.record_trailer_result, item["content_type"], item["id"], error=str(exc))
+    await asyncio.gather(*(check(item) for item in pending))
+
+
 async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
     """Run provider-free identity enrichment before provider-only fallback."""
     try:
@@ -1751,6 +1774,9 @@ async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> Non
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Enriching details and reconciling duplicates")
         await bulk_enrich_all(pending_only=True)
+        if track_catalog_workflow:
+            _set_catalog_workflow_phase("Checking available trailers")
+        await bulk_enrich_missing_trailers()
         if track_catalog_workflow:
             mark_catalog_workflow_ready()
     except Exception:

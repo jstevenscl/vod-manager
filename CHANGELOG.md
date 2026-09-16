@@ -21,6 +21,16 @@ included.
 
 ## 2026-09-15
 
+- ✅ TMDB trailer availability is now captured without any provider requests.
+  Known movie and series IDs receive the YouTube trailer key from the existing
+  TMDB detail call when available; older known IDs use a bounded low-priority
+  videos-only pass. Results are stored as found, temporary error, first
+  no-result retry, or confirmed absence after two no-result checks, including
+  the last checked time and failure reason. Dispatcharr movie and series list
+  and detail responses now expose the saved `youtube_trailer` key. Synthetic
+  regression fixtures covered movie success, series failure recording, retry,
+  and confirmed-no-trailer behavior (16 focused regression tests passed).
+
 - ✅ Provider imports now have one shared **Catalog workflow** handoff instead
   of leaving people to infer readiness from separate progress bars. The
   centered header advances through queued import, TMDB identity resolution,

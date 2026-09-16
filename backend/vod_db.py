@@ -97,7 +97,13 @@ def init_db() -> None:
             is_adult_manual INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT,
-            last_enriched_at TEXT
+            last_enriched_at TEXT,
+            trailer_key TEXT,
+            trailer_site TEXT,
+            trailer_status TEXT NOT NULL DEFAULT 'unknown',
+            trailer_attempts INTEGER NOT NULL DEFAULT 0,
+            trailer_checked_at TEXT,
+            trailer_last_error TEXT
         );
 
         CREATE TABLE IF NOT EXISTS movie_sources (
@@ -140,7 +146,13 @@ def init_db() -> None:
             last_enriched_at TEXT,
             -- Separate from provider episode/detail enrichment: this marks
             -- that the canonical TMDB record has supplied the visible title.
-            tmdb_metadata_enriched_at TEXT
+            tmdb_metadata_enriched_at TEXT,
+            trailer_key TEXT,
+            trailer_site TEXT,
+            trailer_status TEXT NOT NULL DEFAULT 'unknown',
+            trailer_attempts INTEGER NOT NULL DEFAULT 0,
+            trailer_checked_at TEXT,
+            trailer_last_error TEXT
         );
 
         -- Multi-provider support for series, mirroring movie_sources --
@@ -927,10 +939,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
     NOT EXISTS above only helps fresh databases."""
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
+        ("movies", "trailer_key", "TEXT"),
+        ("movies", "trailer_site", "TEXT"),
+        ("movies", "trailer_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("movies", "trailer_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "trailer_checked_at", "TEXT"),
+        ("movies", "trailer_last_error", "TEXT"),
         ("movies", "cast_list", "TEXT"),
         ("movies", "director", "TEXT"),
         ("movies", "country", "TEXT"),
         ("series", "last_enriched_at", "TEXT"),
+        ("series", "trailer_key", "TEXT"),
+        ("series", "trailer_site", "TEXT"),
+        ("series", "trailer_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("series", "trailer_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "trailer_checked_at", "TEXT"),
+        ("series", "trailer_last_error", "TEXT"),
         ("series", "cast_list", "TEXT"),
         ("series", "director", "TEXT"),
         ("series", "country", "TEXT"),
@@ -5307,6 +5331,54 @@ def list_series_pending_tmdb_metadata_enrichment() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_pending_trailer_enrichment(limit: int = 100) -> list[dict]:
+    """Return a bounded, provider-free queue for known identities.
+
+    A missing trailer is retried once; confirmed absences are permanently
+    quiet until a future explicit force operation clears the status.
+    """
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT 'movie' AS content_type, id, tmdb_id FROM movies
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> '' AND is_adult=0
+          AND review_excluded=0 AND trailer_status IN ('unknown', 'not_found', 'error')
+          AND trailer_attempts < 2
+        UNION ALL
+        SELECT 'series' AS content_type, id, tmdb_id FROM series
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> '' AND is_adult=0
+          AND review_excluded=0 AND trailer_status IN ('unknown', 'not_found', 'error')
+          AND trailer_attempts < 2
+        ORDER BY content_type, id LIMIT ?
+    """, (max(1, int(limit)),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_trailer_result(content_type: str, item_id: int, *, key: str | None = None,
+                          site: str | None = None, error: str | None = None) -> None:
+    """Persist a found, absent, or failed trailer check without provider I/O."""
+    table = "movies" if content_type == "movie" else "series"
+    with _WRITE_LOCK:
+        conn = _connect()
+        row = conn.execute(f"SELECT trailer_attempts FROM {table} WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            conn.close(); return
+        attempts = int(row["trailer_attempts"] or 0) + 1
+        if key:
+            status, last_error = "found", None
+        elif error:
+            status, last_error = "error", str(error)[:500]
+        else:
+            status = "confirmed_none" if attempts >= 2 else "not_found"
+            last_error = "TMDB returned no YouTube trailer or teaser"
+        conn.execute(f"""UPDATE {table}
+            SET trailer_key=?, trailer_site=?, trailer_status=?, trailer_attempts=?,
+                trailer_checked_at=?, trailer_last_error=?, updated_at=? WHERE id=?""",
+            (key, site or ("YouTube" if key else None), status, attempts, _now(), last_error, _now(), item_id))
+        _commit_with_retry(conn)
+        conn.close()
+
+
 def list_movie_ids_pending_provider_enrichment(provider_id: int | None = None) -> list[int]:
     """New movies with no imported TMDB identity left for provider fallback."""
     conn = _connect()
@@ -5905,7 +5977,7 @@ def get_movie_export_rows() -> list[dict]:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
-            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id, m.trailer_key AS trailer_key,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -5970,7 +6042,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
-            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id, m.trailer_key AS trailer_key,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -6834,7 +6906,7 @@ def get_series_export_rows() -> list[dict]:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
-            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id, s.trailer_key AS trailer_key,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -6854,7 +6926,7 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
-            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id, s.trailer_key AS trailer_key,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
