@@ -30,6 +30,9 @@ included.
   and detail responses now expose the saved `youtube_trailer` key. Synthetic
   regression fixtures covered movie success, series failure recording, retry,
   and confirmed-no-trailer behavior (16 focused regression tests passed).
+  Trailer backfill now continues as a fair movie/series trickle in the
+  background for up to two hours after catalog readiness, rather than making
+  one front-loaded batch or delaying review.
 
 - ✅ Provider imports now have one shared **Catalog workflow** handoff instead
   of leaving people to infer readiness from separate progress bars. The

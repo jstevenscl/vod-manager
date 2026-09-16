@@ -1608,6 +1608,7 @@ _TMDB_ENRICH_PROGRESS: dict = {
     "started_at": None, "finished_at": None,
 }
 _POST_IMPORT_ENRICH_TASK: asyncio.Task | None = None
+_TRAILER_TRICKLE_TASK: asyncio.Task | None = None
 
 
 def get_tmdb_enrich_progress() -> dict:
@@ -1761,6 +1762,18 @@ async def bulk_enrich_missing_trailers(concurrency: int = 4, limit: int = 100) -
     await asyncio.gather(*(check(item) for item in pending))
 
 
+async def _trickle_missing_trailers(max_seconds: int = 2 * 60 * 60) -> None:
+    """Continue trailer checks after catalog readiness at a bounded pace."""
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+        before = time.monotonic()
+        await bulk_enrich_missing_trailers(concurrency=4, limit=40)
+        if time.monotonic() - before < 1.0:
+            await asyncio.sleep(0.5)
+        if not await asyncio.to_thread(vod_db.list_pending_trailer_enrichment, 1):
+            break
+
+
 async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
     """Run provider-free identity enrichment before provider-only fallback."""
     try:
@@ -1776,7 +1789,9 @@ async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> Non
         await bulk_enrich_all(pending_only=True)
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Checking available trailers")
-        await bulk_enrich_missing_trailers()
+        global _TRAILER_TRICKLE_TASK
+        if not _TRAILER_TRICKLE_TASK or _TRAILER_TRICKLE_TASK.done():
+            _TRAILER_TRICKLE_TASK = asyncio.create_task(_trickle_missing_trailers())
         if track_catalog_workflow:
             mark_catalog_workflow_ready()
     except Exception:

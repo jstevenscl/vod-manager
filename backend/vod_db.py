@@ -5338,18 +5338,23 @@ def list_pending_trailer_enrichment(limit: int = 100) -> list[dict]:
     quiet until a future explicit force operation clears the status.
     """
     conn = _connect()
+    per_type = max(1, int(limit) // 2)
     rows = conn.execute("""
+        SELECT * FROM (
         SELECT 'movie' AS content_type, id, tmdb_id FROM movies
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> '' AND is_adult=0
           AND review_excluded=0 AND trailer_status IN ('unknown', 'not_found', 'error')
-          AND trailer_attempts < 2
+          AND trailer_attempts < 2 ORDER BY id LIMIT ?
+        )
         UNION ALL
+        SELECT * FROM (
         SELECT 'series' AS content_type, id, tmdb_id FROM series
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> '' AND is_adult=0
           AND review_excluded=0 AND trailer_status IN ('unknown', 'not_found', 'error')
-          AND trailer_attempts < 2
-        ORDER BY content_type, id LIMIT ?
-    """, (max(1, int(limit)),)).fetchall()
+          AND trailer_attempts < 2 ORDER BY id LIMIT ?
+        )
+        ORDER BY content_type, id
+    """, (per_type, per_type)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
