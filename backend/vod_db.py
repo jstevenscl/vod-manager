@@ -5384,6 +5384,39 @@ def record_trailer_result(content_type: str, item_id: int, *, key: str | None = 
         conn.close()
 
 
+def apply_provider_trailers(provider_id: int, content_type: str, items: list[dict]) -> int:
+    """Persist trailer values supplied by the provider's catalog response."""
+    if not items:
+        return 0
+    source_table = "movie_sources" if content_type == "movie" else "series_sources"
+    source_id = "provider_stream_id" if content_type == "movie" else "provider_series_id"
+    target_table = "movies" if content_type == "movie" else "series"
+    updated = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        for item in items:
+            trailer = item.get("trailer") or item.get("youtube_trailer")
+            if not trailer:
+                continue
+            trailer = str(trailer).strip()
+            if not trailer:
+                continue
+            row = conn.execute(
+                f"SELECT {('movie_id' if content_type == 'movie' else 'series_id')} AS item_id FROM {source_table} WHERE provider_id=? AND {source_id}=?",
+                (provider_id, str(item.get(source_id) or item.get("provider_stream_id") or item.get("provider_series_id"))),
+            ).fetchone()
+            if not row:
+                continue
+            conn.execute(
+                f"UPDATE {target_table} SET trailer_key=?, trailer_site='provider', trailer_status='found', trailer_attempts=0, trailer_checked_at=?, trailer_last_error=NULL, updated_at=? WHERE id=?",
+                (trailer, _now(), _now(), row["item_id"]),
+            )
+            updated += 1
+        _commit_with_retry(conn)
+        conn.close()
+    return updated
+
+
 def list_movie_ids_pending_provider_enrichment(provider_id: int | None = None) -> list[int]:
     """New movies with no imported TMDB identity left for provider fallback."""
     conn = _connect()

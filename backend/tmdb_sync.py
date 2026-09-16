@@ -358,7 +358,7 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
         async with _tmdb_semaphore:
             r = await _tmdb_get(
                 f"{_API_BASE}/movie/{tmdb_id}",
-                params={"api_key": api_key, "append_to_response": "credits,release_dates,videos"},
+                params={"api_key": api_key, "append_to_response": "credits,release_dates"},
             )
         r.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -377,7 +377,6 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
     )
     cast = [c["name"] for c in data.get("credits", {}).get("cast", [])[:10]]
     runtime = data.get("runtime")
-    trailer = _select_youtube_trailer(data)
     return {
         "name": data.get("title") or None,
         "genre": ", ".join(g["name"] for g in data.get("genres", [])) or None,
@@ -390,9 +389,6 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
         "rating": data.get("vote_average") or None,
         "release_date": data.get("release_date") or None,
         "content_rating": _extract_us_movie_certification(data),
-        "trailer_key": trailer["key"] if trailer else None,
-        "trailer_site": trailer["site"] if trailer else None,
-        "trailer_checked": True,
     }
 
 
@@ -455,7 +451,7 @@ async def get_tv_full_details(tmdb_id: str) -> dict | None:
         async with _tmdb_semaphore:
             response = await _tmdb_get(
                 f"{_API_BASE}/tv/{tmdb_id}",
-                params={"api_key": api_key, "append_to_response": "content_ratings,videos"},
+                params={"api_key": api_key, "append_to_response": "content_ratings"},
             )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -477,7 +473,6 @@ async def get_tv_full_details(tmdb_id: str) -> dict | None:
             break
     first_air_date = data.get("first_air_date") or None
     year = int(first_air_date[:4]) if first_air_date and first_air_date[:4].isdigit() else None
-    trailer = _select_youtube_trailer(data)
     return {
         "name": title,
         "content_rating": content_rating,
@@ -486,47 +481,7 @@ async def get_tv_full_details(tmdb_id: str) -> dict | None:
         # to callers too, but the pool's canonical identity uses its year.
         "first_air_date": first_air_date,
         "year": year,
-        "trailer_key": trailer["key"] if trailer else None,
-        "trailer_site": trailer["site"] if trailer else None,
-        "trailer_checked": True,
     }
-
-
-def _select_youtube_trailer(data: dict) -> dict | None:
-    """Choose one stable YouTube trailer key from TMDB's video payload."""
-    videos = (data.get("videos") or {}).get("results") or []
-    candidates = [v for v in videos if str(v.get("site", "")).lower() == "youtube" and v.get("key")]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda v: (
-        0 if v.get("official") else 1,
-        0 if str(v.get("type", "")).lower() == "trailer" else 1,
-        0 if str(v.get("type", "")).lower() == "teaser" else 1,
-    ))
-    winner = candidates[0]
-    return {"key": str(winner["key"]), "site": "YouTube"}
-
-
-async def _get_videos(tmdb_type: str, tmdb_id: str) -> dict:
-    api_key = get_tmdb_api_key()
-    if not api_key:
-        return {"ok": False, "error": "TMDB API key is not configured"}
-    try:
-        async with _tmdb_semaphore:
-            response = await _tmdb_get(f"{_API_BASE}/{tmdb_type}/{tmdb_id}/videos", params={"api_key": api_key})
-        response.raise_for_status()
-        trailer = _select_youtube_trailer(response.json())
-        return {"ok": True, "trailer": trailer}
-    except Exception as exc:
-        return {"ok": False, "error": _redact(exc)}
-
-
-async def get_movie_trailer(tmdb_id: str) -> dict:
-    return await _get_videos("movie", tmdb_id)
-
-
-async def get_tv_trailer(tmdb_id: str) -> dict:
-    return await _get_videos("tv", tmdb_id)
 
 
 # sync_category/sync_all moved to vod_list_sync.py 2026-09-07, generalized

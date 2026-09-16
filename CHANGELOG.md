@@ -21,18 +21,12 @@ included.
 
 ## 2026-09-15
 
-- ✅ TMDB trailer availability is now captured without any provider requests.
-  Known movie and series IDs receive the YouTube trailer key from the existing
-  TMDB detail call when available; older known IDs use a bounded low-priority
-  videos-only pass. Results are stored as found, temporary error, first
-  no-result retry, or confirmed absence after two no-result checks, including
-  the last checked time and failure reason. Dispatcharr movie and series list
-  and detail responses now expose the saved `youtube_trailer` key. Synthetic
-  regression fixtures covered movie success, series failure recording, retry,
-  and confirmed-no-trailer behavior (16 focused regression tests passed).
-  Trailer backfill now continues as a fair movie/series trickle in the
-  background for up to two hours after catalog readiness, rather than making
-  one front-loaded batch or delaying review.
+- ✅ Provider-supplied `trailer`/`youtube_trailer` values are now preserved
+  during movie and series imports and exposed through Dispatcharr list/detail
+  responses. This avoids unnecessary TMDB/YouTube requests and keeps the
+  provider's own verified trailer reference. Synthetic movie/series fixtures
+  cover persistence and exclusion of already-saved values from the review
+  queue.
 
 - ✅ Provider imports now have one shared **Catalog workflow** handoff instead
   of leaving people to infer readiness from separate progress bars. The

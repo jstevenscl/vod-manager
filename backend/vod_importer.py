@@ -572,6 +572,7 @@ async def _import_movies_for_provider(
     )
     db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
+    await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "movie", movie_items)
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
@@ -617,6 +618,7 @@ def _build_movie_import_items(streams, category_names, exclude_categories, exclu
             # plot in this endpoint though (unlike get_series), so nothing
             # else is worth capturing here.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
+            "trailer": s.get("trailer") or s.get("youtube_trailer"),
             # XC movie-list responses conventionally expose their free bulk
             # artwork as stream_icon.
             # A few nonstandard panels use one of the later names instead,
@@ -660,6 +662,7 @@ async def _import_series_for_provider(
     )
     db_started = time.time()
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
+    await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "series", series_items)
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
@@ -703,6 +706,7 @@ def _build_series_import_items(series_list, series_category_names, exclude_categ
             # Some providers send this under "tmdb", not "tmdb_id" -- see
             # enrich_series's identical comment for why both need checking.
             "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
+            "trailer": s.get("trailer") or s.get("youtube_trailer"),
             "provider_last_modified": s.get("last_modified") or None,
         })
     return series_items, seen_series_ids
@@ -1608,7 +1612,6 @@ _TMDB_ENRICH_PROGRESS: dict = {
     "started_at": None, "finished_at": None,
 }
 _POST_IMPORT_ENRICH_TASK: asyncio.Task | None = None
-_TRAILER_TRICKLE_TASK: asyncio.Task | None = None
 
 
 def get_tmdb_enrich_progress() -> dict:
@@ -1739,39 +1742,6 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
-async def bulk_enrich_missing_trailers(concurrency: int = 4, limit: int = 100) -> None:
-    """Low-priority TMDB-only trailer pass for known movie/series IDs."""
-    pending = await asyncio.to_thread(vod_db.list_pending_trailer_enrichment, limit)
-    if not pending:
-        return
-    sem = asyncio.Semaphore(max(1, concurrency))
-    async def check(item: dict) -> None:
-        async with sem:
-            try:
-                fetch = tmdb_sync.get_movie_trailer if item["content_type"] == "movie" else tmdb_sync.get_tv_trailer
-                result = await fetch(str(item["tmdb_id"]))
-                trailer = result.get("trailer") if result.get("ok") else None
-                await asyncio.to_thread(
-                    vod_db.record_trailer_result, item["content_type"], item["id"],
-                    key=trailer.get("key") if trailer else None,
-                    site=trailer.get("site") if trailer else None,
-                    error=None if result.get("ok") else result.get("error"),
-                )
-            except Exception as exc:
-                await asyncio.to_thread(vod_db.record_trailer_result, item["content_type"], item["id"], error=str(exc))
-    await asyncio.gather(*(check(item) for item in pending))
-
-
-async def _trickle_missing_trailers(max_seconds: int = 2 * 60 * 60) -> None:
-    """Continue trailer checks after catalog readiness at a bounded pace."""
-    deadline = time.monotonic() + max_seconds
-    while time.monotonic() < deadline:
-        before = time.monotonic()
-        await bulk_enrich_missing_trailers(concurrency=4, limit=40)
-        if time.monotonic() - before < 1.0:
-            await asyncio.sleep(0.5)
-        if not await asyncio.to_thread(vod_db.list_pending_trailer_enrichment, 1):
-            break
 
 
 async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
@@ -1787,11 +1757,6 @@ async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> Non
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Enriching details and reconciling duplicates")
         await bulk_enrich_all(pending_only=True)
-        if track_catalog_workflow:
-            _set_catalog_workflow_phase("Checking available trailers")
-        global _TRAILER_TRICKLE_TASK
-        if not _TRAILER_TRICKLE_TASK or _TRAILER_TRICKLE_TASK.done():
-            _TRAILER_TRICKLE_TASK = asyncio.create_task(_trickle_missing_trailers())
         if track_catalog_workflow:
             mark_catalog_workflow_ready()
     except Exception:
