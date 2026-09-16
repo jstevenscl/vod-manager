@@ -7049,12 +7049,6 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                 # to fix -- see evaluate_smart_category's docstring).
                                 conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                                 did_archive = True
-                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                # Mirror of the archive branch above -- see this
-                                # function's docstring for why an automatically
-                                # applied archive can be automatically lifted too.
-                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
-                                did_unarchive = True
                         elif year is None:
                             # No exact (name, NULL) row, and no year to key an exact match
                             # on -- same reasoning as upsert_movie: exactly one same-named
@@ -7079,9 +7073,6 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                     conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                                     conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                                     did_archive = True
-                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
-                                    did_unarchive = True
                             else:
                                 cur = conn.execute(
                                     "INSERT INTO movies (name, year, is_adult, needs_year_review, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?,?)",
@@ -7144,9 +7135,6 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                     conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                                     conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                                     did_archive = True
-                                elif not should_archive and fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
-                                    did_unarchive = True
                             else:
                                 cur = conn.execute(
                                     "INSERT INTO movies (name, year, is_adult, review_excluded, poster_url, created_at) VALUES (?,?,?,?,?,?)",
@@ -7381,9 +7369,6 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 # Dispatcharr, not just the flag on its own.
                                 conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (row["id"],))
                                 did_archive = True
-                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
-                                did_unarchive = True
                             if row["import_provider_id"] is None:
                                 # This series previously had no working way to fetch episode
                                 # detail (e.g. its only prior source's provider was later
@@ -7415,9 +7400,6 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (candidates[0]["id"],))
                                     conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (candidates[0]["id"],))
                                     did_archive = True
-                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (candidates[0]["id"],))
-                                    did_unarchive = True
                             else:
                                 cur = conn.execute(
                                     "INSERT INTO series (name, year, is_adult, needs_year_review, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -7467,9 +7449,6 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id_for_detail,))
                                     conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id_for_detail,))
                                     did_archive = True
-                                elif not should_archive and fuzzy_candidates[0]["review_excluded"] and not fuzzy_candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id_for_detail,))
-                                    did_unarchive = True
                             else:
                                 cur = conn.execute(
                                     "INSERT INTO series (name, year, is_adult, review_excluded, import_provider_id, import_provider_series_id, provider_category_name, raw_name, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -7704,9 +7683,6 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                                 conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                                 conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                                 did_archive = True
-                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
-                                did_unarchive = True
                         elif year is None:
                             # Same reasoning as bulk_import_movies. Still writes full detail
                             # even when flagged -- more info for whoever reviews it later.
@@ -7722,9 +7698,6 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                                     conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
                                     conn.execute("DELETE FROM movie_category_placements WHERE movie_id=?", (movie_id,))
                                     did_archive = True
-                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (movie_id,))
-                                    did_unarchive = True
                             else:
                                 cols = ["name", "year", "needs_year_review", "review_excluded", *detail.keys()]
                                 vals = [name, year, 1 if candidates else 0, int(should_archive), *detail.values()]
@@ -7874,9 +7847,6 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                 conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id,))
                                 conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id,))
                                 did_archive = True
-                            elif not should_archive and row["review_excluded"] and not row["review_excluded_manual"]:
-                                conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id,))
-                                did_unarchive = True
                         elif year is None:
                             # Same reasoning as bulk_import_plex_movies's identical
                             # branch -- a null year (rare for Plex/Emby, which
@@ -7899,9 +7869,6 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                     conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (series_id,))
                                     conn.execute("DELETE FROM series_category_placements WHERE series_id=?", (series_id,))
                                     did_archive = True
-                                elif not should_archive and candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
-                                    conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (series_id,))
-                                    did_unarchive = True
                             else:
                                 cols = ["name", "year", "needs_year_review", "review_excluded", "import_provider_id", "import_provider_series_id", *detail.keys()]
                                 vals = [name, year, 1 if candidates else 0, int(should_archive), provider_id, item.get("provider_series_id"), *detail.values()]
