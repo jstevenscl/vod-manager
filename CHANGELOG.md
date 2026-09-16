@@ -48,7 +48,7 @@ instead of opening a duplicate request.
   Review row for an already-fixed title; ambiguous candidates remain manual.
   Regression tests cover both safe inheritance and ambiguity protection.
 
-- ✅🔀 Provider-supplied `trailer`/`youtube_trailer` values are now preserved
+- ✅⛔ Provider-supplied `trailer`/`youtube_trailer` values are now preserved
   during movie and series imports and exposed through Dispatcharr list/detail
   responses. This avoids unnecessary TMDB/YouTube requests and keeps the
   provider's own verified trailer reference. Synthetic movie/series fixtures
