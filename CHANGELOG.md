@@ -21,6 +21,13 @@ included.
 
 ## 2026-09-15
 
+- ✅ Cross-provider matches now preserve an existing automatic archive by
+  default. If a movie or series was archived and a later provider supplies the
+  same title, that source is attached without resurrecting the catalog item;
+  only an exact re-import of the already-known source can clear an automatic
+  archive. Manual archive decisions remain protected. Regression coverage now
+  includes both movies and series.
+
 - ✅ Undated cross-provider movie/series cards now inherit a confirmed TMDB
   identity when exactly one normalized-title candidate already exists in the
   pool. This prevents a second provider from creating a duplicate Metadata
