@@ -33,14 +33,14 @@ instead of opening a duplicate request.
 
 ## 2026-09-15
 
-- ✅ Cross-provider matches now preserve an existing automatic archive by
+- ✅🔀 Cross-provider matches now preserve an existing automatic archive by
   default. If a movie or series was archived and a later provider supplies the
   same title, that source is attached without resurrecting the catalog item;
   only an exact re-import of the already-known source can clear an automatic
   archive. Manual archive decisions remain protected. Regression coverage now
-  includes both movies and series. Next upstream candidate: compare commit
-  `2a5f0e8` with current upstream first; submit only if v0.2.15/v0.2.16 do not
-  already cover archive preservation for cross-provider matches.
+  includes both movies and series. Submitted as clean upstream PR
+  [#26](https://github.com/jstevenscl/vod-manager/pull/26) after confirming the
+  behavior is not covered by v0.2.15/v0.2.16.
 
 - ✅ Undated cross-provider movie/series cards now inherit a confirmed TMDB
   identity when exactly one normalized-title candidate already exists in the
