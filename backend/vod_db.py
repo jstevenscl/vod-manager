@@ -9006,6 +9006,33 @@ def auto_merge_series_by_tmdb_batch(series_ids) -> None:
         auto_merge_series_by_tmdb(series_id)
 
 
+def auto_merge_movie_tmdb_collisions() -> None:
+    """Merge every *current* movie TMDB-ID collision safely.
+
+    A post-import run normally only sweeps the movie IDs that needed detail
+    enrichment. A newly imported movie that already carries a valid TMDB ID
+    does not need that detail work, but can still be an exact-ID sibling of a
+    pre-existing card. Discover collision groups directly so that inexpensive
+    path is never stranded for manual Duplicate Finder review. The existing
+    per-item merge retains the language-overlap and explicit-ignore gates.
+    """
+    if not get_duplicate_finder_auto_merge_tmdb():
+        return
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id FROM movies
+        WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+          AND tmdb_id IN (
+              SELECT tmdb_id FROM movies
+              WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
+              GROUP BY tmdb_id HAVING COUNT(*) > 1
+          )
+        ORDER BY tmdb_id, id
+    """).fetchall()
+    conn.close()
+    auto_merge_movies_by_tmdb_batch([row["id"] for row in rows])
+
+
 def auto_merge_series_tmdb_collisions() -> None:
     """Merge every *current* series TMDB-ID collision safely.
 
@@ -9116,6 +9143,43 @@ def list_metadata_review(content_type: str | None = None) -> dict:
         out[key] = rows
     conn.close()
     return out
+
+
+def get_review_summary() -> dict:
+    """Small, poll-safe counts for the post-import review handoff.
+
+    The full Metadata Review endpoint can legitimately contain thousands of
+    adult rows. The application header needs only the same non-adult counts
+    a reviewer sees with Hide adult titles enabled, so keep this as aggregate
+    queries instead of loading every review record on each status poll.
+    """
+    conn = _connect()
+
+    def identity_count(table: str) -> int:
+        return conn.execute(
+            f"""SELECT COUNT(*) AS c FROM {table}
+                WHERE review_excluded=0 AND COALESCE(is_adult, 0)=0
+                  AND (needs_year_review=1 OR (tmdb_id IS NULL AND year IS NULL))"""
+        ).fetchone()["c"]
+
+    def invalid_tmdb_count(content_type: str, table: str) -> int:
+        return conn.execute(
+            f"""SELECT COUNT(*) AS c FROM tmdb_lookup_failures f
+                JOIN {table} t ON t.id=f.item_id
+                WHERE f.content_type=? AND t.review_excluded=0
+                  AND COALESCE(t.is_adult, 0)=0""",
+            (content_type,),
+        ).fetchone()["c"]
+
+    result = {
+        "missing_identity": {"movies": identity_count("movies"), "series": identity_count("series")},
+        "invalid_tmdb": {
+            "movies": invalid_tmdb_count("movie", "movies"),
+            "series": invalid_tmdb_count("series", "series"),
+        },
+    }
+    conn.close()
+    return result
 
 
 def record_tmdb_lookup_failure(content_type: str, item_id: int, tmdb_id: str, error: str = "TMDB returned 404 Not Found") -> None:

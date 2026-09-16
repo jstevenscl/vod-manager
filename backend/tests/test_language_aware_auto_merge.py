@@ -262,3 +262,16 @@ def test_collision_sweep_merges_exact_tmdb_series_omitted_from_work_list(db):
 
     remaining = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "602"]
     assert len(remaining) == 1
+
+
+def test_collision_sweep_merges_exact_tmdb_movies_omitted_from_work_list(db):
+    """Known-ID movies may skip detail enrichment but must still reconcile."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    first = _import_movie(db, provider_id, "Canonical Movie", 2020, "canonical", "Canonical Movie", tmdb_id=701)
+    second = _import_movie(db, provider_id, "Provider Movie Alias", 2020, "alias", "Provider Movie Alias", tmdb_id=701)
+
+    db.auto_merge_movie_tmdb_collisions()
+
+    remaining = [movie_id for movie_id in (first["id"], second["id"]) if db.get_movie(movie_id)]
+    assert len(remaining) == 1

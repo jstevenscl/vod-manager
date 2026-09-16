@@ -716,12 +716,66 @@ _IMPORT_PROGRESS: dict = {
     "provider_id": None, "provider_name": None,
     "started_at": None, "finished_at": None, "error": None,
 }
+# This is deliberately distinct from the immediate provider-import state
+# above. A catalog import can finish its provider fetch while the automatic
+# TMDB, provider-detail, and safe duplicate-reconciliation phases are still
+# running. Keeping the whole lifecycle here gives every connected browser a
+# single, durable answer to "is it safe to begin manual review yet?".
+_CATALOG_WORKFLOW_PROGRESS: dict = {
+    "state": "idle",  # idle | queued | running | ready | failed
+    "phase": None,
+    "provider_name": None,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
 _XC_IMPORT_LOCK = asyncio.Lock()
 _CPU_SAMPLE: tuple[float, float] | None = None
 
 
 def get_import_progress() -> dict:
     return dict(_IMPORT_PROGRESS)
+
+
+def get_catalog_workflow_progress() -> dict:
+    """Shared import-to-review lifecycle for the header and sidebar."""
+    return dict(_CATALOG_WORKFLOW_PROGRESS)
+
+
+def _start_catalog_workflow(provider_name: str | None, phase: str, *, queued: bool = False) -> None:
+    _CATALOG_WORKFLOW_PROGRESS.update({
+        "state": "queued" if queued else "running",
+        "phase": phase,
+        "provider_name": provider_name,
+        "started_at": time.time(),
+        "finished_at": None,
+        "error": None,
+    })
+
+
+def _set_catalog_workflow_phase(phase: str) -> None:
+    # A periodic reconciliation can start without a user-initiated provider
+    # import. It still deserves an honest progress state, rather than an
+    # unexplained idle header while it uses the worker pool.
+    if _CATALOG_WORKFLOW_PROGRESS["started_at"] is None:
+        _CATALOG_WORKFLOW_PROGRESS["started_at"] = time.time()
+    _CATALOG_WORKFLOW_PROGRESS.update({"state": "running", "phase": phase, "finished_at": None, "error": None})
+
+
+def mark_catalog_workflow_ready() -> None:
+    if _CATALOG_WORKFLOW_PROGRESS["started_at"] is None:
+        _CATALOG_WORKFLOW_PROGRESS["started_at"] = time.time()
+    _CATALOG_WORKFLOW_PROGRESS.update({
+        "state": "ready", "phase": "Catalog ready for review",
+        "finished_at": time.time(), "error": None,
+    })
+
+
+def _mark_catalog_workflow_failed(error: str) -> None:
+    _CATALOG_WORKFLOW_PROGRESS.update({
+        "state": "failed", "phase": "Automatic work needs attention",
+        "finished_at": time.time(), "error": error,
+    })
 
 
 def mark_import_queued(provider_id: int, provider_name: str, queue_position: int) -> None:
@@ -731,6 +785,7 @@ def mark_import_queued(provider_id: int, provider_name: str, queue_position: int
         "provider_id": provider_id, "provider_name": provider_name,
         "started_at": None, "finished_at": None, "error": None,
     })
+    _start_catalog_workflow(provider_name, "Waiting to import catalog", queued=True)
 
 
 def mark_import_running(provider_id: int, provider_name: str) -> None:
@@ -746,6 +801,7 @@ def mark_import_running(provider_id: int, provider_name: str) -> None:
         "provider_id": provider_id, "provider_name": provider_name,
         "started_at": time.time(), "finished_at": None, "error": None,
     })
+    _start_catalog_workflow(provider_name, "Importing provider catalog")
 
 
 def mark_import_finished(provider_id: int, error: str | None = None) -> None:
@@ -756,6 +812,8 @@ def mark_import_finished(provider_id: int, error: str | None = None) -> None:
         "running": False, "queued": False, "queue_position": None,
         "finished_at": time.time(), "error": error,
     })
+    if error:
+        _mark_catalog_workflow_failed(error)
 
 
 def get_process_cpu_percent() -> float | None:
@@ -786,6 +844,7 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
     # This lock makes periodic and manual XC imports wait their turn rather
     # than competing for the writer and starving normal API reads.
     async with _XC_IMPORT_LOCK:
+        _start_catalog_workflow(provider.get("name") if provider else f"provider {provider_id}", "Importing provider catalog")
         _IMPORT_PROGRESS.update({
             "running": True, "queued": False, "queue_position": None,
             "provider_id": provider_id,
@@ -796,10 +855,16 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
             result = await _import_provider_catalog_impl(provider_id)
         except Exception as exc:
             _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
+            _mark_catalog_workflow_failed(type(exc).__name__)
             raise
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
     if schedule_enrichment and result["catalog_changed"]:
         result["post_import_enrichment_queued"] = schedule_post_import_enrichment()
+    elif schedule_enrichment:
+        # Nothing changed, so there is no enrichment/reconciliation phase to
+        # await. Keep the handoff truthful instead of stranding it at the
+        # completed provider-import phase.
+        mark_catalog_workflow_ready()
     return result
 
 
@@ -1596,6 +1661,10 @@ async def bulk_enrich_tmdb_movies(concurrency: int = 8) -> None:
             await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, pending[offset:offset + _MOVIE_BATCH_CHUNK_SIZE])
         if succeeded:
             await asyncio.to_thread(vod_db.auto_merge_movies_by_tmdb_batch, succeeded)
+        # A card can arrive with an already-valid TMDB ID and therefore skip
+        # this detail queue entirely. Reconcile the current collision set so
+        # it does not wait for a later provider-detail enrichment pass.
+        await asyncio.to_thread(vod_db.auto_merge_movie_tmdb_collisions)
     finally:
         _TMDB_ENRICH_PROGRESS["running"] = False
         _TMDB_ENRICH_PROGRESS["finished_at"] = time.time()
@@ -1669,25 +1738,37 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
-async def _post_import_enrichment() -> None:
+async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
     """Run provider-free identity enrichment before provider-only fallback."""
     try:
+        if track_catalog_workflow:
+            _set_catalog_workflow_phase("Resolving known TMDB identities")
         await bulk_enrich_tmdb_movies()
         await bulk_enrich_tmdb_series_metadata()
         # Remaining new movies have no imported TMDB ID; bulk_enrich_all's
         # movie phase now selects only those fallback rows.  Its series phase
         # remains the deliberate provider-detail path for episode discovery.
+        if track_catalog_workflow:
+            _set_catalog_workflow_phase("Enriching details and reconciling duplicates")
         await bulk_enrich_all(pending_only=True)
+        if track_catalog_workflow:
+            mark_catalog_workflow_ready()
     except Exception:
         logger.exception("[vod_importer] post-import enrichment failed")
+        if track_catalog_workflow:
+            _mark_catalog_workflow_failed("automatic enrichment failed")
 
 
-def schedule_post_import_enrichment() -> bool:
+def schedule_post_import_enrichment(*, track_catalog_workflow: bool = True) -> bool:
     """Queue one reconciliation pass; coalesce overlapping provider imports."""
     global _POST_IMPORT_ENRICH_TASK
     if _POST_IMPORT_ENRICH_TASK and not _POST_IMPORT_ENRICH_TASK.done():
         return False
-    _POST_IMPORT_ENRICH_TASK = asyncio.create_task(_post_import_enrichment())
+    if track_catalog_workflow:
+        _set_catalog_workflow_phase("Preparing automatic catalog review")
+    _POST_IMPORT_ENRICH_TASK = asyncio.create_task(
+        _post_import_enrichment(track_catalog_workflow=track_catalog_workflow)
+    )
     return True
 
 
@@ -2239,6 +2320,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         # coalesced catalog imports can create an exact-ID sibling after that
         # list was assembled.  This queries only TMDB collision groups, not
         # the whole catalog, and retains the normal language/ignore guards.
+        await asyncio.to_thread(vod_db.auto_merge_movie_tmdb_collisions)
         await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
     finally:
         if not writer_task.done():

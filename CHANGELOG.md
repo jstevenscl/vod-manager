@@ -21,6 +21,23 @@ included.
 
 ## 2026-09-15
 
+- ✅ Provider imports now have one shared **Catalog workflow** handoff instead
+  of leaving people to infer readiness from separate progress bars. The
+  centered header advances through queued import, TMDB identity resolution,
+  provider enrichment, and safe duplicate reconciliation; only after every
+  automatic phase finishes does it show **Import complete · Catalog ready for
+  review**. That ready banner includes the visible (non-adult) movie/TV
+  identity-review counts and incorrect-TMDB-ID count. The sidebar now gives a
+  clickable review order: Metadata Review, Incorrect TMDB IDs, remaining
+  ambiguous duplicates, then missing artwork.
+
+- ✅ Known-TMDB movie cards now receive the same final database collision
+  sweep as series. A newly imported movie that already has a valid TMDB ID no
+  longer misses auto-merge merely because it did not require provider-detail
+  enrichment; the normal same-language and explicit-ignore safeguards still
+  apply. This closes the live multi-provider import case where exact-TMDB
+  movie pairs remained in Duplicate Finder after all progress bars completed.
+
 - ✅🔀 Provider-free TMDB enrichment for known series IDs now also records TMDB's
   first-air year. A confirmed series no longer remains falsely held in
   **Metadata Review** merely because its provider omitted a year; the existing

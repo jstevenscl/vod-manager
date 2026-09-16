@@ -57,24 +57,49 @@ def test_xc_imports_are_serialized(monkeypatch):
 
 def test_non_xc_import_lifecycle_updates_shared_sidebar_status():
     previous = vod_importer.get_import_progress()
+    previous_workflow = vod_importer.get_catalog_workflow_progress()
     try:
         vod_importer.mark_import_queued(42, "Plex", 1)
         assert vod_importer.get_import_progress()["queued"] is True
+        assert vod_importer.get_catalog_workflow_progress()["state"] == "queued"
 
         vod_importer.mark_import_running(42, "Plex")
         running = vod_importer.get_import_progress()
         assert running["running"] is True
         assert running["queued"] is False
         assert running["provider_name"] == "Plex"
+        assert vod_importer.get_catalog_workflow_progress()["phase"] == "Importing provider catalog"
 
         vod_importer.mark_import_finished(42)
         finished = vod_importer.get_import_progress()
         assert finished["running"] is False
         assert finished["queued"] is False
         assert finished["error"] is None
+
+        vod_importer.mark_catalog_workflow_ready()
+        ready = vod_importer.get_catalog_workflow_progress()
+        assert ready["state"] == "ready"
+        assert ready["finished_at"] is not None
     finally:
         vod_importer._IMPORT_PROGRESS.clear()
         vod_importer._IMPORT_PROGRESS.update(previous)
+        vod_importer._CATALOG_WORKFLOW_PROGRESS.clear()
+        vod_importer._CATALOG_WORKFLOW_PROGRESS.update(previous_workflow)
+
+
+def test_review_summary_matches_visible_metadata_review_counts(db):
+    movie_id = db.upsert_movie("Needs identity", None)
+    series_id = db.upsert_series("Series needs identity", None)
+    adult_id = db.upsert_movie("Hidden adult", None)
+    db.set_movie_adult(adult_id, True)
+    invalid_id = db.upsert_movie("Incorrect TMDB", 2024, tmdb_id="gone")
+    db.record_tmdb_lookup_failure("movie", invalid_id, "gone")
+
+    assert movie_id and series_id
+    assert db.get_review_summary() == {
+        "missing_identity": {"movies": 1, "series": 1},
+        "invalid_tmdb": {"movies": 1, "series": 0},
+    }
 
 
 def test_unchanged_sources_do_not_rewrite_movies_or_series(db):

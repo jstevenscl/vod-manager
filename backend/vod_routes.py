@@ -1672,8 +1672,14 @@ async def _manual_import_worker() -> None:
                 # The import module records XC status for the sidebar; retain
                 # a traceback for the non-XC importer paths as well.
                 logger.exception("[vod_routes] queued provider import %s failed", provider_id)
-        if catalog_changed and vod_importer.schedule_post_import_enrichment():
-            logger.info("[vod_routes] queued post-import enrichment after manual import queue drained")
+        if catalog_changed:
+            if vod_importer.schedule_post_import_enrichment():
+                logger.info("[vod_routes] queued post-import enrichment after manual import queue drained")
+        else:
+            # An unchanged catalog has no automatic reconciliation work to
+            # schedule. Still hand the user a definitive ready state rather
+            # than leaving the header on the earlier import phase forever.
+            vod_importer.mark_catalog_workflow_ready()
     finally:
         _MANUAL_IMPORT_TASK = None
 
@@ -2924,7 +2930,7 @@ async def list_tmdb_lookup_failures(content_type: Optional[str] = None):
 @router.post("/tmdb-lookup-failures/scan/", dependencies=_GUARDS, status_code=202)
 async def scan_tmdb_lookup_failures():
     """Re-check pending known IDs to seed the Incorrect TMDB IDs queue."""
-    if not vod_importer.schedule_post_import_enrichment():
+    if not vod_importer.schedule_post_import_enrichment(track_catalog_workflow=False):
         return {"started": False, "detail": "TMDB enrichment is already running"}
     return {"started": True}
 
@@ -3774,6 +3780,8 @@ async def runtime_status():
         "enrichment": vod_importer.get_enrich_progress(),
         "tmdb": vod_importer.get_tmdb_enrich_progress(),
         "bulk_ai": vod_bulk_ai_service.get_active_bulk_ai_status(),
+        "catalog_workflow": vod_importer.get_catalog_workflow_progress(),
+        "review_summary": await asyncio.to_thread(vod_db.get_review_summary),
         "process_cpu_percent": vod_importer.get_process_cpu_percent(),
     }
 
