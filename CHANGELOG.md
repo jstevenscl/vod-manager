@@ -19,6 +19,18 @@ add its second status marker and link to the pull request: 🔀 = open/under
 review, 🔼 = included in an upstream release, ⛔ = closed without being
 included.
 
+### Upstream PR hygiene
+
+Upstream submissions are prepared from a clean branch based on the current
+upstream `main`, with one focused commit whenever possible. Never use the
+fork's development `main` as a PR head. Before opening a PR, compare the
+branch with upstream and remove fork-only changelog entries, internal issue or
+bead references, AI/co-author attribution, private deployment/provider data,
+hostnames, IPs, credentials, and unrelated tooling. Test data and URLs must be
+synthetic placeholders. If upstream already contains equivalent or evolved
+work, update the existing changelog entry with that PR/release reference
+instead of opening a duplicate request.
+
 ## 2026-09-15
 
 - ✅ Cross-provider matches now preserve an existing automatic archive by
@@ -26,7 +38,9 @@ included.
   same title, that source is attached without resurrecting the catalog item;
   only an exact re-import of the already-known source can clear an automatic
   archive. Manual archive decisions remain protected. Regression coverage now
-  includes both movies and series.
+  includes both movies and series. Next upstream candidate: compare commit
+  `2a5f0e8` with current upstream first; submit only if v0.2.15/v0.2.16 do not
+  already cover archive preservation for cross-provider matches.
 
 - ✅ Undated cross-provider movie/series cards now inherit a confirmed TMDB
   identity when exactly one normalized-title candidate already exists in the
@@ -39,7 +53,11 @@ included.
   responses. This avoids unnecessary TMDB/YouTube requests and keeps the
   provider's own verified trailer reference. Synthetic movie/series fixtures
   cover persistence and exclusion of already-saved values from the review
-  queue. Submitted upstream for review in [#25](https://github.com/jstevenscl/vod-manager/pull/25).
+  queue. PR [#25](https://github.com/jstevenscl/vod-manager/pull/25) was closed
+  because the submitted branch contained the full fork history and unrelated
+  files. Upstream will review the current behavior directly; no duplicate PR
+  should be opened until a clean focused branch is prepared.
+  Status: closed without inclusion in [#25](https://github.com/jstevenscl/vod-manager/pull/25).
 
 - ✅ Provider imports now have one shared **Catalog workflow** handoff instead
   of leaving people to infer readiness from separate progress bars. The
@@ -69,7 +87,8 @@ included.
   variants and human decisions remain untouched. A reviewer-selected TMDB ID
   in Metadata Review now invokes that same safe merge path immediately rather
   than waiting for the next import.
-  ([#24](https://github.com/jstevenscl/vod-manager/pull/24))
+  This was included, with upstream hardening, in v0.2.16 via
+  [#24](https://github.com/jstevenscl/vod-manager/pull/24).
 
 - ✅ Metadata Review now has an **Incorrect TMDB IDs** tab for titles whose
   stored ID receives a confirmed TMDB 404. It supports a pending-ID scan,
