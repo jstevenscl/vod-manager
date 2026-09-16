@@ -21,12 +21,12 @@ included.
 
 ## 2026-09-15
 
-- ✅ Provider-supplied `trailer`/`youtube_trailer` values are now preserved
+- ✅🔀 Provider-supplied `trailer`/`youtube_trailer` values are now preserved
   during movie and series imports and exposed through Dispatcharr list/detail
   responses. This avoids unnecessary TMDB/YouTube requests and keeps the
   provider's own verified trailer reference. Synthetic movie/series fixtures
   cover persistence and exclusion of already-saved values from the review
-  queue.
+  queue. Submitted upstream for review in [#25](https://github.com/jstevenscl/vod-manager/pull/25).
 
 - ✅ Provider imports now have one shared **Catalog workflow** handoff instead
   of leaving people to infer readiness from separate progress bars. The
