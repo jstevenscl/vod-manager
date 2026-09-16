@@ -1387,6 +1387,13 @@ confirmed TMDB id and year; if the corrected identity already matches an
 existing pool entry, sources and categories merge into it automatically,
 same as everywhere else in the app.
 
+A series that already carries a TMDB id but no year gets resolved
+automatically in the background after each provider import, straight from
+that id — no provider detail request and no manual step needed — so it
+often never appears in this queue at all. Any duplicate this uncovers
+(two rows that turn out to share the same id) merges the same automatic
+way described in Duplicate Finder above.
+
 ### Orphan Checker
 
 Finds dead rows a provider deletion (or a bug) can leave behind — a series
