@@ -2923,6 +2923,17 @@ async def list_metadata_review(content_type: Optional[str] = None):
     return await asyncio.to_thread(vod_db.list_metadata_review, content_type)
 
 
+@router.get("/needs-review/{content_type}/{item_id}/existing-matches/", dependencies=_GUARDS)
+async def needs_review_existing_matches(content_type: str, item_id: int):
+    """Return possible existing catalog matches for an expanded review row."""
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    try:
+        return await asyncio.to_thread(vod_db.find_existing_metadata_matches, content_type, item_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
 @router.get("/tmdb-lookup-failures/", dependencies=_GUARDS)
 async def list_tmdb_lookup_failures(content_type: Optional[str] = None):
     if content_type not in (None, "movie", "series"):

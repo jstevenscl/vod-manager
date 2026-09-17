@@ -9251,6 +9251,48 @@ def list_metadata_review(content_type: str | None = None) -> dict:
     return out
 
 
+def find_existing_metadata_matches(content_type: str, item_id: int) -> list[dict]:
+    """Return possible active catalog matches for an expanded review row.
+
+    Title matching is only a reviewer hint; an explicit action is still
+    required.  Existing TMDB ids can be passed through the normal merge-safe
+    TMDB setter instead of introducing a second merge path.
+    """
+    if content_type not in ("movie", "series"):
+        raise ValueError("content_type must be 'movie' or 'series'")
+    table = "movies" if content_type == "movie" else "series"
+    source_table = "movie_sources" if content_type == "movie" else "series_sources"
+    source_key = "movie_id" if content_type == "movie" else "series_id"
+    conn = _connect()
+    item = conn.execute(f"SELECT id, name, year FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        raise ValueError(f"{content_type} {item_id} not found")
+    normalized = _normalize_title_for_dedup(item["name"])
+    rows = conn.execute(
+        f"""SELECT t.id, t.name, t.year, t.tmdb_id,
+                   COUNT(DISTINCT s.provider_id) AS source_count
+              FROM {table} t
+              LEFT JOIN {source_table} s ON s.{source_key}=t.id
+             WHERE t.id != ? AND t.review_excluded=0
+             GROUP BY t.id
+             ORDER BY t.id""",
+        (item_id,),
+    ).fetchall()
+    conn.close()
+    matches = [dict(row) for row in rows if _normalize_title_for_dedup(row["name"]) == normalized]
+    year = item["year"]
+    matches.sort(key=lambda row: (
+        0 if year is not None and row["year"] == year else 1,
+        0 if row["tmdb_id"] is not None else 1,
+        -(row["source_count"] or 0),
+        row["id"],
+    ))
+    for row in matches:
+        row["match_reason"] = "same title and year" if year is not None and row["year"] == year else "same normalized title"
+    return matches[:5]
+
+
 def get_review_summary() -> dict:
     """Small, poll-safe counts for the post-import review handoff.
 

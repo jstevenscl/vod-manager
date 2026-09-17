@@ -33,6 +33,12 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ Metadata Review now calls out likely existing catalog matches when a row is
+  expanded. Same-title rows from another provider show their year, source
+  count, and match reason; rows with a confirmed TMDB ID can be explicitly
+  applied through the existing merge-safe TMDB resolver. Rows without an ID
+  remain informational so title-only matches are never auto-merged.
+
 - ✅ Automatic post-import processing is now **import-first and provider-safe**.
   Imported TMDB IDs continue through the bounded TMDB metadata pass; titles
   without an ID remain in Metadata Review instead of triggering automatic

@@ -289,6 +289,15 @@ interface NeedsReviewItem {
   attempts?: number
 }
 
+interface ExistingMetadataMatch {
+  id: number
+  name: string
+  year: number | null
+  tmdb_id: string | null
+  source_count: number
+  match_reason: string
+}
+
 interface NeedsReviewData {
   movies: NeedsReviewItem[]
   series: NeedsReviewItem[]
@@ -1434,6 +1443,12 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identit
     enabled:  expanded,
     retry:    false,
   })
+  const existingMatchesQuery = useQuery<ExistingMetadataMatch[]>({
+    queryKey: ['vod-needs-review-existing-matches', contentType, item.id],
+    queryFn: () => api.get(`/vod/needs-review/${contentType}/${item.id}/existing-matches/`).then((r) => r.data),
+    enabled: expanded,
+    retry: false,
+  })
 
   const resolve = useMutation({
     mutationFn: (body: { year: number; tmdb_id?: string }) =>
@@ -1530,6 +1545,33 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identit
 
       {expanded && (
         <div className="mt-2 space-y-2">
+          {!!existingMatchesQuery.data?.length && (
+            <div className="rounded border border-amber-500/50 bg-amber-500/5 px-2.5 py-2 text-xs">
+              <div className="font-medium text-amber-600 dark:text-amber-400">Already in your catalog</div>
+              <p className="text-muted-foreground mt-0.5">A possible match from another provider is shown below. Verify it before applying.</p>
+              <div className="mt-1.5 space-y-1">
+                {existingMatchesQuery.data.map((match) => (
+                  <div key={match.id} className="flex items-center justify-between gap-2 rounded border border-border/60 px-2 py-1.5">
+                    <span className="min-w-0">
+                      <strong className="text-foreground">{match.name}</strong>{match.year != null && <span className="text-muted-foreground"> ({match.year})</span>}
+                      <span className="text-muted-foreground"> · {match.source_count || 0} provider source{match.source_count === 1 ? '' : 's'} · {match.match_reason}</span>
+                    </span>
+                    {match.tmdb_id ? (
+                      <Button size="sm" variant="outline" className="h-7 shrink-0" disabled={setTmdbId.isPending || resolve.isPending} onClick={() => {
+                        if (match.year != null) resolve.mutate({ year: match.year, tmdb_id: match.tmdb_id! })
+                        else setTmdbId.mutate(Number(match.tmdb_id))
+                      }}>
+                        {setTmdbId.isPending || resolve.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Use existing match'}
+                      </Button>
+                    ) : (
+                      <span className="text-muted-foreground shrink-0">Needs manual confirmation</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {existingMatchesQuery.isError && <p className="text-muted-foreground text-xs">Could not check for an existing catalog match.</p>}
           <div className="flex items-center gap-1.5">
             <span className="text-muted-foreground">search TMDB as:</span>
             <input
