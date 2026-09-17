@@ -617,7 +617,11 @@ def _build_movie_import_items(streams, category_names, exclude_categories, exclu
             # from this movie's very first enrichment pass. No genre/cast/
             # plot in this endpoint though (unlike get_series), so nothing
             # else is worth capturing here.
-            "tmdb_id": _clean_tmdb_id(s.get("tmdb")),
+            # XC panels are inconsistent here: some use ``tmdb`` while
+            # others expose the same bulk-list identity as ``tmdb_id``.
+            # Capture both so valid IDs do not fall into the expensive
+            # provider-detail fallback queue.
+            "tmdb_id": _clean_tmdb_id(s.get("tmdb")) or _clean_tmdb_id(s.get("tmdb_id")),
             "trailer": s.get("trailer") or s.get("youtube_trailer"),
             # XC movie-list responses conventionally expose their free bulk
             # artwork as stream_icon.

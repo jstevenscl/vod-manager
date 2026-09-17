@@ -38,6 +38,11 @@ instead of opening a duplicate request.
   allowing the current request to finish, so a large fallback pass can be
   halted without restarting the container. Added cancellation regression tests.
 
+- ✅ XC movie imports now capture TMDB identity from either the provider's
+  `tmdb` or `tmdb_id` bulk-list field. This prevents valid WarpTV-style IDs from
+  being mistaken for missing identities and triggering thousands of unnecessary
+  provider-detail requests.
+
 - ✅🔀 Cross-provider matches now preserve an existing automatic archive by
   default. If a movie or series was archived and a later provider supplies the
   same title, that source is attached without resurrecting the catalog item;

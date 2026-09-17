@@ -25,6 +25,12 @@ def test_catalog_item_builders_keep_raw_snapshot_when_items_are_filtered(monkeyp
     )
 
     assert [item["provider_stream_id"] for item in movies] == ["keep"]
+    movies_with_ids, _ = vod_importer._build_movie_import_items(
+        [{"stream_id": "tmdb-id", "name": "Known (2020)", "tmdb_id": "123"},
+         {"stream_id": "tmdb", "name": "Known Two (2021)", "tmdb": "456"}],
+        {}, [], False, {"enabled_languages": ["EN"], "exclude_non_latin": False}, [],
+    )
+    assert [item["tmdb_id"] for item in movies_with_ids] == ["123", "456"]
     assert movie_ids == {"keep", "skip"}
     assert [item["provider_series_id"] for item in series] == ["keep"]
     assert series_ids == {"keep", "skip"}
