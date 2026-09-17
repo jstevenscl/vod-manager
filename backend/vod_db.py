@@ -103,7 +103,9 @@ def init_db() -> None:
             trailer_status TEXT NOT NULL DEFAULT 'unknown',
             trailer_attempts INTEGER NOT NULL DEFAULT 0,
             trailer_checked_at TEXT,
-            trailer_last_error TEXT
+            trailer_last_error TEXT,
+            stream_blocked INTEGER NOT NULL DEFAULT 0,
+            stream_blocked_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS movie_sources (
@@ -696,6 +698,11 @@ def init_db() -> None:
     _migrate_encrypt_plaintext_credentials(conn)
     _migrate_legacy_catchall_categories(conn)
     _seed_default_categories(conn)
+    # KNM: added 2026-09-17 -- apply the all-fallbacks-failed rule to rows
+    # recorded before stream_blocked existed, so deployment cleans up the
+    # existing failed-stream backlog without waiting for one more request.
+    _block_existing_exhausted_movies(conn)
+    _commit_with_retry(conn)
     conn.close()
 
 
@@ -1043,6 +1050,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("metadata_rules", "is_regex", "INTEGER NOT NULL DEFAULT 1"),
         ("movie_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("movie_sources", "last_failed_at", "TEXT"),
+        ("movies", "stream_blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "stream_blocked_at", "TEXT"),
         ("episode_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("episode_sources", "last_failed_at", "TEXT"),
         ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
@@ -2183,6 +2192,26 @@ def get_recording_failure(provider_id: int, dispatcharr_recording_id: int) -> di
 _MAX_STORED_STREAM_FAILURES = 500
 
 
+def _block_existing_exhausted_movies(conn: sqlite3.Connection) -> int:
+    """Hide movies whose every currently playable source is already over the
+    failure threshold. Shared by startup migration and the per-failure path."""
+    lang_clause, lang_params = _enabled_languages_clause("ms.language")
+    cur = conn.execute(f"""
+        UPDATE movies SET stream_blocked=1, stream_blocked_at=COALESCE(stream_blocked_at, ?)
+        WHERE stream_blocked=0
+          AND EXISTS (
+              SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+              WHERE ms.movie_id=movies.id AND p.is_active=1 AND {lang_clause}
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+              WHERE ms.movie_id=movies.id AND p.is_active=1 AND {lang_clause}
+                AND ms.consecutive_failures < {_FAILING_SOURCE_THRESHOLD}
+          )
+    """, (_now(), *lang_params, *lang_params))
+    return cur.rowcount
+
+
 def log_stream_failure(
     kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str,
     movie_id: int | None = None, episode_id: int | None = None,
@@ -2240,6 +2269,31 @@ def record_source_failure(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
             (_now(), source_id),
         )
+        if kind == "movie":
+            row = conn.execute("SELECT movie_id FROM movie_sources WHERE id=?", (source_id,)).fetchone()
+            if row:
+                # KNM: added 2026-09-17 -- a title whose every playable
+                # fallback has repeatedly failed should not remain advertised
+                # to clients. Keep its source history for diagnostics and a
+                # manual retry, but suppress it from the exported catalog.
+                lang_clause, lang_params = _enabled_languages_clause("ms.language")
+                now = _now()
+                cur = conn.execute(f"""
+                    UPDATE movies SET stream_blocked=1, stream_blocked_at=?
+                    WHERE id=? AND stream_blocked=0
+                      AND EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                            AND ms.consecutive_failures < {_FAILING_SOURCE_THRESHOLD}
+                      )
+                """, (now, row["movie_id"], row["movie_id"], *lang_params,
+                       row["movie_id"], *lang_params))
+                if cur.rowcount:
+                    logger.warning("[vod_db] blocked movie id=%s after all playable sources failed", row["movie_id"])
         _commit_with_retry(conn)
         conn.close()
 
@@ -2259,6 +2313,13 @@ def record_source_success(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
             (source_id,),
         )
+        if kind == "movie":
+            # A successful explicit retry is authoritative evidence that the
+            # title is playable again, so return it to the exported catalog.
+            conn.execute("""
+                UPDATE movies SET stream_blocked=0, stream_blocked_at=NULL
+                WHERE id=(SELECT movie_id FROM movie_sources WHERE id=?) AND stream_blocked=1
+            """, (source_id,))
         _commit_with_retry(conn)
         conn.close()
 
@@ -6058,6 +6119,7 @@ def get_movie_export_rows() -> list[dict]:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
+        WHERE m.stream_blocked=0
         ORDER BY m.name
     """, lang_params).fetchall()
     conn.close()
@@ -6123,7 +6185,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         LEFT JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
-        WHERE p.export_stream_id = ?
+        WHERE p.export_stream_id = ? AND m.stream_blocked=0
         LIMIT 1
     """, (*lang_params, export_stream_id)).fetchone()
     conn.close()

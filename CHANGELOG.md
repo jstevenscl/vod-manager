@@ -33,6 +33,13 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ A movie is now automatically blocked from exported client catalogs when
+  every active, enabled-language provider source has repeatedly failed. The
+  source rows and failure history remain available for diagnosis; a successful
+  retry clears the block and returns the title to the catalog. Deployment also
+  sweeps already-exhausted titles, so existing all-404 entries are removed
+  without needing another playback attempt.
+
 - ✅ Series refreshes now preserve the canonical row already attached to a
   provider's source ID, including when that provider is a secondary source.
   This fixes a regression that could reassign a source during a refresh and
