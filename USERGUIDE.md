@@ -104,7 +104,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   vod-manager:
-    image: ghcr.io/jstevenscl/vod-manager:latest
+    image: ghcr.io/knmplace/vod-manager:latest
     container_name: vod-manager
     restart: unless-stopped
     ports:

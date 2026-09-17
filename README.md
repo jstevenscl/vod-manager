@@ -56,7 +56,7 @@ what's changed in this fork's image, release by release.
 docker compose up -d
 ```
 
-This pulls the published `ghcr.io/jstevenscl/vod-manager:latest` image (see
+This pulls the fork's published `ghcr.io/knmplace/vod-manager:latest` image (see
 `docker-compose.yml`). Building from source instead — e.g. for local
 development against this repo — works too:
 
