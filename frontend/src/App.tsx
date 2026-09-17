@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CalendarDays, CheckCircle2, CircleAlert, ClipboardCheck, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Activity, CalendarDays, CheckCircle2, CircleAlert, ClipboardCheck, Film, Flame, Globe2, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
@@ -144,6 +144,13 @@ export default function App() {
       const status = query.state.data
       return status?.import.running || status?.enrichment.running || status?.tmdb.running || status?.bulk_ai.running ? 2000 : 10_000
     },
+    retry: false,
+  })
+  const externalIpQuery = useQuery<{ ip: string | null; available: boolean }>({
+    queryKey: ['external-ip'],
+    queryFn: () => api.get('/external-ip/').then((r) => r.data),
+    enabled: authState === 'ready',
+    staleTime: 5 * 60_000,
     retry: false,
   })
   const workflow = runtimeStatusQuery.data?.catalog_workflow
@@ -295,6 +302,9 @@ export default function App() {
               </p>
             )}
             <p className="mt-1 text-[10px] text-muted-foreground/80">App CPU: {runtimeStatusQuery.data?.process_cpu_percent == null ? 'sampling…' : `${runtimeStatusQuery.data.process_cpu_percent}%`}</p>
+            <p className="mt-1 flex items-center gap-1 text-[10px] text-muted-foreground/80" title="Public address seen by external services">
+              <Globe2 size={11} /> External IP: {externalIpQuery.isLoading ? 'checking…' : externalIpQuery.data?.ip ?? 'unavailable'}
+            </p>
           </div>
           {workflowIsReady && (
             <div className="rounded-md border border-emerald-500/25 bg-emerald-500/5 px-2.5 py-2 text-[11px]">

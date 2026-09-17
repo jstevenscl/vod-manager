@@ -1,9 +1,12 @@
+import asyncio
+import json
 import logging
 import os
 import time
 from typing import Optional
+from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from auth import create_session, revoke_all_sessions, revoke_session, verify_session
@@ -42,6 +45,8 @@ _LOGIN_SWEEP_INTERVAL_SECONDS = 600  # bound memory growth under sustained attac
 _login_failed_attempts: dict[str, tuple[int, float]] = {}
 _login_locked_until: dict[str, float] = {}
 _login_last_sweep_at = 0.0
+_external_ip_cache: tuple[str | None, float] = (None, 0.0)
+_EXTERNAL_IP_CACHE_SECONDS = 600
 
 
 def _login_client_ip(request: Request) -> str:
@@ -176,3 +181,27 @@ async def get_version():
         "commit": os.environ.get("GIT_SHA", "dev")[:7],
         "ref": os.environ.get("GIT_REF", "local"),
     }
+
+
+@router.get("/external-ip/", dependencies=[Depends(require_auth)])
+async def get_external_ip():
+    """Return the manager host's public address, cached to limit lookups."""
+    global _external_ip_cache
+    cached_ip, cached_at = _external_ip_cache
+    now = time.monotonic()
+    if now - cached_at < _EXTERNAL_IP_CACHE_SECONDS:
+        return {"ip": cached_ip, "available": cached_ip is not None}
+    try:
+        def fetch() -> str:
+            request = UrlRequest("https://api.ipify.org?format=json", headers={"User-Agent": "vod-manager/diagnostic"})
+            with urlopen(request, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            ip = str(payload.get("ip", "")).strip()
+            if not ip:
+                raise ValueError("external IP service returned no address")
+            return ip
+        _external_ip_cache = (await asyncio.to_thread(fetch), now)
+    except Exception as exc:
+        logger.info("[routes] external IP lookup unavailable: %s", exc)
+        _external_ip_cache = (cached_ip, now)
+    return {"ip": _external_ip_cache[0], "available": _external_ip_cache[0] is not None}
