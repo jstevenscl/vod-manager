@@ -2232,13 +2232,6 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
 
     providers = await asyncio.to_thread(vod_db.list_providers)
     configured_provider_count = len(providers)
-    movie_ids_all = await asyncio.to_thread(
-        vod_db.list_movie_ids_pending_provider_enrichment
-        if pending_only and not force else vod_db.list_all_movie_ids,
-    )
-    series_ids_all = await asyncio.to_thread(
-        vod_db.list_pending_series_sources if pending_only and not force else vod_db.list_all_series_ids
-    )
     # Only providers that can actually perform work participate in the
     # fair-share calculation below.  Counting configured-but-empty providers
     # can turn concurrency=8 into one worker for the sole provider with
@@ -2246,6 +2239,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
     # Each selected provider still keeps its own movie-then-series lane,
     # adaptive limiter, and backoff state.
     active_providers: list[dict] = []
+    movie_ids_all: set[int] = set()
+    series_ids_all: set[int] = set()
     for provider in providers:
         # A disabled provider must not participate in fallback enrichment,
         # even when old catalog source rows still reference it.  Imports and
@@ -2258,6 +2253,14 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
             lambda: vod_db.list_movie_ids_pending_provider_enrichment(provider_id)
             if pending_only and not force else vod_db.list_all_movie_ids(provider_id=provider_id)
         )
+        movie_ids_all.update(provider_movie_ids)
+        provider_series_rows = await asyncio.to_thread(
+            vod_db.list_pending_series_sources, provider_id
+        ) if pending_only and not force else None
+        if provider_series_rows is not None:
+            series_ids_all.update(row["series_id"] for row in provider_series_rows)
+        else:
+            series_ids_all.update(await asyncio.to_thread(vod_db.list_all_series_ids, provider_id=provider_id))
         provider_has_series_work = await asyncio.to_thread(
             vod_db.has_pending_series_source_enrichment, provider_id
         ) if pending_only and not force else bool(
@@ -2266,6 +2269,8 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         if provider_movie_ids or provider_has_series_work:
             active_providers.append(provider)
     providers = active_providers
+    movie_ids_all = sorted(movie_ids_all)
+    series_ids_all = sorted(series_ids_all)
     # Actual per-provider ids seen during this run (populated below) --
     # used for the end-of-phase merge sweeps instead of movie_ids_all/
     # series_ids_all, since a provider isn't guaranteed to have been listed
