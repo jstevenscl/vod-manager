@@ -33,6 +33,14 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ Stream Recovery is now a dedicated Operations page for movies blocked
+  after every playable source repeatedly fails. It lists the blocked title,
+  provider copies, failure counts, and last failure time. Test source opens
+  the real authenticated provider-preview path; a successful stream clears
+  the block and restores the movie to client VOD listings automatically.
+  Failed Streams remains the diagnostic history. TV recovery remains
+  episode-level work so one bad episode never hides an entire series.
+
 - ✅🔄 A movie is now automatically blocked from exported client catalogs when
   every active, enabled-language provider source has repeatedly failed. The
   source rows and failure history remain available for diagnosis; a successful

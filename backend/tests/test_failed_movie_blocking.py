@@ -25,6 +25,10 @@ def test_all_failed_movie_sources_are_blocked_and_a_success_restores_the_title(d
     finally:
         conn.close()
     assert db.get_movie_export_rows() == []
+    blocked = db.list_blocked_movies()
+    assert [row["id"] for row in blocked] == [movie["id"]]
+    assert {source["provider_name"] for source in blocked[0]["sources"]} == {"Provider A", "Provider B"}
 
     db.record_source_success("movie", sources[0]["source_id"])
     assert [row["movie_id"] for row in db.get_movie_export_rows()] == [movie["id"]]
+    assert db.list_blocked_movies() == []

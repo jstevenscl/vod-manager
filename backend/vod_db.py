@@ -2417,6 +2417,31 @@ def clear_stream_failures() -> None:
     conn.close()
 
 
+def list_blocked_movies() -> list[dict]:
+    """Actionable recovery queue for movies hidden after every playable
+    fallback repeatedly failed. Sources remain intact so an admin can test a
+    specific provider copy; record_source_success clears the block."""
+    conn = _connect()
+    movies = conn.execute("""
+        SELECT id, name, year, poster_url, stream_blocked_at
+        FROM movies WHERE stream_blocked=1
+        ORDER BY stream_blocked_at DESC, name
+    """).fetchall()
+    result = []
+    for movie in movies:
+        sources = conn.execute("""
+            SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id,
+                   ms.container_extension, ms.consecutive_failures, ms.last_failed_at,
+                   p.name AS provider_name
+            FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+            WHERE ms.movie_id=?
+            ORDER BY ms.consecutive_failures DESC, p.name
+        """, (movie["id"],)).fetchall()
+        result.append({**dict(movie), "sources": [dict(source) for source in sources]})
+    conn.close()
+    return result
+
+
 # ── DVR per-person resource limits ──────────────────────────────────────────
 # Opt-in: a person (a real Dispatcharr login user, identified by their numeric
 # id) with no row here has no DVR limit enforced at all. See
