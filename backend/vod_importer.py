@@ -1774,6 +1774,11 @@ def schedule_post_import_enrichment(*, track_catalog_workflow: bool = True) -> b
     global _POST_IMPORT_ENRICH_TASK
     if _POST_IMPORT_ENRICH_TASK and not _POST_IMPORT_ENRICH_TASK.done():
         return False
+    reset_enrichment_progress()
+    _TMDB_ENRICH_PROGRESS.update({
+        "running": False, "total": 0, "done": 0, "errors": 0,
+        "started_at": None, "finished_at": None,
+    })
     if track_catalog_workflow:
         _set_catalog_workflow_phase("Preparing automatic catalog review")
     _POST_IMPORT_ENRICH_TASK = asyncio.create_task(
@@ -1787,6 +1792,7 @@ _ENRICH_PROGRESS: dict = {
     "movies_total": 0, "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
     "series_total": 0, "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
     "started_at": None, "finished_at": None,
+    "cancelled": False,
     # Populated by bulk_enrich_all's per-provider sequencing (beads-f7e/
     # beads-sw9 redesign) when a provider's movie or series phase never
     # succeeded even after the single allotted retry -- see that function's
@@ -1805,6 +1811,18 @@ def cancel_bulk_enrichment() -> bool:
     _ENRICH_CANCEL_REQUESTED = True
     logger.warning("[vod_importer] bulk enrichment cancellation requested")
     return True
+
+
+def reset_enrichment_progress() -> None:
+    """Discard the previous bulk snapshot before a new catalog workflow."""
+    if _ENRICH_PROGRESS["running"]:
+        return
+    _ENRICH_PROGRESS.update({
+        "movies_total": 0, "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
+        "series_total": 0, "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
+        "started_at": None, "finished_at": None, "cancelled": False,
+        "providers_incomplete": [],
+    })
 
 # Item ids already counted into movies_done/series_done this run. The
 # single-retry pass (bulk_enrich_all) re-runs a failed provider's ENTIRE
@@ -2257,6 +2275,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         "movies_total": len(movie_ids_all), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
         "series_total": len(series_ids_all), "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
         "started_at": time.time(), "finished_at": None,
+        "cancelled": False,
         "providers_incomplete": [],
     })
     logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, %d active/%d configured providers, concurrency=%d",
@@ -2354,10 +2373,12 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
         await asyncio.to_thread(vod_db.auto_merge_movie_tmdb_collisions)
         await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
     finally:
+        was_cancelled = _ENRICH_CANCEL_REQUESTED
         if not writer_task.done():
             writer_task.cancel()
         _ENRICH_PROGRESS["running"] = False
         _ENRICH_PROGRESS["finished_at"] = time.time()
+        _ENRICH_PROGRESS["cancelled"] = was_cancelled
         elapsed = _ENRICH_PROGRESS["finished_at"] - _ENRICH_PROGRESS["started_at"]
         logger.info(
             "[vod_importer] bulk enrich done in %.1fs: movies %d/%d (%d errors, %d backoff-skipped), "

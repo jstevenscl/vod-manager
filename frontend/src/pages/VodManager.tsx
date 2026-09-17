@@ -1333,6 +1333,7 @@ interface EnrichProgress {
   movies_total: number; movies_done: number; movies_errors: number; movies_backoff_skipped: number
   series_total: number; series_done: number; series_errors: number; series_backoff_skipped: number
   started_at: number | null; finished_at: number | null
+  cancelled?: boolean
   providers_backing_off: { provider_id: number; seconds_remaining: number }[]
   providers_throttled: { provider_id: number; concurrency: number; max_concurrency: number }[]
 }
@@ -7520,7 +7521,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <RefreshCw size={12} className="mr-1" /> Force Re-Enrich All
           </Button>
-          {enrichProgress && !enrichProgress.running && enrichProgress.started_at && enrichProgress.finished_at && (
+          {enrichProgress && !enrichProgress.running && !enrichProgress.cancelled && enrichProgress.started_at && enrichProgress.finished_at && (
             <span className="text-xs text-muted-foreground">took {Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s</span>
           )}
         </div>
@@ -7540,7 +7541,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             }).join(', ')} after recent errors — eases back up automatically as requests keep succeeding.
           </p>
         )}
-        {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
+        {enrichProgress && (enrichProgress.running || (enrichProgress.finished_at && !enrichProgress.cancelled)) && (
           <div className="space-y-1.5">
             {(() => {
               // Real bug found live: unclamped, so movies_done could exceed

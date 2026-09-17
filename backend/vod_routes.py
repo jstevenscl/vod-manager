@@ -1704,6 +1704,9 @@ async def import_provider_catalog(provider_id: int):
     position = len(_MANUAL_IMPORT_QUEUE) + (1 if worker_running else 0) + 1
     _MANUAL_IMPORT_QUEUE.append(provider_id)
     if not worker_running:
+        # Do not leave the previous provider's completed enrichment totals in
+        # the UI while this new catalog workflow is being imported.
+        vod_importer.reset_enrichment_progress()
         vod_importer.mark_import_queued(provider_id, provider["name"], position)
         _MANUAL_IMPORT_TASK = asyncio.create_task(_manual_import_worker())
     return {"queued": True, "already_queued": False, "position": position, "provider": provider["name"]}
