@@ -33,22 +33,24 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
-- ✅ A movie is now automatically blocked from exported client catalogs when
+- ✅🔄 A movie is now automatically blocked from exported client catalogs when
   every active, enabled-language provider source has repeatedly failed. The
   source rows and failure history remain available for diagnosis; a successful
   retry clears the block and returns the title to the catalog. Deployment also
   sweeps already-exhausted titles, so existing all-404 entries are removed
   without needing another playback attempt. Live validation confirmed the
   reported all-404 case was an upstream provider issue; after the provider was
-  corrected, the affected movies played normally again.
+  corrected, the affected movies played normally again. Proposed upstream in
+  [#28](https://github.com/jstevenscl/vod-manager/pull/28).
 
-- ✅ Series refreshes now preserve the canonical row already attached to a
+- ✅🔄 Series refreshes now preserve the canonical row already attached to a
   provider's source ID, including when that provider is a secondary source.
   This fixes a regression that could reassign a source during a refresh and
   leave a duplicate zero-source series row in Metadata Review or Duplicate
   Finder. Successful imports now also purge existing rows with neither a
   provider source nor playable episode source; normal newly listed series
-  awaiting episode detail are retained.
+  awaiting episode detail are retained. Proposed upstream in
+  [#28](https://github.com/jstevenscl/vod-manager/pull/28).
 
 - ✅ Metadata Review now calls out likely existing catalog matches when a row is
   expanded. Same-title rows from another provider show their year, source
