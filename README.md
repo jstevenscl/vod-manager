@@ -11,7 +11,8 @@ different resellers). VOD & DVR Manager treats those as multiple *sources* for o
 pool entry rather than duplicate entries, and automatically fails over
 between them if one goes down or hits its connection limit — series
 included, pulling episodes from every provider that matches, not just
-whichever matched first.
+whichever matched first. A source's own trailer, when it has one, passes
+through to the re-exposed XC feed as-is.
 
 **New here?** See [USERGUIDE.md](USERGUIDE.md) for a full walkthrough with
 screenshots — installation, connecting Dispatcharr (single or multiple
@@ -349,9 +350,13 @@ opt-in, off-by-default checkbox also groups a quality-tagged title like "4K:
 Movie" with its plain "Movie" as a candidate, for consolidating with Stream
 Priority's quality mode below — matches sharing a confirmed TMDB id merge
 automatically the moment enrichment confirms it, before ever reaching this
-queue), **Needs Review** and the broader sidebar **Metadata Review** (resolve
-year-ambiguous imports and titles a provider left without any TMDB identity
-at all), and **Orphan Checker** (finds dead rows a provider deletion can
+queue — and an archived item stays archived even when a different
+provider's own import later matches it by name; only re-importing from the
+exact same source it was archived from can bring it back), **Needs Review**
+and the broader sidebar **Metadata Review** (resolve year-ambiguous imports
+and titles a provider left without any TMDB identity at all) alongside its
+sibling **Incorrect TMDB IDs** (a stored id TMDB itself now confirms is
+gone), and **Orphan Checker** (finds dead rows a provider deletion can
 leave behind — a series whose only source provider no longer exists, or
 movies/episodes with zero sources at all).
 Every movie/series can also be manually renamed or have its year corrected

@@ -78,6 +78,11 @@ Why this matters in practice:
   one matched first — so a season missing from one reseller's catalog can
   still play from another that has it, the same automatic failover movies
   already got.
+- **Trailers pass through, too.** When a source provider's own catalog
+  listing includes a trailer, VOD & DVR Manager keeps it and re-exposes it
+  through its own XC feed, so Dispatcharr and other clients that read that
+  field can show it — nothing to configure, and nothing is fetched from
+  anywhere else on VOD & DVR Manager's side.
 - **Recommended deployment**: on the same host/stack as Dispatcharr, since
   the two talk to each other constantly. It's fully capable of running on
   its own separate host too — nothing about it requires colocation, it's
@@ -203,7 +208,13 @@ for the first time. This is a metadata-only pass (name/year/category/stream
 ID) — poster art, cast, and descriptions are fetched lazily per-item after
 that (see *Rich Metadata* at the top of the same tab for a manual bulk-fetch
 button, or just let the background refresh schedule handle it — §6 in
-[README.md](README.md#refresh-schedule)).
+[README.md](README.md#refresh-schedule)). The click queues the import and
+returns immediately — a confirmation names the queue position, and you can
+keep using the rest of the app right away instead of the page locking up
+for the whole catalog pull. Live progress (and any other provider still
+ahead of it) shows in the sidebar **Status** widget (§9 below); clicking
+**Import catalog** again on a provider already queued or importing just
+confirms it's already in progress instead of double-queueing it.
 
 **Plex/Emby/Jellyfin: only Movies and TV Shows libraries are imported.** A
 library's own **Content type** setting (in Plex/Emby/Jellyfin's own library
@@ -1276,8 +1287,13 @@ exact shared id, and it still respects any pair you've already told the
 Duplicate Finder to **Ignore** (below) — a dismissed pair stays split even
 if it later shares an id. Auto-archiving disabled-language content (see
 [Enabled Playback Languages](#enabled-playback-languages) above) works the
-same automatic way. What's left for Duplicate Finder itself is everything
-that isn't (yet) that clear-cut, found three ways at once:
+same automatic way. An item archived this way (or by an import-exclusion
+rule) also stays archived when a *different* provider's own import later
+matches it by name — only re-importing from the exact same source it was
+archived from can bring it back, so one provider's catalog never silently
+resurrects something another provider's rules already hid. What's left for
+Duplicate Finder itself is everything that isn't (yet) that clear-cut,
+found three ways at once:
 
 - **Cosmetic punctuation** — a colon, a dash, quote style — the same title
   formatted slightly differently by different providers.
@@ -1393,6 +1409,18 @@ that id — no provider detail request and no manual step needed — so it
 often never appears in this queue at all. Any duplicate this uncovers
 (two rows that turn out to share the same id) merges the same automatic
 way described in Duplicate Finder above.
+
+### Incorrect TMDB IDs
+
+A sibling queue on the same page — different problem from Metadata Review
+above, which is for titles with no TMDB identity at all. This one catches
+a *stored* TMDB id that TMDB itself has since confirmed no longer exists (a
+404 on lookup), so the item is surfaced here instead of silently carrying a
+dead id forever. Same shape as Metadata Review: Movies/TV Shows tabs and
+bulk select with **Resolve selected with AI** — search TMDB and select the
+exact result to replace the bad id, same merge-if-it-already-exists
+behavior as everywhere else. Empty most of the time; a clean message says
+so when there's nothing currently flagged.
 
 ### Orphan Checker
 
