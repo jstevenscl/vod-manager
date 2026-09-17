@@ -88,7 +88,7 @@ async def import_plex_library(provider_id: int) -> dict:
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
     # Fetched once per library-import call, not once per item -- see
     # vod_importer._should_auto_archive's docstring for why.
-    lang = config.get_import_language_exclusion()
+    lang = vod_importer._current_lang_settings()
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
@@ -125,6 +125,10 @@ async def import_plex_library(provider_id: int) -> dict:
                     part_key, container = plex_client.extract_part(item)
                     if not part_key:
                         continue
+                    if vod_importer._should_exclude_from_import(
+                        item.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
+                    ):
+                        continue
                     fields = plex_client.extract_common_fields(item)
                     movie_items.append({
                         "name": item.get("title", ""),
@@ -142,9 +146,6 @@ async def import_plex_library(provider_id: int) -> dict:
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
-                        "auto_archive": vod_importer._should_auto_archive(
-                            item.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
-                        ),
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_movies, provider_id, movie_items)
                 for k in movie_result:
@@ -164,6 +165,10 @@ async def import_plex_library(provider_id: int) -> dict:
                     rating_key = show.get("ratingKey")
                     if not rating_key:
                         continue
+                    if vod_importer._should_exclude_from_import(
+                        show.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
+                    ):
+                        continue
                     fields = plex_client.extract_common_fields(show)
                     series_items.append({
                         "name": show.get("title", ""),
@@ -179,9 +184,6 @@ async def import_plex_library(provider_id: int) -> dict:
                         "release_date": fields["release_date"],
                         "last_enriched_at": now,
                         "provider_category_name": category_name,
-                        "auto_archive": vod_importer._should_auto_archive(
-                            show.get("title", ""), category_name, exclude_categories, exclude_uncategorized, lang,
-                        ),
                         "episodes": episodes,
                     })
                 r = await asyncio.to_thread(vod_db.bulk_import_plex_series, provider_id, series_items)

@@ -26,9 +26,16 @@ import vod_db
 from xc_server import _redact_upstream_url
 
 
-def _should_auto_archive(
+def _current_lang_settings() -> dict:
+    return {
+        "enabled_languages": config.get_enabled_languages(),
+        "exclude_non_latin": config.get_import_language_exclusion()["exclude_non_latin"],
+    }
+
+
+def _should_exclude_from_import(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
-    exclude_uncategorized: bool = False, lang: dict | None = None,
+    exclude_uncategorized: bool = False, lang: dict | None = None, raw_name: str | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -38,6 +45,9 @@ def _should_auto_archive(
     global (config.get_import_language_exclusion); category rules are
     per-provider (providers.import_exclude_categories), since available
     categories genuinely differ provider to provider.
+
+    Excluded items are filtered before persistence. Re-importing after a
+    policy change makes newly eligible items available again.
 
     provider_category_name/provider_exclude_categories default to no-ops
     for callers that only want language rules -- plex_importer.py/
@@ -53,19 +63,15 @@ def _should_auto_archive(
     dedicated switch, checked only when the item truly has no category,
     never as a substitute for an actual category-name match.
 
-    lang is optional so any caller that doesn't pre-fetch it keeps working --
-    falls back to the original per-call read below. Import callers
-    (import_provider_catalog, plex_importer.py, emby_vod_importer.py) fetch
-    it once per provider-import call and pass it through instead of
-    re-reading it (a disk read + JSON parse) once per catalog item -- against
-    a real ~275k-item catalog this cut ~274,600 redundant reads to 1 per
-    import run."""
-    lang = lang if lang is not None else config.get_import_language_exclusion()
-    if lang["exclude_prefixes"]:
-        code = vod_db._name_prefix_code(name)
-        if code and code in lang["exclude_prefixes"]:
-            return True
-    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
+    Classify language from the provider's raw title, before display rules
+    can remove a language prefix. Falls back to `name` for direct callers.
+    """
+    lang = lang if lang is not None else _current_lang_settings()
+    # Untagged titles use the same EN fallback as source-language storage.
+    code = vod_db._name_prefix_code(raw_name if raw_name is not None else name) or "EN"
+    if code not in lang["enabled_languages"]:
+        return True
+    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(raw_name if raw_name is not None else name):
         return True
     if provider_category_name:
         if provider_category_name in provider_exclude_categories:
@@ -465,17 +471,22 @@ class XCProviderClient:
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict,
+    lang: dict | None = None,
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     streams = await client.get_vod_streams()
     fetch_elapsed = time.time() - fetch_started
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+    lang = lang if lang is not None else _current_lang_settings()
     movie_items = []
     for s in streams:
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
         category_name = category_names.get(str(s.get("category_id")))
+        if _should_exclude_from_import(
+            name, category_name, exclude_categories, exclude_uncategorized, lang, raw_name=s.get("name") or "",
+        ):
+            continue
         movie_items.append({
             "name": name,
             "year": year,
@@ -491,7 +502,6 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -530,7 +540,7 @@ async def _import_movies_for_provider(
 async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict,
+    lang: dict | None = None,
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     series_list = await client.get_series()
@@ -547,11 +557,16 @@ async def _import_series_for_provider(
         field: await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", field)
         for field in ("genre", "description", "cast_list", "director")
     }
+    lang = lang if lang is not None else _current_lang_settings()
     series_items = []
     for s in series_list:
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
         category_name = series_category_names.get(str(s.get("category_id")))
+        if _should_exclude_from_import(
+            name, category_name, exclude_categories, exclude_uncategorized, lang, raw_name=s.get("name") or "",
+        ):
+            continue
         series_items.append({
             "name": name,
             "year": year or _coerce_year(s.get("year")),
@@ -561,7 +576,6 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -852,7 +866,7 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     # Fetched once per provider-import call, not once per catalog item -- see
     # _should_auto_archive's docstring for why (a disk read + JSON parse
     # repeated ~274,600 times in a real large-catalog import cycle).
-    lang = config.get_import_language_exclusion()
+    lang = _current_lang_settings()
 
     movie_result, streams_total, seen_movie_stream_ids = await _import_movies_for_provider(
         client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized, lang,
@@ -929,7 +943,6 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     provider_exclusions = {
         p["id"]: (p.get("import_exclude_categories") or [], bool(p.get("import_exclude_uncategorized")))
         for p in vod_db.list_providers()
-        if p.get("import_exclude_categories") or p.get("import_exclude_uncategorized")
     }
     if provider_exclusions:
         purge_lang = {
