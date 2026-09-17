@@ -31,6 +31,30 @@ synthetic placeholders. If upstream already contains equivalent or evolved
 work, update the existing changelog entry with that PR/release reference
 instead of opening a duplicate request.
 
+## 2026-09-17
+
+- ✅ Automatic post-import processing is now **import-first and provider-safe**.
+  Imported TMDB IDs continue through the bounded TMDB metadata pass; titles
+  without an ID remain in Metadata Review instead of triggering automatic
+  `get_vod_info` or `get_series_info` requests. Provider detail and episode
+  discovery remain explicit, user-initiated actions. This prevents a normal
+  catalog import from turning into thousands of provider calls.
+
+- ✅ Bulk enrichment now excludes disabled providers at selection time, even
+  when old source rows still reference them. Progress totals are scoped to
+  active providers, so an inactive provider cannot continue receiving requests
+  or inflate the displayed workload. Validated against a live disabled-provider
+  cleanup and a separate multi-provider import test.
+
+- ✅ Stale bulk-enrichment progress is cleared when a new import or automatic
+  workflow starts, and cancelled runs no longer leave old totals and completion
+  time visible. This prevents one provider's previous run from being mistaken
+  for the current import.
+
+- ✅ The sidebar now displays the manager host's current external IP using a
+  cached, authenticated lookup. The value refreshes periodically and shows
+  unavailable cleanly when the lookup service cannot be reached.
+
 ## 2026-09-15
 
 - ✅ Bulk enrichment now has a cooperative **Cancel enrichment** action in the
