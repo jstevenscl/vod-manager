@@ -3200,7 +3200,10 @@ def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphan
         JOIN episodes e ON e.id = es.episode_id
         WHERE e.series_id=?
     """, (series_id,)).fetchone()["c"]
-    if remaining == 0:
+    remaining_series_sources = conn.execute(
+        "SELECT COUNT(*) c FROM series_sources WHERE series_id=?", (series_id,)
+    ).fetchone()["c"]
+    if remaining == 0 and remaining_series_sources == 0:
         conn.execute("DELETE FROM series WHERE id=?", (series_id,))
     elif orphaned_provider_id is not None:
         conn.execute(
@@ -3397,16 +3400,22 @@ def delete_provider(provider_id: int) -> None:
 # Deliberately does NOT flag "series with zero episodes yet" as an orphan --
 # that's the overwhelming majority of any freshly bulk-imported pool (XC
 # episodes are fetched lazily per-series, on demand, by design) and is
-# completely normal, not broken. Only a series whose cached
-# import_provider_id points at a provider that no longer exists at all is
-# genuinely unfixable and worth flagging.
+# completely normal. A series with neither a provider-level source nor an
+# episode source, however, is unplayable even if its legacy import_provider_id
+# happens to point at a still-configured provider.
 
 def find_orphans() -> dict:
     conn = _connect()
-    valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-    orphaned_series = [dict(r) for r in conn.execute("SELECT id, name, import_provider_id FROM series").fetchall()
-                        if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+    orphaned_series = [dict(r) for r in conn.execute("""
+        SELECT s.id, s.name, s.import_provider_id
+        FROM series s
+        WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM episode_sources es
+              JOIN episodes e ON e.id=es.episode_id
+              WHERE e.series_id=s.id
+          )
+    """).fetchall()]
     sourceless_movies = [dict(r) for r in conn.execute("""
         SELECT m.id, m.name FROM movies m
         LEFT JOIN movie_sources ms ON ms.movie_id = m.id
@@ -3472,10 +3481,16 @@ def purge_orphans() -> dict:
     concurrent import and cause its inserts to fail with a FOREIGN KEY error."""
     with _WRITE_LOCK:
         conn = _connect()
-        valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-        orphaned_series_ids = [r["id"] for r in conn.execute("SELECT id, import_provider_id FROM series").fetchall()
-                                if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+        orphaned_series_ids = [r["id"] for r in conn.execute("""
+            SELECT s.id
+            FROM series s
+            WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM episode_sources es
+                  JOIN episodes e ON e.id=es.episode_id
+                  WHERE e.series_id=s.id
+              )
+        """).fetchall()]
         sourceless_movie_ids = [r["id"] for r in conn.execute("""
             SELECT m.id FROM movies m LEFT JOIN movie_sources ms ON ms.movie_id = m.id WHERE ms.id IS NULL
         """).fetchall()]
@@ -7646,11 +7661,12 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
             chunk = items[chunk_start:chunk_start + chunk_size]
 
             # -- Bulk-fetch every lookup this chunk could possibly need, in a
-            # small constant number of round trips -- see bulk_import_movies's
-            # identical comment for the general approach. The primary-match
-            # lookup here is keyed on (import_provider_id, import_provider_
-            # series_id) directly against `series` (no movie_sources-style
-            # join table for series).
+            # small constant number of round trips. A provider_series_id is a
+            # source identity, not merely a legacy primary-pointer value: a
+            # secondary provider source must return to the canonical row it
+            # already belongs to. Otherwise ON CONFLICT below reassigns its
+            # series_sources row and leaves the old row as an unplayable
+            # zero-source shadow (observed live 2026-09-17).
             series_ids = [item.get("provider_series_id") for item in chunk]
             existing_by_series_id: dict[object, sqlite3.Row] = {}
             source_fingerprints: dict[str, str | None] = {}
@@ -7658,12 +7674,15 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                 sub = series_ids[i:i + 900]
                 placeholders = ",".join("?" * len(sub))
                 rows = conn.execute(
-                    f"SELECT provider_series_id, catalog_fingerprint FROM series_sources "
-                    f"WHERE provider_id=? AND provider_series_id IN ({placeholders})",
+                    f"SELECT ss.provider_series_id, ss.catalog_fingerprint, s.id, s.is_adult, s.is_adult_manual, "
+                    f"s.review_excluded, s.review_excluded_manual, s.import_provider_series_id "
+                    f"FROM series_sources ss JOIN series s ON s.id=ss.series_id "
+                    f"WHERE ss.provider_id=? AND ss.provider_series_id IN ({placeholders})",
                     (provider_id, *sub),
                 ).fetchall()
                 for row in rows:
                     source_fingerprints[row["provider_series_id"]] = row["catalog_fingerprint"]
+                    existing_by_series_id[row["provider_series_id"]] = row
             for i in range(0, len(series_ids), 900):
                 sub = series_ids[i:i + 900]
                 placeholders = ",".join("?" * len(sub))
@@ -7673,7 +7692,10 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     (provider_id, *sub),
                 ).fetchall()
                 for row in rows:
-                    existing_by_series_id[row["import_provider_series_id"]] = row
+                    # A direct source mapping above is authoritative. This
+                    # legacy pointer remains only as a fallback for rows
+                    # created before series_sources existed.
+                    existing_by_series_id.setdefault(row["import_provider_series_id"], row)
 
             # Only items with no provider_series_id match need name/year
             # lookups -- same short-circuit as bulk_import_movies.

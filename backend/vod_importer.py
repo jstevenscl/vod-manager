@@ -1018,6 +1018,17 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
                 archive_result["movies_unarchived"], archive_result["series_unarchived"],
             )
 
+    # KNM: added 2026-09-17 -- source-first series matching prevents new
+    # shadows; this catches the pre-fix rows after a successful full refresh.
+    # It deletes only records with neither a series source nor any playable
+    # episode source, never a newly imported series merely awaiting details.
+    orphan_result = await asyncio.to_thread(vod_db.purge_orphans)
+    if orphan_result["series_deleted"] or orphan_result["movies_deleted"] or orphan_result["episodes_deleted"]:
+        logger.info(
+            "[vod_importer] provider=%s purged %d source-less series, %d movie(s), %d episode(s)",
+            provider["name"], orphan_result["series_deleted"], orphan_result["movies_deleted"], orphan_result["episodes_deleted"],
+        )
+
     if provider.get("auto_create_categories"):
         try:
             created = await asyncio.to_thread(

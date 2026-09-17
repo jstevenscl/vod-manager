@@ -33,6 +33,14 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ Series refreshes now preserve the canonical row already attached to a
+  provider's source ID, including when that provider is a secondary source.
+  This fixes a regression that could reassign a source during a refresh and
+  leave a duplicate zero-source series row in Metadata Review or Duplicate
+  Finder. Successful imports now also purge existing rows with neither a
+  provider source nor playable episode source; normal newly listed series
+  awaiting episode detail are retained.
+
 - ✅ Metadata Review now calls out likely existing catalog matches when a row is
   expanded. Same-title rows from another provider show their year, source
   count, and match reason. Choosing a candidate with a confirmed TMDB ID
