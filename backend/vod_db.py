@@ -1178,6 +1178,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    # Seed the durable decision for pre-existing sources.  Rows whose
+    # canonical item still has no TMDB identity are exactly the sources that
+    # the import-first workflow leaves for review; future imports maintain the
+    # flag per source as identities arrive.
+    conn.execute(
+        "UPDATE movie_sources SET provider_detail_deferred=1 "
+        "WHERE provider_detail_deferred=0 AND movie_id IN "
+        "(SELECT id FROM movies WHERE tmdb_id IS NULL OR TRIM(tmdb_id)='')"
+    )
+    conn.execute(
+        "UPDATE series_sources SET provider_detail_deferred=1 "
+        "WHERE provider_detail_deferred=0 AND series_id IN "
+        "(SELECT id FROM series WHERE tmdb_id IS NULL OR TRIM(tmdb_id)='')"
+    )
     _commit_with_retry(conn)
 
 
