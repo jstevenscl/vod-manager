@@ -38,7 +38,9 @@ instead of opening a duplicate request.
   source rows and failure history remain available for diagnosis; a successful
   retry clears the block and returns the title to the catalog. Deployment also
   sweeps already-exhausted titles, so existing all-404 entries are removed
-  without needing another playback attempt.
+  without needing another playback attempt. Live validation confirmed the
+  reported all-404 case was an upstream provider issue; after the provider was
+  corrected, the affected movies played normally again.
 
 - ✅ Series refreshes now preserve the canonical row already attached to a
   provider's source ID, including when that provider is a secondary source.
