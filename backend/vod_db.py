@@ -117,6 +117,7 @@ def init_db() -> None:
             bitrate INTEGER,
             raw_name TEXT,
             catalog_fingerprint TEXT,
+            provider_detail_deferred INTEGER NOT NULL DEFAULT 0,
             added_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
             UNIQUE(provider_id, provider_stream_id)
@@ -179,6 +180,7 @@ def init_db() -> None:
             provider_category_name TEXT,
             raw_name TEXT,
             catalog_fingerprint TEXT,
+            provider_detail_deferred INTEGER NOT NULL DEFAULT 0,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             last_failed_at TEXT,
             added_at TEXT NOT NULL,
@@ -961,6 +963,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("series", "import_provider_id", "INTEGER"),
         ("series", "import_provider_series_id", "TEXT"),
         ("movie_sources", "provider_category_name", "TEXT"),
+        ("movie_sources", "provider_detail_deferred", "INTEGER NOT NULL DEFAULT 0"),
+        ("series_sources", "provider_detail_deferred", "INTEGER NOT NULL DEFAULT 0"),
         ("episode_sources", "provider_category_name", "TEXT"),
         ("providers", "priority", "INTEGER NOT NULL DEFAULT 0"),
         ("movies", "is_adult", "INTEGER NOT NULL DEFAULT 0"),
@@ -5575,6 +5579,7 @@ def set_movie_enrichment(movie_id: int, **fields) -> None:
         fields["last_enriched_at"] = _now()
         sets = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE movies SET {sets} WHERE id=?", (*fields.values(), movie_id))
+        conn.execute("UPDATE movie_sources SET provider_detail_deferred=0 WHERE movie_id=?", (movie_id,))
         _commit_with_retry(conn)
         conn.close()
 
@@ -6421,7 +6426,7 @@ def set_series_source_enrichment(series_id: int, provider_id: int, provider_seri
     with _WRITE_LOCK:
         conn = _connect()
         conn.execute(
-            "UPDATE series_sources SET last_seen_at=?, episodes_last_enriched_at=?, "
+            "UPDATE series_sources SET last_seen_at=?, episodes_last_enriched_at=?, provider_detail_deferred=0, "
             "consecutive_failures=0, last_failed_at=NULL "
             "WHERE series_id=? AND provider_id=? AND provider_series_id=?",
             (_now(), _now(), series_id, provider_id, provider_series_id),
@@ -7516,13 +7521,15 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             )
                         if entry["source_changed"]:
                             conn.execute(
-                                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, catalog_fingerprint, added_at, last_seen_at)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                                """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, catalog_fingerprint, provider_detail_deferred, added_at, last_seen_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
                                    ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                                        movie_id=excluded.movie_id, container_extension=excluded.container_extension, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
-                                       raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint""",
+                                       raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint,
+                                       provider_detail_deferred=excluded.provider_detail_deferred""",
                                 (entry["movie_id"], provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                                 item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], now, now),
+                                 item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"],
+                                 int(not item.get("tmdb_id")), now, now),
                             )
                             sources_changed += 1
                         created += entry["did_create"]
@@ -7893,12 +7900,12 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # bulk_import_movies exactly.
                         if entry["source_changed"] and item.get("provider_series_id") is not None:
                             conn.execute(
-                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, catalog_fingerprint, added_at, last_seen_at) "
-                                "VALUES (?,?,?,?,?,?,?,?,?) "
+                                "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, catalog_fingerprint, provider_detail_deferred, added_at, last_seen_at) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?) "
                                 "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
                                 "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
-                                "raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint, last_seen_at=excluded.last_seen_at",
-                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], now, now),
+                                "raw_name=excluded.raw_name, language=excluded.language, catalog_fingerprint=excluded.catalog_fingerprint, provider_detail_deferred=excluded.provider_detail_deferred, last_seen_at=excluded.last_seen_at",
+                                (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], int(not item.get("tmdb_id")), now, now),
                             )
                             sources_changed += 1
                         if entry["cat_update_needed"]:
@@ -9354,6 +9361,10 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
         fields["tmdb_id"] = tmdb_id
     sets = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
+    if tmdb_id:
+        source_table = "movie_sources" if content_type == "movie" else "series_sources"
+        source_key = "movie_id" if content_type == "movie" else "series_id"
+        conn.execute(f"UPDATE {source_table} SET provider_detail_deferred=0 WHERE {source_key}=?", (item_id,))
     _commit_with_retry(conn)
     conn.close()
     if tmdb_id:
@@ -10610,6 +10621,9 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
 
     conn = _connect()
     conn.execute(f"UPDATE {table} SET tmdb_id=?, updated_at=? WHERE id=?", (tmdb_id, _now(), item_id))
+    source_table = "movie_sources" if content_type == "movie" else "series_sources"
+    source_key = "movie_id" if content_type == "movie" else "series_id"
+    conn.execute(f"UPDATE {source_table} SET provider_detail_deferred=0 WHERE {source_key}=?", (item_id,))
     _commit_with_retry(conn)
     conn.close()
     clear_tmdb_lookup_failure(content_type, item_id)

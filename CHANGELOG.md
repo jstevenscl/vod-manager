@@ -55,6 +55,12 @@ instead of opening a duplicate request.
   cached, authenticated lookup. The value refreshes periodically and shows
   unavailable cleanly when the lookup service cannot be reached.
 
+- ✅ Provider sources now record `provider_detail_deferred` explicitly. A
+  source imported without a TMDB ID is marked for later review rather than
+  being silently treated as an automatic enrichment failure; approving an ID
+  or completing explicit provider detail clears the marker. This leaves a
+  durable hook for future review and on-demand actions.
+
 ## 2026-09-15
 
 - ✅ Bulk enrichment now has a cooperative **Cancel enrichment** action in the
