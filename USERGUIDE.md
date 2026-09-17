@@ -255,6 +255,17 @@ its name.
 
 ![Import Language Exclusion settings](docs/screenshots/import-language-exclusion.png)
 
+**Country** (Curation & Maintenance → *Import Country Exclusion*) is the
+same idea as Language above, just keyed on a title's trailing `(XX)`
+country-of-origin tag instead of a leading language prefix — a separate
+provider convention (`Married at First Sight (NZ)` vs. `EN| Married at
+First Sight`), so it's its own picker rather than folded into the language
+one. Most useful for an internationally-franchised show that imports
+several genuinely different country editions under one base title: check
+the editions you don't want and only those get auto-archived, everything
+else stays untouched. Same searchable-checklist pattern as Language, with
+live counts pulled from what's actually in your pool right now.
+
 **Category** (the **Exclude Categories** button on each provider row) is
 per-provider, since available categories genuinely differ from one provider
 to the next — the picker shows exactly what that provider itself calls its

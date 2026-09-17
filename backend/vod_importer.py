@@ -28,7 +28,7 @@ from xc_server import _redact_upstream_url
 
 def _should_auto_archive(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
-    exclude_uncategorized: bool = False, lang: dict | None = None,
+    exclude_uncategorized: bool = False, lang: dict | None = None, country: list[str] | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -53,13 +53,23 @@ def _should_auto_archive(
     dedicated switch, checked only when the item truly has no category,
     never as a substitute for an actual category-name match.
 
-    lang is optional so any caller that doesn't pre-fetch it keeps working --
-    falls back to the original per-call read below. Import callers
-    (import_provider_catalog, plex_importer.py, emby_vod_importer.py) fetch
-    it once per provider-import call and pass it through instead of
-    re-reading it (a disk read + JSON parse) once per catalog item -- against
-    a real ~275k-item catalog this cut ~274,600 redundant reads to 1 per
-    import run."""
+    lang/country are optional so any caller that doesn't pre-fetch them
+    keeps working -- falls back to the original per-call read below. Import
+    callers (import_provider_catalog, plex_importer.py, emby_vod_importer.py)
+    fetch both once per provider-import call and pass them through instead
+    of re-reading them (a disk read + JSON parse) once per catalog item --
+    against a real ~275k-item catalog this cut ~274,600 redundant reads to 1
+    per import run.
+
+    country (Import Country Exclusion): a separate provider convention from
+    the leading language prefix above -- a trailing "(<country code>)" tag
+    (vod_db._country_suffix_code, the same allowlist-only check Duplicate
+    Finder's normalization already uses, so the two features never disagree
+    on what counts as a country tag). Real motivating case: an
+    internationally-franchised show ("Married at First Sight") importing
+    several genuinely-different country editions under the same base
+    title -- there was no way to keep just the ones you want without
+    archiving them one at a time by hand."""
     lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
         code = vod_db._name_prefix_code(name)
@@ -67,6 +77,11 @@ def _should_auto_archive(
             return True
     if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
         return True
+    country = country if country is not None else config.get_import_country_exclusion()
+    if country:
+        code = vod_db._country_suffix_code(name)
+        if code and code in country:
+            return True
     if provider_category_name:
         if provider_category_name in provider_exclude_categories:
             return True
@@ -465,7 +480,7 @@ class XCProviderClient:
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict,
+    lang: dict, country: list[str],
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     streams = await client.get_vod_streams()
@@ -491,7 +506,7 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang, country),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -530,7 +545,7 @@ async def _import_movies_for_provider(
 async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict,
+    lang: dict, country: list[str],
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     series_list = await client.get_series()
@@ -561,7 +576,7 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang),
+            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang, country),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -853,12 +868,13 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     # _should_auto_archive's docstring for why (a disk read + JSON parse
     # repeated ~274,600 times in a real large-catalog import cycle).
     lang = config.get_import_language_exclusion()
+    country = config.get_import_country_exclusion()
 
     movie_result, streams_total, seen_movie_stream_ids = await _import_movies_for_provider(
-        client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized, lang,
+        client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized, lang, country,
     )
     series_result, series_total, seen_series_ids = await _import_series_for_provider(
-        client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized, lang,
+        client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized, lang, country,
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)

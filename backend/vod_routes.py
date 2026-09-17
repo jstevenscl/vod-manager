@@ -16,6 +16,7 @@ from config import (
     get_enabled_languages,
     get_gemini_api_key,
     get_hide_dvr_tab,
+    get_import_country_exclusion,
     get_import_language_exclusion,
     get_lockout_settings,
     get_mdblist_api_key,
@@ -31,6 +32,7 @@ from config import (
     save_duplicate_finder_quality_prefix_matching,
     save_enabled_languages,
     save_gemini_api_key,
+    save_import_country_exclusion,
     save_import_language_exclusion,
     save_lockout_settings,
     save_mdblist_api_key,
@@ -112,6 +114,10 @@ class HideDvrTabRequest(BaseModel):
 class ImportLanguageExclusionRequest(BaseModel):
     exclude_prefixes: list[str] = []
     exclude_non_latin: bool = False
+
+
+class ImportCountryExclusionRequest(BaseModel):
+    exclude_country_codes: list[str] = []
 
 
 class EnabledLanguagesRequest(BaseModel):
@@ -929,6 +935,22 @@ async def save_import_language_exclusion_settings(body: ImportLanguageExclusionR
 @router.get("/import-language-exclusion/prefixes/", dependencies=_GUARDS)
 async def list_import_language_exclusion_prefixes():
     return vod_db.list_all_pool_prefixes()
+
+
+@router.get("/import-country-exclusion/", dependencies=_GUARDS)
+async def get_import_country_exclusion_settings():
+    return {"exclude_country_codes": get_import_country_exclusion()}
+
+
+@router.post("/import-country-exclusion/", dependencies=_GUARDS)
+async def save_import_country_exclusion_settings(body: ImportCountryExclusionRequest):
+    save_import_country_exclusion(body.exclude_country_codes)
+    return {"ok": True}
+
+
+@router.get("/import-country-exclusion/codes/", dependencies=_GUARDS)
+async def list_import_country_exclusion_codes():
+    return vod_db.list_all_pool_country_suffixes()
 
 
 @router.post("/import-exclusions/apply-now/", dependencies=_GUARDS)

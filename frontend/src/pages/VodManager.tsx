@@ -1133,6 +1133,22 @@ const LANGUAGE_CODE_NAMES: Record<string, string> = {
   // shorthand with no reliable interpretation). A wrong guess here is
   // worse than just showing the raw code.
 }
+// Country-of-origin suffix codes (backend _KNOWN_COUNTRY_SUFFIX_CODES,
+// vod_db._country_suffix_code) -- a separate, trailing-tag provider
+// convention from the leading language prefixes above, e.g. "Married at
+// First Sight (NZ)". Kept as its own map rather than reusing
+// LANGUAGE_CODE_NAMES since a few codes overlap but mean something
+// different in this context (GB/UK here is "United Kingdom" the country,
+// not "British English" the language dialect).
+const COUNTRY_CODE_NAMES: Record<string, string> = {
+  US: 'United States', GB: 'United Kingdom', UK: 'United Kingdom', ES: 'Spain',
+  FR: 'France', CA: 'Canada', AU: 'Australia', KR: 'South Korea', IT: 'Italy',
+  DE: 'Germany', MX: 'Mexico', TR: 'Turkey', SE: 'Sweden', BR: 'Brazil',
+  PL: 'Poland', JP: 'Japan', NO: 'Norway', IN: 'India', ZA: 'South Africa',
+  CO: 'Colombia', AR: 'Argentina', DK: 'Denmark', BE: 'Belgium', IL: 'Israel',
+  NL: 'Netherlands', IE: 'Ireland', NZ: 'New Zealand', FI: 'Finland',
+  TH: 'Thailand', IS: 'Iceland', PT: 'Portugal',
+}
 type AiProvider = 'anthropic' | 'openai' | 'gemini'
 const AI_PROVIDER_DEFAULT_MODELS: Record<AiProvider, string> = {
   anthropic: 'claude-haiku-4-5-20251001', openai: 'gpt-5-mini', gemini: 'gemini-2.5-flash',
@@ -1801,8 +1817,9 @@ function DuplicateInlinePreview({ kind, itemId, xcCredentials }: {
   )
 }
 
-function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPending, onIgnore, isIgnorePending, tmdbDetails }: {
+function DuplicateGroupRow({ group, groupIndex, contentType, xcCredentials, onMerge, isPending, onIgnore, isIgnorePending, tmdbDetails }: {
   group: DuplicateGroup
+  groupIndex: number
   contentType: 'movie' | 'series'
   xcCredentials?: XcCredentials
   onMerge: (keepId: number, mergeIds: number[]) => void
@@ -1832,12 +1849,33 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
   }
   const sameTmdbMatch = [...tmdbIdCounts.values()].some((c) => c > 1)
 
+  // Real gap found live 2026-09-17: "Merge into selected" always merged
+  // EVERY other item in the group into the keep pick, with no way to act on
+  // a subset -- a real problem the moment a group has 3+ items and only
+  // some of them are true matches (found live: a base-name-only pass 5
+  // candidate mixing a genuine pair with an unrelated third title). All
+  // items start checked (so a normal 2-item group behaves exactly like
+  // before, zero extra clicks), and both Merge and Ignore below now act on
+  // only the checked subset -- an unchecked item is left completely
+  // untouched (not merged, not dismissed), free to resurface however the
+  // next scan groups it.
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(() => new Set(group.items.map((i) => i.id)))
+  const toggleChecked = (id: number) => setCheckedIds((prev) => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+  const checkedItems = group.items.filter((i) => checkedIds.has(i.id))
+
   // Backend sorts most-sourced/most-placed first, but that ignores TMDB
   // confirmation entirely -- an unconfirmed candidate with more sources used
   // to beat a TMDB-confirmed one for the default "keep" pick. Rank by TMDB
   // signal first (corroborated match > uncorroborated match > no signal
   // either way > year mismatch > confirmed-wrong while a sibling matches),
   // falling back to the backend's source/category order within a tier.
+  // Corroboration (tmdbIdCounts) is deliberately still read from the WHOLE
+  // group, not just the checked subset -- unchecking a sibling doesn't
+  // un-corroborate a shared id, that's still real evidence either way.
   const rankTmdbTier = (item: DuplicateGroup['items'][number]) => {
     const trueYear = item.tmdb_id ? tmdbDetails?.[item.tmdb_id]?.year : undefined
     const corroborated = item.tmdb_id != null && (tmdbIdCounts.get(item.tmdb_id) ?? 0) > 1
@@ -1850,18 +1888,32 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
     if (noMatchWhileSiblingHas) return -1
     return 1 // no tmdb signal either way -- neutral, defer to source/category order
   }
-  const bestDefaultId = group.items.reduce(
+  // "Keep" is scoped to the checked subset -- an unchecked item can never be
+  // the default (or a stale manual) keep pick. Falls back to the full group
+  // only in the (unreachable via UI, since unchecking below the last two
+  // items disables the checkbox) edge case of zero checked items.
+  const keepCandidates = checkedItems.length ? checkedItems : group.items
+  const bestDefaultId = keepCandidates.reduce(
     (best, item) => (rankTmdbTier(item) > rankTmdbTier(best) ? item : best),
-    group.items[0],
+    keepCandidates[0],
   ).id
   const [keepId, setKeepId] = useState(bestDefaultId)
   const [userPickedKeep, setUserPickedKeep] = useState(false)
   useEffect(() => {
+    // Current keep just got unchecked -- it can't stay keep, and a
+    // reviewer's earlier manual pick no longer applies to this new subset,
+    // so fall back to the best remaining checked candidate and let
+    // auto-ranking resume.
+    if (!checkedIds.has(keepId)) {
+      setKeepId(bestDefaultId)
+      setUserPickedKeep(false)
+      return
+    }
     // tmdbDetails resolves asynchronously after this group first renders;
     // re-rank once it lands, but never override a reviewer's manual pick.
     if (!userPickedKeep) setKeepId(bestDefaultId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bestDefaultId, userPickedKeep])
+  }, [bestDefaultId, userPickedKeep, checkedIds])
   const [previewIds, setPreviewIds] = useState<Set<number>>(new Set())
   const togglePreview = (id: number) => setPreviewIds((prev) => {
     const next = new Set(prev)
@@ -1895,8 +1947,17 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
   const artworkMatches = group.items.some((item) => item.poster_url && (posterCounts.get(item.poster_url) ?? 0) > 1)
 
   return (
-    <div className="border border-border rounded px-2 py-1.5 space-y-1.5">
+    // bg-card + shadow-sm (both absent before) give each group its own
+    // clearly-bounded card against the page background, on top of the
+    // wider inter-group gap at the call site -- see that comment for why
+    // (two adjacent correct-but-separate groups misread as one, live
+    // 2026-09-17). The "Group N of M" label is the unambiguous fallback
+    // even if the visual styling itself doesn't survive a screenshot.
+    <div className="border border-border rounded-lg bg-card shadow-sm px-2.5 py-2 space-y-1.5">
       <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
+          Group {groupIndex + 1} · {group.items.length} candidate{group.items.length === 1 ? '' : 's'}
+        </span>
         {sameTmdbMatch && (
           <span className="text-[10px] font-normal px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30">
             same TMDB match
@@ -1932,12 +1993,26 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
         // see _split_by_tmdb_conflict).
         const isCorroborated = item.tmdb_id != null && (tmdbIdCounts.get(item.tmdb_id) ?? 0) > 1
         const otherHasTmdbId = group.items.some((other) => other.id !== item.id && other.tmdb_id != null)
+        const isChecked = checkedIds.has(item.id)
         return (
-          <div key={item.id} className="flex gap-2">
+          <div key={item.id} className={`flex gap-2 ${isChecked ? '' : 'opacity-50'}`}>
+            <input
+              type="checkbox"
+              className="mt-1.5 shrink-0"
+              checked={isChecked}
+              onChange={() => toggleChecked(item.id)}
+              title="Include this candidate in Merge selected / Ignore selected below -- uncheck it to leave it completely untouched instead"
+            />
             <PosterThumb url={item.poster_url} className="w-12 h-[72px] object-cover rounded shrink-0" fallback={null} />
             <div className="flex-1 min-w-0">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="radio" checked={keepId === item.id} onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }} />
+              <label className={`flex items-center gap-2 ${isChecked ? 'cursor-pointer' : 'cursor-not-allowed'}`}>
+                <input
+                  type="radio"
+                  checked={keepId === item.id}
+                  disabled={!isChecked}
+                  onChange={() => { setKeepId(item.id); setUserPickedKeep(true) }}
+                  title={isChecked ? undefined : 'Unchecked candidates can\'t be the keep pick'}
+                />
                 <span className={keepId === item.id ? 'font-medium' : ''}>{item.name}{item.year && !item.name.trim().endsWith(`(${item.year})`) ? ` (${item.year})` : ''}</span>
                 <span className="text-muted-foreground">
                   {item.source_count} source{item.source_count === 1 ? '' : 's'} · {item.category_count} categor{item.category_count === 1 ? 'y' : 'ies'}
@@ -2001,21 +2076,26 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
       <div className="flex items-center gap-1.5">
         <Button
           size="sm"
-          disabled={isPending}
-          onClick={() => onMerge(keepId, group.items.filter((i) => i.id !== keepId).map((i) => i.id))}
+          disabled={isPending || checkedItems.length < 2}
+          title={checkedItems.length < 2 ? 'Check at least 2 candidates to merge' : undefined}
+          onClick={() => onMerge(keepId, checkedItems.filter((i) => i.id !== keepId).map((i) => i.id))}
         >
           {isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-          Merge into selected
+          Merge selected{checkedItems.length < group.items.length ? ` (${checkedItems.length})` : ''}
         </Button>
         <Button
           size="sm"
           variant="outline"
-          disabled={isIgnorePending}
-          title="Not actually duplicates -- dismiss this group so it stops resurfacing"
-          onClick={() => onIgnore(group.items.map((i) => i.id))}
+          disabled={isIgnorePending || checkedItems.length < 2}
+          title={
+            checkedItems.length < 2
+              ? 'Check at least 2 candidates to dismiss as not-duplicates'
+              : 'Not actually duplicates of each other -- dismiss the checked candidates so this exact pairing stops resurfacing (any unchecked candidate is left untouched)'
+          }
+          onClick={() => onIgnore(checkedItems.map((i) => i.id))}
         >
           {isIgnorePending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-          Ignore
+          Ignore selected{checkedItems.length < group.items.length ? ` (${checkedItems.length})` : ''}
         </Button>
       </div>
     </div>
@@ -4672,6 +4752,67 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setLanguageDraft(next)
     setLanguageLastClickedIndex(index)
   }
+  // Import Country Exclusion -- sibling to Import Language Exclusion above,
+  // same shape/pattern, keyed on a title's trailing "(<country code>)" tag
+  // instead of a leading language prefix. Real motivating case: an
+  // internationally-franchised show importing several genuinely-different
+  // country editions under the same base title, with no way to keep just
+  // the ones wanted without archiving them one at a time by hand.
+  const importCountryExclusionQuery = useQuery<{ exclude_country_codes: string[] }>({
+    queryKey: ['vod-import-country-exclusion'],
+    queryFn:  () => api.get('/vod/import-country-exclusion/').then((r) => r.data),
+  })
+  const countryCodesQuery = useQuery<{ code: string; count: number }[]>({
+    queryKey: ['vod-import-country-codes'],
+    queryFn:  () => api.get('/vod/import-country-exclusion/codes/').then((r) => r.data),
+  })
+  const saveImportCountryExclusion = useMutation({
+    mutationFn: (body: { exclude_country_codes: string[] }) =>
+      api.post('/vod/import-country-exclusion/', body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-import-country-exclusion'] }),
+  })
+  const [countrySearch, setCountrySearch] = useState('')
+  const [countryShowFilter, setCountryShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [countryDraft, setCountryDraft] = useState<Set<string>>(new Set())
+  const [countryLastClickedIndex, setCountryLastClickedIndex] = useState<number | null>(null)
+  const countryDraftInitialized = useRef(false)
+  useEffect(() => {
+    if (countryDraftInitialized.current || !importCountryExclusionQuery.data) return
+    countryDraftInitialized.current = true
+    setCountryDraft(new Set(importCountryExclusionQuery.data.exclude_country_codes))
+  }, [importCountryExclusionQuery.data])
+  const allCountryCodes = (() => {
+    const counts = new Map((countryCodesQuery.data ?? []).map((p) => [p.code, p.count]))
+    for (const code of importCountryExclusionQuery.data?.exclude_country_codes ?? []) {
+      if (!counts.has(code)) counts.set(code, 0)
+    }
+    return [...counts.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
+  })()
+  const visibleCountryCodes = allCountryCodes.filter((c) => {
+    const label = `${c.code} ${COUNTRY_CODE_NAMES[c.code] ?? ''}`.toLowerCase()
+    if (countrySearch && !label.includes(countrySearch.toLowerCase())) return false
+    if (countryShowFilter === 'selected' && !countryDraft.has(c.code)) return false
+    if (countryShowFilter === 'unselected' && countryDraft.has(c.code)) return false
+    return true
+  })
+  function toggleCountrySelected(code: string, index: number, shiftKey: boolean) {
+    const willBeChecked = !countryDraft.has(code)
+    const next = new Set(countryDraft)
+    if (shiftKey && countryLastClickedIndex != null) {
+      const [start, end] = [countryLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const c = visibleCountryCodes[j]?.code
+        if (c == null) continue
+        if (willBeChecked) next.add(c); else next.delete(c)
+      }
+    } else {
+      if (willBeChecked) next.add(code); else next.delete(code)
+    }
+    setCountryDraft(next)
+    setCountryLastClickedIndex(index)
+  }
   // Enabled Playback Languages -- separate from the exclusion picker above:
   // that one gates future imports by raw_name prefix (archives on import,
   // via _should_auto_archive); this is a live filter over the language
@@ -5040,6 +5181,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-provider-available-categories', excludeCategoriesProviderId],
     queryFn:  () => api.get(`/vod/providers/${excludeCategoriesProviderId}/available-categories/`).then((r) => r.data),
     enabled:  excludeCategoriesProviderId != null,
+    // Real bug found live 2026-09-17: this hits the provider's own API
+    // fresh every time (get_vod_categories/get_series_categories, not a
+    // cached snapshot -- see the backend route's docstring). React Query's
+    // default refetchOnWindowFocus:true meant switching windows (e.g. to
+    // take a screenshot) while the picker was open silently refetched live
+    // from the provider mid-session -- if that provider's own category
+    // list had shifted even slightly, the sorted list reordered/added/
+    // removed entries under the user, making checked boxes appear to
+    // randomly flip position while scrolling even though their actual
+    // saved selection never changed. Worse, saving while looking at a
+    // stale mid-refetch snapshot could silently save a wrong exclusion
+    // list. Deliberately NOT also setting staleTime:Infinity -- this still
+    // refetches fresh every time the picker is opened (enabled flips
+    // false->true, default staleTime:0 means that's still "stale"), just
+    // never again while it stays open and mounted.
+    refetchOnWindowFocus: false,
   })
   const setProviderImportExcludeCategories = useMutation({
     mutationFn: ({ id, category_names, exclude_uncategorized }: { id: number; category_names: string[]; exclude_uncategorized: boolean }) =>
@@ -8266,6 +8423,81 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         )}
       </SectionCard>
+      <SectionCard title="Import Country Exclusion" icon={<Trash2 size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Sibling to Import Language Exclusion above, same rule either way (archives on import, never deletes, never
+          overrides a manual un-archive) — but keyed on a title's trailing "(XX)" country-of-origin tag instead of a
+          leading language prefix. Useful for an internationally-franchised show that imports several genuinely
+          different country editions under the same base title — check the ones you don't want and only those
+          editions get auto-archived, the rest of the catalog is untouched.
+        </p>
+        {allCountryCodes.length > 0 ? (
+          <>
+            <div className="flex items-center gap-1.5">
+              <input
+                className={inputCls('flex-1')}
+                placeholder="Search countries…"
+                value={countrySearch}
+                onChange={(e) => setCountrySearch(e.target.value)}
+              />
+              <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                {(['all', 'selected', 'unselected'] as const).map((f) => (
+                  <button
+                    key={f}
+                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${countryShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setCountryShowFilter(f)}
+                  >
+                    {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 text-xs">
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => setCountryDraft(new Set([...countryDraft, ...visibleCountryCodes.map((c) => c.code)]))}
+              >
+                Select visible ({visibleCountryCodes.length})
+              </button>
+              <button
+                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                onClick={() => { const next = new Set(countryDraft); visibleCountryCodes.forEach((c) => next.delete(c.code)); setCountryDraft(next) }}
+              >
+                Deselect visible ({visibleCountryCodes.filter((c) => countryDraft.has(c.code)).length})
+              </button>
+              <span className="text-muted-foreground ml-auto">{countryDraft.size} selected total · shift-click to select a range</span>
+            </div>
+            <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+              {visibleCountryCodes.map((c, i) => (
+                <label key={c.code} className="flex items-center gap-1.5 select-none">
+                  <input
+                    type="checkbox"
+                    checked={countryDraft.has(c.code)}
+                    onChange={() => {}}
+                    onClick={(e) => toggleCountrySelected(c.code, i, e.shiftKey)}
+                  />
+                  <span className="font-mono">{c.code}</span>
+                  {COUNTRY_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {COUNTRY_CODE_NAMES[c.code]}</span>}
+                  <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+                </label>
+              ))}
+              {visibleCountryCodes.length === 0 && <p className="text-muted-foreground">No countries match.</p>}
+            </div>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            No titles in the pool carry a recognized trailing country tag (e.g. "Title (US)", "Title (NZ)").
+          </p>
+        )}
+        <Button
+          size="sm"
+          disabled={saveImportCountryExclusion.isPending}
+          onClick={() => saveImportCountryExclusion.mutate({ exclude_country_codes: [...countryDraft] })}
+        >
+          {saveImportCountryExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Save selected countries
+        </Button>
+      </SectionCard>
       </>
       )}
 
@@ -9556,10 +9788,21 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           // already walked the whole pool in one query; thousands of groups
           // in the DOM at once (not just in memory) is what actually made
           // the page unusably slow, so only render one page's worth.
-          <div className="text-xs space-y-1.5">
-            {duplicatesPageItems.map((group) => (
+          //
+          // space-y-3 (up from space-y-1.5), not just cosmetic: a real user
+          // found live 2026-09-17 that two adjacent, CORRECT, separate
+          // 2-item groups (an unrelated same-base-name show's AU pair next
+          // to its NZ pair) were misread as one 4-item group -- the cards'
+          // subtle shared border + ~6px gap gave no reliable boundary,
+          // especially once the visual spacing/border don't survive a
+          // screenshot or copy-paste. The wider gap here plus each card's
+          // own bg-card/shadow/numbered header (see DuplicateGroupRow)
+          // together make the boundary unambiguous even then.
+          <div className="text-xs space-y-3">
+            {duplicatesPageItems.map((group, groupIndex) => (
               <DuplicateGroupRow
                 key={group.items.map((i) => i.id).join('-')}
+                groupIndex={groupIndex}
                 group={group}
                 contentType={duplicatesContentType}
                 xcCredentials={xcCredentialsQuery.data}

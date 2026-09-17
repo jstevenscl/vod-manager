@@ -68,7 +68,7 @@ def test_movie_catalog_mapping_prefers_stream_icon(monkeypatch):
     asyncio.run(vod_importer._import_movies_for_provider(
         _FakeClient(), {"id": 1, "name": "test-provider"}, 1,
         {"1": "Movies"}, [], False,
-        {"exclude_prefixes": [], "exclude_non_latin": False},
+        {"exclude_prefixes": [], "exclude_non_latin": False}, [],
     ))
 
     assert captured["items"][0]["poster_url"] == "https://images.example/stream-icon.jpg"

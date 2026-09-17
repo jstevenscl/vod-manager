@@ -3582,6 +3582,22 @@ _KNOWN_COUNTRY_SUFFIX_CODES = {
 _COUNTRY_SUFFIX_RE = re.compile(r"\s*\(([A-Za-z]{2,4})\)\s*$")
 
 
+def _country_suffix_code(name: str) -> str | None:
+    """The trailing "(<known country code>)" tag on a title, if any, e.g.
+    "Severance (2022) (US)" -> "US". Allowlist-only against
+    _KNOWN_COUNTRY_SUFFIX_CODES, same reasoning as that set's own comment --
+    a real title can legitimately end in "(Something)" that isn't a country
+    tag at all. Shared by _strip_country_suffix_for_dedup (Duplicate Finder
+    normalization) and vod_importer._should_auto_archive (Import Country
+    Exclusion) so the two features agree on exactly what counts as a
+    country-tagged title instead of drifting out of sync with their own
+    copies of this check."""
+    m = _COUNTRY_SUFFIX_RE.search(name)
+    if m and m.group(1).upper() in _KNOWN_COUNTRY_SUFFIX_CODES:
+        return m.group(1).upper()
+    return None
+
+
 def _strip_country_suffix_for_dedup(name: str) -> str:
     """Strips a single trailing "(<known country code>)" tag, e.g.
     "Severance (2022) (US)" -> "Severance (2022)". Only removes ONE layer
@@ -9784,6 +9800,24 @@ def list_all_pool_prefixes() -> list[dict]:
         for r in rows:
             code = _name_prefix_code(r["name"])
             if code and code not in _NON_LANGUAGE_PIPE_TAGS:
+                counts[code] = counts.get(code, 0) + 1
+    conn.close()
+    return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])
+
+
+def list_all_pool_country_suffixes() -> list[dict]:
+    """Every known trailing "(<country code>)" tag (_country_suffix_code,
+    allowlist-only against _KNOWN_COUNTRY_SUFFIX_CODES) actually present
+    across the WHOLE pool right now, with live counts -- same shape and
+    reasoning as list_all_pool_prefixes above, just for Import Country
+    Exclusion's picker instead of Import Language Exclusion's."""
+    conn = _connect()
+    counts: dict[str, int] = {}
+    for table in ("movies", "series"):
+        rows = conn.execute(f"SELECT name FROM {table}").fetchall()
+        for r in rows:
+            code = _country_suffix_code(r["name"])
+            if code:
                 counts[code] = counts.get(code, 0) + 1
     conn.close()
     return sorted(({"code": c, "count": n} for c, n in counts.items()), key=lambda x: -x["count"])

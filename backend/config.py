@@ -321,6 +321,24 @@ def save_import_language_exclusion(exclude_prefixes: list[str], exclude_non_lati
     _write_raw(data)
 
 
+def get_import_country_exclusion() -> list[str]:
+    """Global (not per-provider) sibling to get_import_language_exclusion
+    above, same reasoning -- keyed on a title's trailing "(<country code>)"
+    tag (vod_db._country_suffix_code) instead of its leading language
+    prefix. A separate provider convention from the language prefix (e.g.
+    "Married at First Sight (NZ)" vs "EN| Married at First Sight"), so this
+    is its own setting rather than folded into the language one. See
+    vod_importer._should_auto_archive."""
+    data = _read_raw()
+    return [c.strip().upper() for c in (data.get("import_exclude_country_codes") or []) if c.strip()]
+
+
+def save_import_country_exclusion(exclude_country_codes: list[str]) -> None:
+    data = _read_raw()
+    data["import_exclude_country_codes"] = [c.strip().upper() for c in exclude_country_codes if c.strip()]
+    _write_raw(data)
+
+
 def get_enabled_languages() -> list[str]:
     """Which already-imported sources are eligible for playback/export/
     failover (vod_db._enabled_languages_clause), independent of
