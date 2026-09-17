@@ -7501,7 +7501,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       )}
       <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Imported TMDB IDs are resolved first without contacting providers. Provider detail is reserved for
+          Imported TMDB IDs are resolved without contacting providers. Provider detail is manual for
           unmatched movies and series episode discovery. Runs in the background — safe to navigate away while it works.
         </p>
         <div className="flex items-center gap-1.5">

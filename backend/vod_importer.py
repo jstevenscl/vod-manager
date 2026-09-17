@@ -1749,18 +1749,20 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
 
 
 async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
-    """Run provider-free identity enrichment before provider-only fallback."""
+    """Run only provider-free identity metadata after a catalog import.
+
+    Provider detail calls are deliberately not part of the automatic import
+    handoff.  A missing TMDB ID stays in Metadata Review for an explicit user
+    decision; silently falling back to one provider per title can turn a
+    normal import into thousands of slow/rate-limited requests.
+    """
     try:
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Resolving known TMDB identities")
         await bulk_enrich_tmdb_movies()
         await bulk_enrich_tmdb_series_metadata()
-        # Remaining new movies have no imported TMDB ID; bulk_enrich_all's
-        # movie phase now selects only those fallback rows.  Its series phase
-        # remains the deliberate provider-detail path for episode discovery.
         if track_catalog_workflow:
-            _set_catalog_workflow_phase("Enriching details and reconciling duplicates")
-        await bulk_enrich_all(pending_only=True)
+            _set_catalog_workflow_phase("Preparing catalog review")
         if track_catalog_workflow:
             mark_catalog_workflow_ready()
     except Exception:
