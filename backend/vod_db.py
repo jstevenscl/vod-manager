@@ -100,7 +100,9 @@ def init_db() -> None:
             is_adult_manual INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT,
-            last_enriched_at TEXT
+            last_enriched_at TEXT,
+            stream_blocked INTEGER NOT NULL DEFAULT 0,
+            stream_blocked_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS movie_sources (
@@ -1005,6 +1007,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("metadata_rules", "is_regex", "INTEGER NOT NULL DEFAULT 1"),
         ("movie_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("movie_sources", "last_failed_at", "TEXT"),
+        ("movies", "stream_blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "stream_blocked_at", "TEXT"),
         ("episode_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("episode_sources", "last_failed_at", "TEXT"),
         ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
@@ -2229,6 +2233,24 @@ def record_source_failure(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
             (_now(), source_id),
         )
+        if kind == "movie":
+            row = conn.execute("SELECT movie_id FROM movie_sources WHERE id=?", (source_id,)).fetchone()
+            if row:
+                lang_clause, lang_params = _enabled_languages_clause("ms.language")
+                conn.execute(f"""
+                    UPDATE movies SET stream_blocked=1, stream_blocked_at=?
+                    WHERE id=? AND stream_blocked=0
+                      AND EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                            AND ms.consecutive_failures < {_FAILING_SOURCE_THRESHOLD}
+                      )
+                """, (_now(), row["movie_id"], row["movie_id"], *lang_params,
+                       row["movie_id"], *lang_params))
         _commit_with_retry(conn)
         conn.close()
 
@@ -2248,6 +2270,11 @@ def record_source_success(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
             (source_id,),
         )
+        if kind == "movie":
+            conn.execute("""
+                UPDATE movies SET stream_blocked=0, stream_blocked_at=NULL
+                WHERE id=(SELECT movie_id FROM movie_sources WHERE id=?) AND stream_blocked=1
+            """, (source_id,))
         _commit_with_retry(conn)
         conn.close()
 
@@ -3209,7 +3236,10 @@ def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphan
         JOIN episodes e ON e.id = es.episode_id
         WHERE e.series_id=?
     """, (series_id,)).fetchone()["c"]
-    if remaining == 0:
+    remaining_series_sources = conn.execute(
+        "SELECT COUNT(*) c FROM series_sources WHERE series_id=?", (series_id,)
+    ).fetchone()["c"]
+    if remaining == 0 and remaining_series_sources == 0:
         conn.execute("DELETE FROM series WHERE id=?", (series_id,))
     elif orphaned_provider_id is not None:
         conn.execute(
@@ -3396,18 +3426,22 @@ def delete_provider(provider_id: int) -> None:
 # every future gap will go through the choke points already covered.
 #
 # Deliberately does NOT flag "series with zero episodes yet" as an orphan --
-# that's the overwhelming majority of any freshly bulk-imported pool (XC
-# episodes are fetched lazily per-series, on demand, by design) and is
-# completely normal, not broken. Only a series whose cached
-# import_provider_id points at a provider that no longer exists at all is
-# genuinely unfixable and worth flagging.
+# that's normal for a freshly imported catalog. A series with neither a
+# provider-level source nor an episode source is unplayable, however, even if
+# its legacy import_provider_id points to a configured provider.
 
 def find_orphans() -> dict:
     conn = _connect()
-    valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-    orphaned_series = [dict(r) for r in conn.execute("SELECT id, name, import_provider_id FROM series").fetchall()
-                        if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+    orphaned_series = [dict(r) for r in conn.execute("""
+        SELECT s.id, s.name, s.import_provider_id
+        FROM series s
+        WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM episode_sources es
+              JOIN episodes e ON e.id=es.episode_id
+              WHERE e.series_id=s.id
+          )
+    """).fetchall()]
     sourceless_movies = [dict(r) for r in conn.execute("""
         SELECT m.id, m.name FROM movies m
         LEFT JOIN movie_sources ms ON ms.movie_id = m.id
@@ -3473,10 +3507,16 @@ def purge_orphans() -> dict:
     concurrent import and cause its inserts to fail with a FOREIGN KEY error."""
     with _WRITE_LOCK:
         conn = _connect()
-        valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-        orphaned_series_ids = [r["id"] for r in conn.execute("SELECT id, import_provider_id FROM series").fetchall()
-                                if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+        orphaned_series_ids = [r["id"] for r in conn.execute("""
+            SELECT s.id
+            FROM series s
+            WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM episode_sources es
+                  JOIN episodes e ON e.id=es.episode_id
+                  WHERE e.series_id=s.id
+              )
+        """).fetchall()]
         sourceless_movie_ids = [r["id"] for r in conn.execute("""
             SELECT m.id FROM movies m LEFT JOIN movie_sources ms ON ms.movie_id = m.id WHERE ms.id IS NULL
         """).fetchall()]
@@ -5874,6 +5914,7 @@ def get_movie_export_rows() -> list[dict]:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
+        WHERE m.stream_blocked=0
         ORDER BY m.name
     """, lang_params).fetchall()
     conn.close()
@@ -5939,7 +5980,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         LEFT JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
-        WHERE p.export_stream_id = ?
+        WHERE p.export_stream_id = ? AND m.stream_blocked=0
         LIMIT 1
     """, (*lang_params, export_stream_id)).fetchone()
     conn.close()
@@ -7389,18 +7430,25 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     # last statement has actually succeeded.
                     did_create = did_match = did_flag = did_archive = did_unarchive = False
                     series_id_for_detail = None
-                    # Primary match: this exact provider+series_id was already
-                    # imported before -- reuse its established identity directly,
-                    # UNCONDITIONALLY (not just for a blank name), same reasoning
-                    # as bulk_import_movies's identical hoist above (see its
-                    # comment for the full explanation of why this is what makes
-                    # it safe for enrichment to later overwrite a raw/placeholder
-                    # name with the provider's clean title without the next
-                    # re-import creating a duplicate orphaned row).
+                    # A provider series ID is a stable source identity. Resolve
+                    # through series_sources first so a secondary provider's
+                    # source returns to its established canonical row instead
+                    # of creating a new row whose INSERT OR IGNORE source write
+                    # leaves it unplayable and source-less.
                     existing = conn.execute(
-                        "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                        "SELECT s.id, s.is_adult, s.is_adult_manual, s.review_excluded, s.review_excluded_manual "
+                        "FROM series_sources ss JOIN series s ON s.id=ss.series_id "
+                        "WHERE ss.provider_id=? AND ss.provider_series_id=?",
                         (provider_id, item.get("provider_series_id")),
                     ).fetchone()
+                    if not existing:
+                        # Compatibility fallback for a row created before
+                        # series_sources existed.
+                        existing = conn.execute(
+                            "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                            "FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                            (provider_id, item.get("provider_series_id")),
+                        ).fetchone()
                     if existing:
                         did_match = True
                         series_id_for_detail = existing["id"]

@@ -886,6 +886,15 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
             reconcile_result["episode_sources_removed"],
         )
 
+    # A successful catalog pass is a safe opportunity to remove any legacy
+    # rows with neither a provider source nor a playable episode source.
+    orphan_result = await asyncio.to_thread(vod_db.purge_orphans)
+    if orphan_result["series_deleted"] or orphan_result["movies_deleted"] or orphan_result["episodes_deleted"]:
+        logger.info(
+            "[vod_importer] provider=%s purged %d source-less series, %d movie(s), %d episode(s)",
+            provider["name"], orphan_result["series_deleted"], orphan_result["movies_deleted"], orphan_result["episodes_deleted"],
+        )
+
     if provider.get("auto_create_categories"):
         try:
             created = await asyncio.to_thread(
