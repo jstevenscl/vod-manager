@@ -1790,6 +1790,17 @@ _ENRICH_PROGRESS: dict = {
     # {"provider_id": int, "provider_name": str, "phase": "movies"|"series"}.
     "providers_incomplete": [],
 }
+_ENRICH_CANCEL_REQUESTED = False
+
+
+def cancel_bulk_enrichment() -> bool:
+    """Request a cooperative stop for the active bulk enrichment job."""
+    global _ENRICH_CANCEL_REQUESTED
+    if not _ENRICH_PROGRESS["running"]:
+        return False
+    _ENRICH_CANCEL_REQUESTED = True
+    logger.warning("[vod_importer] bulk enrichment cancellation requested")
+    return True
 
 # Item ids already counted into movies_done/series_done this run. The
 # single-retry pass (bulk_enrich_all) re-runs a failed provider's ENTIRE
@@ -2002,6 +2013,8 @@ async def _run_provider_movie_phase(
     async def _worker() -> None:
         nonlocal ok
         while True:
+            if _ENRICH_CANCEL_REQUESTED:
+                return
             try:
                 mid = queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -2059,6 +2072,8 @@ async def _run_provider_series_phase(
     async def _worker() -> None:
         nonlocal ok
         while True:
+            if _ENRICH_CANCEL_REQUESTED:
+                return
             try:
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -2188,8 +2203,10 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
     skip_auto_merge=True from this function so the inline per-item merge
     never double-runs during a bulk pass -- single on-demand enrich (outside
     bulk_enrich_all) keeps its immediate inline merge unchanged."""
+    global _ENRICH_CANCEL_REQUESTED
     if _ENRICH_PROGRESS["running"]:
         return
+    _ENRICH_CANCEL_REQUESTED = False
 
     providers = await asyncio.to_thread(vod_db.list_providers)
     configured_provider_count = len(providers)
@@ -2272,11 +2289,15 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
             if result["series_ran"]:
                 merged_series_ids.update(result["series_ids"])
 
+        if _ENRICH_CANCEL_REQUESTED:
+            return
         # Retry pass: only for providers whose movie phase failed on the
         # first attempt, and only after every OTHER provider has already
         # finished both phases (spec: "after ALL other providers finish").
         needs_retry = [(p, r) for p, r in zip(providers, results) if not r["movie_ok"]]
         for provider, _first_result in needs_retry:
+            if _ENRICH_CANCEL_REQUESTED:
+                return
             retry_kwargs = {"write_queue": write_queue}
             if pending_only:
                 retry_kwargs["pending_only"] = True

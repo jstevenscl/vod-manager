@@ -3766,6 +3766,13 @@ async def enrich_all_status():
     return vod_importer.get_enrich_progress()
 
 
+@router.post("/enrich-all/cancel/", dependencies=_GUARDS)
+async def enrich_all_cancel():
+    if not vod_importer.cancel_bulk_enrichment():
+        raise HTTPException(409, detail="bulk enrichment is not running")
+    return {"cancel_requested": True}
+
+
 @router.get("/enrich-tmdb/status/", dependencies=_GUARDS)
 async def enrich_tmdb_status():
     """Progress for automatic provider-free metadata ingestion."""

@@ -5033,6 +5033,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
   })
+  const cancelBulkEnrich = useMutation({
+    mutationFn: () => api.post('/vod/enrich-all/cancel/'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enrich-progress'] }),
+  })
   const enrichProgress = enrichProgressQuery.data
   const tmdbEnrichProgress = tmdbEnrichProgressQuery.data
   const wasEnrichRunning = useRef(false)
@@ -7504,6 +7508,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {enrichProgress?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
             {enrichProgress?.running ? 'Enriching…' : 'Bulk Enrich All'}
           </Button>
+          {enrichProgress?.running && (
+            <Button size="sm" variant="outline" disabled={cancelBulkEnrich.isPending} onClick={() => cancelBulkEnrich.mutate()}>
+              Cancel enrichment
+            </Button>
+          )}
           <Button
             size="sm" variant="outline" disabled={!!enrichProgress?.running || startBulkEnrich.isPending}
             title="Re-fetches every movie/series from its provider even if it was already enriched -- use this once after an update adds new captured fields (e.g. rating, release date, bitrate), so existing items backfill them right away instead of waiting out the normal freshness window."

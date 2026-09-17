@@ -33,6 +33,11 @@ instead of opening a duplicate request.
 
 ## 2026-09-15
 
+- ✅ Bulk enrichment now has a cooperative **Cancel enrichment** action in the
+  UI and API. Cancellation stops scheduling new provider-detail requests while
+  allowing the current request to finish, so a large fallback pass can be
+  halted without restarting the container. Added cancellation regression tests.
+
 - ✅🔀 Cross-provider matches now preserve an existing automatic archive by
   default. If a movie or series was archived and a later provider supplies the
   same title, that source is attached without resurrecting the catalog item;
