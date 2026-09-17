@@ -2247,6 +2247,12 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False, pending_onl
     # adaptive limiter, and backoff state.
     active_providers: list[dict] = []
     for provider in providers:
+        # A disabled provider must not participate in fallback enrichment,
+        # even when old catalog source rows still reference it.  Imports and
+        # playback already honor this flag; bulk detail enrichment must do so
+        # as well or disabling a provider cannot stop its requests.
+        if not provider.get("is_active", True):
+            continue
         provider_id = provider["id"]
         provider_movie_ids = await asyncio.to_thread(
             lambda: vod_db.list_movie_ids_pending_provider_enrichment(provider_id)
