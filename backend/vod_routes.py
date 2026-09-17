@@ -753,6 +753,14 @@ async def clear_stream_failures():
     return {"ok": True}
 
 
+@router.get("/stream-recovery/movies/", dependencies=_GUARDS)
+async def list_blocked_movies():
+    """Movies hidden after every playable source reached the failure limit.
+    The returned source IDs are used by the existing authenticated preview
+    route, whose successful playback clears the block automatically."""
+    return vod_db.list_blocked_movies()
+
+
 # ── Content-mismatch flagging ────────────────────────────────────────────────
 # "This isn't actually what its label says" -- see vod_db.py's own section
 # docstring for the full reasoning and the 5 supported granularities.

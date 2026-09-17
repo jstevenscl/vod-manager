@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -259,6 +259,23 @@ interface StreamFailure {
   series_providers: string[] | null
   client_ip: string | null
   client_label: string | null
+}
+
+interface BlockedMovie {
+  id: number
+  name: string
+  year: number | null
+  poster_url: string | null
+  stream_blocked_at: string | null
+  sources: {
+    source_id: number
+    provider_id: number
+    provider_stream_id: string
+    container_extension: string
+    provider_name: string
+    consecutive_failures: number
+    last_failed_at: string | null
+  }[]
 }
 
 interface FlaggedContentItem {
@@ -4243,7 +4260,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'curation' | 'providers' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -4302,6 +4319,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const clearStreamFailures = useMutation({
     mutationFn: () => api.delete('/vod/stream-failures/'),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-failures'] }),
+  })
+  const blockedMoviesQuery = useQuery<BlockedMovie[]>({
+    queryKey: ['vod-stream-recovery-movies'],
+    queryFn: () => api.get('/vod/stream-recovery/movies/').then((r) => r.data),
+    enabled: activeTab === 'recovery',
+    refetchInterval: activeTab === 'recovery' ? 5000 : false,
   })
 
 
@@ -6161,6 +6184,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         </Modal>
       )}
+      {activeTab !== 'metadata' && activeTab !== 'recovery' && <>
       <SectionCard title="Activity" icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
@@ -6276,6 +6300,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </>
         )}
       </SectionCard>
+
+      </>}
 
       {activeTab === 'config' && (
       <>
@@ -7204,6 +7230,66 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {diagnosticsBusy ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
           Download Diagnostic Logs
         </Button>
+      </SectionCard>
+      </>
+      )}
+
+      {activeTab === 'recovery' && (
+      <>
+      <SectionCard title="Stream Recovery" icon={<Activity size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Movies are hidden from client VOD listings only after every active playable source repeatedly fails.
+          Test an individual provider copy below. A successful stream immediately restores the movie; a failed test leaves it blocked.
+        </p>
+        <div className="flex items-center gap-2 pt-1">
+          <Button size="sm" variant="outline" className="gap-1" disabled={blockedMoviesQuery.isFetching} onClick={() => blockedMoviesQuery.refetch()}>
+            {blockedMoviesQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            Refresh
+          </Button>
+          <span className="text-[11px] text-muted-foreground">
+            {blockedMoviesQuery.data?.length ?? 0} blocked movie{blockedMoviesQuery.data?.length === 1 ? '' : 's'}
+          </span>
+        </div>
+        {blockedMoviesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading blocked movies…</p>}
+        {blockedMoviesQuery.isError && <p className="text-xs text-destructive">Could not load stream recovery. Refresh and try again.</p>}
+        {!blockedMoviesQuery.isLoading && !blockedMoviesQuery.isError && !blockedMoviesQuery.data?.length && (
+          <p className="text-xs text-muted-foreground">No movies are currently blocked.</p>
+        )}
+        <div className="space-y-2">
+          {blockedMoviesQuery.data?.map((movie) => (
+            <div key={movie.id} className="rounded-lg border border-destructive/30 bg-destructive/5 overflow-hidden">
+              <div className="flex gap-3 p-3">
+                <PosterThumb url={movie.poster_url} className="w-10 h-14 rounded object-cover shrink-0" fallback={<div className="w-10 h-14 rounded bg-muted flex items-center justify-center"><Film size={15} className="text-muted-foreground" /></div>} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold truncate">{movie.name}{movie.year ? ` (${movie.year})` : ''}</p>
+                  <p className="text-[11px] text-destructive">Blocked {movie.stream_blocked_at ? new Date(Number(movie.stream_blocked_at) * 1000).toLocaleString() : 'after all sources failed'}</p>
+                  <div className="mt-2 space-y-1.5">
+                    {movie.sources.map((source) => {
+                      const ext = source.container_extension || 'mp4'
+                      return (
+                        <div key={source.source_id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs rounded border border-border/60 bg-card px-2 py-1.5">
+                          <span className="font-medium">{source.provider_name}</span>
+                          <span className="text-destructive">Failed {source.consecutive_failures}×</span>
+                          {source.last_failed_at && <span className="text-muted-foreground">last {new Date(Number(source.last_failed_at) * 1000).toLocaleString()}</span>}
+                          <span className="ml-auto flex items-center gap-1 text-primary">
+                            <PlayButton
+                              url={buildPreviewSourceUrl('movie', source.source_id, ext, xcCredentialsQuery.data)}
+                              transcodedUrl={buildTranscodedPreviewSourceUrl('movie', source.source_id, xcCredentialsQuery.data)}
+                              hlsUrl={buildHlsPreviewSourceUrl('movie', source.source_id, xcCredentialsQuery.data)}
+                              title={`${movie.name} — ${source.provider_name}`}
+                            />
+                            <span className="text-[11px]">Test source</span>
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {!xcCredentialsQuery.data && <p className="mt-2 text-[11px] text-destructive">Add an enabled Connected Instance before testing a source.</p>}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
       </SectionCard>
       </>
       )}
