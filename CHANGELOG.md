@@ -33,6 +33,21 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅🔄 Language policy now applies consistently at import: XC, Plex, and
+  Emby catalogs use the enabled playback languages, classify from the raw
+  provider title before display rules can remove a prefix, and skip excluded
+  items before they enter the catalog. Legacy automatically excluded entries
+  are safely cleaned up while manual archives remain untouched. Regression
+  coverage: 53 focused language-policy tests passed. Proposed upstream in
+  [#29](https://github.com/jstevenscl/vod-manager/pull/29).
+
+- ✅🔄 Configuration now includes preview-before-apply language maintenance:
+  backfill missing source-language values or recompute values that no longer
+  match the raw provider title. These operations correct source metadata only;
+  catalog entries are not changed. Regression tests and the production
+  frontend build passed. Proposed upstream in
+  [#30](https://github.com/jstevenscl/vod-manager/pull/30).
+
 - ✅ Stream Recovery is now a dedicated Operations page for movies blocked
   after every playable source repeatedly fails. It lists the blocked title,
   provider copies, failure counts, and last failure time. Test source opens
