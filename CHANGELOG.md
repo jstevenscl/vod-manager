@@ -33,6 +33,9 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ Fork Docker Compose now pulls `ghcr.io/knmplace/vod-manager:latest` so
+  deployments use the fork image rather than the upstream repository image.
+
 - ✅ Metadata Review now calls out likely existing catalog matches when a row is
   expanded. Same-title rows from another provider show their year, source
   count, and match reason; rows with a confirmed TMDB ID can be explicitly
