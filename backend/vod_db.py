@@ -9402,10 +9402,102 @@ def language_recompute_dry_run_report(sample_size: int = 5) -> dict:
     longer matches what _source_language would compute today -- i.e. they
     were classified by a since-fixed bug (e.g. a missing prefix code)
     rather than never classified at all. Distinct from
+    were classified by a since-fixed bug (e.g. beads-d2t's missing "IR"
+    prefix code) rather than never classified at all. Distinct from
     language_backfill_dry_run_report, which only covers language IS NULL
     rows. Reports what apply_language_recompute would change, per table,
     per newly-detected code, so it can be sanity-checked before touching
     any data."""
+    conn = _connect()
+    report = {}
+    for table, fk_col, parent_table in _BACKFILL_TABLES:
+        rows = conn.execute(
+            f"SELECT raw_name, language, {fk_col} AS parent_id FROM {table} WHERE language IS NOT NULL"
+        ).fetchall()
+        by_code: dict[str, dict] = {}
+        for row in rows:
+            recomputed = _source_language(row["raw_name"])
+            if recomputed == row["language"]:
+                continue
+            bucket = by_code.setdefault(recomputed, {"count": 0, "sample_titles": [], "_parent_ids": set()})
+            bucket["count"] += 1
+            bucket["_parent_ids"].add(row["parent_id"])
+        for code, bucket in by_code.items():
+            sample_ids = list(bucket.pop("_parent_ids"))[:sample_size]
+            if sample_ids:
+                placeholders = ",".join("?" for _ in sample_ids)
+                name_rows = conn.execute(
+                    f"SELECT name FROM {parent_table} WHERE id IN ({placeholders})", sample_ids
+                ).fetchall()
+                bucket["sample_titles"] = [r["name"] for r in name_rows]
+        if by_code:
+            report[table] = by_code
+    conn.close()
+    return report
+
+
+def apply_language_recompute() -> int:
+    """Writes the recomputed language (see language_recompute_dry_run_report)
+    onto every existing movie_sources/series_sources/episode_sources row
+    whose stored value disagrees with what _source_language computes now.
+    Safe to re-run -- once nothing disagrees, it becomes a no-op. Returns
+    the total number of rows updated."""
+    total = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        for table, _fk_col, _parent_table in _BACKFILL_TABLES:
+            rows = conn.execute(f"SELECT id, raw_name, language FROM {table} WHERE language IS NOT NULL").fetchall()
+            for row in rows:
+                recomputed = _source_language(row["raw_name"])
+                if recomputed != row["language"]:
+                    conn.execute(
+                        f"UPDATE {table} SET language = ? WHERE id = ?",
+                        (recomputed, row["id"]),
+                    )
+                    total += 1
+        _commit_with_retry(conn)
+        conn.close()
+    return total
+
+
+def _group_source_languages_by_conflict(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> list[dict]:
+    """beads-974 (Step 3): union-chains a single movie's/series' own
+    movie_sources/series_sources rows by COALESCE(language,'EN') -- the same
+    grouping rule as _split_by_language_conflict, just applied to one row's
+    own sources instead of a duplicate-candidate cluster, since Step 3 is
+    the retroactive inverse of the merge Step 1/2 now block going forward.
+    Returns one dict per resulting language group: {"langs": set[str],
+    "source_ids": list[int]}, largest group first (ties broken by lowest
+    source id, for determinism) -- callers keep group [0] on the original
+    row and split the rest off."""
+    rows = conn.execute(
+        f"SELECT id, COALESCE(language, 'EN') AS lang FROM {sources_table} WHERE {fk_column}=?",
+        (row_id,),
+    ).fetchall()
+
+    groups: list[dict] = []
+    for row in rows:
+        row_langs = {row["lang"]}
+        joined = False
+        for g in groups:
+            if g["langs"] & row_langs:
+                g["source_ids"].append(row["id"])
+                g["langs"] |= row_langs
+                joined = True
+                break
+        if not joined:
+            groups.append({"langs": row_langs, "source_ids": [row["id"]]})
+
+    groups.sort(key=lambda g: (-len(g["source_ids"]), min(g["source_ids"])))
+    return groups
+
+
+def movie_language_split_dry_run_report() -> dict:
+    """beads-974 (Step 3): reports every existing movie whose movie_sources
+    span more than one language group (see _group_source_languages_by_
+    conflict) -- these were merged back when auto_merge_movie_by_tmdb gated
+    on tmdb_id alone, before Step 1's language gate existed. Read-only --
+    see apply_movie_language_split for the actual re-split."""
     conn = _connect()
     report = {}
     for table, fk_col, parent_table in _BACKFILL_TABLES:

@@ -4687,7 +4687,38 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
   })
+
+  // Language backfill + retroactive movie/series language split (beads-974
+  // Step 3): one-off maintenance actions, previously only runnable via a
+  // direct backend/SSH call. Each preview query runs the read-only
+  // *_dry_run_report(), and the matching mutation runs the real apply_*().
+  const languageBackfillPreview = useQuery<{ movie_sources?: number; series_sources?: number; episode_sources?: number }>({
+    queryKey: ['vod-language-backfill-preview'],
+    queryFn: () => api.get('/vod/language-backfill/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageBackfillApply = useMutation({
+    mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
+  // Recompute (beads-d2t): distinct from backfill above. Backfill only fills
+  // in rows that were never classified (language IS NULL). This instead
+  // catches rows that WERE classified but by a since-fixed bug, e.g. "IR -"
+  // prefixed sources written as language='EN' before "IR" was added to
+  // _KNOWN_LANGUAGE_CODES. Report shape: { [table]: { [code]: { count, sample_titles } } }.
+  const languageRecomputePreview = useQuery<Record<string, Record<string, { count: number; sample_titles: string[] }>>>({
+    queryKey: ['vod-language-recompute-preview'],
+    queryFn: () => api.get('/vod/language-recompute/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageRecomputeApply = useMutation({
+    mutationFn: () => api.post('/vod/language-recompute/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
+  const [enabledLanguageSearch, setEnabledLanguageSearch] = useState('')
+  const [enabledLanguageShowFilter, setEnabledLanguageShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
   const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
+  const [enabledLanguageLastClickedIndex, setEnabledLanguageLastClickedIndex] = useState<number | null>(null)
   const enabledLanguageDraftInitialized = useRef(false)
   useEffect(() => {
     if (enabledLanguageDraftInitialized.current || !enabledLanguagesQuery.data) return
@@ -4714,6 +4745,31 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     const next = new Set(enabledLanguageDraft)
     if (next.has(code)) next.delete(code); else next.add(code)
     setEnabledLanguageDraft(next)
+  }
+  const visibleEnabledLanguageCodes = allEnabledLanguageCodes.filter((c) => {
+    const label = `${c.code} ${LANGUAGE_CODE_NAMES[c.code] ?? ''}`.toLowerCase()
+    if (enabledLanguageSearch && !label.includes(enabledLanguageSearch.toLowerCase())) return false
+    if (enabledLanguageShowFilter === 'selected' && !enabledLanguageDraft.has(c.code)) return false
+    if (enabledLanguageShowFilter === 'unselected' && enabledLanguageDraft.has(c.code)) return false
+    return true
+  })
+  function toggleEnabledLanguageSelected(code: string, index: number, shiftKey: boolean) {
+    const willBeChecked = !enabledLanguageDraft.has(code)
+    const next = new Set(enabledLanguageDraft)
+    if (shiftKey && enabledLanguageLastClickedIndex != null) {
+      const [start, end] = [enabledLanguageLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const visible = visibleEnabledLanguageCodes[j]?.code
+        if (visible) willBeChecked ? next.add(visible) : next.delete(visible)
+      }
+    } else {
+      willBeChecked ? next.add(code) : next.delete(code)
+    }
+    setEnabledLanguageDraft(next)
+    setEnabledLanguageLastClickedIndex(index)
+  }
+  function saveEnabledLanguagesWithImpactCheck() {
+    saveEnabledLanguages.mutate([...enabledLanguageDraft])
   }
   const [applyExclusionsJobId, setApplyExclusionsJobId] = useState<string | null>(null)
   const applyImportExclusionsNow = useMutation({
@@ -8265,6 +8321,139 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             ))}
           </div>
         )}
+      </SectionCard>
+
+      <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          This is a different filter from "Import Language Exclusion" above. That one decides what gets imported in
+          the first place, so it only affects titles going forward (or when you click "Apply rules to existing
+          catalog now"). This one is a live backstop on top of everything already in the catalog: it gates which
+          language a movie/episode/export/failover is allowed to stream from right now, regardless of import
+          history. Checking a language back on instantly makes any matching source eligible again — no re-import
+          needed. Unchecking one instantly removes eligibility for sources in that language, which can take a title
+          out of streaming/export entirely if that was its only enabled-language source.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <input
+            className={inputCls('flex-1')}
+            placeholder="Search languages…"
+            value={enabledLanguageSearch}
+            onChange={(e) => setEnabledLanguageSearch(e.target.value)}
+          />
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+            {(['all', 'selected', 'unselected'] as const).map((f) => (
+              <button
+                key={f}
+                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${enabledLanguageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                onClick={() => setEnabledLanguageShowFilter(f)}
+              >
+                {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 text-xs">
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => setEnabledLanguageDraft(new Set([...enabledLanguageDraft, ...visibleEnabledLanguageCodes.map((c) => c.code)]))}
+          >
+            Select visible ({visibleEnabledLanguageCodes.length})
+          </button>
+          <button
+            className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+            onClick={() => { const next = new Set(enabledLanguageDraft); visibleEnabledLanguageCodes.forEach((c) => next.delete(c.code)); setEnabledLanguageDraft(next) }}
+          >
+            Deselect visible ({visibleEnabledLanguageCodes.filter((c) => enabledLanguageDraft.has(c.code)).length})
+          </button>
+          <span className="text-muted-foreground ml-auto">{enabledLanguageDraft.size} selected total · shift-click to select a range</span>
+        </div>
+        <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+          {visibleEnabledLanguageCodes.map((c, i) => (
+            <label key={c.code} className="flex items-center gap-1.5 select-none">
+              <input
+                type="checkbox"
+                checked={enabledLanguageDraft.has(c.code)}
+                onChange={() => {}}
+                onClick={(e) => toggleEnabledLanguageSelected(c.code, i, e.shiftKey)}
+              />
+              <span className="font-mono">{c.code}</span>
+              {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+              <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+            </label>
+          ))}
+          {visibleEnabledLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
+        </div>
+        <Button
+          size="sm"
+          disabled={saveEnabledLanguages.isPending || enabledLanguageDraft.size === 0}
+          onClick={saveEnabledLanguagesWithImpactCheck}
+        >
+          {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+          Save enabled languages
+        </Button>
+      </SectionCard>
+
+      <SectionCard title="Language Maintenance" icon={<Wrench size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Maintenance for content imported before per-language matching existed. Movies/series that were
+          auto-merged across languages under the old rule stay mixed until split here. Run in order: 1) backfill
+          fills in any missing per-source language, 2) movie split, 3) series split (also re-splits mixed-language
+          episodes). Each is safe to re-run — once nothing is left to change, it becomes a no-op.
+        </p>
+
+        {[
+          {
+            key: 'backfill' as const,
+            label: 'Language backfill',
+            preview: languageBackfillPreview,
+            apply: languageBackfillApply,
+            previewCount: (d: any) => d ? Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0) : undefined,
+            previewLabel: (d: any) => `${Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0)} source rows missing a language`,
+            resultLabel: (r: any) => `${r.updated} rows backfilled.`,
+          },
+          {
+            key: 'recompute' as const,
+            label: 'Language recompute',
+            preview: languageRecomputePreview,
+            apply: languageRecomputeApply,
+            previewCount: (d: any) =>
+              d ? Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0) : undefined,
+            previewLabel: (d: any) => {
+              const total = Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0)
+              return `${total} source row${total === 1 ? '' : 's'} misclassified by an old bug`
+            },
+            resultLabel: (r: any) => `${r.updated} rows recomputed.`,
+          },
+        ].map(({ key, label, preview, apply, previewCount, previewLabel, resultLabel }) => (
+          <div key={key} className="flex items-center gap-2 border border-border rounded p-2">
+            <span className="text-xs font-medium w-40">{label}</span>
+            <Button size="sm" variant="outline" disabled={preview.isFetching} onClick={() => preview.refetch()}>
+              {preview.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Preview
+            </Button>
+            <Button
+              size="sm"
+              disabled={apply.isPending || !preview.data || previewCount(preview.data) === 0}
+              onClick={() => apply.mutate()}
+            >
+              {apply.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Apply
+            </Button>
+            <span className="text-xs text-muted-foreground flex-1">
+              {apply.data
+                ? resultLabel(apply.data)
+                : apply.isError
+                ? `Failed: ${(apply.error as any)?.response?.data?.detail ?? (apply.error as any)?.message}`
+                : preview.data
+                ? previewLabel(preview.data)
+                : preview.isError
+                ? `Failed: ${(preview.error as any)?.response?.data?.detail ?? (preview.error as any)?.message}`
+                : ''}
+            </span>
+          </div>
+        ))}
       </SectionCard>
       </>
       )}
