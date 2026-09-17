@@ -577,6 +577,21 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- TMDB returned 404 for an identity already stored on a pool item.
+        -- Intentionally distinct from the no-id/ambiguous-id review queue
+        -- (Metadata Review): the item has an explicit identity, but it's no
+        -- longer valid upstream and needs a reviewer to correct or clear it.
+        CREATE TABLE IF NOT EXISTS tmdb_lookup_failures (
+            content_type TEXT NOT NULL CHECK(content_type IN ('movie','series')),
+            item_id INTEGER NOT NULL,
+            tmdb_id TEXT NOT NULL,
+            last_error TEXT NOT NULL,
+            first_failed_at TEXT NOT NULL,
+            last_failed_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(content_type, item_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
@@ -599,6 +614,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_portal_accounts_provider_id ON portal_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_dvr_recording_failures_provider_id ON dvr_recording_failures(provider_id);
         CREATE INDEX IF NOT EXISTS idx_vod_stream_failures_created_at ON vod_stream_failures(created_at);
+        CREATE INDEX IF NOT EXISTS idx_tmdb_lookup_failures_type_time ON tmdb_lookup_failures(content_type, last_failed_at);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_accounts_provider_id ON provider_sub_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_account_live_accounts_sub_account_id ON provider_sub_account_live_accounts(sub_account_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
@@ -1105,6 +1121,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # _is_stale(None) is True, so the next enrichment pass naturally
         # re-attempts every series source once; no backfill needed.
         ("series_sources", "episodes_last_enriched_at", "TEXT"),
+        # Provider-supplied trailer (see apply_provider_trailers) -- a bulk
+        # XC catalog list commonly includes a "trailer"/"youtube_trailer"
+        # field already, so this is captured for free at import time, same
+        # spirit as poster_url above. trailer_status/attempts/checked_at/
+        # last_error exist for a future TMDB-lookup fallback pass (not yet
+        # implemented here -- @Knm's own fork has the schema for one but no
+        # wired caller either, confirmed by reading their current main), so
+        # they just sit at their defaults until that lands.
+        ("movies", "trailer_key", "TEXT"),
+        ("movies", "trailer_site", "TEXT"),
+        ("movies", "trailer_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("movies", "trailer_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "trailer_checked_at", "TEXT"),
+        ("movies", "trailer_last_error", "TEXT"),
+        ("series", "trailer_key", "TEXT"),
+        ("series", "trailer_site", "TEXT"),
+        ("series", "trailer_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("series", "trailer_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "trailer_checked_at", "TEXT"),
+        ("series", "trailer_last_error", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5829,7 +5865,7 @@ def get_movie_export_rows() -> list[dict]:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
-            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id, m.trailer_key AS trailer_key,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -5894,7 +5930,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
             m.description AS description, m.duration_secs AS duration_secs, m.poster_url AS poster_url,
             m.cast_list AS cast_list, m.director AS director, m.country AS country,
             m.rating AS rating, m.release_date AS release_date, m.is_adult AS is_adult,
-            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id,
+            m.tmdb_id AS tmdb_id, m.imdb_id AS imdb_id, m.trailer_key AS trailer_key,
             p.export_stream_id AS export_stream_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name,
             ms.provider_id AS provider_id, ms.provider_stream_id AS provider_stream_id,
@@ -6740,7 +6776,7 @@ def get_series_export_rows() -> list[dict]:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
-            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id, s.trailer_key AS trailer_key,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -6760,7 +6796,7 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
             s.description AS description, s.poster_url AS poster_url,
             s.cast_list AS cast_list, s.director AS director, s.country AS country,
             s.rating AS rating, s.release_date AS release_date,
-            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id,
+            s.tmdb_id AS tmdb_id, s.imdb_id AS imdb_id, s.trailer_key AS trailer_key,
             p.export_series_id AS export_series_id, p.name_suffix AS name_suffix,
             c.id AS category_id, c.name AS category_name
         FROM series_category_placements p
@@ -7062,9 +7098,23 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                             # metadata from this provider; two or more is genuinely
                             # ambiguous, flag rather than silently duplicate.
                             candidates = conn.execute(
-                                "SELECT id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
+                                "SELECT id, tmdb_id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
                             ).fetchall()
-                            if len(candidates) == 1:
+                            # Requiring the sole candidate to already carry a
+                            # confirmed tmdb_id (found live on @Knm's fork,
+                            # "Inherit confirmed identities across providers"
+                            # 2026-09-16): without a year OR a corroborating
+                            # id, a same-name-only match is really just a
+                            # coincidence between two DIFFERENT real titles
+                            # that happen to share a name -- attaching a new
+                            # source to it would be a silent wrong merge, not
+                            # a real match. An unconfirmed candidate now falls
+                            # through to the create-new-row branch below
+                            # (same as zero candidates), which is exactly
+                            # correct: a real title deserves its own row
+                            # until something actually corroborates the
+                            # match.
+                            if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
                                 # Same archive-upgrade check as the exact (name, year)
@@ -7256,6 +7306,55 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
     return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
 
 
+def apply_provider_trailers(provider_id: int, content_type: str, items: list[dict]) -> int:
+    """Persist a trailer value supplied directly by the provider's bulk
+    catalog response (item["trailer"]/item["youtube_trailer"]) -- free at
+    import time, no extra request, same spirit as bulk_import_movies'
+    stream_icon poster capture. Called separately after bulk_import_movies/
+    bulk_import_series rather than inlined into them, since it needs each
+    item's now-resolved movie_id/series_id (looked up via the just-written
+    *_sources row) rather than the pre-insert item dict alone.
+
+    Always wins over whatever's currently stored -- unlike poster_url's
+    fill-only-if-blank rule, a provider can legitimately update which
+    trailer it serves for a title, and there's no other trailer source
+    competing to protect (trailer_site='provider' marks it as such)."""
+    if not items:
+        return 0
+    source_table = "movie_sources" if content_type == "movie" else "series_sources"
+    source_id_col = "provider_stream_id" if content_type == "movie" else "provider_series_id"
+    target_table = "movies" if content_type == "movie" else "series"
+    fk_col = "movie_id" if content_type == "movie" else "series_id"
+    updated = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        for item in items:
+            trailer = item.get("trailer") or item.get("youtube_trailer")
+            if not trailer:
+                continue
+            trailer = str(trailer).strip()
+            if not trailer:
+                continue
+            provider_item_id = item.get(source_id_col) or item.get("provider_stream_id") or item.get("provider_series_id")
+            row = conn.execute(
+                f"SELECT {fk_col} AS item_id FROM {source_table} WHERE provider_id=? AND {source_id_col}=?",
+                (provider_id, str(provider_item_id)),
+            ).fetchone()
+            if not row:
+                continue
+            conn.execute(
+                f"""UPDATE {target_table}
+                    SET trailer_key=?, trailer_site='provider', trailer_status='found',
+                        trailer_attempts=0, trailer_checked_at=?, trailer_last_error=NULL, updated_at=?
+                    WHERE id=?""",
+                (trailer, _now(), _now(), row["item_id"]),
+            )
+            updated += 1
+        _commit_with_retry(conn)
+        conn.close()
+    return updated
+
+
 def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
     """items: [{name, year, provider_series_id, provider_category_name}, ...],
     optionally carrying genre/description/cast_list/director/poster_url/
@@ -7394,12 +7493,13 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                     (provider_id, item.get("provider_series_id"), row["id"]),
                                 )
                         elif year is None:
-                            # Same reasoning as bulk_import_movies above.
+                            # Same reasoning as bulk_import_movies above,
+                            # including the confirmed-tmdb_id requirement.
                             candidates = conn.execute(
-                                "SELECT id, import_provider_id, review_excluded, review_excluded_manual FROM series WHERE name=?",
+                                "SELECT id, tmdb_id, import_provider_id, review_excluded, review_excluded_manual FROM series WHERE name=?",
                                 (name,),
                             ).fetchall()
-                            if len(candidates) == 1:
+                            if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 did_match = True
                                 series_id_for_detail = candidates[0]["id"]
                                 conn.execute("UPDATE series SET provider_category_name=?, raw_name=? WHERE id=?", (item.get("provider_category_name"), item.get("raw_name"), candidates[0]["id"]))
@@ -7711,9 +7811,23 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                             # Same reasoning as bulk_import_movies. Still writes full detail
                             # even when flagged -- more info for whoever reviews it later.
                             candidates = conn.execute(
-                                "SELECT id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
+                                "SELECT id, tmdb_id, review_excluded, review_excluded_manual FROM movies WHERE name=?", (name,)
                             ).fetchall()
-                            if len(candidates) == 1:
+                            # Requiring the sole candidate to already carry a
+                            # confirmed tmdb_id (found live on @Knm's fork,
+                            # "Inherit confirmed identities across providers"
+                            # 2026-09-16): without a year OR a corroborating
+                            # id, a same-name-only match is really just a
+                            # coincidence between two DIFFERENT real titles
+                            # that happen to share a name -- attaching a new
+                            # source to it would be a silent wrong merge, not
+                            # a real match. An unconfirmed candidate now falls
+                            # through to the create-new-row branch below
+                            # (same as zero candidates), which is exactly
+                            # correct: a real title deserves its own row
+                            # until something actually corroborates the
+                            # match.
+                            if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
                                 sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
@@ -9007,6 +9121,59 @@ def list_metadata_review(content_type: str | None = None) -> dict:
     return out
 
 
+def record_tmdb_lookup_failure(content_type: str, item_id: int, tmdb_id: str, error: str = "TMDB returned 404 Not Found") -> None:
+    """Persist a confirmed invalid TMDB identity for reviewer correction --
+    called when tmdb_sync raises TmdbNotFoundError for an id already stored
+    on this item (see enrich_movie / reconcile_known_series_identities)."""
+    now = _now()
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            """INSERT INTO tmdb_lookup_failures
+               (content_type,item_id,tmdb_id,last_error,first_failed_at,last_failed_at,attempts)
+               VALUES (?,?,?,?,?,?,1)
+               ON CONFLICT(content_type,item_id) DO UPDATE SET
+                 tmdb_id=excluded.tmdb_id, last_error=excluded.last_error,
+                 last_failed_at=excluded.last_failed_at, attempts=tmdb_lookup_failures.attempts+1""",
+            (content_type, item_id, str(tmdb_id), error, now, now),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def clear_tmdb_lookup_failure(content_type: str, item_id: int) -> None:
+    """Drop a tracked lookup failure once its tmdb_id is corrected/cleared
+    (set_tmdb_id, clear_tmdb_id) or a later lookup for the same id succeeds."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute("DELETE FROM tmdb_lookup_failures WHERE content_type=? AND item_id=?", (content_type, item_id))
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def list_tmdb_lookup_failures(content_type: str | None = None) -> dict:
+    """Reviewer queue for stored TMDB IDs that TMDB confirmed no longer
+    exist -- distinct from list_metadata_review (no id at all / ambiguous),
+    this is an id that WAS valid and now 404s."""
+    conn = _connect()
+    out: dict = {}
+    for requested_type, table, key in (("movie", "movies", "movies"), ("series", "series", "series")):
+        if content_type not in (None, requested_type):
+            continue
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT t.*, f.tmdb_id AS invalid_tmdb_id, f.last_error,
+                       f.last_failed_at, f.attempts
+                FROM {table} t JOIN tmdb_lookup_failures f
+                  ON f.content_type=? AND f.item_id=t.id
+                WHERE t.review_excluded=0
+                ORDER BY f.last_failed_at DESC, t.name""",
+            (requested_type,),
+        ).fetchall()]
+        out[key] = rows
+    conn.close()
+    return out
+
+
 def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
     """Sets the correct year (and tmdb_id, if known) on a flagged item and
     clears the flag. If that year now exactly matches an existing item of
@@ -9029,6 +9196,8 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
                 merge_movie(item_id, existing["id"])
             else:
                 merge_series(item_id, existing["id"])
+            if tmdb_id:
+                clear_tmdb_lookup_failure(content_type, item_id)
             return {"merged_into": existing["id"]}
 
         conn = _connect()
@@ -9040,6 +9209,7 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
         _commit_with_retry(conn)
         conn.close()
         if tmdb_id:
+            clear_tmdb_lookup_failure(content_type, item_id)
             if content_type == "movie":
                 auto_merge_movie_by_tmdb(item_id)
             else:
@@ -9753,8 +9923,9 @@ def clear_tmdb_id(content_type: str, item_id: int) -> dict:
         conn.execute(f"UPDATE {table} SET tmdb_id=NULL, updated_at=? WHERE id=?", (_now(), item_id))
         _commit_with_retry(conn)
         conn.close()
-        logger.info("[clear_tmdb_id] %s id=%s (%r) tmdb_id %s -> NULL", content_type, item_id, row["name"], row["tmdb_id"])
-        return {"cleared_id": item_id}
+    clear_tmdb_lookup_failure(content_type, item_id)
+    logger.info("[clear_tmdb_id] %s id=%s (%r) tmdb_id %s -> NULL", content_type, item_id, row["name"], row["tmdb_id"])
+    return {"cleared_id": item_id}
 
 
 def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
@@ -9782,14 +9953,16 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
                 merge_movie(item_id, existing["id"])
             else:
                 merge_series(item_id, existing["id"])
+            clear_tmdb_lookup_failure(content_type, item_id)
             return {"merged_into": existing["id"]}
 
         conn = _connect()
         conn.execute(f"UPDATE {table} SET tmdb_id=?, updated_at=? WHERE id=?", (tmdb_id, _now(), item_id))
         _commit_with_retry(conn)
         conn.close()
-        logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
-        return {"resolved_id": item_id}
+    clear_tmdb_lookup_failure(content_type, item_id)
+    logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
+    return {"resolved_id": item_id}
 
 
 def update_episode(episode_id: int, name: str | None = None, season_number: int | None = None, episode_number: int | None = None) -> dict:
@@ -10115,7 +10288,7 @@ def set_catchall_include_adult(include_adult: bool) -> list[dict]:
         return [evaluate_smart_category(cid) for cid in results]
 
 
-def evaluate_smart_category(category_id: int) -> dict:
+def evaluate_smart_category(category_id: int, ids: set[int] | None = None) -> dict:
     """Evaluate a smart category's rule_json against the whole pool (movies or
     series, per the category's content_type) and auto-place every match.
     Never un-places existing matches — same additive semantics as manual
@@ -10129,7 +10302,12 @@ def evaluate_smart_category(category_id: int) -> dict:
     own review queues" at the row level (see bulk_set_review_excluded), it
     was never wired into category placement/export visibility on its own --
     this filter is what actually makes an archived item invisible to
-    Dispatcharr, since visibility is governed by placement, not the flag."""
+    Dispatcharr, since visibility is governed by placement, not the flag.
+
+    ids: optional scoping to just this set of movie/series ids instead of
+    the whole table (see resweep_smart_categories' matching parameter) --
+    None (every caller today) means the full-pool scan, unchanged. An empty
+    (but not None) set means nothing to evaluate; skip the query entirely."""
     category = get_category(category_id)
     if not category:
         raise ValueError(f"category {category_id} not found")
@@ -10141,25 +10319,54 @@ def evaluate_smart_category(category_id: int) -> dict:
     import json
     rule = json.loads(category["rule_json"])
 
-    conn = _connect()
-    if category["content_type"] == "movie":
-        rows = [dict(r) for r in conn.execute("""
-            SELECT m.*, (
-                SELECT GROUP_CONCAT(DISTINCT ms.provider_category_name) FROM movie_sources ms
-                WHERE ms.movie_id = m.id AND ms.provider_category_name IS NOT NULL
-            ) AS provider_category
-            FROM movies m WHERE m.review_excluded=0
-        """).fetchall()]
+    if ids is not None and not ids:
+        rows: list[dict] = []
     else:
-        rows = [dict(r) for r in conn.execute("""
-            SELECT s.*, (
-                SELECT GROUP_CONCAT(DISTINCT es.provider_category_name) FROM episode_sources es
-                JOIN episodes e ON e.id = es.episode_id
-                WHERE e.series_id = s.id AND es.provider_category_name IS NOT NULL
-            ) AS provider_category
-            FROM series s WHERE s.review_excluded=0
-        """).fetchall()]
-    conn.close()
+        conn = _connect()
+        id_list = list(ids) if ids is not None else None
+        if category["content_type"] == "movie":
+            if id_list is None:
+                rows = [dict(r) for r in conn.execute("""
+                    SELECT m.*, (
+                        SELECT GROUP_CONCAT(DISTINCT ms.provider_category_name) FROM movie_sources ms
+                        WHERE ms.movie_id = m.id AND ms.provider_category_name IS NOT NULL
+                    ) AS provider_category
+                    FROM movies m WHERE m.review_excluded=0
+                """).fetchall()]
+            else:
+                rows = []
+                for chunk in _chunked(id_list):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(dict(r) for r in conn.execute(f"""
+                        SELECT m.*, (
+                            SELECT GROUP_CONCAT(DISTINCT ms.provider_category_name) FROM movie_sources ms
+                            WHERE ms.movie_id = m.id AND ms.provider_category_name IS NOT NULL
+                        ) AS provider_category
+                        FROM movies m WHERE m.review_excluded=0 AND m.id IN ({placeholders})
+                    """, chunk).fetchall())
+        else:
+            if id_list is None:
+                rows = [dict(r) for r in conn.execute("""
+                    SELECT s.*, (
+                        SELECT GROUP_CONCAT(DISTINCT es.provider_category_name) FROM episode_sources es
+                        JOIN episodes e ON e.id = es.episode_id
+                        WHERE e.series_id = s.id AND es.provider_category_name IS NOT NULL
+                    ) AS provider_category
+                    FROM series s WHERE s.review_excluded=0
+                """).fetchall()]
+            else:
+                rows = []
+                for chunk in _chunked(id_list):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(dict(r) for r in conn.execute(f"""
+                        SELECT s.*, (
+                            SELECT GROUP_CONCAT(DISTINCT es.provider_category_name) FROM episode_sources es
+                            JOIN episodes e ON e.id = es.episode_id
+                            WHERE e.series_id = s.id AND es.provider_category_name IS NOT NULL
+                        ) AS provider_category
+                        FROM series s WHERE s.review_excluded=0 AND s.id IN ({placeholders})
+                    """, chunk).fetchall())
+        conn.close()
 
     matched_ids = [row["id"] for row in rows if _rule_matches(row, rule)]
     if category["content_type"] == "movie":

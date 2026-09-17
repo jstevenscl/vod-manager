@@ -1380,11 +1380,16 @@ function SeasonEpisodeMatch({ imported, candidate, label }: { imported?: number;
   )
 }
 
-function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
+function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateKey }: {
   contentType: 'movie' | 'series'
   item: NeedsReviewItem
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
+  // Metadata Review's own queue key invalidates by default below; a caller
+  // reusing this row for a different queue (e.g. Incorrect TMDB IDs) passes
+  // its own key here so resolving a row here also refreshes that queue,
+  // instead of leaving a now-stale row visible until a manual refresh.
+  extraInvalidateKey?: string
 }) {
   const [expanded, setExpanded] = useState(false)
   const [manualYear, setManualYear] = useState('')
@@ -1427,6 +1432,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials }: {
       api.post(`/vod/needs-review/${contentType}/${item.id}/resolve/`, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      if (extraInvalidateKey) qc.invalidateQueries({ queryKey: [extraInvalidateKey] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -4267,6 +4273,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
   const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
   const [metadataHideAdult, setMetadataHideAdult] = useState(false)
+  const [tmdbFailuresContentType, setTmdbFailuresContentType] = useState<'movie' | 'series'>('movie')
+  const [tmdbFailuresSelected, setTmdbFailuresSelected] = useState<Set<number>>(new Set())
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
@@ -5514,8 +5522,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     // catalog this size. 30 minutes is generous enough for even a very
     // large library while still eventually giving up on something truly
     // stuck, rather than removing the cap outright.
+    // XC catalog imports are now queued server-side and return immediately
+    // (see backend/vod_routes.py's _manual_import_worker) so this browser
+    // can keep using the app -- live progress appears in the sidebar
+    // status widget -- instead of holding this request open for the whole
+    // catalog pull. Non-XC imports (Plex/Emby/Jellyfin) still run
+    // synchronously and return their final counts directly, same as
+    // before, so both response shapes are handled below.
     mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 1_800_000 }) },
     onSuccess: (r) => {
+      if (r.data.queued) {
+        setImportResult(r.data.already_queued
+          ? `${r.data.provider ?? 'Provider'} is already queued for import.`
+          : `${r.data.provider ?? 'Provider'} import queued${r.data.position > 1 ? ` (position ${r.data.position})` : ''}. You can keep using the app; live progress appears in the sidebar.`)
+        qc.invalidateQueries({ queryKey: ['vod-providers'] })
+        return
+      }
       const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
       const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
       const skipped: { name: string; collection_type: string | null }[] = r.data.skipped_libraries ?? []
@@ -5696,6 +5718,23 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metadataBulkAi.job?.running])
+  // ── Incorrect TMDB IDs (a stored id TMDB itself now confirms is gone,
+  // via a 404 -- distinct from Metadata Review above, which is no id at all) ──
+  const tmdbFailuresQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-tmdb-lookup-failures'],
+    queryFn:  () => api.get('/vod/tmdb-lookup-failures/').then((r) => r.data),
+    enabled: activeTab === 'metadata',
+  })
+  const tmdbFailuresItems = (tmdbFailuresContentType === 'movie' ? tmdbFailuresQuery.data?.movies : tmdbFailuresQuery.data?.series) ?? []
+  const tmdbFailuresBulkAi = useBulkAiJob('/vod/tmdb-lookup-failures/bulk-resolve/', '/vod/tmdb-lookup-failures/bulk-resolve/')
+  useEffect(() => {
+    if (tmdbFailuresBulkAi.job && !tmdbFailuresBulkAi.job.running) {
+      setTmdbFailuresSelected(new Set())
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
+      qc.invalidateQueries({ queryKey: tmdbFailuresContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tmdbFailuresBulkAi.job?.running])
 
   // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
   const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
@@ -7263,7 +7302,88 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           Select
                         </label>
                       </li>
-                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} />
+                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} extraInvalidateKey="vod-metadata-review" />
+                    </Fragment>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        )}
+      </SectionCard>
+      <SectionCard title="Incorrect TMDB IDs" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Titles whose stored TMDB ID TMDB itself has confirmed no longer exists (a 404 on lookup) — different from
+          Metadata Review above, which is for titles with no TMDB identity at all. Search TMDB and select the exact
+          result to replace the bad ID.
+        </p>
+        <div className="flex items-center gap-1.5 pt-1">
+          <Button
+            size="sm"
+            variant={tmdbFailuresContentType === 'movie' ? 'default' : 'outline'}
+            onClick={() => { setTmdbFailuresContentType('movie'); setTmdbFailuresSelected(new Set()) }}
+          >
+            Movies{tmdbFailuresQuery.data?.movies.length ? ` (${tmdbFailuresQuery.data.movies.length})` : ''}
+          </Button>
+          <Button
+            size="sm"
+            variant={tmdbFailuresContentType === 'series' ? 'default' : 'outline'}
+            onClick={() => { setTmdbFailuresContentType('series'); setTmdbFailuresSelected(new Set()) }}
+          >
+            TV Shows{tmdbFailuresQuery.data?.series.length ? ` (${tmdbFailuresQuery.data.series.length})` : ''}
+          </Button>
+          <Button size="sm" variant="outline" disabled={tmdbFailuresQuery.isFetching} onClick={() => tmdbFailuresQuery.refetch()}>
+            {tmdbFailuresQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            <span className="ml-1">Refresh</span>
+          </Button>
+        </div>
+        {tmdbFailuresQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
+        {tmdbFailuresQuery.isError && <p className="text-xs text-destructive">Could not load the incorrect TMDB ID queue.</p>}
+        {tmdbFailuresQuery.data && (
+          <>
+            {tmdbFailuresItems.length === 0 ? (
+              <p className="text-xs text-muted-foreground pt-1">Clean — no stored TMDB IDs are currently confirmed invalid.</p>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
+                  <button
+                    className="text-primary hover:underline"
+                    onClick={() => setTmdbFailuresSelected(new Set(tmdbFailuresItems.map((i) => i.id)))}
+                  >
+                    Select all
+                  </button>
+                  <button className="text-muted-foreground hover:underline" onClick={() => setTmdbFailuresSelected(new Set())}>Clear</button>
+                  <span className="text-muted-foreground">{tmdbFailuresSelected.size} selected</span>
+                  <Button
+                    size="sm" variant="outline" className="h-7 text-xs ml-auto"
+                    disabled={tmdbFailuresSelected.size === 0 || tmdbFailuresBulkAi.starting || !!tmdbFailuresBulkAi.job?.running}
+                    title="Searches TMDB for each selected title and replaces the invalid ID only when AI is highly confident."
+                    onClick={() => tmdbFailuresBulkAi.start({ content_type: tmdbFailuresContentType, ids: Array.from(tmdbFailuresSelected) })}
+                  >
+                    {tmdbFailuresBulkAi.starting || tmdbFailuresBulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
+                    Resolve selected with AI ({tmdbFailuresSelected.size})
+                  </Button>
+                </div>
+                {tmdbFailuresBulkAi.startError && <p className="text-xs text-destructive">{tmdbFailuresBulkAi.startError}</p>}
+                {tmdbFailuresBulkAi.job && <BulkAiJobSummary job={tmdbFailuresBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                <ul className="divide-y divide-border/50">
+                  {tmdbFailuresItems.map((item) => (
+                    <Fragment key={item.id}>
+                      <li className="pt-1.5 -mb-1.5">
+                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={tmdbFailuresSelected.has(item.id)}
+                            onChange={() => setTmdbFailuresSelected((selected) => {
+                              const next = new Set(selected)
+                              if (next.has(item.id)) next.delete(item.id); else next.add(item.id)
+                              return next
+                            })}
+                          />
+                          Select
+                        </label>
+                      </li>
+                      <NeedsReviewRow contentType={tmdbFailuresContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} extraInvalidateKey="vod-tmdb-lookup-failures" />
                     </Fragment>
                   ))}
                 </ul>

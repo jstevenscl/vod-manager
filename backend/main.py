@@ -142,7 +142,13 @@ async def _vod_catalog_refresher() -> None:
                         elif p.get("provider_type") in ("emby", "jellyfin"):
                             result = await emby_vod_importer.import_emby_library(p["id"])
                         else:
-                            result = await vod_importer.import_provider_catalog(p["id"])
+                            # Deferred (schedule_enrichment=False): firing
+                            # identity reconciliation once per provider here
+                            # would have each new pass compete with the
+                            # NEXT due provider's import for SQLite's one
+                            # writer -- run it once after the whole batch
+                            # below instead.
+                            result = await vod_importer.import_provider_catalog(p["id"], schedule_enrichment=False)
                         await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                         logger.info("[vod_catalog_refresher] %s: %s", p["name"], result)
                     except Exception as exc:
@@ -156,6 +162,7 @@ async def _vod_catalog_refresher() -> None:
                 # catalog" click -- see vod_routes.py -- so that doesn't have
                 # to wait for this loop's next cycle either.)
                 await vod_importer.resweep_smart_categories()
+                vod_importer.schedule_known_series_identity_reconciliation()
         except Exception as exc:
             logger.warning("[vod_catalog_refresher] cycle failed: %s", exc)
 

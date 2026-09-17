@@ -40,6 +40,14 @@ _tmdb_semaphore = asyncio.Semaphore(_GLOBAL_TMDB_CONCURRENCY)
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
 
 
+class TmdbNotFoundError(Exception):
+    """The requested TMDB identity no longer exists (HTTP 404) -- distinct
+    from every other failure mode (network error, rate limit, TMDB down),
+    which stay silent/retryable. A 404 on an id we already have stored is a
+    confirmed-bad identity a human needs to correct, not a transient miss --
+    see vod_db.record_tmdb_lookup_failure / the Incorrect TMDB ID queue."""
+
+
 def _redact(exc: Exception) -> str:
     """str(exc) on an httpx.HTTPStatusError embeds the full request URL,
     api_key included -- this must wrap every logged/returned exception from
@@ -319,6 +327,11 @@ async def get_movie_full_details(tmdb_id: str) -> dict | None:
                 params={"api_key": api_key, "append_to_response": "credits,release_dates"},
             )
             r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+            if exc.response.status_code == 404:
+                raise TmdbNotFoundError(tmdb_id) from exc
+            return None
         except Exception as exc:
             logger.warning("[tmdb_sync] failed to fetch movie detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
             return None
@@ -411,6 +424,11 @@ async def get_tv_identity(tmdb_id: str) -> dict | None:
                     params={"api_key": api_key, "append_to_response": "content_ratings"},
                 )
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("[tmdb_sync] failed to fetch TV identity for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+        if exc.response.status_code == 404:
+            raise TmdbNotFoundError(tmdb_id) from exc
+        return None
     except Exception as exc:
         logger.warning("[tmdb_sync] failed to fetch TV identity for tmdb_id=%s: %s", tmdb_id, _redact(exc))
         return None

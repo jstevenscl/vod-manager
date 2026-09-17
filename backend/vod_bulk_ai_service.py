@@ -140,6 +140,64 @@ async def start_needs_review_bulk_resolve(content_type: str, ids: list[int]) -> 
 
 
 # ---------------------------------------------------------------------------
+# Incorrect TMDB IDs (see vod_db.list_tmdb_lookup_failures / tmdb_sync.
+# TmdbNotFoundError) -- an id that WAS confirmed-valid but TMDB now 404s on,
+# distinct from _resolve_one_needs_review's no-id-at-all case above.
+# ---------------------------------------------------------------------------
+
+async def _resolve_one_tmdb_lookup_failure(content_type: str, item_id: int) -> dict:
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        return {"id": item_id, "status": "error", "detail": "not found"}
+    if item.get("is_adult"):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "adult title"}
+    try:
+        candidates = await tmdb_sync.search_title(item["name"], content_type)
+    except Exception as exc:
+        return {"id": item_id, "name": item["name"], "status": "error", "detail": f"TMDB search failed: {exc}"}
+    if not candidates:
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no TMDB results"}
+    try:
+        suggestion = await ai_assist.suggest_year_review_match(item["name"], item.get("provider_category_name"), content_type, candidates)
+    except Exception as exc:
+        return {"id": item_id, "name": item["name"], "status": "error", "detail": f"AI suggestion failed: {exc}"}
+    idx = suggestion.get("best_match_index")
+    if idx is None or suggestion.get("confidence") != _HIGH_CONFIDENCE or not (0 <= idx < len(candidates)):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": suggestion.get("reasoning") or "no confident match"}
+    pick = candidates[idx]
+    if not pick.get("tmdb_id"):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "AI result has no TMDB ID"}
+    try:
+        result = vod_db.set_tmdb_id(content_type, item_id, int(pick["tmdb_id"]))
+    except ValueError as exc:
+        return {"id": item_id, "name": item["name"], "status": "error", "detail": str(exc)}
+    if result.get("merged_into"):
+        return {"id": item_id, "name": item["name"], "status": "resolved", "detail": f"merged into #{result['merged_into']}"}
+    return {"id": item_id, "name": item["name"], "status": "resolved", "detail": f"set TMDB ID {pick['tmdb_id']}"}
+
+
+async def _run_tmdb_lookup_failure_job(job_id: str, content_type: str, ids: list[int]) -> None:
+    try:
+        for item_id in ids:
+            try:
+                result = await _resolve_one_tmdb_lookup_failure(content_type, item_id)
+            except Exception as exc:
+                result = {"id": item_id, "status": "error", "detail": str(exc)}
+            _record(job_id, result)
+    except Exception as exc:
+        _jobs[job_id]["error"] = str(exc)
+        logger.exception("[vod_bulk_ai] tmdb-lookup-failure job %s failed: %s", job_id, exc)
+    finally:
+        _finish_job(job_id)
+
+
+async def start_tmdb_lookup_failure_bulk_resolve(content_type: str, ids: list[int]) -> str:
+    job_id = _new_job(len(ids))
+    asyncio.create_task(_run_tmdb_lookup_failure_job(job_id, content_type, ids))
+    return job_id
+
+
+# ---------------------------------------------------------------------------
 # Missing Artwork
 # ---------------------------------------------------------------------------
 
