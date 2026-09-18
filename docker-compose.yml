@@ -1,6 +1,6 @@
 services:
   vod-manager:
-    image: ghcr.io/knmplace/vod-manager:latest
+    image: ghcr.io/jstevenscl/vod-manager:latest
     container_name: vod-manager
     restart: unless-stopped
     ports:

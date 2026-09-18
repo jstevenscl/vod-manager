@@ -1,17 +1,5 @@
 # VOD & DVR Manager
 
-> **⚠️ This is an unofficial fork, not the upstream project.** This repo
-> (`knmplace/vod-manager`) is a personal fork of
-> [jstevenscl/vod-manager](https://github.com/jstevenscl/vod-manager) used to
-> prototype fixes and features, which are then submitted upstream as pull
-> requests for the original developer to review. The `:latest` image built
-> from this fork's `main` branch is **strictly a beta build**: it may
-> contain untested or half-verified changes that haven't been accepted
-> upstream yet, and some have broken things before being fixed. Functional,
-> but pull and run it with that in mind — for a stable release, use the
-> upstream project directly unless you specifically want this fork's
-> in-progress work.
-
 Curates movies and TV shows from multiple real sources — Xtream-Codes (XC)
 IPTV providers, Plex, and Emby/Jellyfin — into one deduplicated pool, then
 re-exposes that pool as its own XC-compatible catalog server so one or more
@@ -21,15 +9,15 @@ Same real content is often available from several sources at once (a movie
 on both an XC reseller and your own Plex library, or the same title from two
 different resellers). VOD & DVR Manager treats those as multiple *sources* for one
 pool entry rather than duplicate entries, and automatically fails over
-between them if one goes down or hits its connection limit.
+between them if one goes down or hits its connection limit — series
+included, pulling episodes from every provider that matches, not just
+whichever matched first. A source's own trailer, when it has one, passes
+through to the re-exposed XC feed as-is.
 
 **New here?** See [USERGUIDE.md](USERGUIDE.md) for a full walkthrough with
 screenshots — installation, connecting Dispatcharr (single or multiple
 instances), security hardening, and every curation tool. This README is a
 concise technical reference for people already up and running.
-
-**What's actually in this build?** See [CHANGELOG.md](CHANGELOG.md) for
-what's changed in this fork's image, release by release.
 
 ## Requirements
 
@@ -56,7 +44,7 @@ what's changed in this fork's image, release by release.
 docker compose up -d
 ```
 
-This pulls the fork's published `ghcr.io/knmplace/vod-manager:latest` image (see
+This pulls the published `ghcr.io/jstevenscl/vod-manager:latest` image (see
 `docker-compose.yml`). Building from source instead — e.g. for local
 development against this repo — works too:
 
@@ -351,16 +339,26 @@ Curation & Maintenance and the Movies/TV Shows toolbars host a set of
 catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
 language-aware filter and sibling-safe bulk archiving), **Language Filter**
 (the same language filtering over your whole library, not just
-poster-missing items), **Duplicate Finder** (matches on punctuation
-variants, adjacent-year mislabeling, and TMDB id, with one-click bulk merges
-for both fully-corroborated TMDB-confirmed matches and a second, separate
-tier where only one candidate carries a self-consistent TMDB id; an opt-in,
-off-by-default checkbox also groups a quality-tagged title like "4K: Movie"
-with its plain "Movie" as a candidate, for consolidating with Stream
-Priority's quality mode below), **Needs
-Review** (resolves year-ambiguous imports), and **Orphan Checker** (finds
-dead rows a provider deletion can leave behind — a series whose only source
-provider no longer exists, or movies/episodes with zero sources at all).
+poster-missing items), **Enabled Playback Languages** (a live,
+instantly-reversible playback/export filter by source language — separate
+from the import-time Language Exclusion above; nothing archived or deleted,
+just hidden from playback while unchecked), **Duplicate Finder** (matches on
+punctuation variants, adjacent-year mislabeling, and TMDB id, with one-click
+bulk merges for both fully-corroborated TMDB-confirmed matches and a second,
+separate tier where only one candidate carries a self-consistent TMDB id; an
+opt-in, off-by-default checkbox also groups a quality-tagged title like "4K:
+Movie" with its plain "Movie" as a candidate, for consolidating with Stream
+Priority's quality mode below — matches sharing a confirmed TMDB id merge
+automatically the moment enrichment confirms it, before ever reaching this
+queue — and an archived item stays archived even when a different
+provider's own import later matches it by name; only re-importing from the
+exact same source it was archived from can bring it back), **Needs Review**
+and the broader sidebar **Metadata Review** (resolve year-ambiguous imports
+and titles a provider left without any TMDB identity at all) alongside its
+sibling **Incorrect TMDB IDs** (a stored id TMDB itself now confirms is
+gone), and **Orphan Checker** (finds dead rows a provider deletion can
+leave behind — a series whose only source provider no longer exists, or
+movies/episodes with zero sources at all).
 Every movie/series can also be manually renamed or have its year corrected
 from its own detail view, for whatever a provider's own catalog data got
 wrong with no other way to fix it — including setting its TMDB id directly
