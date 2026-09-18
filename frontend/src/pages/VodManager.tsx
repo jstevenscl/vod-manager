@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -261,6 +261,23 @@ interface StreamFailure {
   client_label: string | null
 }
 
+interface BlockedMovie {
+  id: number
+  name: string
+  year: number | null
+  poster_url: string | null
+  stream_blocked_at: string | null
+  sources: {
+    source_id: number
+    provider_id: number
+    provider_stream_id: string
+    container_extension: string
+    provider_name: string
+    consecutive_failures: number
+    last_failed_at: string | null
+  }[]
+}
+
 interface FlaggedContentItem {
   level: 'movie' | 'series' | 'episode' | 'movie_source' | 'episode_source'
   id: number
@@ -306,6 +323,26 @@ interface UncategorizedReport {
   series_needing_year_review: OrphanGroup
   movies_uncategorized: OrphanGroup
   series_uncategorized: OrphanGroup
+}
+
+interface LanguageBackfillBucket {
+  count: number
+  sample_titles: string[]
+}
+interface LanguageBackfillReport {
+  missing: Record<string, Record<string, LanguageBackfillBucket>>
+  outdated: Record<string, Record<string, LanguageBackfillBucket>>
+}
+
+interface LanguageSplitCandidate {
+  movie_id?: number
+  series_id?: number
+  name: string
+  groups: { languages: string[]; source_count: number }[]
+}
+interface LanguageSplitReport {
+  count: number
+  sample: LanguageSplitCandidate[]
 }
 
 interface TmdbSuggestion {
@@ -1817,9 +1854,8 @@ function DuplicateInlinePreview({ kind, itemId, xcCredentials }: {
   )
 }
 
-function DuplicateGroupRow({ group, groupIndex, contentType, xcCredentials, onMerge, isPending, onIgnore, isIgnorePending, tmdbDetails }: {
+function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPending, onIgnore, isIgnorePending, tmdbDetails }: {
   group: DuplicateGroup
-  groupIndex: number
   contentType: 'movie' | 'series'
   xcCredentials?: XcCredentials
   onMerge: (keepId: number, mergeIds: number[]) => void
@@ -1951,13 +1987,11 @@ function DuplicateGroupRow({ group, groupIndex, contentType, xcCredentials, onMe
     // clearly-bounded card against the page background, on top of the
     // wider inter-group gap at the call site -- see that comment for why
     // (two adjacent correct-but-separate groups misread as one, live
-    // 2026-09-17). The "Group N of M" label is the unambiguous fallback
-    // even if the visual styling itself doesn't survive a screenshot.
+    // 2026-09-17). User feedback the same day, after seeing this live: the
+    // card boundary alone is unambiguous enough now -- a "Group N of M"
+    // text label on top of it was redundant, not a needed fallback.
     <div className="border border-border rounded-lg bg-card shadow-sm px-2.5 py-2 space-y-1.5">
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
-          Group {groupIndex + 1} · {group.items.length} candidate{group.items.length === 1 ? '' : 's'}
-        </span>
         {sameTmdbMatch && (
           <span className="text-[10px] font-normal px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30">
             same TMDB match
@@ -4323,7 +4357,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'curation' | 'providers' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -4382,6 +4416,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const clearStreamFailures = useMutation({
     mutationFn: () => api.delete('/vod/stream-failures/'),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-failures'] }),
+  })
+  // ── Stream Recovery (movies hidden after every source repeatedly failed) ──
+  const blockedMoviesQuery = useQuery<BlockedMovie[]>({
+    queryKey: ['vod-stream-recovery-movies'],
+    queryFn: () => api.get('/vod/stream-recovery/movies/').then((r) => r.data),
+    enabled: activeTab === 'recovery',
+    refetchInterval: activeTab === 'recovery' ? 5000 : false,
   })
 
 
@@ -5953,6 +5994,52 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
   })
 
+  // ── Language backfill (sources written, or last classified, before a
+  // language-detection fix landed -- movie_sources/episode_sources/
+  // series_sources) ──
+  const languageBackfillQuery = useQuery<LanguageBackfillReport>({
+    queryKey: ['vod-language-backfill'],
+    queryFn:  () => api.get('/vod/language-backfill/').then((r) => r.data),
+    enabled:  false,  // scan on demand only, same reasoning as Orphan Checker above
+  })
+  const applyLanguageBackfill = useMutation({
+    mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-language-backfill'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+
+  // ── Language split (movies/series auto-merged across languages before
+  // the auto-merge language gate existed -- retroactive undo, run after
+  // Language Backfill above since it depends on accurate per-source
+  // language values) ──
+  const movieLanguageSplitQuery = useQuery<LanguageSplitReport>({
+    queryKey: ['vod-movie-language-split'],
+    queryFn:  () => api.get('/vod/language-split/movies/').then((r) => r.data),
+    enabled:  false,
+  })
+  const applyMovieLanguageSplit = useMutation({
+    mutationFn: () => api.post('/vod/language-split/movies/apply/').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-movie-language-split'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+    },
+  })
+  const seriesLanguageSplitQuery = useQuery<LanguageSplitReport>({
+    queryKey: ['vod-series-language-split'],
+    queryFn:  () => api.get('/vod/language-split/series/').then((r) => r.data),
+    enabled:  false,
+  })
+  const applySeriesLanguageSplit = useMutation({
+    mutationFn: () => api.post('/vod/language-split/series/apply/').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-series-language-split'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+
   // ── Duplicate finder (punctuation variants + adjacent-year mislabeling) ──
   const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
   const [duplicatesOffset, setDuplicatesOffset] = useState(0)
@@ -7361,6 +7448,66 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {diagnosticsBusy ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
           Download Diagnostic Logs
         </Button>
+      </SectionCard>
+      </>
+      )}
+
+      {activeTab === 'recovery' && (
+      <>
+      <SectionCard title="Stream Recovery" icon={<Activity size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Movies are hidden from client VOD listings only after every active playable source repeatedly fails.
+          Test an individual provider copy below. A successful stream immediately restores the movie; a failed test leaves it blocked.
+        </p>
+        <div className="flex items-center gap-2 pt-1">
+          <Button size="sm" variant="outline" className="gap-1" disabled={blockedMoviesQuery.isFetching} onClick={() => blockedMoviesQuery.refetch()}>
+            {blockedMoviesQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            Refresh
+          </Button>
+          <span className="text-[11px] text-muted-foreground">
+            {blockedMoviesQuery.data?.length ?? 0} blocked movie{blockedMoviesQuery.data?.length === 1 ? '' : 's'}
+          </span>
+        </div>
+        {blockedMoviesQuery.isLoading && <p className="text-xs text-muted-foreground">Loading blocked movies…</p>}
+        {blockedMoviesQuery.isError && <p className="text-xs text-destructive">Could not load stream recovery. Refresh and try again.</p>}
+        {!blockedMoviesQuery.isLoading && !blockedMoviesQuery.isError && !blockedMoviesQuery.data?.length && (
+          <p className="text-xs text-muted-foreground">No movies are currently blocked.</p>
+        )}
+        <div className="space-y-2">
+          {blockedMoviesQuery.data?.map((movie) => (
+            <div key={movie.id} className="rounded-lg border border-destructive/30 bg-destructive/5 overflow-hidden">
+              <div className="flex gap-3 p-3">
+                <PosterThumb url={movie.poster_url} className="w-10 h-14 rounded object-cover shrink-0" fallback={<div className="w-10 h-14 rounded bg-muted flex items-center justify-center"><Film size={15} className="text-muted-foreground" /></div>} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold truncate">{movie.name}{movie.year ? ` (${movie.year})` : ''}</p>
+                  <p className="text-[11px] text-destructive">Blocked {movie.stream_blocked_at ? new Date(Number(movie.stream_blocked_at) * 1000).toLocaleString() : 'after all sources failed'}</p>
+                  <div className="mt-2 space-y-1.5">
+                    {movie.sources.map((source) => {
+                      const ext = source.container_extension || 'mp4'
+                      return (
+                        <div key={source.source_id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs rounded border border-border/60 bg-card px-2 py-1.5">
+                          <span className="font-medium">{source.provider_name}</span>
+                          <span className="text-destructive">Failed {source.consecutive_failures}×</span>
+                          {source.last_failed_at && <span className="text-muted-foreground">last {new Date(Number(source.last_failed_at) * 1000).toLocaleString()}</span>}
+                          <span className="ml-auto flex items-center gap-1 text-primary">
+                            <PlayButton
+                              url={buildPreviewSourceUrl('movie', source.source_id, ext, xcCredentialsQuery.data)}
+                              transcodedUrl={buildTranscodedPreviewSourceUrl('movie', source.source_id, xcCredentialsQuery.data)}
+                              hlsUrl={buildHlsPreviewSourceUrl('movie', source.source_id, xcCredentialsQuery.data)}
+                              title={`${movie.name} — ${source.provider_name}`}
+                            />
+                            <span className="text-[11px]">Test source</span>
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {!xcCredentialsQuery.data && <p className="mt-2 text-[11px] text-destructive">Add an enabled Connected Instance before testing a source.</p>}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
       </SectionCard>
       </>
       )}
@@ -9554,6 +9701,110 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
+      <SectionCard title="Language Backfill" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Every source's language (used by Enabled Playback Languages, Import Language Exclusion, and Duplicate
+          Finder's language matching) is detected from its raw title and provider category. Rows written before that
+          detection existed on a given import path -- or classified by a since-fixed version of it -- sit with the
+          wrong value until backfilled. Safe to re-run any time; once nothing's missing or outdated it's a no-op.
+        </p>
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" variant="outline" disabled={languageBackfillQuery.isFetching} onClick={() => languageBackfillQuery.refetch()}>
+            {languageBackfillQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+            Scan
+          </Button>
+          {!!languageBackfillQuery.data && (() => {
+            const countAll = (buckets: Record<string, Record<string, LanguageBackfillBucket>>) =>
+              Object.values(buckets).reduce((sum, byCode) => sum + Object.values(byCode).reduce((s, b) => s + b.count, 0), 0)
+            const total = countAll(languageBackfillQuery.data.missing) + countAll(languageBackfillQuery.data.outdated)
+            return total === 0
+              ? <span className="text-xs text-muted-foreground">Clean — nothing to backfill.</span>
+              : (
+                <Button size="sm" variant="outline" disabled={applyLanguageBackfill.isPending} onClick={() => applyLanguageBackfill.mutate()}>
+                  {applyLanguageBackfill.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+                  Backfill {total} row{total === 1 ? '' : 's'}
+                </Button>
+              )
+          })()}
+        </div>
+        {!!languageBackfillQuery.data && (
+          <div className="space-y-1.5">
+            {(['missing', 'outdated'] as const).flatMap((kind) =>
+              Object.entries(languageBackfillQuery.data![kind]).map(([table, byCode]) => {
+                const count = Object.values(byCode).reduce((s, b) => s + b.count, 0)
+                const codes = Object.entries(byCode).sort((a, b) => b[1].count - a[1].count)
+                const samples = codes.flatMap(([, b]) => b.sample_titles).slice(0, 5)
+                return (
+                  <div key={`${kind}-${table}`} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+                    <StatusPill tone={count ? 'warning' : 'success'} label={`${table} ${kind}`} />
+                    <span className="flex-1 text-muted-foreground truncate">
+                      {count} -- {codes.slice(0, 6).map(([code, b]) => `${code}: ${b.count}`).join(', ')}
+                      {!!samples.length && ` · e.g. ${samples.join(', ')}`}
+                    </span>
+                  </div>
+                )
+              })
+            )}
+            {Object.keys(languageBackfillQuery.data.missing).length === 0 && Object.keys(languageBackfillQuery.data.outdated).length === 0 && (
+              <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+                <StatusPill tone="success" label="Language" />
+                <span className="flex-1 text-muted-foreground">Clean — every source already has an up-to-date language.</span>
+              </div>
+            )}
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard title="Language Split" icon={<Search size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          A movie/series with sources in two languages that share no common source got auto-merged together back
+          when auto-merging only checked for a shared TMDB id -- before the current auto-merge language gate existed.
+          This finds and undoes those: the largest-source language stays on the original entry, every other language
+          gets split off into its own new entry with its own sources (and, for series, its own episodes) and the same
+          category placements. Run after Language Backfill above -- it depends on accurate per-source language.
+          Safe to re-run; once nothing conflicts it's a no-op.
+        </p>
+        {([
+          { label: 'Movies', query: movieLanguageSplitQuery, apply: applyMovieLanguageSplit, idKey: 'movie_id' as const },
+          { label: 'Series', query: seriesLanguageSplitQuery, apply: applySeriesLanguageSplit, idKey: 'series_id' as const },
+        ]).map(({ label, query, apply, idKey }) => (
+          <div key={label} className="space-y-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium">{label}</span>
+              <Button size="sm" variant="outline" disabled={query.isFetching} onClick={() => query.refetch()}>
+                {query.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+                Scan
+              </Button>
+              {!!query.data && (
+                query.data.count === 0
+                  ? <span className="text-xs text-muted-foreground">Clean — nothing to split.</span>
+                  : (
+                    <Button size="sm" variant="outline" disabled={apply.isPending} onClick={() => apply.mutate()}>
+                      {apply.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+                      Split {query.data.count} {label.toLowerCase()}
+                    </Button>
+                  )
+              )}
+            </div>
+            {!!query.data && query.data.count > 0 && (
+              <div className="space-y-1.5">
+                {query.data.sample.map((c) => (
+                  <div key={c[idKey]} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
+                    <StatusPill tone="warning" label={c.name} />
+                    <span className="flex-1 text-muted-foreground truncate">
+                      {c.groups.map((g) => `${g.languages.join('/')} (${g.source_count})`).join(' vs ')}
+                    </span>
+                  </div>
+                ))}
+                {query.data.count > query.data.sample.length && (
+                  <p className="text-xs text-muted-foreground">…and {query.data.count - query.data.sample.length} more.</p>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </SectionCard>
+
       <SectionCard title="Stream Priority" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           When a title has sources from more than one provider, which one plays: by provider priority (Providers
@@ -9793,16 +10044,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           // found live 2026-09-17 that two adjacent, CORRECT, separate
           // 2-item groups (an unrelated same-base-name show's AU pair next
           // to its NZ pair) were misread as one 4-item group -- the cards'
-          // subtle shared border + ~6px gap gave no reliable boundary,
-          // especially once the visual spacing/border don't survive a
-          // screenshot or copy-paste. The wider gap here plus each card's
-          // own bg-card/shadow/numbered header (see DuplicateGroupRow)
-          // together make the boundary unambiguous even then.
+          // subtle shared border + ~6px gap gave no reliable boundary. The
+          // wider gap here plus each card's own bg-card/shadow (see
+          // DuplicateGroupRow) together make the boundary unambiguous. A
+          // "Group N of M" text label was tried first but dropped same-day
+          // on user feedback -- the card boundary alone reads fine live,
+          // the label was redundant clutter once seen in the actual UI.
           <div className="text-xs space-y-3">
-            {duplicatesPageItems.map((group, groupIndex) => (
+            {duplicatesPageItems.map((group) => (
               <DuplicateGroupRow
                 key={group.items.map((i) => i.id).join('-')}
-                groupIndex={groupIndex}
                 group={group}
                 contentType={duplicatesContentType}
                 xcCredentials={xcCredentialsQuery.data}

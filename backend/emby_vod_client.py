@@ -71,6 +71,18 @@ class EmbyVodClient:
         self.base_url = provider["base_url"].rstrip("/")
         self.api_key = provider["password"]
         self._client: httpx.AsyncClient | None = None
+        # GH#27: the module docstring's claim that Jellyfin "kept the
+        # /emby/* path aliases for client compatibility" isn't true across
+        # every Jellyfin install/version -- a real user's server 404'd on
+        # /emby/Library/VirtualFolders while the server itself was reachable
+        # and the native (unprefixed) Jellyfin API worked fine. Rather than
+        # branch on provider_type (which the class deliberately avoids,
+        # since Emby and Jellyfin share almost the entire surface), _get
+        # retries once without the /emby prefix on a 404 and remembers the
+        # result for the rest of this client's lifetime, so a whole
+        # multi-call import pass against a no-alias Jellyfin server pays the
+        # extra round-trip only on its first request, not every single one.
+        self._emby_prefix_unsupported = False
 
     async def __aenter__(self) -> "EmbyVodClient":
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
@@ -85,19 +97,40 @@ class EmbyVodClient:
         query = {"api_key": self.api_key}
         if params:
             query.update(params)
+        effective_path = path
+        if self._emby_prefix_unsupported and path.startswith("/emby/"):
+            effective_path = path[len("/emby"):]
 
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=timeout)
         t0 = time.monotonic()
         try:
             r = await asyncio.wait_for(
-                client.get(f"{self.base_url}{path}", params=query, timeout=timeout),
+                client.get(f"{self.base_url}{effective_path}", params=query, timeout=timeout),
                 timeout=timeout + 5.0,
             )
+            if r.status_code == 404 and effective_path == path and path.startswith("/emby/"):
+                # See __init__'s note (GH#27) -- this server doesn't alias
+                # /emby/* at all; retry once against the native path and, if
+                # that's what actually works, stop paying the failed-request
+                # round-trip on every later call this client makes.
+                native_path = path[len("/emby"):]
+                r2 = await asyncio.wait_for(
+                    client.get(f"{self.base_url}{native_path}", params=query, timeout=timeout),
+                    timeout=timeout + 5.0,
+                )
+                if r2.status_code != 404:
+                    self._emby_prefix_unsupported = True
+                    logger.info(
+                        "[emby_vod_client] %s 404'd, %s worked -- this server doesn't alias /emby/*, "
+                        "using native Jellyfin paths for the rest of this session",
+                        path, native_path,
+                    )
+                    r = r2
             r.raise_for_status()
             return r.json() if r.content else {}
         except Exception:
-            logger.warning("[emby_vod_client] GET %s failed after %.1fs", path, time.monotonic() - t0)
+            logger.warning("[emby_vod_client] GET %s failed after %.1fs", effective_path, time.monotonic() - t0)
             raise
         finally:
             if owns_client:
@@ -106,16 +139,20 @@ class EmbyVodClient:
     async def _post_session(self, path: str, body: dict) -> None:
         """Best-effort: a failed session report shouldn't interrupt the
         actual video relay in xc_server.py, so this swallows its own
-        errors (same contract as plex_client.report_timeline)."""
+        errors (same contract as plex_client.report_timeline). See _get's
+        identical note (GH#27) for why effective_path can differ from path."""
+        effective_path = path
+        if self._emby_prefix_unsupported and path.startswith("/emby/"):
+            effective_path = path[len("/emby"):]
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
         try:
             await client.post(
-                f"{self.base_url}{path}", params={"api_key": self.api_key},
+                f"{self.base_url}{effective_path}", params={"api_key": self.api_key},
                 json=body, headers=_SESSION_HEADERS,
             )
         except Exception as exc:
-            logger.warning("[emby_vod_client] POST %s failed: %s", path, _redact(exc))
+            logger.warning("[emby_vod_client] POST %s failed: %s", effective_path, _redact(exc))
         finally:
             if owns_client:
                 await client.aclose()

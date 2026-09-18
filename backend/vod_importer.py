@@ -29,6 +29,7 @@ from xc_server import _redact_upstream_url
 def _should_auto_archive(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
     exclude_uncategorized: bool = False, lang: dict | None = None, country: list[str] | None = None,
+    raw_name: str | None = None,
 ) -> bool:
     """Import-time equivalent of the manual Language Filter archive tool --
     deliberately NOT sibling-safe (see USERGUIDE's Language Filter section
@@ -69,17 +70,28 @@ def _should_auto_archive(
     internationally-franchised show ("Married at First Sight") importing
     several genuinely-different country editions under the same base
     title -- there was no way to keep just the ones you want without
-    archiving them one at a time by hand."""
+    archiving them one at a time by hand.
+
+    raw_name: the provider's own unmodified title, checked instead of `name`
+    for the language/non-latin/country signals below when given. Real bug
+    (found live, credit @Knm): `name` here is the DISPLAY name, already run
+    through Title & Metadata Rules by the caller -- a rule that strips a
+    leading language prefix for display (e.g. "ES - Title" -> "Title") also
+    silently erases the only signal this function had to exclude it, so an
+    admin excluding Spanish would still get Spanish content imported the
+    moment a "strip ES - " display rule existed. `name` remains the default
+    for any caller that doesn't have a separate raw title to pass."""
+    check_name = raw_name if raw_name is not None else name
     lang = lang if lang is not None else config.get_import_language_exclusion()
     if lang["exclude_prefixes"]:
-        code = vod_db._name_prefix_code(name)
+        code = vod_db._name_prefix_code(check_name)
         if code and code in lang["exclude_prefixes"]:
             return True
-    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(name):
+    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(check_name):
         return True
     country = country if country is not None else config.get_import_country_exclusion()
     if country:
-        code = vod_db._country_suffix_code(name)
+        code = vod_db._country_suffix_code(check_name)
         if code and code in country:
             return True
     if provider_category_name:
@@ -506,7 +518,10 @@ async def _import_movies_for_provider(
             # own. This is the real per-source signal a quality-based stream
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang, country),
+            "auto_archive": _should_auto_archive(
+                name, category_name, exclude_categories, exclude_uncategorized, lang, country,
+                raw_name=s.get("name") or "",
+            ),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -576,7 +591,10 @@ async def _import_series_for_provider(
             # provider's own unstripped name, before parse_name_year and
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
-            "auto_archive": _should_auto_archive(name, category_name, exclude_categories, exclude_uncategorized, lang, country),
+            "auto_archive": _should_auto_archive(
+                name, category_name, exclude_categories, exclude_uncategorized, lang, country,
+                raw_name=s.get("name") or "",
+            ),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),
@@ -900,6 +918,19 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
             reconcile_result["movie_sources_removed"],
             reconcile_result["series_sources_removed"],
             reconcile_result["episode_sources_removed"],
+        )
+
+    # A successful catalog pass is a safe opportunity to remove any legacy
+    # rows with neither a provider source nor a playable episode source
+    # (ported from knmplace's fork) -- catches whatever slips through the
+    # choke points above (a bug elsewhere, a manual DB edit, an upgrade from
+    # before series_sources existed) instead of leaving it to sit until
+    # someone runs the Orphan Checker by hand.
+    orphan_result = await asyncio.to_thread(vod_db.purge_orphans)
+    if orphan_result["series_deleted"] or orphan_result["movies_deleted"] or orphan_result["episodes_deleted"]:
+        logger.info(
+            "[vod_importer] provider=%s purged %d source-less series, %d movie(s), %d episode(s)",
+            provider["name"], orphan_result["series_deleted"], orphan_result["movies_deleted"], orphan_result["episodes_deleted"],
         )
 
     if provider.get("auto_create_categories"):

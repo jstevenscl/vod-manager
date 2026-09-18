@@ -100,7 +100,9 @@ def init_db() -> None:
             is_adult_manual INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT,
-            last_enriched_at TEXT
+            last_enriched_at TEXT,
+            stream_blocked INTEGER NOT NULL DEFAULT 0,
+            stream_blocked_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS movie_sources (
@@ -1005,6 +1007,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("metadata_rules", "is_regex", "INTEGER NOT NULL DEFAULT 1"),
         ("movie_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("movie_sources", "last_failed_at", "TEXT"),
+        ("movies", "stream_blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ("movies", "stream_blocked_at", "TEXT"),
         ("episode_sources", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("episode_sources", "last_failed_at", "TEXT"),
         ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
@@ -2229,6 +2233,32 @@ def record_source_failure(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = consecutive_failures + 1, last_failed_at = ? WHERE id = ?",
             (_now(), source_id),
         )
+        if kind == "movie":
+            # Hide a movie from client listings the moment every one of its
+            # active, enabled-language sources has crossed the failure
+            # threshold (ported from knmplace's fork) -- otherwise a movie
+            # whose every provider copy is dead still gets advertised as
+            # playable, and a client just gets a dead stream with no signal
+            # anything is wrong. list_blocked_movies surfaces these for an
+            # admin to test/fix; record_source_success below clears the
+            # block the moment any source actually works again.
+            row = conn.execute("SELECT movie_id FROM movie_sources WHERE id=?", (source_id,)).fetchone()
+            if row:
+                lang_clause, lang_params = _enabled_languages_clause("ms.language")
+                conn.execute(f"""
+                    UPDATE movies SET stream_blocked=1, stream_blocked_at=?
+                    WHERE id=? AND stream_blocked=0
+                      AND EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+                          WHERE ms.movie_id=? AND p.is_active=1 AND {lang_clause}
+                            AND ms.consecutive_failures < {_FAILING_SOURCE_THRESHOLD}
+                      )
+                """, (_now(), row["movie_id"], row["movie_id"], *lang_params,
+                      row["movie_id"], *lang_params))
         _commit_with_retry(conn)
         conn.close()
 
@@ -2248,6 +2278,11 @@ def record_source_success(kind: str, source_id: int) -> None:
             f"UPDATE {table} SET consecutive_failures = 0, last_failed_at = NULL WHERE id = ? AND consecutive_failures != 0",
             (source_id,),
         )
+        if kind == "movie":
+            conn.execute("""
+                UPDATE movies SET stream_blocked=0, stream_blocked_at=NULL
+                WHERE id=(SELECT movie_id FROM movie_sources WHERE id=?) AND stream_blocked=1
+            """, (source_id,))
         _commit_with_retry(conn)
         conn.close()
 
@@ -2345,6 +2380,33 @@ def clear_stream_failures() -> None:
         conn.execute("DELETE FROM vod_stream_failures")
         _commit_with_retry(conn)
         conn.close()
+
+
+def list_blocked_movies() -> list[dict]:
+    """Actionable recovery queue for movies hidden after every playable
+    fallback repeatedly failed (see record_source_failure's stream_blocked
+    logic). Sources remain intact so an admin can test a specific provider
+    copy from the Stream Recovery page; record_source_success clears the
+    block automatically the moment any source actually works."""
+    conn = _connect()
+    movies = conn.execute("""
+        SELECT id, name, year, poster_url, stream_blocked_at
+        FROM movies WHERE stream_blocked=1
+        ORDER BY stream_blocked_at DESC, name
+    """).fetchall()
+    result = []
+    for movie in movies:
+        sources = conn.execute("""
+            SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id,
+                   ms.container_extension, ms.consecutive_failures, ms.last_failed_at,
+                   p.name AS provider_name
+            FROM movie_sources ms JOIN providers p ON p.id=ms.provider_id
+            WHERE ms.movie_id=?
+            ORDER BY ms.consecutive_failures DESC, p.name
+        """, (movie["id"],)).fetchall()
+        result.append({**dict(movie), "sources": [dict(source) for source in sources]})
+    conn.close()
+    return result
 
 
 # ── DVR per-person resource limits ──────────────────────────────────────────
@@ -3196,9 +3258,15 @@ def _purge_if_sourceless_episode(conn: sqlite3.Connection, episode_id: int) -> N
 
 def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphaned_provider_id: int | None = None) -> None:
     """Series equivalent of _purge_if_sourceless_movie -- deletes the whole
-    series only once none of its episodes have any source left at all (see
-    _purge_if_sourceless_episode for the per-episode version). If the series
-    survives (still has sources from other providers) but its cached
+    series only once none of its episodes have any source left AND it has
+    no series_sources row of its own either (see _purge_if_sourceless_
+    episode for the per-episode version). The series_sources check matters
+    on its own: a series can have a real series-level source from a
+    provider before its episodes are lazily fetched (or between two
+    episode-level source losses), and that's not sourceless -- only
+    checking episode_sources here (pre-ported-fix behavior) could delete a
+    series still legitimately known to a provider. If the series survives
+    (still has sources from other providers) but its cached
     import_provider_id -- the "ask this provider for episode details"
     reference used by enrich_series, a plain column with no real FK, not a
     real source record -- pointed at the provider that just lost its
@@ -3209,7 +3277,10 @@ def _purge_if_sourceless_series(conn: sqlite3.Connection, series_id: int, orphan
         JOIN episodes e ON e.id = es.episode_id
         WHERE e.series_id=?
     """, (series_id,)).fetchone()["c"]
-    if remaining == 0:
+    remaining_series_sources = conn.execute(
+        "SELECT COUNT(*) c FROM series_sources WHERE series_id=?", (series_id,)
+    ).fetchone()["c"]
+    if remaining == 0 and remaining_series_sources == 0:
         conn.execute("DELETE FROM series WHERE id=?", (series_id,))
     elif orphaned_provider_id is not None:
         conn.execute(
@@ -3398,16 +3469,26 @@ def delete_provider(provider_id: int) -> None:
 # Deliberately does NOT flag "series with zero episodes yet" as an orphan --
 # that's the overwhelming majority of any freshly bulk-imported pool (XC
 # episodes are fetched lazily per-series, on demand, by design) and is
-# completely normal, not broken. Only a series whose cached
-# import_provider_id points at a provider that no longer exists at all is
-# genuinely unfixable and worth flagging.
+# completely normal, not broken. A series with neither a series_sources row
+# nor any episode_sources is unplayable, though, even if its legacy
+# import_provider_id still points at a configured provider -- that pointer
+# is just a cached "ask this provider for detail" hint (see
+# _purge_if_sourceless_series's docstring), not itself a source record, so
+# checking only it (pre-ported-fix behavior) missed a series whose provider
+# still exists but whose actual sources are all gone.
 
 def find_orphans() -> dict:
     conn = _connect()
-    valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-    orphaned_series = [dict(r) for r in conn.execute("SELECT id, name, import_provider_id FROM series").fetchall()
-                        if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+    orphaned_series = [dict(r) for r in conn.execute("""
+        SELECT s.id, s.name, s.import_provider_id
+        FROM series s
+        WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM episode_sources es
+              JOIN episodes e ON e.id=es.episode_id
+              WHERE e.series_id=s.id
+          )
+    """).fetchall()]
     sourceless_movies = [dict(r) for r in conn.execute("""
         SELECT m.id, m.name FROM movies m
         LEFT JOIN movie_sources ms ON ms.movie_id = m.id
@@ -3473,10 +3554,19 @@ def purge_orphans() -> dict:
     concurrent import and cause its inserts to fail with a FOREIGN KEY error."""
     with _WRITE_LOCK:
         conn = _connect()
-        valid_provider_ids = {r["id"] for r in conn.execute("SELECT id FROM providers").fetchall()}
-
-        orphaned_series_ids = [r["id"] for r in conn.execute("SELECT id, import_provider_id FROM series").fetchall()
-                                if r["import_provider_id"] is None or r["import_provider_id"] not in valid_provider_ids]
+        # See find_orphans' identical docstring/query -- same series_sources
+        # + episode_sources definition of "orphaned", not the legacy
+        # import_provider_id-only check.
+        orphaned_series_ids = [r["id"] for r in conn.execute("""
+            SELECT s.id
+            FROM series s
+            WHERE NOT EXISTS (SELECT 1 FROM series_sources ss WHERE ss.series_id=s.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM episode_sources es
+                  JOIN episodes e ON e.id=es.episode_id
+                  WHERE e.series_id=s.id
+              )
+        """).fetchall()]
         sourceless_movie_ids = [r["id"] for r in conn.execute("""
             SELECT m.id FROM movies m LEFT JOIN movie_sources ms ON ms.movie_id = m.id WHERE ms.id IS NULL
         """).fetchall()]
@@ -5890,6 +5980,7 @@ def get_movie_export_rows() -> list[dict]:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
+        WHERE m.stream_blocked=0
         ORDER BY m.name
     """, lang_params).fetchall()
     conn.close()
@@ -5955,7 +6046,7 @@ def get_movie_export_row_by_stream_id(export_stream_id: int) -> dict | None:
         JOIN movies m ON m.id = p.movie_id
         JOIN categories c ON c.id = p.category_id AND c.is_active = 1
         LEFT JOIN best_source ms ON ms.movie_id = m.id AND ms.rn = 1
-        WHERE p.export_stream_id = ?
+        WHERE p.export_stream_id = ? AND m.stream_blocked=0
         LIMIT 1
     """, (*lang_params, export_stream_id)).fetchone()
     conn.close()
@@ -6454,7 +6545,7 @@ def _add_episode_source_row(
                provider_category_name=excluded.provider_category_name,
                bitrate=COALESCE(excluded.bitrate, episode_sources.bitrate),
                language=excluded.language""",
-        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _source_language(raw_name), _now(), _now()),
+        (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _source_language(raw_name, provider_category_name), _now(), _now()),
     )
     return conn.execute(
         "SELECT id FROM episode_sources WHERE provider_id=? AND provider_stream_id=?",
@@ -7246,7 +7337,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
                                raw_name=excluded.raw_name, language=excluded.language""",
                         (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
-                         item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), now, now),
+                         item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name"), item.get("provider_category_name")), now, now),
                     )
                     created += did_create
                     matched += did_match
@@ -7413,10 +7504,32 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     # it safe for enrichment to later overwrite a raw/placeholder
                     # name with the provider's clean title without the next
                     # re-import creating a duplicate orphaned row).
+                    #
+                    # Resolved through series_sources first (ported from
+                    # knmplace's fork, real bug): series.import_provider_id/
+                    # import_provider_series_id is a single "primary provider"
+                    # pointer on the row itself, set once at creation. A
+                    # SECOND provider re-importing a series it's seen before
+                    # was never checked against that single pointer, so it
+                    # fell through to name/year matching (or created a new
+                    # row outright) instead of returning to the series its
+                    # own provider_series_id was already attached to via
+                    # series_sources -- silently spawning a duplicate,
+                    # source-less-from-this-provider's-perspective shadow row.
+                    # Falls back to the legacy import_provider_id check for a
+                    # row written before series_sources existed.
                     existing = conn.execute(
-                        "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                        "SELECT s.id, s.is_adult, s.is_adult_manual, s.review_excluded, s.review_excluded_manual "
+                        "FROM series_sources ss JOIN series s ON s.id=ss.series_id "
+                        "WHERE ss.provider_id=? AND ss.provider_series_id=?",
                         (provider_id, item.get("provider_series_id")),
                     ).fetchone()
+                    if not existing:
+                        existing = conn.execute(
+                            "SELECT id, is_adult, is_adult_manual, review_excluded, review_excluded_manual "
+                            "FROM series WHERE import_provider_id=? AND import_provider_series_id=?",
+                            (provider_id, item.get("provider_series_id")),
+                        ).fetchone()
                     if existing:
                         did_match = True
                         series_id_for_detail = existing["id"]
@@ -7601,7 +7714,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                             (
                                 series_id_for_detail, provider_id, item.get("provider_series_id"),
                                 item.get("provider_category_name"), item.get("raw_name"),
-                                _source_language(item.get("raw_name") or name), now, now,
+                                _source_language(item.get("raw_name") or name, item.get("provider_category_name")), now, now,
                             ),
                         )
                         conn.execute(
@@ -8038,12 +8151,13 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                     # series_sources rows.
                     if item.get("provider_series_id") is not None:
                         conn.execute(
-                            "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, added_at, last_seen_at) "
-                            "VALUES (?,?,?,?,?,?,?) "
+                            "INSERT INTO series_sources (series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, added_at, last_seen_at) "
+                            "VALUES (?,?,?,?,?,?,?,?) "
                             "ON CONFLICT(provider_id, provider_series_id) DO UPDATE SET "
                             "series_id=excluded.series_id, provider_category_name=excluded.provider_category_name, "
                             "last_seen_at=excluded.last_seen_at",
-                            (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("name"), now, now),
+                            (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("name"),
+                             _source_language(item.get("name"), item.get("provider_category_name")), now, now),
                         )
 
                     for ep in item.get("episodes", []):
@@ -8525,6 +8639,314 @@ def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: s
         (row_id,),
     ).fetchall()
     return {row["lang"] for row in rows} or {"EN"}
+
+
+def _group_source_languages_by_conflict(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> list[dict]:
+    """Union-chains a single movie's/series' own movie_sources/series_sources
+    rows by COALESCE(language,'EN') -- the retroactive counterpart to
+    _split_by_language_conflict above (that one splits a set of DUPLICATE
+    CANDIDATE rows apart before a merge; this one splits a single ALREADY-
+    MERGED row's own sources apart, for movie_language_split_dry_run_report/
+    series_language_split_dry_run_report to find catalog entries merged back
+    when auto_merge_movie_by_tmdb/auto_merge_series_by_tmdb gated on tmdb_id
+    alone, before _split_by_language_conflict's language gate existed).
+    Same union-not-exact-set-equality grouping as that function: {EN},
+    {EN,ES}, {ES} sources all end up in one group (the middle one bridges
+    them), not three. Returns one dict per resulting language group:
+    {"langs": set[str], "source_ids": list[int]}, largest group first (ties
+    broken by lowest source id, for determinism) -- callers keep group [0]
+    on the original row and split the rest off into new rows."""
+    rows = conn.execute(
+        f"SELECT id, COALESCE(language, 'EN') AS lang FROM {sources_table} WHERE {fk_column}=?",
+        (row_id,),
+    ).fetchall()
+
+    groups: list[dict] = []
+    for row in rows:
+        row_langs = {row["lang"]}
+        joined = False
+        for g in groups:
+            if g["langs"] & row_langs:
+                g["source_ids"].append(row["id"])
+                g["langs"] |= row_langs
+                joined = True
+                break
+        if not joined:
+            groups.append({"langs": row_langs, "source_ids": [row["id"]]})
+
+    groups.sort(key=lambda g: (-len(g["source_ids"]), min(g["source_ids"])))
+    return groups
+
+
+def _row_columns_to_copy(table: str) -> list[str]:
+    """Every real column on `table` except id/created_at/updated_at -- for
+    cloning a movies/series row when splitting one language group off into
+    a brand-new row. Read from the live schema (PRAGMA table_info) rather
+    than a hardcoded list so a future column addition is copied
+    automatically instead of silently dropped."""
+    conn = _connect()
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if r["name"] not in ("id", "created_at", "updated_at")]
+    conn.close()
+    return cols
+
+
+def _movie_language_split_candidates(conn: sqlite3.Connection) -> list[int]:
+    """Cheap first pass: only movies whose sources carry more than one
+    distinct COALESCE(language,'EN') value at all can possibly be a split
+    candidate -- the overwhelming majority of a real catalog has exactly
+    one, so this SQL-side prefilter avoids running the full per-row
+    union-conflict grouping (_group_source_languages_by_conflict) against
+    every movie just to find the rare few actually worth it."""
+    rows = conn.execute("""
+        SELECT movie_id FROM movie_sources
+        GROUP BY movie_id
+        HAVING COUNT(DISTINCT COALESCE(language, 'EN')) > 1
+    """).fetchall()
+    return [r["movie_id"] for r in rows]
+
+
+def movie_language_split_dry_run_report(sample_size: int = 20) -> dict:
+    """Reports every existing movie whose movie_sources span more than one
+    non-overlapping language group (see _group_source_languages_by_conflict)
+    -- these were auto-merged together back when auto_merge_movie_by_tmdb
+    gated on a shared tmdb_id alone, before the language gate
+    (_split_by_language_conflict) existed to keep it from happening for new
+    merges. Read-only -- see apply_movie_language_split for the actual
+    re-split. {"count": N, "sample": [{"movie_id", "name",
+    "groups": [{"languages": [...], "source_count": N}, ...]}, ...]}."""
+    conn = _connect()
+    candidates = []
+    for movie_id in _movie_language_split_candidates(conn):
+        groups = _group_source_languages_by_conflict(conn, "movie_sources", "movie_id", movie_id)
+        if len(groups) <= 1:
+            continue
+        row = conn.execute("SELECT name FROM movies WHERE id=?", (movie_id,)).fetchone()
+        if not row:
+            continue
+        candidates.append({
+            "movie_id": movie_id,
+            "name": row["name"],
+            "groups": [{"languages": sorted(g["langs"]), "source_count": len(g["source_ids"])} for g in groups],
+        })
+    conn.close()
+    return {"count": len(candidates), "sample": candidates[:sample_size]}
+
+
+def apply_movie_language_split() -> dict:
+    """Re-splits every movie found by movie_language_split_dry_run_report:
+    the largest language group stays on the original row, every other group
+    gets a brand-new movie row (cloned from the original -- name/year/
+    tmdb_id/poster/etc, see _row_columns_to_copy) with that group's
+    movie_sources reassigned onto it and the original's category placements
+    copied (not moved -- both language editions belong in whatever
+    categories the merged row was already in). Safe to re-run -- once every
+    movie's sources agree on language, it's a no-op. Returns {"movies_split":
+    N, "rows_created": N}."""
+    copy_cols = _row_columns_to_copy("movies")
+    movies_split = 0
+    rows_created = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            candidate_ids = _movie_language_split_candidates(conn)
+            for movie_id in candidate_ids:
+                groups = _group_source_languages_by_conflict(conn, "movie_sources", "movie_id", movie_id)
+                if len(groups) <= 1:
+                    continue
+                original = conn.execute(f"SELECT {', '.join(copy_cols)} FROM movies WHERE id=?", (movie_id,)).fetchone()
+                if not original:
+                    continue
+                placements = [r["category_id"] for r in conn.execute(
+                    "SELECT category_id FROM movie_category_placements WHERE movie_id=?", (movie_id,)
+                ).fetchall()]
+                for group in groups[1:]:
+                    now = _now()
+                    placeholders = ", ".join("?" * len(copy_cols))
+                    cur = conn.execute(
+                        f"INSERT INTO movies ({', '.join(copy_cols)}, created_at, updated_at) VALUES ({placeholders}, ?, ?)",
+                        (*[original[c] for c in copy_cols], now, now),
+                    )
+                    new_id = cur.lastrowid
+                    placeholders = ",".join("?" * len(group["source_ids"]))
+                    conn.execute(
+                        f"UPDATE movie_sources SET movie_id=? WHERE id IN ({placeholders})",
+                        (new_id, *group["source_ids"]),
+                    )
+                    # place_movie_in_category owns export_stream_id
+                    # generation (a NOT NULL UNIQUE the raw INSERT this
+                    # replaced didn't know how to fill in), but it opens
+                    # its own connection and does its own BEGIN IMMEDIATE --
+                    # which deadlocks against this function's still-open
+                    # transaction on `conn`. Commit first so the new row it
+                    # needs to see (and the write lock it needs to take) are
+                    # both actually available.
+                    _commit_with_retry(conn)
+                    for category_id in placements:
+                        # Its needs-year-review/archived guards can raise
+                        # ValueError -- normally impossible here (an
+                        # archived original strips its own placements
+                        # before this loop ever sees them), but one
+                        # unexpected candidate must not abort every other
+                        # movie's split in the same batch.
+                        try:
+                            place_movie_in_category(new_id, category_id)
+                        except ValueError as exc:
+                            logger.warning("[apply_movie_language_split] movie_id=%s: couldn't place split-off row %s in category %s: %s",
+                                            movie_id, new_id, category_id, exc)
+                    rows_created += 1
+                movies_split += 1
+                if (movies_split % 25) == 0:
+                    _commit_with_retry(conn)
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+    return {"movies_split": movies_split, "rows_created": rows_created}
+
+
+def _series_language_split_candidates(conn: sqlite3.Connection) -> list[int]:
+    """series_sources counterpart to _movie_language_split_candidates."""
+    rows = conn.execute("""
+        SELECT series_id FROM series_sources
+        GROUP BY series_id
+        HAVING COUNT(DISTINCT COALESCE(language, 'EN')) > 1
+    """).fetchall()
+    return [r["series_id"] for r in rows]
+
+
+def series_language_split_dry_run_report(sample_size: int = 20) -> dict:
+    """series counterpart to movie_language_split_dry_run_report, grouping
+    by series_sources instead of movie_sources. See apply_series_language_
+    split for the actual re-split (episodes included)."""
+    conn = _connect()
+    candidates = []
+    for series_id in _series_language_split_candidates(conn):
+        groups = _group_source_languages_by_conflict(conn, "series_sources", "series_id", series_id)
+        if len(groups) <= 1:
+            continue
+        row = conn.execute("SELECT name FROM series WHERE id=?", (series_id,)).fetchone()
+        if not row:
+            continue
+        candidates.append({
+            "series_id": series_id,
+            "name": row["name"],
+            "groups": [{"languages": sorted(g["langs"]), "source_count": len(g["source_ids"])} for g in groups],
+        })
+    conn.close()
+    return {"count": len(candidates), "sample": candidates[:sample_size]}
+
+
+def apply_series_language_split() -> dict:
+    """Re-splits every series found by series_language_split_dry_run_report.
+    Same shape as apply_movie_language_split (largest group stays, every
+    other group gets a new series row with series_sources reassigned and
+    category placements copied), plus episode handling series_sources alone
+    doesn't need: for every episode of the original series, whichever of
+    its episode_sources belong to a provider in the group being split off
+    move with it -- into a matching (season, episode) row on the new
+    series, created if it doesn't have one yet, same reassign-or-merge
+    pattern _merge_series_row uses in the opposite direction. An episode
+    left with zero remaining episode_sources on the original series (all of
+    them moved) is purged, same as any other now-sourceless episode.
+    import_provider_id/import_provider_series_id are left NULL on the new
+    row rather than guessed -- the normal periodic re-sync re-establishes
+    them the next time that provider's catalog is processed. Safe to
+    re-run. Returns {"series_split": N, "rows_created": N}."""
+    copy_cols = _row_columns_to_copy("series")
+    copy_cols = [c for c in copy_cols if c not in ("import_provider_id", "import_provider_series_id")]
+    series_split = 0
+    rows_created = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            candidate_ids = _series_language_split_candidates(conn)
+            for series_id in candidate_ids:
+                groups = _group_source_languages_by_conflict(conn, "series_sources", "series_id", series_id)
+                if len(groups) <= 1:
+                    continue
+                original = conn.execute(f"SELECT {', '.join(copy_cols)} FROM series WHERE id=?", (series_id,)).fetchone()
+                if not original:
+                    continue
+                placements = [r["category_id"] for r in conn.execute(
+                    "SELECT category_id FROM series_category_placements WHERE series_id=?", (series_id,)
+                ).fetchall()]
+                for group in groups[1:]:
+                    now = _now()
+                    placeholders = ", ".join("?" * len(copy_cols))
+                    cur = conn.execute(
+                        f"INSERT INTO series ({', '.join(copy_cols)}, created_at, updated_at) VALUES ({placeholders}, ?, ?)",
+                        (*[original[c] for c in copy_cols], now, now),
+                    )
+                    new_series_id = cur.lastrowid
+                    source_placeholders = ",".join("?" * len(group["source_ids"]))
+                    moved_provider_ids = {
+                        r["provider_id"] for r in conn.execute(
+                            f"SELECT DISTINCT provider_id FROM series_sources WHERE id IN ({source_placeholders})",
+                            group["source_ids"],
+                        ).fetchall()
+                    }
+                    conn.execute(
+                        f"UPDATE series_sources SET series_id=? WHERE id IN ({source_placeholders})",
+                        (new_series_id, *group["source_ids"]),
+                    )
+                    # See apply_movie_language_split's identical note --
+                    # place_series_in_category opens its own connection/
+                    # transaction, which deadlocks against this one's still
+                    # -open transaction without committing first.
+                    _commit_with_retry(conn)
+                    for category_id in placements:
+                        # One unexpected ValueError must not abort the rest
+                        # of this batch.
+                        try:
+                            place_series_in_category(new_series_id, category_id)
+                        except ValueError as exc:
+                            logger.warning("[apply_series_language_split] series_id=%s: couldn't place split-off row %s in category %s: %s",
+                                            series_id, new_series_id, category_id, exc)
+
+                    provider_placeholders = ",".join("?" * len(moved_provider_ids))
+                    episodes = conn.execute(
+                        "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (series_id,)
+                    ).fetchall()
+                    for ep in episodes:
+                        moved_source_ids = [
+                            r["id"] for r in conn.execute(
+                                f"SELECT id FROM episode_sources WHERE episode_id=? AND provider_id IN ({provider_placeholders})",
+                                (ep["id"], *moved_provider_ids),
+                            ).fetchall()
+                        ] if moved_provider_ids else []
+                        if not moved_source_ids:
+                            continue
+                        target_ep = conn.execute(
+                            "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+                            (new_series_id, ep["season_number"], ep["episode_number"]),
+                        ).fetchone()
+                        if target_ep:
+                            target_ep_id = target_ep["id"]
+                        else:
+                            new_ep_cur = conn.execute(
+                                "INSERT INTO episodes (series_id, season_number, episode_number, name, description, duration_secs, created_at) "
+                                "SELECT ?, season_number, episode_number, name, description, duration_secs, ? FROM episodes WHERE id=?",
+                                (new_series_id, now, ep["id"]),
+                            )
+                            target_ep_id = new_ep_cur.lastrowid
+                        moved_es_placeholders = ",".join("?" * len(moved_source_ids))
+                        conn.execute(
+                            f"UPDATE episode_sources SET episode_id=? WHERE id IN ({moved_es_placeholders})",
+                            (target_ep_id, *moved_source_ids),
+                        )
+                        _purge_if_sourceless_episode(conn, ep["id"])
+                    rows_created += 1
+                series_split += 1
+                if (series_split % 25) == 0:
+                    _commit_with_retry(conn)
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+    return {"series_split": series_split, "rows_created": rows_created}
 
 
 def auto_merge_movie_by_tmdb(movie_id: int) -> None:
@@ -9304,6 +9726,27 @@ def _name_prefix_code(name: str) -> str | None:
     return _dash_prefix_code(name)
 
 
+# Some providers only tag language at the category level ("[FR] NETFLIX")
+# rather than per-title -- or per-title tagging exists but is malformed in a
+# way _name_prefix_code doesn't catch (stray leading whitespace, a zero-width
+# character before the code, lowercase, a typo'd separator). This is checked
+# only as a fallback, never in place of a detected title prefix: ~2% of real
+# rows carry a title prefix that legitimately disagrees with their category
+# (e.g. a Kurdish-tagged title filed under an "Africa Movies" category) --
+# the per-item tag is the more specific, more trustworthy signal when present.
+_CATEGORY_PREFIX_BRACKET_RE = re.compile(r"^\[([A-Z]{2,6})\]")
+
+
+def _category_prefix_code(category_name: str | None) -> str | None:
+    if not category_name:
+        return None
+    m = _CATEGORY_PREFIX_BRACKET_RE.match(category_name.strip())
+    if not m:
+        return None
+    code = m.group(1)
+    return code if code in _KNOWN_LANGUAGE_CODES else None
+
+
 def _strip_one_lang_prefix(name: str) -> str | None:
     """One leading language-style prefix removed, or None if there isn't
     one -- see _name_prefix_code for why colon/dash-matching is
@@ -9330,18 +9773,21 @@ def _strip_lang_prefixes(name: str) -> str:
         name = new_name
 
 
-def _source_language(raw_name: str | None) -> str:
-    """Per-source language for movie_sources/episode_sources, computed from
-    the provider's raw_name via the same prefix-detection used for
-    import-time archiving (_name_prefix_code). Defaults to "EN" when no
-    known foreign-language prefix is present -- an untagged title is treated
-    as English/Spanish-safe, matching how providers actually tag things (the
-    absence of a prefix is the common case for EN/ES content, not a sign of
-    unknown language)."""
-    if not raw_name:
-        return "EN"
-    code = _name_prefix_code(raw_name)
-    return code or "EN"
+def _source_language(raw_name: str | None, category_name: str | None = None) -> str:
+    """Per-source language for movie_sources/episode_sources/series_sources,
+    computed from the provider's raw_name via the same prefix-detection used
+    for import-time archiving (_name_prefix_code). Falls back to the
+    provider category's own "[XX]" bracket tag (_category_prefix_code) when
+    the title has no detected prefix -- catches titles under a
+    correctly-tagged category whose own tag is missing or malformed.
+    Defaults to "EN" when neither signal is present -- an untagged title
+    under an untagged/generic category is treated as English/Spanish-safe,
+    matching how providers actually tag things (the absence of a prefix is
+    the common case for EN/ES content, not a sign of unknown language)."""
+    code = _name_prefix_code(raw_name) if raw_name else None
+    if code:
+        return code
+    return _category_prefix_code(category_name) or "EN"
 
 
 def _enabled_languages_clause(column: str) -> tuple[str, list[str]]:
@@ -9359,6 +9805,7 @@ def _enabled_languages_clause(column: str) -> tuple[str, list[str]]:
 _BACKFILL_TABLES = [
     ("movie_sources", "movie_id", "movies"),
     ("episode_sources", "episode_id", "episodes"),
+    ("series_sources", "series_id", "series"),
 ]
 
 
@@ -9372,11 +9819,11 @@ def language_backfill_dry_run_report(sample_size: int = 5) -> dict:
     report = {}
     for table, fk_col, parent_table in _BACKFILL_TABLES:
         rows = conn.execute(
-            f"SELECT raw_name, {fk_col} AS parent_id FROM {table} WHERE language IS NULL"
+            f"SELECT raw_name, provider_category_name, {fk_col} AS parent_id FROM {table} WHERE language IS NULL"
         ).fetchall()
         by_code: dict[str, dict] = {}
         for row in rows:
-            code = _source_language(row["raw_name"])
+            code = _source_language(row["raw_name"], row["provider_category_name"])
             bucket = by_code.setdefault(code, {"count": 0, "sample_titles": [], "_parent_ids": set()})
             bucket["count"] += 1
             bucket["_parent_ids"].add(row["parent_id"])
@@ -9395,21 +9842,36 @@ def language_backfill_dry_run_report(sample_size: int = 5) -> dict:
 
 def apply_language_backfill() -> int:
     """Writes the computed language (see language_backfill_dry_run_report)
-    onto every existing movie_sources/episode_sources row that doesn't have
-    one yet. Returns the total number of rows updated."""
+    onto every existing movie_sources/episode_sources/series_sources row
+    that doesn't have one yet. Can touch well over a million rows on a real
+    catalog, so -- same reasoning as merge_duplicate_groups_bulk's identical
+    pattern (see its docstring) -- this commits and releases/reacquires
+    _WRITE_LOCK every batch_size rows rather than holding one giant
+    transaction + the write lock for the whole run, which would starve
+    every other writer (imports, enrichment) and balloon the WAL file for
+    however many minutes the full pass takes. Returns the total number of
+    rows updated."""
+    batch_size = 25
     total = 0
-    with _WRITE_LOCK:
-        conn = _connect()
-        for table, _fk_col, _parent_table in _BACKFILL_TABLES:
-            rows = conn.execute(f"SELECT id, raw_name FROM {table} WHERE language IS NULL").fetchall()
-            for row in rows:
+    for table, _fk_col, _parent_table in _BACKFILL_TABLES:
+        rows = _connect().execute(f"SELECT id, raw_name, provider_category_name FROM {table} WHERE language IS NULL").fetchall()
+        _WRITE_LOCK.acquire()
+        try:
+            conn = _connect()
+            for i, row in enumerate(rows):
                 conn.execute(
                     f"UPDATE {table} SET language = ? WHERE id = ?",
-                    (_source_language(row["raw_name"]), row["id"]),
+                    (_source_language(row["raw_name"], row["provider_category_name"]), row["id"]),
                 )
-            total += len(rows)
-        _commit_with_retry(conn)
-        conn.close()
+                if (i + 1) % batch_size == 0:
+                    _commit_with_retry(conn)
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
+            _commit_with_retry(conn)
+            conn.close()
+        finally:
+            _WRITE_LOCK.release()
+        total += len(rows)
     return total
 
 
@@ -9426,11 +9888,11 @@ def language_recompute_dry_run_report(sample_size: int = 5) -> dict:
     report = {}
     for table, fk_col, parent_table in _BACKFILL_TABLES:
         rows = conn.execute(
-            f"SELECT raw_name, language, {fk_col} AS parent_id FROM {table} WHERE language IS NOT NULL"
+            f"SELECT raw_name, provider_category_name, language, {fk_col} AS parent_id FROM {table} WHERE language IS NOT NULL"
         ).fetchall()
         by_code: dict[str, dict] = {}
         for row in rows:
-            recomputed = _source_language(row["raw_name"])
+            recomputed = _source_language(row["raw_name"], row["provider_category_name"])
             if recomputed == row["language"]:
                 continue
             bucket = by_code.setdefault(recomputed, {"count": 0, "sample_titles": [], "_parent_ids": set()})
@@ -9452,25 +9914,37 @@ def language_recompute_dry_run_report(sample_size: int = 5) -> dict:
 
 def apply_language_recompute() -> int:
     """Writes the recomputed language (see language_recompute_dry_run_report)
-    onto every existing movie_sources/episode_sources row whose stored
-    value disagrees with what _source_language computes now. Safe to
-    re-run -- once nothing disagrees, it becomes a no-op. Returns the total
-    number of rows updated."""
+    onto every existing movie_sources/episode_sources/series_sources row
+    whose stored value disagrees with what _source_language computes now.
+    Safe to re-run -- once nothing disagrees, it becomes a no-op. The
+    scan/recompute over every already-classified row (can be well over a
+    million) runs without the write lock, since only real mismatches need
+    one; those are then written in batches, releasing/reacquiring
+    _WRITE_LOCK every batch_size rows -- same reasoning as
+    apply_language_backfill (see its docstring). Returns the total number
+    of rows updated."""
+    batch_size = 25
     total = 0
-    with _WRITE_LOCK:
-        conn = _connect()
-        for table, _fk_col, _parent_table in _BACKFILL_TABLES:
-            rows = conn.execute(f"SELECT id, raw_name, language FROM {table} WHERE language IS NOT NULL").fetchall()
-            for row in rows:
-                recomputed = _source_language(row["raw_name"])
-                if recomputed != row["language"]:
-                    conn.execute(
-                        f"UPDATE {table} SET language = ? WHERE id = ?",
-                        (recomputed, row["id"]),
-                    )
-                    total += 1
-        _commit_with_retry(conn)
-        conn.close()
+    for table, _fk_col, _parent_table in _BACKFILL_TABLES:
+        rows = _connect().execute(f"SELECT id, raw_name, provider_category_name, language FROM {table} WHERE language IS NOT NULL").fetchall()
+        mismatches = [(row["id"], recomputed) for row in rows
+                      if (recomputed := _source_language(row["raw_name"], row["provider_category_name"])) != row["language"]]
+        if not mismatches:
+            continue
+        _WRITE_LOCK.acquire()
+        try:
+            conn = _connect()
+            for i, (row_id, recomputed) in enumerate(mismatches):
+                conn.execute(f"UPDATE {table} SET language = ? WHERE id = ?", (recomputed, row_id))
+                if (i + 1) % batch_size == 0:
+                    _commit_with_retry(conn)
+                    _WRITE_LOCK.release()
+                    _WRITE_LOCK.acquire()
+            _commit_with_retry(conn)
+            conn.close()
+        finally:
+            _WRITE_LOCK.release()
+        total += len(mismatches)
     return total
 
 

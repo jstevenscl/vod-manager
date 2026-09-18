@@ -25,5 +25,11 @@ def db(tmp_path, monkeypatch):
     db_path = tmp_path / "vod_db.sqlite"
     monkeypatch.setattr(vod_db, "DB_PATH", db_path)
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    # config._read_raw/_write_raw cache config.json's contents in memory
+    # (see their docstring) -- without resetting it here too, a setting
+    # saved in one test would leak into every later test in the same
+    # pytest run via the stale cache, even though CONFIG_FILE above now
+    # points at a fresh file.
+    monkeypatch.setattr(config, "_raw_cache", None)
     vod_db.init_db()
     return vod_db

@@ -61,6 +61,7 @@ const NAV_GROUPS: NavGroup[] = [
   { label: 'Operations', items: [
     { label: 'Providers', icon: <RefreshCw size={15} />, tab: 'providers' },
     { label: 'Metadata Review', icon: <Search size={15} />, tab: 'metadata' },
+    { label: 'Stream Recovery', icon: <Activity size={15} />, tab: 'recovery' },
     { label: 'Curation & Maintenance', icon: <Wrench size={15} />, tab: 'curation' },
   ] },
   { label: 'System', items: [
@@ -76,7 +77,7 @@ export default function App() {
 
   const [activeTab, setActiveTabState] = useState<VodManagerTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'curation' || saved === 'config' || saved === 'dvr' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'dvr' ? saved : 'movies'
   })
   function setActiveTab(t: VodManagerTab) {
     localStorage.setItem('vodmanager-tab', t)

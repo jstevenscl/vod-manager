@@ -920,6 +920,24 @@ Above the catalog itself, the dashboard always shows two live cards:
 
 ![Failed Streams, showing a mid-stream crash and an every-source-exhausted failure](docs/screenshots/failed-streams.png)
 
+### Stream Recovery
+
+A separate, dedicated page (its own sidebar entry under Operations) for the
+case Failed Streams alone can't fully resolve: a movie whose *every* active,
+enabled-language source has failed repeatedly gets automatically hidden from
+client VOD listings — Dispatcharr and any downstream player simply won't see
+it any more, instead of continuing to advertise a stream that's actually
+dead. Nothing is deleted; its sources stay intact.
+
+Stream Recovery lists every currently-hidden movie with each of its
+sources and how many times that specific source has failed. Click **Test
+source** on any one of them to try it directly, bypassing the normal
+priority/failover ordering — a successful test immediately restores the
+movie to client listings; a failed test leaves it blocked and moves on to
+the next thing to try. This is the fastest way to tell "this whole title is
+actually gone everywhere" apart from "one provider copy is bad, but another
+one would work if the client just retried."
+
 The **Movies** and **TV Shows** tabs below that are the main catalog views,
 each with a **list** or **grid** (poster wall) mode.
 
@@ -1436,13 +1454,38 @@ so when there's nothing currently flagged.
 ### Orphan Checker
 
 Finds dead rows a provider deletion (or a bug) can leave behind — a series
-whose only source provider no longer exists, or movies/episodes with zero
-sources at all. Run it periodically, especially after removing a provider.
-It won't flag a series with no episodes yet — that's normal for anything
-not yet lazily enriched, not broken. Once a scan finds anything, a **Delete
-N orphans** button purges everything the scan found in one action — useful
-when a provider's fully abandoned and its dead rows just need to go, rather
-than investigating one at a time.
+with neither a provider-level source nor a single episode source anywhere,
+or movies/episodes with zero sources at all. A series that still has real
+sources from another provider is never flagged, even if the provider it was
+originally imported from is long gone — only a series with *zero* sources
+left, from any provider, is actually broken. Run it periodically, especially
+after removing a provider. It won't flag a series with no episodes yet —
+that's normal for anything not yet lazily enriched, not broken. Once a scan
+finds anything, a **Delete N orphans** button purges everything the scan
+found in one action — useful when a provider's fully abandoned and its dead
+rows just need to go, rather than investigating one at a time.
+
+### Language Backfill and Language Split
+
+Two related maintenance tools, both scanning the whole catalog and safe to
+re-run any time (each becomes a no-op once nothing's left to fix):
+
+- **Language Backfill** — every source's language (used by Enabled Playback
+  Languages, Import Language Exclusion, and Duplicate Finder's language
+  matching) is detected from its raw title and provider category. A source
+  written before that detection existed on a given import path — or
+  classified by a since-fixed version of it — sits with the wrong value
+  until backfilled. Scan shows what's missing or outdated per table/language
+  code with sample titles; **Backfill N rows** applies it.
+- **Language Split** — a movie or series with sources in two languages that
+  share no common source can end up merged into a single catalog entry from
+  before the auto-merge language gate existed (a shared TMDB id used to be
+  the only thing auto-merge checked). Language Split finds and undoes those:
+  the largest-source language stays on the original entry, and every other
+  language gets split off into its own new entry with its own sources (and,
+  for a series, its own episodes) and the same category placements. Run
+  this after Language Backfill — it depends on accurate per-source
+  language.
 
 ---
 

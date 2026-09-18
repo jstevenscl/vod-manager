@@ -14,7 +14,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.17"
+APP_VERSION = "0.2.18"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -25,18 +25,40 @@ LOG_FILE        = LOG_DIR / "vod_manager.log"
 LOG_BACKUP_COUNT = 5
 
 
+# In-memory cache of config.json -- every one of this file's ~40 getters
+# (including require_auth's has_credentials() check, run synchronously on
+# the event loop for nearly every API request via _GUARDS) used to call
+# _read_raw() straight through to a blocking disk read, every single call,
+# uncached. Invisible on a fast local disk, but the moment the underlying
+# volume is under heavy I/O pressure from something else on the same mount
+# (a large SQLite write -- e.g. a slow provider import, or a backfill/scan
+# touching the whole catalog), those blocking reads, being on the event
+# loop and not wrapped in asyncio.to_thread, stall every concurrent
+# request in the whole app, not just the slow one. Caching removes the
+# disk read from the hot path entirely for every call after the first.
+# Nothing else writes this file (single-process, single-container app), so
+# there's no external-invalidation case to handle.
+_raw_cache: dict | None = None
+
+
 def _read_raw() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text())
-        except Exception:
-            pass
-    return {}
+    global _raw_cache
+    if _raw_cache is None:
+        if CONFIG_FILE.exists():
+            try:
+                _raw_cache = json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                _raw_cache = {}
+        else:
+            _raw_cache = {}
+    return _raw_cache
 
 
 def _write_raw(data: dict) -> None:
+    global _raw_cache
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    _raw_cache = data
 
 
 # ── Dispatcharr connection ───────────────────────────────────────────────────

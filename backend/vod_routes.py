@@ -759,6 +759,15 @@ async def clear_stream_failures():
     return {"ok": True}
 
 
+@router.get("/stream-recovery/movies/", dependencies=_GUARDS)
+async def list_blocked_movies():
+    """Movies hidden after every playable source reached the failure limit
+    (see vod_db.record_source_failure's stream_blocked logic). The returned
+    source IDs are used by the existing authenticated preview route, whose
+    successful playback clears the block automatically."""
+    return await asyncio.to_thread(vod_db.list_blocked_movies)
+
+
 # ── Content-mismatch flagging ────────────────────────────────────────────────
 # "This isn't actually what its label says" -- see vod_db.py's own section
 # docstring for the full reasoning and the 5 supported granularities.
@@ -2778,6 +2787,61 @@ async def resweep_uncategorized():
     an admin get an immediate result instead of waiting for the next tick."""
     await vod_importer.resweep_smart_categories()
     return vod_db.find_uncategorized()
+
+
+# ── Language backfill ────────────────────────────────────────────────────────
+# Self-service scan/apply for sources written (or last classified) before a
+# language-detection fix landed -- see vod_db.language_backfill_dry_run_report
+# and language_recompute_dry_run_report for what each half covers.
+
+@router.get("/language-backfill/", dependencies=_GUARDS)
+async def scan_language_backfill():
+    # Walks every movie_sources/episode_sources/series_sources row (well
+    # over a million on a real catalog) -- run off the event loop via
+    # asyncio.to_thread like every other heavy scan (see duplicate finder's
+    # scan route above) so it doesn't freeze the whole app, including
+    # playback-serving routes, for the minutes this can take.
+    missing, outdated = await asyncio.gather(
+        asyncio.to_thread(vod_db.language_backfill_dry_run_report),
+        asyncio.to_thread(vod_db.language_recompute_dry_run_report),
+    )
+    return {"missing": missing, "outdated": outdated}
+
+
+@router.post("/language-backfill/apply/", dependencies=_GUARDS)
+async def apply_language_backfill_route():
+    filled = await asyncio.to_thread(vod_db.apply_language_backfill)
+    corrected = await asyncio.to_thread(vod_db.apply_language_recompute)
+    return {"filled": filled, "corrected": corrected}
+
+
+# ── Language split ───────────────────────────────────────────────────────────
+# Retroactive counterpart to the auto-merge language gate: movies/series
+# auto-merged together (by a shared tmdb_id) before that gate existed can
+# still be carrying sources in more than one non-overlapping language under
+# one catalog entry. Same preview-then-apply shape as language-backfill
+# above, one pair of routes per content type since movies and series split
+# on different tables (and series involves episodes too -- see
+# apply_series_language_split's docstring).
+
+@router.get("/language-split/movies/", dependencies=_GUARDS)
+async def scan_movie_language_split():
+    return await asyncio.to_thread(vod_db.movie_language_split_dry_run_report)
+
+
+@router.post("/language-split/movies/apply/", dependencies=_GUARDS)
+async def apply_movie_language_split_route():
+    return await asyncio.to_thread(vod_db.apply_movie_language_split)
+
+
+@router.get("/language-split/series/", dependencies=_GUARDS)
+async def scan_series_language_split():
+    return await asyncio.to_thread(vod_db.series_language_split_dry_run_report)
+
+
+@router.post("/language-split/series/apply/", dependencies=_GUARDS)
+async def apply_series_language_split_route():
+    return await asyncio.to_thread(vod_db.apply_series_language_split)
 
 
 # ── Duplicate finder ─────────────────────────────────────────────────────────
