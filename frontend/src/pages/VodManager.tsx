@@ -1486,6 +1486,16 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identit
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
+  const manualMerge = useMutation({
+    mutationFn: (keepId: number) => api.post('/vod/duplicates/merge/', {
+      content_type: contentType, keep_id: keepId, merge_ids: [item.id],
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
   const clearTmdbId = useMutation({
     mutationFn: () => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/clear/`),
     onSuccess: () => {
@@ -1581,7 +1591,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identit
                         {setTmdbId.isPending || resolve.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Use existing match'}
                       </Button>
                     ) : (
-                      <span className="text-muted-foreground shrink-0">Needs manual confirmation</span>
+                      <Button
+                        size="sm" variant="outline" className="h-7 shrink-0"
+                        disabled={manualMerge.isPending}
+                        onClick={() => {
+                          if (window.confirm(`Merge "${item.name}" into "${match.name}"? This moves its sources and cannot be undone.`)) {
+                            manualMerge.mutate(match.id)
+                          }
+                        }}
+                      >
+                        {manualMerge.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Merge into existing'}
+                      </Button>
                     )}
                   </div>
                 ))}
