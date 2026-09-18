@@ -1931,7 +1931,7 @@ async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
     skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
     write_queue: "asyncio.Queue | None" = None, series_id: int | None = None,
-    episodes_only: bool = False,
+    episodes_only: bool = False, source_id: int | None = None,
 ) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
@@ -1963,7 +1963,10 @@ async def _enrich_one(
                 if episodes_only:
                     series_kwargs["episodes_only"] = True
                 if series_id is not None:
-                    series_kwargs["source_id"] = item_id
+                    # item_id is the canonical series id used for progress
+                    # accounting; source_id identifies the provider-specific
+                    # series_sources row being fetched.
+                    series_kwargs["source_id"] = source_id if source_id is not None else item_id
                 await enrich_series_source_only(series_id or item_id, provider_id, **series_kwargs)
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
@@ -2174,8 +2177,9 @@ async def _run_provider_series_phase(
             try:
                 if pending_sources is not None:
                     outcome = await _enrich_one(
-                        "series", sem, item["id"], force, skip_auto_merge=True, provider_id=provider["id"],
+                        "series", sem, item["series_id"], force, skip_auto_merge=True, provider_id=provider["id"],
                         write_queue=write_queue, series_id=item["series_id"], episodes_only=episodes_only,
+                        source_id=item["id"],
                     )
                 else:
                     outcome = await _enrich_one(

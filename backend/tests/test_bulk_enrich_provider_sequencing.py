@@ -249,6 +249,40 @@ def test_provider_movie_retry_succeeds_then_series_runs(monkeypatch):
     assert progress["movies_done"] == 2, "ids 10 and 11 are each counted once despite 10's retry"
 
 
+def test_shared_series_across_providers_is_counted_once(monkeypatch):
+    """Progress is canonical-series based even when two provider sources
+    point at the same series.  Source ids must not inflate series_done past
+    the unique series total."""
+    providers = [_provider(1, "ProvA"), _provider(2, "ProvB")]
+    pending = {
+        1: [{"id": 101, "series_id": 20}],
+        2: [{"id": 202, "series_id": 20}],
+    }
+
+    async def fake_enrich_series(series_id, provider_id, *, force=False,
+                                 skip_auto_merge=False, write_queue=None,
+                                 source_id=None, episodes_only=False):
+        assert series_id == 20
+        assert source_id in (101, 202)
+        return {"fetched": True, "reason": None}
+
+    monkeypatch.setattr(vod_importer, "enrich_series_source_only", fake_enrich_series)
+    monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: providers)
+    monkeypatch.setattr(vod_importer.vod_db, "list_movie_ids_pending_provider_enrichment", lambda provider_id=None: [])
+    monkeypatch.setattr(vod_importer.vod_db, "list_pending_series_sources", lambda provider_id=None: pending[provider_id])
+    monkeypatch.setattr(vod_importer.vod_db, "has_pending_series_source_enrichment", lambda provider_id: True)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movies_by_tmdb_batch", lambda ids: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb_batch", lambda ids: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movie_tmdb_collisions", lambda: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_tmdb_collisions", lambda: None)
+
+    asyncio.run(vod_importer.bulk_enrich_all(concurrency=8, pending_only=True))
+
+    progress = vod_importer.get_enrich_progress()
+    assert progress["series_total"] == 1
+    assert progress["series_done"] == 1
+
+
 def test_provider_retry_does_not_double_count_already_succeeded_items(monkeypatch):
     """A provider's movie phase can fail overall while some of its OTHER
     items already succeeded on the first pass (phase ok=False just means AT
