@@ -1418,7 +1418,8 @@ async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge:
 
 
 async def _enrich_one_series_source(
-    series_id: int, series: dict, source: dict, *, force: bool = False, write_queue: "asyncio.Queue | None" = None,
+    series_id: int, series: dict, source: dict, *, force: bool = False,
+    write_queue: "asyncio.Queue | None" = None, episodes_only: bool = False,
 ) -> dict:
     """Fetches and persists exactly ONE series_sources row's episodes/detail.
     Extracted from enrich_series's original single-source-at-a-time loop body
@@ -1465,7 +1466,7 @@ async def _enrich_one_series_source(
     detail = _as_dict(info.get("info"))
     detail_written = False
 
-    if detail:
+    if detail and not episodes_only:
         # See enrich_movie's identical comment -- safe as of 2026-07-29's
         # bulk_import_series rewrite, which now matches primarily by
         # (import_provider_id, import_provider_series_id), not by
@@ -1575,6 +1576,7 @@ async def _enrich_one_series_source(
 async def enrich_series_source_only(
     series_id: int, provider_id: int, *, force: bool = False, skip_auto_merge: bool = False,
     write_queue: "asyncio.Queue | None" = None, source_id: int | None = None,
+    episodes_only: bool = False,
 ) -> dict:
     """Provider-scoped counterpart to enrich_series (plan-doc follow-up "make
     a provider lane fetch only that provider's series source", 2026-09-14).
@@ -1607,7 +1609,10 @@ async def enrich_series_source_only(
     if not source:
         return {"fetched": False, "reason": "no source recorded for this series from this provider"}
 
-    outcome = await _enrich_one_series_source(series_id, series, source, force=force, write_queue=write_queue)
+    outcome = await _enrich_one_series_source(
+        series_id, series, source, force=force, write_queue=write_queue,
+        episodes_only=episodes_only,
+    )
 
     if outcome["fetched"] and outcome["detail_written"] and not skip_auto_merge:
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
@@ -1757,21 +1762,71 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
+async def bulk_enrich_series_episodes(concurrency: int = 8) -> None:
+    """Fetch provider detail only for pending series episode sources.
+
+    TMDB remains authoritative for series metadata; the provider call exists
+    only because XC series detail supplies episode listings and stream IDs.
+    """
+    providers = [p for p in await asyncio.to_thread(vod_db.list_providers)
+                 if p.get("is_active", True)]
+    pending_provider_ids = []
+    series_ids: set[int] = set()
+    for provider in providers:
+        rows = await asyncio.to_thread(vod_db.list_pending_series_sources, provider["id"])
+        if rows:
+            pending_provider_ids.append(provider["id"])
+            series_ids.update(row["series_id"] for row in rows)
+
+    _ENRICH_PROGRESS.update({
+        "running": True, "movies_total": 0, "movies_done": 0,
+        "movies_errors": 0, "series_total": len(series_ids), "series_done": 0,
+        "series_errors": 0, "series_backoff_skipped": 0,
+        "started_at": time.time(), "finished_at": None,
+        "cancelled": False, "providers_incomplete": [],
+    })
+    series_sem = asyncio.Semaphore(max(1, concurrency))
+    write_queue: "asyncio.Queue" = asyncio.Queue(maxsize=32)
+    writer_task = asyncio.create_task(_run_global_writer(write_queue))
+    try:
+        selected = [p for p in providers if p["id"] in pending_provider_ids]
+        results = await asyncio.gather(*(
+            _run_provider_series_phase(
+                provider, series_sem, False, write_queue=write_queue,
+                provider_count=len(selected), pending_only=True, episodes_only=True,
+            ) for provider in selected
+        ))
+        for provider, result in zip(selected, results):
+            if not result[0]:
+                _ENRICH_PROGRESS["providers_incomplete"].append({
+                    "provider_id": provider["id"],
+                    "provider_name": provider.get("name"), "phase": "series",
+                })
+        await write_queue.put(None)
+        await writer_task
+        await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb_batch, series_ids)
+        await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
+    finally:
+        if not writer_task.done():
+            writer_task.cancel()
+        _ENRICH_PROGRESS["running"] = False
+        _ENRICH_PROGRESS["finished_at"] = time.time()
 
 
 async def _post_import_enrichment(*, track_catalog_workflow: bool = True) -> None:
-    """Run only provider-free identity metadata after a catalog import.
+    """Run the ordered metadata and series-episode phases after import.
 
-    Provider detail calls are deliberately not part of the automatic import
-    handoff.  A missing TMDB ID stays in Metadata Review for an explicit user
-    decision; silently falling back to one provider per title can turn a
-    normal import into thousands of slow/rate-limited requests.
+    Movie provider detail is never part of this handoff. Series provider
+    detail is used only for episode discovery after TMDB metadata completes.
     """
     try:
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Resolving known TMDB identities")
         await bulk_enrich_tmdb_movies()
         await bulk_enrich_tmdb_series_metadata()
+        if track_catalog_workflow:
+            _set_catalog_workflow_phase("Discovering series episodes")
+        await bulk_enrich_series_episodes()
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Preparing catalog review")
         if track_catalog_workflow:
@@ -1876,6 +1931,7 @@ async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
     skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
     write_queue: "asyncio.Queue | None" = None, series_id: int | None = None,
+    episodes_only: bool = False,
 ) -> bool:
     """Returns True iff this item's enrichment call actually succeeded (no
     exception, including no ProviderBackoffError) -- used by bulk_enrich_all's
@@ -1904,6 +1960,8 @@ async def _enrich_one(
                 series_kwargs = {
                     "force": force, "skip_auto_merge": skip_auto_merge, "write_queue": write_queue,
                 }
+                if episodes_only:
+                    series_kwargs["episodes_only"] = True
                 if series_id is not None:
                     series_kwargs["source_id"] = item_id
                 await enrich_series_source_only(series_id or item_id, provider_id, **series_kwargs)
@@ -2072,7 +2130,7 @@ async def _run_provider_movie_phase(
 
 async def _run_provider_series_phase(
     provider: dict, sem: asyncio.Semaphore, force: bool, write_queue: "asyncio.Queue | None" = None,
-    provider_count: int = 1, pending_only: bool = False,
+    provider_count: int = 1, pending_only: bool = False, episodes_only: bool = False,
 ) -> tuple[bool, list]:
     """Runs one provider's series phase to completion. Same ok semantics as
     _run_provider_movie_phase. write_queue: see _run_provider_movie_phase's
@@ -2117,11 +2175,12 @@ async def _run_provider_series_phase(
                 if pending_sources is not None:
                     outcome = await _enrich_one(
                         "series", sem, item["id"], force, skip_auto_merge=True, provider_id=provider["id"],
-                        write_queue=write_queue, series_id=item["series_id"],
+                        write_queue=write_queue, series_id=item["series_id"], episodes_only=episodes_only,
                     )
                 else:
                     outcome = await _enrich_one(
                         "series", sem, item, force, skip_auto_merge=True, provider_id=provider["id"], write_queue=write_queue,
+                        episodes_only=episodes_only,
                     )
             except BaseException:
                 outcome = False

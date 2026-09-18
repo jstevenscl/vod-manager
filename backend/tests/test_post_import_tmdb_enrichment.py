@@ -150,3 +150,53 @@ def test_adult_known_tmdb_ids_are_not_retried(db):
     movie_id = db.list_movie_ids_pending_tmdb_enrichment()[0]
     db.set_movie_adult(movie_id, True)
     assert db.list_movie_ids_pending_tmdb_enrichment() == []
+
+
+def test_post_import_runs_series_episode_phase_after_tmdb_phases(monkeypatch):
+    calls = []
+
+    async def movie_phase():
+        calls.append("movie-tmdb")
+
+    async def series_metadata_phase():
+        calls.append("series-tmdb")
+
+    async def episode_phase():
+        calls.append("series-episodes")
+
+    monkeypatch.setattr(vod_importer, "bulk_enrich_tmdb_movies", movie_phase)
+    monkeypatch.setattr(vod_importer, "bulk_enrich_tmdb_series_metadata", series_metadata_phase)
+    monkeypatch.setattr(vod_importer, "bulk_enrich_series_episodes", episode_phase)
+
+    asyncio.run(vod_importer._post_import_enrichment(track_catalog_workflow=False))
+
+    assert calls == ["movie-tmdb", "series-tmdb", "series-episodes"]
+
+
+def test_episode_only_series_phase_preserves_tmdb_metadata(db, monkeypatch):
+    provider_id = db.upsert_provider("Example Provider", "http://example.invalid", "user", "pass")
+    db.bulk_import_series(provider_id, [{
+        "name": "TMDB Name", "year": 2020, "provider_series_id": "series-1",
+        "raw_name": "Provider Name", "tmdb_id": "123", "_has_detail": True,
+    }])
+    series_id = db.list_series(limit=10)[0]["id"]
+    db.set_series_enrichment(series_id, name="TMDB Name", tmdb_id="123")
+
+    class FakeClient:
+        def __init__(self, _provider):
+            pass
+
+        async def get_series_info(self, series_id):
+            assert series_id == "series-1"
+            return {"info": {"name": "Provider Replacement"}, "episodes": {
+                "1": [{"id": "episode-1", "episode_num": 1, "title": "Pilot"}]
+            }}
+
+    monkeypatch.setattr(vod_importer, "XCProviderClient", FakeClient)
+    result = asyncio.run(vod_importer.enrich_series_source_only(
+        series_id, provider_id, episodes_only=True,
+    ))
+
+    assert result["fetched"] is True
+    assert db.get_series(series_id)["name"] == "TMDB Name"
+    assert len(db.list_episodes(series_id)) == 1

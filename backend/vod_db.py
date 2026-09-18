@@ -8988,6 +8988,12 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> None:
             year_status = "agree"
         else:
             year_status = "MISMATCH"
+        if year_status != "agree":
+            logger.warning(
+                "[auto_merge_movie_by_tmdb] tmdb_id=%s year_status=%s -- skipping id=%s -> id=%s",
+                tmdb_id, year_status, row["id"], movie_id,
+            )
+            continue
         logger.warning(
             "[auto_merge_movie_by_tmdb] tmdb_id=%s year_status=%s -- id=%s (%r, year=%s) auto-merging into id=%s (%r, year=%s)",
             tmdb_id, year_status, row["id"], row["name"], other_year, movie_id, movie.get("name"), this_year,
@@ -9167,6 +9173,13 @@ def auto_merge_series_by_tmdb(series_id: int) -> None:
             year_status = "agree"
         else:
             year_status = "MISMATCH"
+
+        if year_status != "agree":
+            logger.warning(
+                "[auto_merge_series_by_tmdb] tmdb_id=%s year_status=%s -- skipping id=%s -> id=%s",
+                tmdb_id, year_status, row["id"], series_id,
+            )
+            continue
 
         # Cleanest-name tiebreak: prefer whichever row's name has no
         # provider/language prefix to strip. If both (or neither) are

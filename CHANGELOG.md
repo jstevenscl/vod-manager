@@ -33,6 +33,12 @@ instead of opening a duplicate request.
 
 ## 2026-09-17
 
+- ✅ Post-import catalog processing now completes the intended staged handoff:
+  TMDB metadata resolution runs first, then series-only provider detail calls
+  discover episode streams. Movie metadata never falls back to a second
+  provider call in this workflow. Automatic TMDB merges now require matching
+  non-null years; conflicting or missing years remain for user review.
+
 - ✅🔄 Language policy now applies consistently at import: XC, Plex, and
   Emby catalogs use the enabled playback languages, classify from the raw
   provider title before display rules can remove a prefix, and skip excluded

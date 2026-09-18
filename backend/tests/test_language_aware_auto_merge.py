@@ -194,6 +194,34 @@ def test_auto_merge_series_merges_same_tmdb_id_same_language(db):
     assert len(remaining) == 1
 
 
+def test_auto_merge_movie_skips_same_tmdb_id_when_year_differs(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    first = _import_movie(db, provider_id, "Example Movie", 2020, "one", "Example Movie", tmdb_id=777)
+    second = _import_movie(db, provider_id, "Example Movie", 2021, "two", "Example Movie", tmdb_id=777)
+
+    db.auto_merge_movie_by_tmdb(first["id"])
+
+    assert db.get_movie(first["id"]) is not None
+    assert db.get_movie(second["id"]) is not None
+
+
+def test_auto_merge_series_skips_same_tmdb_id_when_year_differs(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    db.bulk_import_series(provider_id, [
+        {"name": "Example Show", "year": 2020, "provider_series_id": "one",
+         "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
+        {"name": "Example Show", "year": 2021, "provider_series_id": "two",
+         "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
+    ])
+    rows = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "778"]
+
+    db.auto_merge_series_by_tmdb(rows[0]["id"])
+
+    assert all(db.get_series(row["id"]) is not None for row in rows)
+
+
 def test_auto_merge_movies_by_tmdb_batch_merges_each_id_sequentially(db):
     """2026-09-14 CPU-spike fix: bulk enrich's end-of-run sweep used to fan
     out one asyncio.to_thread(auto_merge_movie_by_tmdb, id) task per affected
