@@ -1762,7 +1762,7 @@ async def bulk_enrich_tmdb_series_metadata(concurrency: int = 8) -> None:
     await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
 
 
-async def bulk_enrich_series_episodes(concurrency: int = 8) -> None:
+async def bulk_enrich_series_episodes(concurrency: int = 4) -> None:
     """Fetch provider detail only for pending series episode sources.
 
     TMDB remains authoritative for series metadata; the provider call exists
