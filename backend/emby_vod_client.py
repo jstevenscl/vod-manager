@@ -93,6 +93,22 @@ class EmbyVodClient:
             await self._client.aclose()
             self._client = None
 
+    def _auth_headers(self) -> dict:
+        """GH#27 (second report): a real Jellyfin server 401'd on its native
+        (non-/emby/-prefixed) paths using query-string `api_key=` auth alone
+        -- the /emby/* compatibility routes may be more lenient about this,
+        but Jellyfin's own documented server-to-server auth is the
+        `X-Emby-Token` header (kept from Emby, still honored by Jellyfin
+        today), which every request now sends in addition to the query
+        param rather than instead of it -- redundant-but-harmless on a
+        server that only needed the query param, and the fix for one that
+        needs the header. Sent on every request, not just the Sessions/
+        Playing session-identification ones _SESSION_HEADERS originally
+        covered, since VirtualFolders (an admin-level library-management
+        endpoint, unlike ordinary content browsing) is exactly the kind of
+        call more likely to enforce stricter auth."""
+        return {**_SESSION_HEADERS, "X-Emby-Token": self.api_key}
+
     async def _get(self, path: str, params: dict | None = None, timeout: float = _REQUEST_TIMEOUT) -> dict:
         query = {"api_key": self.api_key}
         if params:
@@ -106,7 +122,7 @@ class EmbyVodClient:
         t0 = time.monotonic()
         try:
             r = await asyncio.wait_for(
-                client.get(f"{self.base_url}{effective_path}", params=query, timeout=timeout),
+                client.get(f"{self.base_url}{effective_path}", params=query, headers=self._auth_headers(), timeout=timeout),
                 timeout=timeout + 5.0,
             )
             if r.status_code == 404 and effective_path == path and path.startswith("/emby/"):
@@ -114,17 +130,34 @@ class EmbyVodClient:
                 # /emby/* at all; retry once against the native path and, if
                 # that's what actually works, stop paying the failed-request
                 # round-trip on every later call this client makes.
+                #
+                # Real bug found live (GH#27, second report): this used to
+                # check `r2.status_code != 404` -- true for ANY non-404
+                # response, including a 401. That both mislabeled a genuine
+                # auth failure as "worked" in the log, AND latched
+                # _emby_prefix_unsupported=True on an unverified path,
+                # committing every later call on this client to a path that
+                # was never actually confirmed to work. Must be an actual
+                # success (2xx) before believing the fallback "worked".
                 native_path = path[len("/emby"):]
                 r2 = await asyncio.wait_for(
-                    client.get(f"{self.base_url}{native_path}", params=query, timeout=timeout),
+                    client.get(f"{self.base_url}{native_path}", params=query, headers=self._auth_headers(), timeout=timeout),
                     timeout=timeout + 5.0,
                 )
-                if r2.status_code != 404:
+                if r2.is_success:
                     self._emby_prefix_unsupported = True
                     logger.info(
                         "[emby_vod_client] %s 404'd, %s worked -- this server doesn't alias /emby/*, "
                         "using native Jellyfin paths for the rest of this session",
                         path, native_path,
+                    )
+                    r = r2
+                else:
+                    logger.warning(
+                        "[emby_vod_client] %s 404'd; native fallback %s also failed (HTTP %s) -- "
+                        "not switching to native paths, surfacing the native failure since it's "
+                        "the more specific/recent error",
+                        path, native_path, r2.status_code,
                     )
                     r = r2
             r.raise_for_status()
@@ -149,7 +182,7 @@ class EmbyVodClient:
         try:
             await client.post(
                 f"{self.base_url}{effective_path}", params={"api_key": self.api_key},
-                json=body, headers=_SESSION_HEADERS,
+                json=body, headers=self._auth_headers(),
             )
         except Exception as exc:
             logger.warning("[emby_vod_client] POST %s failed: %s", effective_path, _redact(exc))

@@ -94,6 +94,32 @@ async def _sync_provider_to_connection(provider: dict, connection: dict) -> dict
     client = DispatcharrClient(connection["url"], connection["token"])
     existing_profile_id = vod_db.get_provider_sync_profile(provider["id"], connection["id"])
 
+    if not existing_profile_id:
+        # Real bug found live (GH#27/#32 follow-up): Dispatcharr enforces a
+        # unique (account, name) constraint on profiles, and its own POST
+        # handler doesn't catch that collision cleanly -- it 500s instead of
+        # a normal 409. This function's own local provider_sync_profiles
+        # mapping can't always know about an already-existing profile with
+        # this provider's name: a prior sync attempt can have created the
+        # Dispatcharr-side profile successfully before failing on a LATER
+        # step (e.g. the provider's own catalog import), leaving that
+        # profile orphaned from this function's perspective on retry; or
+        # the provider was deleted and recreated (a fresh provider_id, no
+        # local mapping) while the old Dispatcharr profile was never
+        # cleaned up. Rather than blindly POST and let a real, reproduced
+        # name collision surface as an opaque 500, check for an existing
+        # profile with this exact name first and adopt it if found.
+        existing_profiles = await client.get(f"/api/m3u/accounts/{account_id}/profiles/")
+        name_match = next((p for p in existing_profiles if p.get("name") == provider["name"]), None)
+        if name_match:
+            existing_profile_id = name_match["id"]
+            vod_db.set_provider_sync_profile(provider["id"], connection["id"], existing_profile_id)
+            logger.info(
+                "[vod_sync] connection=%s: adopted pre-existing Dispatcharr profile %s for provider %s "
+                "(name collision -- no local mapping existed yet)",
+                connection["label"], existing_profile_id, provider["name"],
+            )
+
     if existing_profile_id:
         # Dispatcharr requires search_pattern on PATCH too for non-default
         # profiles ("This field is required for non-default profiles."),

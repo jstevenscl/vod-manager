@@ -226,6 +226,21 @@ check that library's Content type is explicitly set to Movies or TV Shows;
 the import result now calls out any library it couldn't classify by name so
 this is visible instead of silently importing nothing.
 
+**Jellyfin: some installs don't alias the `/emby/*` compatibility paths.**
+VOD & DVR Manager talks to Emby and Jellyfin through the same client, since
+they share almost the entire API surface — including `/emby/*` path aliases
+Jellyfin kept for legacy Emby-client compatibility. Not every Jellyfin
+install has those aliases available, though; if adding a Jellyfin provider
+fails on the library-detection step, VOD & DVR Manager now automatically
+retries against Jellyfin's native (unprefixed) paths and remembers that
+choice for the rest of the request. It also sends the API key as both a
+query parameter and the `X-Emby-Token` header, since some Jellyfin
+deployments (typically ones behind a reverse proxy or with a hardened auth
+config) only accept one or the other. If a Jellyfin provider still can't
+import after this, it's worth checking whether anything sits in front of
+your Jellyfin server (a reverse proxy, an auth gateway) that might be
+altering the request before it reaches Jellyfin itself.
+
 ### Excluding content on import
 
 If a provider's catalog includes languages or categories you don't want in

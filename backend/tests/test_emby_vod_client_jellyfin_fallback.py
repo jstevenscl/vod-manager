@@ -87,3 +87,47 @@ def test_real_404_unrelated_to_emby_prefix_still_raises():
     except httpx.HTTPStatusError:
         pass
     assert client._emby_prefix_unsupported is False
+
+
+def test_native_fallback_that_also_fails_is_not_mistaken_for_success():
+    """Real bug found live (GH#27, second report): the native fallback
+    returning a 401 (a real server, wrong auth) used to be treated as
+    "worked" because the old check was only `!= 404`. Must require an
+    actual 2xx before believing the fallback succeeded, and must not
+    latch _emby_prefix_unsupported on an unverified path."""
+    provider = {"base_url": "http://jellyfin.example", "password": "key"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/emby/Library/VirtualFolders":
+            return httpx.Response(404)
+        if request.url.path == "/Library/VirtualFolders":
+            return httpx.Response(401)
+        return httpx.Response(500)
+
+    client = _client_with_transport(provider, handler)
+    try:
+        asyncio.run(client._get("/emby/Library/VirtualFolders"))
+        assert False, "expected an HTTPStatusError"
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 401
+    assert client._emby_prefix_unsupported is False
+
+
+def test_requests_send_x_emby_token_auth_header():
+    """GH#27 (second report): a real Jellyfin server 401'd on query-string
+    api_key auth alone against its native paths. X-Emby-Token is Jellyfin/
+    Emby's own documented server-to-server auth header -- sent on every
+    request now, in addition to the query param."""
+    provider = {"base_url": "http://jellyfin.example", "password": "secret-key"}
+    seen_headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers["token"] = request.headers.get("X-Emby-Token")
+        seen_headers["client"] = request.headers.get("X-Emby-Client")
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client_with_transport(provider, handler)
+    asyncio.run(client._get("/emby/System/Info"))
+
+    assert seen_headers["token"] == "secret-key"
+    assert seen_headers["client"] == "VOD & DVR Manager"
