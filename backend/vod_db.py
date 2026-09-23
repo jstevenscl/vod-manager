@@ -1129,6 +1129,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # whatever it can, not lose the row or null out unrelated fields.
         ("vod_stream_failures", "client_ip", "TEXT"),
         ("vod_stream_failures", "xc_client_id", "INTEGER"),
+        # Distinguishes a genuine mid-stream break (started playing, then the
+        # connection broke -- a LATER successful retry really is the same
+        # attempt recovering, safe to clear) from every other failure reason
+        # (every source failed before playback ever started at all -- a
+        # later successful stream open is a NEW attempt, not this failure
+        # resolving, and must stay visible). Found live 2026-09-23 reviewing
+        # PR #34: clear_recovered_stream_failures had no such filter and
+        # could silently delete genuine terminal outage rows.
+        ("vod_stream_failures", "recoverable", "INTEGER NOT NULL DEFAULT 0"),
         # Multi-source category list sync: generalizes the single sync_source
         # column above (kept as a back-compat fallback -- see
         # list_sync_categories) into a JSON array of "kind:ref" strings, so
@@ -2371,7 +2380,7 @@ _MAX_STORED_STREAM_FAILURES = 500
 def log_stream_failure(
     kind: str, title: str, username: str | None, attempts: list[dict], final_reason: str,
     movie_id: int | None = None, episode_id: int | None = None,
-    client_ip: str | None = None, xc_client_id: int | None = None,
+    client_ip: str | None = None, xc_client_id: int | None = None, recoverable: bool = False,
 ) -> None:
     """client_ip/xc_client_id: the caller's real identity, distinct from
     `username` above (only the shared VOD-relay/XC-client login, e.g. one
@@ -2385,9 +2394,9 @@ def log_stream_failure(
         import json
         conn = _connect()
         conn.execute(
-            "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at, movie_id, episode_id, client_ip, xc_client_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (kind, title, username, json.dumps(attempts), final_reason, _now(), movie_id, episode_id, client_ip, xc_client_id),
+            "INSERT INTO vod_stream_failures (kind, title, username, attempts, final_reason, created_at, movie_id, episode_id, client_ip, xc_client_id, recoverable) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (kind, title, username, json.dumps(attempts), final_reason, _now(), movie_id, episode_id, client_ip, xc_client_id, int(recoverable)),
         )
         conn.execute(
             "DELETE FROM vod_stream_failures WHERE id NOT IN "
@@ -2396,6 +2405,48 @@ def log_stream_failure(
         )
         _commit_with_retry(conn)
         conn.close()
+
+
+def clear_recovered_stream_failures(
+    kind: str, title: str, username: str | None,
+    movie_id: int | None = None, episode_id: int | None = None,
+    client_ip: str | None = None, xc_client_id: int | None = None,
+    window_seconds: int = 120,
+) -> int:
+    """Remove recent RECOVERABLE failure rows (a genuine mid-stream break,
+    see log_stream_failure's recoverable param) superseded by a successful
+    range request. Never touches a terminal failure (every source failed
+    before playback ever started) -- a later successful stream open there is
+    a new attempt, not this failure resolving, so that row must stay visible
+    in Failed Streams."""
+    if movie_id is None and episode_id is None:
+        return 0
+    cutoff = str(time.time() - max(0, window_seconds))
+    clauses = ["kind = ?", "title = ?", "created_at >= ?", "recoverable = 1"]
+    params: list = [kind, title, cutoff]
+    if movie_id is not None:
+        clauses.append("movie_id = ?")
+        params.append(movie_id)
+    else:
+        clauses.append("episode_id = ?")
+        params.append(episode_id)
+    clauses.append("(username = ? OR (username IS NULL AND ? IS NULL))")
+    params.extend([username, username])
+    if client_ip is not None:
+        clauses.append("(client_ip = ? OR client_ip IS NULL)")
+        params.append(client_ip)
+    if xc_client_id is not None:
+        clauses.append("(xc_client_id = ? OR xc_client_id IS NULL)")
+        params.append(xc_client_id)
+    with _WRITE_LOCK:
+        conn = _connect()
+        cur = conn.execute(
+            f"DELETE FROM vod_stream_failures WHERE {' AND '.join(clauses)}", params
+        )
+        deleted = cur.rowcount
+        _commit_with_retry(conn)
+        conn.close()
+    return deleted
 
 
 def record_source_failure(kind: str, source_id: int) -> None:

@@ -612,7 +612,12 @@ _PLEX_HEARTBEAT_INTERVAL_SECONDS = 10.0
 
 
 def get_active_sessions() -> list[dict]:
-    return list(_active_sessions.values())
+    # A capacity reservation is inserted before the slow upstream connect so
+    # superseding range requests can cancel it. It is not a playable session
+    # yet; do not expose that incomplete placeholder to Activity, where it
+    # renders as undefined/NaN and looks like a failed playback.
+    return [session for session in _active_sessions.values()
+            if session.get("started_at") is not None and session.get("title") and session.get("provider_name")]
 
 
 # Sessions marked for forced termination -- checked by the relay loop itself
@@ -1545,6 +1550,23 @@ async def _proxy_vod_stream(
             upstream_resp.status_code, time.monotonic() - t_connect_start, _redact_upstream_url(upstream_url),
         )
         vod_db.record_source_success(kind, source["source_id"])
+        if "range" in forward_headers:
+            # Off the event loop -- this is on every seek/range-open for
+            # every VOD playback session, not just the first request, so an
+            # unwrapped blocking SQLite write here stalls every other
+            # concurrent request for its duration under sustained load (see
+            # config.py's module docstring for the class of bug this
+            # mirrors).
+            cleared_failures = await asyncio.to_thread(
+                vod_db.clear_recovered_stream_failures,
+                kind, title, username, movie_id=movie_id, episode_id=episode_id,
+                client_ip=client_ip, xc_client_id=xc_client_id,
+            )
+            if cleared_failures:
+                logger.info(
+                    "[xc_server] %s stream id=%s cleared %d superseded failure row(s) after successful range handoff",
+                    kind, conn_id, cleared_failures,
+                )
 
         # Approximate playback position from the requested Range's start byte
         # — we're relaying raw bytes, not a real player, so this is the only
@@ -1587,36 +1609,81 @@ async def _proxy_vod_stream(
             t_start = time.monotonic()
             bytes_sent = 0
             outcome = "ok"
+            current_resp = upstream_resp
+            current_client = client
+            reconnects = 0
+            max_reconnects = 2
             try:
-                async for chunk in upstream_resp.aiter_bytes():
-                    if conn_id in _kill_requested:
-                        outcome = "killed"
+                while True:
+                    try:
+                        async for chunk in current_resp.aiter_bytes():
+                            if conn_id in _kill_requested:
+                                outcome = "killed"
+                                break
+                            if await request.is_disconnected():
+                                outcome = "client disconnected"
+                                break
+                            bytes_sent += len(chunk)
+                            if conn_id in _active_sessions:
+                                _active_sessions[conn_id]["bytes_sent"] = bytes_sent
+                            yield chunk
                         break
-                    if await request.is_disconnected():
-                        outcome = "client disconnected"
-                        break
-                    bytes_sent += len(chunk)
-                    if conn_id in _active_sessions:
-                        _active_sessions[conn_id]["bytes_sent"] = bytes_sent
-                    yield chunk
+                    except Exception as exc:
+                        # A player/Dispatcharr can only recover a broken
+                        # response by opening a new request. Keep that
+                        # recovery inside this response when possible: the
+                        # provider connection can fail transiently after the
+                        # client has already received valid bytes.
+                        if outcome in ("killed", "client disconnected") or await request.is_disconnected():
+                            break
+                        if reconnects >= max_reconnects:
+                            raise
+                        reconnects += 1
+                        resume_at = range_start_byte + bytes_sent
+                        retry_headers = dict(forward_headers)
+                        retry_end = None
+                        requested_range = retry_headers.get("range")
+                        if requested_range and "-" in requested_range:
+                            retry_end = requested_range.split("=", 1)[-1].split("-", 1)[1]
+                        retry_headers["range"] = f"bytes={resume_at}-{retry_end or ''}"
+                        logger.warning(
+                            "[xc_server] %s stream id=%s upstream broke after %d bytes (%s); "
+                            "reconnecting %d/%d at range=%s",
+                            kind, conn_id, bytes_sent, type(exc).__name__, reconnects,
+                            max_reconnects, retry_headers["range"],
+                        )
+                        await current_resp.aclose()
+                        await current_client.aclose()
+                        current_client = httpx.AsyncClient(
+                            timeout=30.0, follow_redirects=True,
+                            headers={"User-Agent": custom_ua} if custom_ua else _UPSTREAM_HEADERS,
+                        )
+                        retry_req = current_client.build_request("GET", upstream_url, headers=retry_headers)
+                        retry_resp = await current_client.send(retry_req, stream=True)
+                        if retry_resp.status_code >= 400 or (
+                            resume_at > 0 and retry_resp.status_code != 206 and "content-range" not in retry_resp.headers
+                        ):
+                            await retry_resp.aclose()
+                            await current_client.aclose()
+                            raise RuntimeError(f"resume returned HTTP {retry_resp.status_code}")
+                        current_resp = retry_resp
             except Exception as exc:
                 outcome = f"{type(exc).__name__}: {exc}"
-                # Only a genuine mid-stream break is logged here -- "killed"
-                # (admin action) and "client disconnected" (user stopped
-                # watching normally) go through the `break` path above, not
-                # this except, and are expected outcomes, not failures.
+                # Only a genuine mid-stream break after internal recovery is
+                # exhausted is logged here. Killed/client-disconnected
+                # sessions are expected player behavior, not failures.
                 vod_db.log_stream_failure(
                     kind, title, username,
                     [{"provider": provider["name"], "error": f"started OK, broke mid-stream after {bytes_sent} bytes"}],
                     outcome, movie_id=movie_id, episode_id=episode_id,
-                    client_ip=client_ip, xc_client_id=xc_client_id,
+                    client_ip=client_ip, xc_client_id=xc_client_id, recoverable=True,
                 )
                 vod_db.record_source_failure(kind, source["source_id"])
                 raise
             finally:
                 _kill_requested.discard(conn_id)
-                await upstream_resp.aclose()
-                await client.aclose()
+                await current_resp.aclose()
+                await current_client.aclose()
                 if sub_account_id is not None:
                     _active_sub_account_streams[sub_account_id] = max(0, _active_sub_account_streams.get(sub_account_id, 1) - 1)
                 else:
