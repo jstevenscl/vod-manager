@@ -306,6 +306,38 @@ async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> di
     return dict(results)
 
 
+async def get_series_full_details(tmdb_id: str) -> dict | None:
+    """Series counterpart to get_movie_full_details (detail fields only, no
+    episodes -- see get_series_episode_list_cached for those). None on any
+    failure so the caller can leave the series as-is and retry later."""
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        return None
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        try:
+            async with _tmdb_semaphore:
+                r = await client.get(f"{_API_BASE}/tv/{tmdb_id}", params={"api_key": api_key, "append_to_response": "credits"})
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.warning("[tmdb_sync] failed to fetch series detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+            if exc.response.status_code == 404:
+                raise TmdbNotFoundError(tmdb_id) from exc
+            return None
+        except Exception as exc:
+            logger.warning("[tmdb_sync] failed to fetch series detail for tmdb_id=%s: %s", tmdb_id, _redact(exc))
+            return None
+        data = r.json()
+    cast = [c["name"] for c in data.get("credits", {}).get("cast", [])[:10]]
+    return {
+        "genre": ", ".join(g["name"] for g in data.get("genres", [])) or None,
+        "description": data.get("overview") or None,
+        "cast_list": ", ".join(cast) or None,
+        "poster_url": f"https://image.tmdb.org/t/p/w500{data['poster_path']}" if data.get("poster_path") else None,
+        "rating": data.get("vote_average") or None,
+        "release_date": data.get("first_air_date") or None,
+    }
+
+
 async def get_movie_full_details(tmdb_id: str) -> dict | None:
     """Full detail fields for one movie by TMDB id, shaped to match what
     vod_importer.enrich_movie fills in from a provider's get_vod_info (genre,

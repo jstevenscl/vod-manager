@@ -16,7 +16,7 @@ interface Provider {
   max_streams: number
   is_active: number
   priority: number
-  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr'
+  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library' | 'dispatcharr_dvr'
   shared_connection_limit: number | null
   custom_user_agent: string | null
   has_password: boolean
@@ -37,6 +37,9 @@ interface Provider {
   dvr_delete_after_copy: number
   auto_create_categories: number
   archive_new_categories: number
+  library_backend: 'local' | 'smb' | 'sftp' | 's3' | 'gdrive' | 'dropbox' | 'box'
+  library_remote_config: Record<string, unknown>
+  has_library_remote_secret: boolean
 }
 
 interface RecordingProfile {
@@ -233,7 +236,7 @@ interface ActivitySession {
   kind: 'movie' | 'series'
   title: string
   provider_name: string
-  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr'
+  provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library' | 'dispatcharr_dvr'
   started_at: number
   bytes_sent: number
   total_bytes: number
@@ -1137,8 +1140,8 @@ interface Category {
   use_ai_evaluation: number
 }
 
-const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin' | 'dispatcharr_dvr', string> = {
-  xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin', dispatcharr_dvr: 'Dispatcharr DVR',
+const PROVIDER_TYPE_LABELS: Record<'xc' | 'plex' | 'emby' | 'jellyfin' | 'library' | 'dispatcharr_dvr', string> = {
+  xc: 'Xtream-Codes', plex: 'Plex', emby: 'Emby', jellyfin: 'Jellyfin', library: 'Folder (local/SMB/NFS)', dispatcharr_dvr: 'Dispatcharr DVR',
 }
 
 // Best-effort friendly names for provider name-prefix codes (e.g. "AR|",
@@ -5149,22 +5152,41 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-providers'],
     queryFn:  () => api.get('/vod/providers/').then((r) => r.data),
   })
+  type LibraryBackend = 'local' | 'smb' | 'sftp' | 's3' | 'gdrive' | 'dropbox' | 'box'
+  const REMOTE_BACKENDS: LibraryBackend[] = ['smb', 'sftp', 's3', 'gdrive', 'dropbox', 'box']
   const [providerForm, setProviderForm] = useState({
     name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0',
-    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin',
+    provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library',
+    library_backend: 'local' as LibraryBackend,
   })
+  const [libraryRemote, setLibraryRemote] = useState({
+    host: '', port: '', share: '', domain: '', path: '',
+    bucket: '', region: '', endpoint: '', s3_provider: '',
+    token: '', client_id: '',
+  })
+  const isRemoteLibrary = providerForm.provider_type === 'library' && REMOTE_BACKENDS.includes(providerForm.library_backend)
+  const isOAuthLibrary = providerForm.provider_type === 'library' && ['gdrive', 'dropbox', 'box'].includes(providerForm.library_backend)
   const addProvider = useMutation({
     mutationFn: () => api.post('/vod/providers/', {
       name: providerForm.name,
       base_url: providerForm.base_url,
-      username: providerForm.provider_type === 'xc' ? providerForm.username : '',
+      username: providerForm.provider_type === 'xc' || (isRemoteLibrary && !isOAuthLibrary) ? providerForm.username : '',
       password: providerForm.password,
       max_streams: Number(providerForm.max_streams) || 0,
       priority: Number(providerForm.priority) || 0, provider_type: providerForm.provider_type,
+      library_backend: providerForm.provider_type === 'library' ? providerForm.library_backend : 'local',
+      library_remote_config: isRemoteLibrary ? {
+        host: libraryRemote.host || undefined, port: libraryRemote.port ? Number(libraryRemote.port) : undefined,
+        share: libraryRemote.share || undefined, domain: libraryRemote.domain || undefined, path: libraryRemote.path || undefined,
+        bucket: libraryRemote.bucket || undefined, region: libraryRemote.region || undefined,
+        endpoint: libraryRemote.endpoint || undefined, s3_provider: libraryRemote.s3_provider || undefined,
+        token: libraryRemote.token || undefined, client_id: libraryRemote.client_id || undefined,
+      } : {},
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
-      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc' })
+      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc', library_backend: 'local' })
+      setLibraryRemote({ host: '', port: '', share: '', domain: '', path: '', bucket: '', region: '', endpoint: '', s3_provider: '', token: '', client_id: '' })
     },
   })
   const syncProvider = useMutation({
@@ -7858,7 +7880,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
         <p className="text-sm text-muted-foreground">
-          Every catalog source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin. (DVR is enabled per Dispatcharr
+          Every catalog source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin, or a folder of your own files (local, SMB or NFS mount). (DVR is enabled per Dispatcharr
           connection in Configuration, not added here.)
         </p>
         <div className="overflow-x-auto rounded-xl border border-border">
@@ -7894,7 +7916,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         if (v && v !== p.name) setProviderName.mutate({ id: p.id, name: v })
                       }}
                     />
-                    {p.provider_type !== 'xc' && <Chip>{PROVIDER_TYPE_LABELS[p.provider_type]}</Chip>}
+                    {p.provider_type !== 'xc' && (
+                      <Chip>
+                        {PROVIDER_TYPE_LABELS[p.provider_type]}
+                        {p.provider_type === 'library' && p.library_backend !== 'local' && ` (${p.library_backend})`}
+                      </Chip>
+                    )}
                     <StatusPill tone={p.is_active ? 'success' : 'destructive'} label={p.is_active ? 'Active' : 'Inactive'} />
                   </span>
                 </td>
@@ -8082,13 +8109,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   />
                 </td>
                 <td className="py-1 flex items-center gap-1.5">
-                  <Button size="sm" variant="outline" disabled={syncProvider.isPending} onClick={() => syncProvider.mutate(p.id)}>
-                    Sync
-                  </Button>
+                  {p.provider_type !== 'library' && (
+                    <Button size="sm" variant="outline" disabled={syncProvider.isPending} onClick={() => syncProvider.mutate(p.id)}>
+                      Sync
+                    </Button>
+                  )}
                   <Button size="sm" variant="outline" disabled={importingId === p.id} onClick={() => importCatalog.mutate(p.id)}>
                     {importingId === p.id ? <Loader2 size={12} className="animate-spin mr-1" /> : <Download size={12} className="mr-1" />}
                     Import catalog
                   </Button>
+                  {p.provider_type !== 'library' && (<>
                   <Button
                     size="sm" variant="outline"
                     title="Categories to auto-archive on import, as this provider itself names them"
@@ -8128,6 +8158,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                     />
                     Archive new categories
                   </label>
+                  </>)}
                   <Button
                     size="sm" variant="outline" disabled={toggleProviderActive.isPending}
                     onClick={() => toggleProviderActive.mutate({ id: p.id, active: !p.is_active })}
@@ -8152,37 +8183,104 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <select
             className={inputCls()}
             value={providerForm.provider_type}
-            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' })}
+            onChange={(e) => setProviderForm({ ...providerForm, provider_type: e.target.value as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library' })}
           >
             <option value="xc">Xtream-Codes</option>
             <option value="plex">Plex</option>
             <option value="emby">Emby</option>
             <option value="jellyfin">Jellyfin</option>
+            <option value="library">Folder / SMB / SFTP / Cloud</option>
           </select>
           <input className={inputCls()} placeholder="Name" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} />
-          <input
-            className={inputCls()}
-            placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : 'Base URL (e.g. http://host:8096)'}
-            value={providerForm.base_url}
-            onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
-          />
-          {providerForm.provider_type === 'xc' && (
-            <input className={inputCls()} placeholder="Username" value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
+          {providerForm.provider_type === 'library' && (
+            <select
+              className={inputCls()}
+              value={providerForm.library_backend}
+              onChange={(e) => setProviderForm({ ...providerForm, library_backend: e.target.value as LibraryBackend })}
+              title="Where this library's files actually live"
+            >
+              <option value="local">Local folder / mounted path</option>
+              <option value="smb">SMB / CIFS share</option>
+              <option value="sftp">SFTP server</option>
+              <option value="s3">S3-compatible (AWS, MinIO, Wasabi, B2, ...)</option>
+              <option value="gdrive">Google Drive</option>
+              <option value="dropbox">Dropbox</option>
+              <option value="box">Box</option>
+            </select>
           )}
-          <input
+          {(providerForm.provider_type !== 'library' || providerForm.library_backend === 'local') && (
+            <input
+              className={inputCls()}
+              placeholder={providerForm.provider_type === 'plex' ? 'Base URL (e.g. https://plex.example.com)' : providerForm.provider_type === 'xc' ? 'Base URL' : providerForm.provider_type === 'library' ? 'Folder path inside the container (e.g. /mnt/media)' : 'Base URL (e.g. http://host:8096)'}
+              value={providerForm.base_url}
+              onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })}
+            />
+          )}
+          {(providerForm.provider_type === 'xc' || (isRemoteLibrary && !isOAuthLibrary)) && (
+            <input className={inputCls()} placeholder={isRemoteLibrary ? (providerForm.library_backend === 's3' ? 'Access key ID' : 'Username') : 'Username'} value={providerForm.username} onChange={(e) => setProviderForm({ ...providerForm, username: e.target.value })} />
+          )}
+          {providerForm.provider_type !== 'library' && <input
             className={inputCls()}
             type="password"
             placeholder={providerForm.provider_type === 'plex' ? 'Plex token (X-Plex-Token)' : providerForm.provider_type === 'xc' ? 'Password' : 'API key'}
             value={providerForm.password}
             onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
-          />
+          />}
+          {isRemoteLibrary && !isOAuthLibrary && (
+            <input
+              className={inputCls()}
+              type="password"
+              placeholder={providerForm.library_backend === 's3' ? 'Secret access key' : 'Password'}
+              value={providerForm.password}
+              onChange={(e) => setProviderForm({ ...providerForm, password: e.target.value })}
+            />
+          )}
+          {(providerForm.library_backend === 'smb' || providerForm.library_backend === 'sftp') && isRemoteLibrary && (
+            <input className={inputCls()} placeholder="Host (e.g. nas.local or 192.168.1.10)" value={libraryRemote.host} onChange={(e) => setLibraryRemote({ ...libraryRemote, host: e.target.value })} />
+          )}
+          {providerForm.library_backend === 'sftp' && isRemoteLibrary && (
+            <input className={inputCls('w-20')} type="number" placeholder="Port (22)" value={libraryRemote.port} onChange={(e) => setLibraryRemote({ ...libraryRemote, port: e.target.value })} />
+          )}
+          {providerForm.library_backend === 'smb' && isRemoteLibrary && (
+            <>
+              <input className={inputCls()} placeholder="Share name (e.g. media)" value={libraryRemote.share} onChange={(e) => setLibraryRemote({ ...libraryRemote, share: e.target.value })} />
+              <input className={inputCls()} placeholder="Domain/workgroup (optional)" value={libraryRemote.domain} onChange={(e) => setLibraryRemote({ ...libraryRemote, domain: e.target.value })} />
+            </>
+          )}
+          {(providerForm.library_backend === 'smb' || providerForm.library_backend === 'sftp') && isRemoteLibrary && (
+            <input className={inputCls()} placeholder="Path within the share (optional)" value={libraryRemote.path} onChange={(e) => setLibraryRemote({ ...libraryRemote, path: e.target.value })} />
+          )}
+          {providerForm.library_backend === 's3' && (
+            <>
+              <input className={inputCls()} placeholder="Bucket" value={libraryRemote.bucket} onChange={(e) => setLibraryRemote({ ...libraryRemote, bucket: e.target.value })} />
+              <input className={inputCls()} placeholder="Path within bucket (optional)" value={libraryRemote.path} onChange={(e) => setLibraryRemote({ ...libraryRemote, path: e.target.value })} />
+              <input className={inputCls()} placeholder="Region (optional)" value={libraryRemote.region} onChange={(e) => setLibraryRemote({ ...libraryRemote, region: e.target.value })} />
+              <input className={inputCls()} placeholder="Endpoint (for non-AWS, e.g. MinIO/Wasabi/B2 URL)" value={libraryRemote.endpoint} onChange={(e) => setLibraryRemote({ ...libraryRemote, endpoint: e.target.value })} />
+            </>
+          )}
+          {isOAuthLibrary && (
+            <>
+              <textarea
+                className={inputCls() + ' w-full min-h-[60px] font-mono text-xs'}
+                placeholder={'Paste the token JSON from running `rclone authorize ' + (providerForm.library_backend === 'gdrive' ? 'drive' : providerForm.library_backend) + '` on your own machine (opens a browser to sign in -- nothing here ever sees your real login)'}
+                value={libraryRemote.token}
+                onChange={(e) => setLibraryRemote({ ...libraryRemote, token: e.target.value })}
+              />
+              <input className={inputCls()} placeholder="Path within the remote (optional)" value={libraryRemote.path} onChange={(e) => setLibraryRemote({ ...libraryRemote, path: e.target.value })} />
+            </>
+          )}
           <input className={inputCls('w-24')} type="number" placeholder="Max streams" value={providerForm.max_streams} onChange={(e) => setProviderForm({ ...providerForm, max_streams: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Priority" value={providerForm.priority} onChange={(e) => setProviderForm({ ...providerForm, priority: e.target.value })} />
           <Button
             size="sm"
             disabled={
               !providerForm.name || addProvider.isPending ||
-              !providerForm.base_url || !providerForm.password || (providerForm.provider_type === 'xc' && !providerForm.username)
+              (providerForm.provider_type !== 'library' && (!providerForm.base_url || !providerForm.password)) ||
+              (providerForm.provider_type === 'xc' && !providerForm.username) ||
+              (providerForm.provider_type === 'library' && providerForm.library_backend === 'local' && !providerForm.base_url) ||
+              (providerForm.provider_type === 'library' && (providerForm.library_backend === 'smb' || providerForm.library_backend === 'sftp') && !libraryRemote.host) ||
+              (providerForm.provider_type === 'library' && providerForm.library_backend === 's3' && !libraryRemote.bucket) ||
+              (isOAuthLibrary && !libraryRemote.token)
             }
             onClick={() => addProvider.mutate()}
           >

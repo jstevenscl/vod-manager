@@ -54,6 +54,8 @@ import dispatcharr_dvr_importer
 import duplicate_confirm
 import emby_vod_client
 import emby_vod_importer
+import library_importer
+import rclone_client
 import plex_client
 import plex_importer
 import portal_auth
@@ -195,6 +197,13 @@ class ProviderRequest(BaseModel):
     max_streams: int = 0
     priority: int = 0
     provider_type: str = "xc"
+    library_backend: str = "local"
+    # Backend-specific fields for a non-local library source (host, share,
+    # port, bucket, region, endpoint, domain, ...) plus secret sub-fields
+    # (see vod_routes._LIBRARY_REMOTE_SECRET_KEYS). A secret field left
+    # blank/omitted here means "keep the saved one", same convention as a
+    # blank password -- see the merge logic in upsert_provider below.
+    library_remote_config: dict = {}
 
 
 class EnableDvrRequest(BaseModel):
@@ -1167,9 +1176,20 @@ async def sync_category_now(category_id: int):
 
 # ── Providers ────────────────────────────────────────────────────────────────
 
+# Sub-fields of library_remote_config that are themselves real credentials
+# (an rclone OAuth token, an S3 secret key when not using username/password)
+# -- never sent to the frontend in plaintext, same bar as providers.password.
+_LIBRARY_REMOTE_SECRET_KEYS = frozenset({"token", "oauth_token", "secret_access_key", "pass"})
+
+
 def _redact_provider(p: dict) -> dict:
     p = dict(p)
     p["has_password"] = bool(p.pop("password", None))
+    remote_config = p.get("library_remote_config") or {}
+    p["library_remote_config"] = {
+        k: v for k, v in remote_config.items() if k not in _LIBRARY_REMOTE_SECRET_KEYS
+    }
+    p["has_library_remote_secret"] = any(remote_config.get(k) for k in _LIBRARY_REMOTE_SECRET_KEYS)
     return p
 
 
@@ -1223,11 +1243,25 @@ async def upsert_provider(body: ProviderRequest):
                     "the password to fix this provider."
                 ),
             )
+    remote_config = body.library_remote_config or {}
+    if body.provider_type == "library" and body.library_backend != "local":
+        existing = next((p for p in vod_db.list_providers() if p["name"] == body.name), None)
+        existing_secrets = (existing or {}).get("library_remote_config") or {}
+        merged = dict(remote_config)
+        for key in _LIBRARY_REMOTE_SECRET_KEYS:
+            if not merged.get(key):
+                merged[key] = existing_secrets.get(key)
+        remote_config = merged
+
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
+        library_backend=body.library_backend, library_remote_config=remote_config or None,
     )
 
     sync_error = None
+    if body.provider_type == "library":
+        # A folder on disk has nothing to relay through Dispatcharr's XC account.
+        return {"id": provider_id, "sync_error": None}
     try:
         await vod_sync.sync_provider(provider_id)
     except vod_sync.VodXcAccountNotConfigured:
@@ -1590,6 +1624,7 @@ async def delete_provider(provider_id: int):
     # (including the Activity poll) while it runs.
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
     await vod_importer.evict_provider_client(provider_id)
+    await rclone_client.stop_daemon(provider_id)
     return {"ok": True}
 
 
@@ -1611,8 +1646,11 @@ async def merge_providers_into_subaccounts(provider_id: int, body: MergeProvider
 
 @router.post("/providers/{provider_id}/sync/", dependencies=_GUARDS)
 async def sync_provider(provider_id: int):
-    if not vod_db.get_provider(provider_id):
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
         raise HTTPException(404, detail="provider not found")
+    if provider.get("provider_type") == "library":
+        raise HTTPException(400, detail="a folder source has nothing to sync to Dispatcharr")
     try:
         results = await vod_sync.sync_provider(provider_id)
     except vod_sync.VodXcAccountNotConfigured as exc:
@@ -1646,6 +1684,8 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
             result = await plex_importer.import_plex_library(provider_id)
         elif provider.get("provider_type") in ("emby", "jellyfin"):
             result = await emby_vod_importer.import_emby_library(provider_id)
+        elif provider.get("provider_type") == "library":
+            result = await library_importer.import_library(provider_id)
         elif provider.get("provider_type") == "dispatcharr_dvr":
             result = await dispatcharr_dvr_importer.import_dvr_recordings(provider_id)
         else:

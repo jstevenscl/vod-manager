@@ -27,6 +27,7 @@ import socket
 import sqlite3
 import tempfile
 import time
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -36,6 +37,7 @@ import config
 from dispatcharr_client import DispatcharrClient
 import emby_vod_client
 import plex_client
+import rclone_client
 import vod_db
 
 logger = logging.getLogger("vod_manager.xc_server")
@@ -863,14 +865,27 @@ def _redact_upstream_url(url: str) -> str:
     return url
 
 
-def _build_upstream_url(kind: str, provider: dict, source: dict, credentials: dict | None = None) -> str:
-    if provider.get("provider_type") == "dispatcharr_dvr":
+async def _build_upstream_url(kind: str, provider: dict, source: dict, credentials: dict | None = None) -> str:
+    if provider.get("provider_type") == "library" and rclone_client.is_remote_backend(provider):
+        # rclone-mediated remote (smb/sftp/s3/gdrive/dropbox/box) -- no local
+        # file, source["local_file_path"] is NULL by construction (see
+        # library_importer's remote-scan branch). ffmpeg's -i and httpx both
+        # accept a plain http:// URL, so this same return value works
+        # unchanged for the transcode/HLS routes AND the direct-relay proxy
+        # below. Ensures the provider's rclone serve http daemon is actually
+        # up (lazy-starts it on first use) before handing back its URL --
+        # raises RcloneError on failure, which every caller here already
+        # treats as "this source is unreachable, try the next one."
+        remote_config = vod_db.get_library_remote_config(provider)
+        port = await rclone_client.ensure_daemon(provider, remote_config)
+        return f"http://127.0.0.1:{port}/{quote(source['provider_stream_id'])}"
+    if provider.get("provider_type") in ("dispatcharr_dvr", "library"):
         # A plain local disk path, not a URL -- correct for ffmpeg's -i
         # (transcode/HLS paths, which accept a local path untouched, no
         # further change needed there). _proxy_vod_stream's direct-relay
         # path can't GET a bare path over httpx, so it short-circuits to a
-        # FileResponse before ever calling this for a dispatcharr_dvr source
-        # -- see its own dispatcharr_dvr branch.
+        # FileResponse before ever calling this for a dispatcharr_dvr or
+        # local-backend library source -- see those branches below.
         return source["local_file_path"]
     if provider.get("provider_type") == "plex":
         # provider_stream_id holds the Plex Part key (e.g.
@@ -994,7 +1009,7 @@ async def _transcode_vod_stream(kind: str, source: dict, request: Request, start
     provider = vod_db.get_provider(source["provider_id"])
     if not provider:
         return Response(status_code=404, content="not found")
-    upstream_url = _build_upstream_url(kind, provider, source)
+    upstream_url = await _build_upstream_url(kind, provider, source)
     conn_id = f"transcode-{time.time():.3f}"
     logger.info("[xc_server] %s transcode OPEN id=%s start=%ds upstream=%s", kind, conn_id, start_secs, _redact_upstream_url(upstream_url))
 
@@ -1090,7 +1105,7 @@ async def _start_hls_session(kind: str, source: dict, request: Request, username
     provider = vod_db.get_provider(source["provider_id"])
     if not provider:
         return None
-    upstream_url = _build_upstream_url(kind, provider, source)
+    upstream_url = await _build_upstream_url(kind, provider, source)
 
     hls_id = secrets.token_urlsafe(16)
     tmpdir = tempfile.mkdtemp(prefix=f"vodhls-{hls_id[:8]}-")
@@ -1259,6 +1274,37 @@ async def hls_segment(username: str, password: str, hls_id: str, segment_name: s
     return FileResponse(path, media_type="video/mp2t")
 
 
+# A hung network mount (NFS's default "hard" option blocks I/O forever when
+# the server is gone) must never freeze the event loop: every filesystem
+# probe on a local_file_path runs in a worker thread under a deadline. Found
+# live -- one playback request against a dead NFS export made the ENTIRE app
+# stop answering, because os.path.isfile ran directly on the loop.
+_LOCAL_FS_TIMEOUT_SECONDS = 5.0
+
+
+def _check_local_file(local_path: str | None, provider: dict) -> str | None:
+    if not local_path:
+        return None
+    if provider.get("provider_type") == "library":
+        # Defence in depth: only ever serve a file that resolves inside this
+        # library's own root, whatever the stored path says.
+        root = os.path.realpath(provider.get("base_url") or "")
+        real = os.path.realpath(local_path)
+        if not root or not (real == root or real.startswith(root.rstrip("/\\") + os.sep)):
+            return None
+    return local_path if os.path.isfile(local_path) else None
+
+
+async def _reachable_local_file(local_path: str | None, provider: dict) -> str | None:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_check_local_file, local_path, provider), _LOCAL_FS_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("[xc_server] filesystem check for %s timed out after %.0fs -- share not responding?",
+                       local_path, _LOCAL_FS_TIMEOUT_SECONDS)
+        return None
+
+
 async def _proxy_vod_stream(
     kind: str, username: str, sources: list[dict], request: Request,
     title: str = "?", duration_secs: int | None = None,
@@ -1320,7 +1366,66 @@ async def _proxy_vod_stream(
             attempts.append({"provider": f"provider {source['provider_id']} (deleted)", "error": "provider no longer exists"})
             continue
 
-        if provider.get("provider_type") == "dispatcharr_dvr":
+        if provider.get("provider_type") == "library" and rclone_client.is_remote_backend(provider):
+            # An rclone-mediated remote (smb/sftp/s3/gdrive/dropbox/box) --
+            # same "no shared-connection-capacity/heartbeat machinery"
+            # exemption as a local file (this container's own storage, not a
+            # scarce shared upstream account), but there IS a real network
+            # hop involved (unlike FileResponse), so it goes through a plain
+            # httpx relay with Range passthrough instead.
+            try:
+                stream_url = await _build_upstream_url(kind, provider, source)
+            except rclone_client.RcloneError as exc:
+                last_error = f"remote unreachable: {exc}"
+                attempts.append({"provider": provider["name"], "error": last_error})
+                vod_db.record_source_failure(kind, source["source_id"])
+                logger.warning("[xc_server] %s stream source %d/%d (%s) rclone remote unreachable id=%s: %s, trying next",
+                                kind, idx + 1, len(sources), provider["name"], conn_id, exc)
+                continue
+            rclone_client_http = httpx.AsyncClient(timeout=30.0)
+            try:
+                upstream_req = rclone_client_http.build_request("GET", stream_url, headers=forward_headers)
+                upstream_resp = await rclone_client_http.send(upstream_req, stream=True)
+            except Exception as exc:
+                await rclone_client_http.aclose()
+                last_error = f"{type(exc).__name__}: {exc}"
+                attempts.append({"provider": provider["name"], "error": last_error})
+                vod_db.record_source_failure(kind, source["source_id"])
+                logger.warning("[xc_server] %s stream source %d/%d (%s) rclone daemon connect FAILED id=%s: %s",
+                                kind, idx + 1, len(sources), provider["name"], conn_id, exc)
+                continue
+            if upstream_resp.status_code >= 400:
+                last_error = f"HTTP {upstream_resp.status_code}"
+                attempts.append({"provider": provider["name"], "error": last_error})
+                await upstream_resp.aclose()
+                await rclone_client_http.aclose()
+                vod_db.record_source_failure(kind, source["source_id"])
+                logger.warning("[xc_server] %s stream source %d/%d (%s) rclone daemon returned %s id=%s, trying next",
+                                kind, idx + 1, len(sources), provider["name"], last_error, conn_id)
+                continue
+            logger.info("[xc_server] %s stream OPEN id=%s -> provider=%s (source %d/%d) via rclone daemon status=%s",
+                        kind, conn_id, provider["name"], idx + 1, len(sources), upstream_resp.status_code)
+            vod_db.record_source_success(kind, source["source_id"])
+
+            async def relay_rclone():
+                try:
+                    async for chunk in upstream_resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream_resp.aclose()
+                    await rclone_client_http.aclose()
+
+            passthrough_headers = {}
+            for h in ("content-range", "accept-ranges", "content-length"):
+                if h in upstream_resp.headers:
+                    passthrough_headers[h] = upstream_resp.headers[h]
+            return StreamingResponse(
+                relay_rclone(), status_code=upstream_resp.status_code,
+                media_type=upstream_resp.headers.get("content-type") or mimetypes.guess_type(source["provider_stream_id"])[0] or "video/mp4",
+                headers=passthrough_headers,
+            )
+
+        if provider.get("provider_type") in ("dispatcharr_dvr", "library"):
             # A local file on disk, not an upstream to relay -- httpx can't
             # GET a bare path, and none of the shared-connection-capacity/
             # heartbeat machinery below applies to a file VOD Manager already
@@ -1328,13 +1433,13 @@ async def _proxy_vod_stream(
             # FileResponse itself. A missing file (recording deleted/moved
             # outside VOD Manager) falls through to the next source, same
             # failover behavior as an unreachable upstream.
-            local_path = source.get("local_file_path")
-            if not local_path or not os.path.isfile(local_path):
+            local_path = await _reachable_local_file(source.get("local_file_path"), provider)
+            if not local_path:
                 last_error = "local file not found"
                 attempts.append({"provider": provider["name"], "error": last_error})
                 vod_db.record_source_failure(kind, source["source_id"])
-                logger.warning("[xc_server] %s stream source %d/%d (%s) local file missing id=%s: %s, trying next",
-                                kind, idx + 1, len(sources), provider["name"], conn_id, local_path)
+                logger.warning("[xc_server] %s stream source %d/%d (%s) local file missing/unreachable id=%s: %s, trying next",
+                                kind, idx + 1, len(sources), provider["name"], conn_id, source.get("local_file_path"))
                 continue
             media_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
             logger.info("[xc_server] %s stream OPEN id=%s -> provider=%s (source %d/%d) local file=%s",
@@ -1362,7 +1467,7 @@ async def _proxy_vod_stream(
             "conn_id": conn_id, "kind": kind, "username": username, "movie_id": movie_id, "episode_id": episode_id,
         }
 
-        upstream_url = _build_upstream_url(kind, provider, source, reservation)
+        upstream_url = await _build_upstream_url(kind, provider, source, reservation)
 
         # follow_redirects=True: real providers commonly 302 movie/series
         # requests off to a CDN edge host rather than serving the file

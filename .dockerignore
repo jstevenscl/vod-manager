@@ -1,0 +1,18 @@
+# Keep local-only and heavy files out of the build context, every image, and the
+# build cache. None of these are tracked in git, so released images never had
+# them -- but every LOCAL `docker build .` copied ~400MB of dev data + a Windows
+# venv into the image and cached it.
+.git
+.beads
+.claude
+.codex
+.agents
+_workshop
+.pytest_cache
+**/__pycache__
+**/*.pyc
+backend/venv
+backend/devdata
+backend/devdata;C
+frontend/node_modules
+frontend/dist

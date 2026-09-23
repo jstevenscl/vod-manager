@@ -17,6 +17,8 @@ from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_
 from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
+import library_importer
+import rclone_client
 import plex_importer
 from portal_routes import router as portal_router
 from routes import router
@@ -141,6 +143,8 @@ async def _vod_catalog_refresher() -> None:
                             result = await plex_importer.import_plex_library(p["id"])
                         elif p.get("provider_type") in ("emby", "jellyfin"):
                             result = await emby_vod_importer.import_emby_library(p["id"])
+                        elif p.get("provider_type") == "library":
+                            result = await library_importer.import_library(p["id"])
                         else:
                             # Deferred (schedule_enrichment=False): firing
                             # identity reconciliation once per provider here
@@ -447,6 +451,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await vod_importer.close_all_provider_clients()
+    await rclone_client.stop_all_daemons()
 
 
 app = FastAPI(title="VOD & DVR Manager", version=APP_VERSION, lifespan=lifespan)

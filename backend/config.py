@@ -2,7 +2,15 @@ import hashlib
 import os
 import json
 import secrets
+import threading
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX only -- production always runs in the Linux container;
+                  # on Windows (local dev/tests) this is None and the cross-process
+                  # lock below is skipped, same as the rest of the app's dev story.
+except ImportError:
+    fcntl = None
 
 from cryptography.fernet import Fernet
 
@@ -97,15 +105,81 @@ def is_configured() -> bool:
 # destroying the Dispatcharr connection / TMDB key / admin login, not a new
 # separate footgun.
 
+# Guards get_or_create_encryption_key's check-then-generate-then-write against
+# two callers racing to create the FIRST key (see that function's docstring)
+# -- this half covers callers within this one process (concurrent requests
+# each encrypting a credential for the first time run on separate
+# asyncio.to_thread worker threads, not serialized by the event loop).
+_ENCRYPTION_KEY_LOCK = threading.Lock()
+
+
+def _race_window_hook() -> None:
+    """No-op in production. Sits at the exact point every racing caller has
+    already observed "no key yet" but before any of them has acquired the
+    lock below -- tests monkeypatch this to force genuine thread
+    interleaving right at that window, rather than relying on OS scheduling
+    luck to (rarely, flakily) hit a race this narrow."""
+    pass
+
+
 def get_or_create_encryption_key() -> bytes:
+    """Generating this key is a one-time, NOT-safely-repeatable event: unlike
+    every other config.json field, once ANYTHING has been encrypted under a
+    key, silently generating a different one doesn't just get overwritten
+    cleanly -- decrypt_value's InvalidToken fallback returns that old
+    ciphertext unchanged with no error, so the credential just quietly stops
+    working (surfaces later as an inexplicable "wrong password", not an
+    error pointing at the real cause).
+
+    Without locking, two callers reading config.json before either has
+    written a key each generate their OWN key and write it, last-writer-wins
+    -- orphaning whatever the other one encrypted moments before. Found live
+    2026-09-22: a one-off script (`docker exec`/`docker run --rm` against
+    the same data volume while the app is up -- an explicitly supported
+    pattern, see this module's _raw_cache docstring and the project's own
+    "isolated docker run for tests" convention) created an XC client that
+    the running app's own decrypt then silently rejected, because the two
+    processes' first-ever encrypt/decrypt calls raced this exact check.
+
+    _ENCRYPTION_KEY_LOCK (in-process) and an flock on a sibling lock file
+    (cross-process, POSIX only) together close both halves of that race --
+    flock alone doesn't serialize two threads in the SAME process (POSIX
+    advisory locks are per-process), and the in-process lock obviously can't
+    reach a separate process."""
     data = _read_raw()
     key = data.get("encryption_key")
     if key:
         return key.encode()
-    new_key = Fernet.generate_key()
-    data["encryption_key"] = new_key.decode()
-    _write_raw(data)
-    return new_key
+
+    _race_window_hook()
+    with _ENCRYPTION_KEY_LOCK:
+        # Next to CONFIG_FILE (not the DATA_DIR module global) so it tracks
+        # wherever config.json actually lives, including when a test
+        # monkeypatches CONFIG_FILE to an isolated path.
+        lock_path = CONFIG_FILE.parent / ".encryption_key.lock"
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+")
+        try:
+            if fcntl:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # Re-read from disk, bypassing the in-process cache -- another
+            # process may have written a key while we waited for the lock,
+            # and trusting our stale pre-lock read here would regenerate one
+            # anyway, defeating the whole point of taking the lock.
+            global _raw_cache
+            _raw_cache = None
+            data = _read_raw()
+            key = data.get("encryption_key")
+            if key:
+                return key.encode()
+            new_key = Fernet.generate_key()
+            data["encryption_key"] = new_key.decode()
+            _write_raw(data)
+            return new_key
+        finally:
+            if fcntl:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
 
 
 # ── VOD manager ──────────────────────────────────────────────────────────────

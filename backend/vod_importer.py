@@ -1224,6 +1224,15 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
         # fall through to the provider so this movie still gets enriched.
 
+    if provider.get("provider_type") == "library":
+        # A folder of files has no get_vod_info to ask -- reaching here means
+        # this movie has no tmdb_id (unmatched/ambiguous) or the TMDB lookup
+        # above failed. Stamp the TTL so it is retried later rather than every
+        # scheduler pass, and never fall through to the XC client below (a
+        # library's base_url is a filesystem path, not a server).
+        await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id)
+        return True
+
     client = XCProviderClient(provider)
 
     info = _as_dict(await client.get_vod_info(source["provider_stream_id"]))
@@ -1372,6 +1381,32 @@ async def _enrich_one_series_source(
         # Same reasoning as enrich_movie: Plex already gave us full detail
         # and every episode at import time (plex_importer.py) — episodes
         # aren't lazily discovered here the way XC's are.
+        await asyncio.to_thread(
+            vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
+        )
+        return {"fetched": True, "reason": None}
+
+    if provider.get("provider_type") == "library":
+        # Episodes came from the files themselves at import time; what's left
+        # is TMDB's series detail and real episode titles (a folder has no
+        # get_series_info to call -- and its base_url is a path, so the XC
+        # client below must never be reached). Best-effort: a TMDB miss just
+        # leaves placeholders and is retried on the next TTL pass.
+        tmdb_id = series.get("tmdb_id")
+        if tmdb_id:
+            try:
+                detail = await tmdb_sync.get_series_full_details(str(tmdb_id))
+                if detail:
+                    await asyncio.to_thread(vod_db.set_series_enrichment, series_id, **_apply_field_rules("series", {
+                        k: detail.get(k) for k in ("genre", "description", "cast_list")
+                    }), poster_url=detail.get("poster_url"), rating=detail.get("rating"),
+                        release_date=detail.get("release_date"))
+                eps = await tmdb_sync.get_series_episode_list_cached(str(tmdb_id))
+                names = {(e["season_number"], e["episode_number"]): e["name"] for e in eps if e.get("name")}
+                if names:
+                    await asyncio.to_thread(vod_db.fill_placeholder_episode_names, series_id, names)
+            except Exception:
+                logger.warning("[_enrich_one_series_source] TMDB enrichment failed for library series_id=%s", series_id, exc_info=True)
         await asyncio.to_thread(
             vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
         )

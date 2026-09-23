@@ -14,7 +14,9 @@ resolving back to the same real provider source.
 
 from contextlib import contextmanager
 import datetime
+import json
 import logging
+import os
 import re
 import secrets
 import sqlite3
@@ -252,6 +254,29 @@ def init_db() -> None:
             token TEXT NOT NULL,
             vod_relay_account_id INTEGER,
             created_at TEXT NOT NULL
+        );
+
+        -- Library-source TMDB match decisions (see library_matcher.py). match_key
+        -- is the file's relative path for movies and the series folder for TV,
+        -- so a show resolves once. query is "title|year" as parsed -- if the
+        -- path is renamed the stored auto decision no longer applies and is
+        -- redone. source='manual' rows (a human's pick) are never overwritten
+        -- by a rescan.
+        CREATE TABLE IF NOT EXISTS library_matches (
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            match_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            tmdb_id TEXT,
+            title TEXT,
+            year INTEGER,
+            confidence TEXT,
+            reason TEXT,
+            candidates_json TEXT,
+            query TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'auto',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, match_key, kind)
         );
 
         CREATE TABLE IF NOT EXISTS provider_live_accounts (
@@ -960,6 +985,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("providers", "dvr_movie_category_id", "INTEGER"),
         ("providers", "dvr_series_category_id", "INTEGER"),
         ("providers", "dvr_remote_recordings_root", "TEXT"),
+        # library_backend distinguishes a provider_type='library' source's real
+        # backend: 'local' (default -- a mounted/bind-mounted path, walked and
+        # served directly, see library_importer/xc_server's existing branches)
+        # vs an rclone-mediated remote (smb/nfs/sftp/s3/gdrive/dropbox/box/
+        # mediafire) -- see rclone_client.py. library_remote_config holds the
+        # backend-specific fields rclone needs beyond username/password (share
+        # name, host, port, bucket, region, endpoint, an OAuth token blob for
+        # the token-based backends, ...) as an ENCRYPTED JSON blob (same Fernet
+        # key as providers.password) -- some of those fields (an OAuth token,
+        # an S3 secret key if not using username/password) are real credentials,
+        # not configuration, and must not sit in plaintext in the database any
+        # more than providers.password does.
+        ("providers", "library_backend", "TEXT NOT NULL DEFAULT 'local'"),
+        ("providers", "library_remote_config", "TEXT"),
         ("movie_sources", "local_file_path", "TEXT"),
         ("episode_sources", "local_file_path", "TEXT"),
         ("dvr_recording_profiles", "dispatcharr_user_id", "INTEGER"),
@@ -1276,7 +1315,7 @@ def _item_savepoint(conn: sqlite3.Connection):
 
 def upsert_provider(
     name: str, base_url: str, username: str, password: str, max_streams: int = 0, priority: int = 0,
-    provider_type: str = "xc",
+    provider_type: str = "xc", library_backend: str = "local", library_remote_config: dict | None = None,
 ) -> int:
     """For real catalog sources (xc/plex/emby/jellyfin) only -- a DVR
     "provider" row is never created through this path, see
@@ -1284,26 +1323,52 @@ def upsert_provider(
     provider_type='plex' (blank username) and 'emby'/'jellyfin' (both
     blank), same convention every one of those importers already expects."""
     encrypted_password = encrypt_value(password)
+    # See the library_backend/library_remote_config column comment (near
+    # _ensure_columns) -- an OAuth token or an S3 secret key living in here
+    # is a real credential, encrypted the same as password, never plaintext.
+    encrypted_remote_config = encrypt_value(json.dumps(library_remote_config)) if library_remote_config else None
     conn = _connect()
     row = conn.execute("SELECT id FROM providers WHERE name = ?", (name,)).fetchone()
     if row:
         conn.execute(
             """UPDATE providers SET base_url=?, username=?, password=?, max_streams=?, priority=?, provider_type=?,
-               updated_at=? WHERE id=?""",
-            (base_url, username, encrypted_password, max_streams, priority, provider_type, _now(), row["id"]),
+               library_backend=?, library_remote_config=?, updated_at=? WHERE id=?""",
+            (base_url, username, encrypted_password, max_streams, priority, provider_type,
+             library_backend, encrypted_remote_config, _now(), row["id"]),
         )
         provider_id = row["id"]
     else:
         cur = conn.execute(
             """INSERT INTO providers (name, base_url, username, password, max_streams, priority, provider_type,
-               created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (name, base_url, username, encrypted_password, max_streams, priority, provider_type, _now()),
+               library_backend, library_remote_config, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (name, base_url, username, encrypted_password, max_streams, priority, provider_type,
+             library_backend, encrypted_remote_config, _now()),
         )
         provider_id = cur.lastrowid
     _commit_with_retry(conn)
     conn.close()
     return provider_id
+
+
+def get_library_remote_config(provider: dict) -> dict:
+    """Decrypts and parses a library provider's backend-specific config blob
+    (see the library_remote_config column comment). Returns {} for a 'local'
+    backend or a row with nothing stored, so callers can always .get() from
+    the result without a None check. Idempotent: get_provider/list_providers
+    already replace the raw encrypted column value with this function's own
+    decrypted dict output, so a caller handed one of THEIR rows (rather than
+    a bare DB row) can safely call this again without double-decrypting."""
+    raw = provider.get("library_remote_config")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    decrypted = decrypt_value(raw)
+    try:
+        return json.loads(decrypted) if decrypted else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 # ── DVR as a connection capability, not a provider type an admin picks ──────
@@ -1422,6 +1487,134 @@ def set_movie_source_local_paths(provider_id: int, path_by_stream_id: dict[str, 
         _commit_with_retry(conn)
         conn.close()
         return movie_id_by_stream_id
+
+
+def get_library_match(provider_id: int, match_key: str, kind: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM library_matches WHERE provider_id=? AND match_key=? AND kind=?",
+            (provider_id, match_key, kind),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_library_match(provider_id: int, match_key: str, kind: str, *, status: str, query: str,
+                         tmdb_id: str | None = None, title: str | None = None, year: int | None = None,
+                         confidence: str | None = None, reason: str | None = None,
+                         candidates_json: str | None = None, source: str = "auto") -> bool:
+    """Returns False (and writes nothing) when an existing source='manual' row
+    would be overwritten by an automatic decision -- a human's correction must
+    survive every rescan. A manual write always wins."""
+    from datetime import datetime, timezone
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            if source != "manual":
+                row = conn.execute(
+                    "SELECT source FROM library_matches WHERE provider_id=? AND match_key=? AND kind=?",
+                    (provider_id, match_key, kind),
+                ).fetchone()
+                if row and row["source"] == "manual":
+                    return False
+            conn.execute(
+                """INSERT INTO library_matches
+                   (provider_id, match_key, kind, status, tmdb_id, title, year, confidence, reason,
+                    candidates_json, query, source, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(provider_id, match_key, kind) DO UPDATE SET
+                     status=excluded.status, tmdb_id=excluded.tmdb_id, title=excluded.title,
+                     year=excluded.year, confidence=excluded.confidence, reason=excluded.reason,
+                     candidates_json=excluded.candidates_json, query=excluded.query,
+                     source=excluded.source, updated_at=excluded.updated_at""",
+                (provider_id, match_key, kind, status, tmdb_id, title, year, confidence, reason,
+                 candidates_json, query, source, datetime.now(timezone.utc).isoformat()),
+            )
+            _commit_with_retry(conn)
+            return True
+        finally:
+            conn.close()
+
+
+def delete_library_matches_not_in(provider_id: int, kind: str, keep_keys: set[str]) -> int:
+    """Prunes decisions for files/folders that no longer exist after a rescan."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT match_key FROM library_matches WHERE provider_id=? AND kind=?", (provider_id, kind)
+            ).fetchall()
+            stale = [r["match_key"] for r in rows if r["match_key"] not in keep_keys]
+            for k in stale:
+                conn.execute(
+                    "DELETE FROM library_matches WHERE provider_id=? AND match_key=? AND kind=?",
+                    (provider_id, k, kind),
+                )
+            _commit_with_retry(conn)
+            return len(stale)
+        finally:
+            conn.close()
+
+
+def count_provider_sources(provider_id: int) -> int:
+    conn = _connect()
+    try:
+        return conn.execute(
+            "SELECT (SELECT COUNT(*) FROM movie_sources WHERE provider_id=?) + "
+            "(SELECT COUNT(*) FROM episode_sources WHERE provider_id=?) AS c", (provider_id, provider_id),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+
+
+def remove_stale_episode_sources(provider_id: int, seen_stream_ids: set[str]) -> int:
+    """Library sources: drops this provider's episode sources whose file is no
+    longer on disk (reconcile_provider_catalog_sources only removes episode
+    sources when a WHOLE series disappears, so one deleted episode file in a
+    surviving show would otherwise linger as a dead source). Canonical
+    episodes/series survive if another provider still supplies them."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, episode_id FROM episode_sources WHERE provider_id=? AND provider_stream_id NOT IN "
+                "(SELECT value FROM json_each(?))",
+                (provider_id, json.dumps(sorted(seen_stream_ids))),
+            ).fetchall()
+            for r in rows:
+                series = conn.execute("SELECT series_id FROM episodes WHERE id=?", (r["episode_id"],)).fetchone()
+                conn.execute("DELETE FROM episode_sources WHERE id=?", (r["id"],))
+                _purge_if_sourceless_episode(conn, r["episode_id"])
+                if series:
+                    _purge_if_sourceless_series(conn, series["series_id"])
+            _commit_with_retry(conn)
+            return len(rows)
+        finally:
+            conn.close()
+
+
+def fill_placeholder_episode_names(series_id: int, names: dict[tuple[int, int], str]) -> int:
+    """Library sources import episodes as "Episode N" (the filename carries no
+    real title). Replaces ONLY those placeholders with TMDB's episode names --
+    an episode already named by another provider is left alone."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = 0
+            rows = conn.execute(
+                "SELECT id, season_number, episode_number, name FROM episodes WHERE series_id=?", (series_id,)
+            ).fetchall()
+            for r in rows:
+                new = names.get((r["season_number"], r["episode_number"]))
+                if new and r["name"] == f"Episode {r['episode_number']}":
+                    conn.execute("UPDATE episodes SET name=?, updated_at=? WHERE id=?", (new, _now(), r["id"]))
+                    n += 1
+            _commit_with_retry(conn)
+            return n
+        finally:
+            conn.close()
 
 
 def set_episode_source_local_paths(provider_id: int, path_by_stream_id: dict[str, str]) -> dict[str, int]:
@@ -3079,6 +3272,7 @@ def get_provider(provider_id: int) -> dict | None:
     d["password"] = decrypt_value(d["password"])
     d["import_exclude_categories"] = _parse_json_list(d.get("import_exclude_categories"))
     d["known_import_categories"] = _parse_json_list(d.get("known_import_categories"))
+    d["library_remote_config"] = get_library_remote_config(d)
     return d
 
 
@@ -3189,6 +3383,7 @@ def list_providers() -> list[dict]:
     for r in rows:
         r["password"] = decrypt_value(r["password"])
         r["import_exclude_categories"] = _parse_json_list(r.get("import_exclude_categories"))
+        r["library_remote_config"] = get_library_remote_config(r)
     counts = _provider_counts(conn)
     conn.close()
     for p in rows:
@@ -3210,6 +3405,34 @@ def set_provider_active(provider_id: int, is_active: bool) -> None:
         conn.close()
 
 
+def _is_under_library_root(file_path: str) -> bool:
+    """True if file_path is inside any provider_type='library' provider's root
+    (stored in base_url). Purely lexical (normalised absolute paths, no
+    filesystem access): realpath() here would stat every path component, and
+    on a dead hard-mounted NFS/SMB share that blocks the calling thread
+    forever. The stored paths are generated by the importer from a walk UNDER
+    the root, so a lexical prefix check is exactly right for them."""
+    def _norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+    try:
+        target = _norm(file_path)
+        conn = _connect()
+        try:
+            roots = [r["base_url"] for r in conn.execute(
+                "SELECT base_url FROM providers WHERE provider_type='library'").fetchall()]
+        finally:
+            conn.close()
+    except Exception:
+        return True  # fail safe: if we can't tell, don't delete
+    for root in roots:
+        if not root:
+            continue
+        nroot = _norm(root)
+        if target == nroot or target.startswith(nroot.rstrip("/\\") + os.sep):
+            return True
+    return False
+
+
 def _delete_file_if_present(file_path: str | None) -> bool:
     """Actually removes a DVR recording's file from disk -- nothing in this
     codebase did this before 2026-07-28 for ANY delete path, admin or
@@ -3225,6 +3448,12 @@ def _delete_file_if_present(file_path: str | None) -> bool:
     filesystem hiccup would leave the DB and disk in a WORSE mismatch, not
     a better one."""
     if not file_path:
+        return False
+    if _is_under_library_root(file_path):
+        # A library source points at the user's OWN media (a NAS share, a
+        # mounted folder) -- removing it from the catalog must never touch the
+        # file. Only DVR recordings this app copied/downloaded are ours to delete.
+        logger.info("[vod_db] not deleting %s: it lives under a library source's root", file_path)
         return False
     try:
         Path(file_path).unlink(missing_ok=True)
@@ -5463,7 +5692,7 @@ def get_enrichment_ttl_seconds() -> int:
 
 
 def get_catalog_refresh_interval_seconds(provider_type: str) -> int:
-    key = f"catalog_refresh_seconds_{provider_type}" if provider_type in ("xc", "plex", "emby", "jellyfin") else "catalog_refresh_seconds_xc"
+    key = f"catalog_refresh_seconds_{provider_type}" if provider_type in ("xc", "plex", "emby", "jellyfin") else ("catalog_refresh_seconds_emby" if provider_type == "library" else "catalog_refresh_seconds_xc")
     return _refresh_settings()[key]
 
 
@@ -5995,7 +6224,7 @@ def get_movie_source_for_streaming(source_id: int) -> dict | None:
     title without a second lookup."""
     conn = _connect()
     row = conn.execute("""
-        SELECT ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path,
+        SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path,
                m.id AS movie_id, m.name AS movie_name, m.year AS movie_year, m.duration_secs AS duration_secs
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
@@ -6935,7 +7164,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
     """Episode equivalent of get_movie_source_for_streaming — see there."""
     conn = _connect()
     row = conn.execute("""
-        SELECT es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path,
+        SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path,
                e.id AS episode_id, e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
                e.duration_secs AS duration_secs, s.id AS series_id, s.name AS series_name
         FROM episode_sources es
@@ -7778,15 +8007,24 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at", "rating", "release_date")
 
 
-def _plex_detail_update_sql(detail: dict, tmdb_id: str | None) -> tuple[str, list]:
+def _plex_detail_update_sql(detail: dict, tmdb_id: str | None, preserve_existing: bool = False) -> tuple[str, list]:
     """SET clause/params for a Plex/Emby detail-refresh UPDATE. Every field
     in `detail` is overwritten unconditionally (Plex/Emby hand back
     authoritative full detail on every listing pass) except tmdb_id, which
     upgrades via COALESCE, same upgrade-only spirit as is_adult_manual/
     review_excluded_manual elsewhere -- a transient missing id in one pass
     (e.g. an unmatched item in the source library) must never erase an id
-    already captured on a previous one."""
-    sets = ", ".join(f"{k}=?" for k in detail)
+    already captured on a previous one.
+
+    preserve_existing (library sources): the importer knows only a title and
+    file, never description/poster/cast, so overwriting unconditionally would
+    blank TMDB-enriched detail (and last_enriched_at, re-queuing enrichment)
+    on every rescan of a movie shared with another provider. With it set, a
+    field is only written when the new value is non-null."""
+    if preserve_existing:
+        sets = ", ".join(f"{k}=COALESCE(?, {k})" for k in detail)
+    else:
+        sets = ", ".join(f"{k}=?" for k in detail)
     params = list(detail.values())
     if tmdb_id:
         sets += ", tmdb_id=COALESCE(tmdb_id, ?)"
@@ -7870,7 +8108,7 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                     if existing_source:
                         movie_id = existing_source["movie_id"]
                         did_match = True
-                        sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                        sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                         conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
                         existing = conn.execute(
                             "SELECT review_excluded, review_excluded_manual FROM movies WHERE id=?", (movie_id,)
@@ -7906,7 +8144,7 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                         if row:
                             movie_id = row["id"]
                             did_match = True
-                            sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                            sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                             conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
                                 conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
@@ -7935,7 +8173,7 @@ def bulk_import_plex_movies(provider_id: int, items: list[dict]) -> dict:
                             if len(candidates) == 1 and candidates[0]["tmdb_id"]:
                                 movie_id = candidates[0]["id"]
                                 did_match = True
-                                sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                                sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                                 conn.execute(f"UPDATE movies SET {sets}, updated_at=? WHERE id=?", (*set_params, now, movie_id))
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
                                     conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (movie_id,))
@@ -8050,7 +8288,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                     ).fetchone()
                     if existing:
                         series_id = existing["id"]
-                        sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                        sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                         conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                         did_match = True
                         if should_archive and not existing["review_excluded"] and not existing["review_excluded_manual"]:
@@ -8083,7 +8321,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                         ).fetchone()
                         if row:
                             series_id = row["id"]
-                            sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                            sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                             conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                             did_match = True
                             if should_archive and not row["review_excluded"] and not row["review_excluded_manual"]:
@@ -8105,7 +8343,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                             ).fetchall()
                             if len(candidates) == 1:
                                 series_id = candidates[0]["id"]
-                                sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"))
+                                sets, set_params = _plex_detail_update_sql(detail, item.get("tmdb_id"), item.get("preserve_existing_detail"))
                                 conn.execute(f"UPDATE series SET {sets}, updated_at=? WHERE id=?", (*set_params, now, series_id))
                                 did_match = True
                                 if should_archive and not candidates[0]["review_excluded"] and not candidates[0]["review_excluded_manual"]:
@@ -8172,10 +8410,18 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                 ).fetchone()
                                 if erow:
                                     episode_id = erow["id"]
-                                    conn.execute(
-                                        "UPDATE episodes SET name=?, description=?, duration_secs=?, updated_at=? WHERE id=?",
-                                        (ep["name"], ep.get("description"), ep.get("duration_secs"), now, episode_id),
-                                    )
+                                    if item.get("preserve_existing_detail"):
+                                        # Library source: never overwrite a TMDB-enriched
+                                        # episode name/description with our placeholder.
+                                        conn.execute(
+                                            "UPDATE episodes SET description=COALESCE(?, description), duration_secs=COALESCE(?, duration_secs), updated_at=? WHERE id=?",
+                                            (ep.get("description"), ep.get("duration_secs"), now, episode_id),
+                                        )
+                                    else:
+                                        conn.execute(
+                                            "UPDATE episodes SET name=?, description=?, duration_secs=?, updated_at=? WHERE id=?",
+                                            (ep["name"], ep.get("description"), ep.get("duration_secs"), now, episode_id),
+                                        )
                                 else:
                                     cur = conn.execute(
                                         "INSERT INTO episodes (series_id, season_number, episode_number, name, description, duration_secs, created_at) VALUES (?,?,?,?,?,?,?)",
@@ -9579,6 +9825,43 @@ def list_tmdb_lookup_failures(content_type: str | None = None) -> dict:
     return out
 
 
+def record_manual_library_match(content_type: str, item_id: int, *, tmdb_id: str | None,
+                                name: str | None = None, year: int | None = None) -> int:
+    """A human's TMDB decision (picked a match, or cleared a wrong one) on a
+    movie/series must outlive rescans of any library source feeding it.
+    Without this, library_matcher.resolve would keep reusing its OLD automatic
+    decision -- so a cleared wrong match would be re-applied on the next scan.
+    Writes source='manual' rows (never overwritten by automatic decisions):
+    status 'matched' when tmdb_id is given, 'unmatched' when it is None.
+    Returns how many library sources were updated (0 for non-library items)."""
+    conn = _connect()
+    try:
+        if content_type == "movie":
+            rows = conn.execute(
+                "SELECT ms.provider_id AS pid, ms.provider_stream_id AS key FROM movie_sources ms "
+                "JOIN providers p ON p.id=ms.provider_id WHERE ms.movie_id=? AND p.provider_type='library'",
+                (item_id,),
+            ).fetchall()
+            targets = [(r["pid"], r["key"], "movie") for r in rows]
+        else:
+            rows = conn.execute(
+                "SELECT ss.provider_id AS pid, ss.provider_series_id AS key FROM series_sources ss "
+                "JOIN providers p ON p.id=ss.provider_id WHERE ss.series_id=? AND p.provider_type='library'",
+                (item_id,),
+            ).fetchall()
+            targets = [(r["pid"], r["key"][4:] if r["key"].startswith("lib-") else r["key"], "series") for r in rows]
+    finally:
+        conn.close()
+    for pid, key, kind in targets:
+        upsert_library_match(
+            pid, key, kind, status="matched" if tmdb_id else "unmatched", query="manual",
+            tmdb_id=tmdb_id, title=name if tmdb_id else None, year=year if tmdb_id else None,
+            confidence="manual" if tmdb_id else None,
+            reason=None if tmdb_id else "match cleared manually", source="manual",
+        )
+    return len(targets)
+
+
 def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str | None = None) -> dict:
     """Sets the correct year (and tmdb_id, if known) on a flagged item and
     clears the flag. If that year now exactly matches an existing item of
@@ -9603,6 +9886,7 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
                 merge_series(item_id, existing["id"])
             if tmdb_id:
                 clear_tmdb_lookup_failure(content_type, item_id)
+                record_manual_library_match(content_type, existing["id"], tmdb_id=tmdb_id, name=row["name"], year=year)
             return {"merged_into": existing["id"]}
 
         conn = _connect()
@@ -9619,6 +9903,7 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
                 auto_merge_movie_by_tmdb(item_id)
             else:
                 auto_merge_series_by_tmdb(item_id)
+            record_manual_library_match(content_type, item_id, tmdb_id=tmdb_id, name=row["name"], year=year)
         return {"resolved_id": item_id}
 
 
@@ -10350,6 +10635,8 @@ def resolve_missing_artwork(
                 merge_movie(item_id, existing["id"])
             else:
                 merge_series(item_id, existing["id"])
+            if tmdb_id:
+                record_manual_library_match(content_type, existing["id"], tmdb_id=tmdb_id, name=final_name, year=final_year)
             return {"merged_into": existing["id"]}
 
         fields = {"poster_url": poster_url, "name": final_name, "year": final_year}
@@ -10359,6 +10646,8 @@ def resolve_missing_artwork(
         conn.execute(f"UPDATE {table} SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), item_id))
         _commit_with_retry(conn)
         conn.close()
+        if tmdb_id:
+            record_manual_library_match(content_type, item_id, tmdb_id=tmdb_id, name=final_name, year=final_year)
         return {"resolved_id": item_id}
 
 
@@ -10399,6 +10688,7 @@ def clear_tmdb_id(content_type: str, item_id: int) -> dict:
         _commit_with_retry(conn)
         conn.close()
     clear_tmdb_lookup_failure(content_type, item_id)
+    record_manual_library_match(content_type, item_id, tmdb_id=None)
     logger.info("[clear_tmdb_id] %s id=%s (%r) tmdb_id %s -> NULL", content_type, item_id, row["name"], row["tmdb_id"])
     return {"cleared_id": item_id}
 
@@ -10429,6 +10719,7 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
             else:
                 merge_series(item_id, existing["id"])
             clear_tmdb_lookup_failure(content_type, item_id)
+            record_manual_library_match(content_type, existing["id"], tmdb_id=str(tmdb_id))
             return {"merged_into": existing["id"]}
 
         conn = _connect()
@@ -10436,6 +10727,7 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
         _commit_with_retry(conn)
         conn.close()
     clear_tmdb_lookup_failure(content_type, item_id)
+    record_manual_library_match(content_type, item_id, tmdb_id=str(tmdb_id))
     logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
     return {"resolved_id": item_id}
 
