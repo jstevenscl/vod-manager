@@ -7145,8 +7145,13 @@ def get_series_export_row_by_export_id(export_series_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def _episode_best_source_cte() -> str:
-    """See _best_source_cte's identical docstring -- episode equivalent."""
+def _episode_best_source_cte(*, extra_join: str = "", extra_where: str = "") -> str:
+    """See _best_source_cte's identical docstring -- episode equivalent.
+
+    Callers may scope the window-function input before SQLite ranks sources.
+    This matters for XC ``get_series_info``: without a scope, every series
+    request ranks every active episode source in the catalog first.
+    """
     lang_clause, _ = _enabled_languages_clause("es.language")
     return f"""
     WITH best_source AS (
@@ -7155,7 +7160,8 @@ def _episode_best_source_cte() -> str:
         ) AS rn
         FROM episode_sources es
         JOIN providers pr ON pr.id = es.provider_id
-        WHERE pr.is_active = 1 AND {lang_clause}
+        {extra_join}
+        WHERE pr.is_active = 1 AND {lang_clause} {extra_where}
     )
 """
 
@@ -7201,7 +7207,7 @@ def get_episode_export_row(episode_id: int) -> dict | None:
     the episode's own row id."""
     conn = _connect()
     _, lang_params = _enabled_languages_clause("es.language")
-    row = conn.execute(_episode_best_source_cte() + """
+    row = conn.execute(_episode_best_source_cte(extra_where="AND es.episode_id = ?") + """
         SELECT
             e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
             e.episode_number AS episode_number, e.name AS name, e.description AS description,
@@ -7211,7 +7217,7 @@ def get_episode_export_row(episode_id: int) -> dict | None:
         FROM episodes e
         LEFT JOIN best_source es ON es.episode_id = e.id AND es.rn = 1
         WHERE e.id = ?
-    """, (*lang_params, episode_id)).fetchone()
+    """, (*lang_params, episode_id, episode_id)).fetchone()
     conn.close()
     if not row:
         return None
@@ -7236,7 +7242,10 @@ def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
     every other request until it finished."""
     conn = _connect()
     _, lang_params = _enabled_languages_clause("es.language")
-    rows = conn.execute(_episode_best_source_cte() + """
+    rows = conn.execute(_episode_best_source_cte(
+        extra_join="JOIN episodes target_episode ON target_episode.id = es.episode_id",
+        extra_where="AND target_episode.series_id = ?",
+    ) + """
         SELECT
             e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
             e.episode_number AS episode_number, e.name AS name, e.description AS description,
@@ -7247,7 +7256,7 @@ def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
         LEFT JOIN best_source es ON es.episode_id = e.id AND es.rn = 1
         WHERE e.series_id = ?
         ORDER BY e.season_number, e.episode_number
-    """, (*lang_params, series_id)).fetchall()
+    """, (*lang_params, series_id, series_id)).fetchall()
     conn.close()
     results = [dict(r) for r in rows]
     for r in results:

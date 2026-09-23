@@ -74,6 +74,9 @@ _locked_until: dict[str, float] = {}                  # ip -> monotonic time loc
 _last_sweep_at = 0.0
 _lockout_settings_cache: dict | None = None
 _lockout_settings_cache_at = 0.0
+_SEEN_UPDATE_TTL_SECONDS = 30.0
+_seen_update_cache: dict[tuple[int, str], float] = {}
+_last_seen_sweep_at = 0.0
 
 
 def _lockout_settings() -> dict:
@@ -136,6 +139,36 @@ def _record_auth_failure(client_ip: str) -> None:
 
 def _record_auth_success(client_ip: str) -> None:
     _failed_attempts.pop(client_ip, None)
+
+
+async def _record_client_seen_if_due(client_id: int, client_ip: str) -> None:
+    """Persist client activity occasionally, not once per catalog item.
+
+    Xtream clients can issue thousands of metadata requests during one
+    refresh. ``last_seen`` is operational telemetry, not request state, so a
+    short in-process debounce preserves the useful signal while avoiding one
+    SQLite write and commit per request.
+    """
+    global _last_seen_sweep_at
+    now = time.monotonic()
+    key = (client_id, client_ip)
+    previous = _seen_update_cache.get(key)
+    if previous is not None and now - previous < _SEEN_UPDATE_TTL_SECONDS:
+        return
+    _seen_update_cache[key] = now
+    if now - _last_seen_sweep_at >= _SWEEP_INTERVAL_SECONDS:
+        _last_seen_sweep_at = now
+        cutoff = now - _SEEN_UPDATE_TTL_SECONDS * 2
+        for cached_key, cached_at in list(_seen_update_cache.items()):
+            if cached_at < cutoff:
+                _seen_update_cache.pop(cached_key, None)
+    try:
+        await asyncio.to_thread(vod_db.record_xc_client_seen, client_id, client_ip)
+    except Exception:
+        # Activity telemetry must never make an otherwise valid XC request
+        # fail. The next debounced interval will retry it.
+        _seen_update_cache.pop(key, None)
+        logger.warning("[xc_server] failed to record client activity id=%s ip=%s", client_id, client_ip, exc_info=True)
 
 
 def _ip_allowed(client_ip: str, allowlist: str) -> bool:
@@ -227,7 +260,7 @@ async def _authenticate(username: str, password: str, request: Request) -> dict 
         return None
 
     _record_auth_success(client_ip)
-    await asyncio.to_thread(vod_db.record_xc_client_seen, matched["id"], client_ip)
+    await _record_client_seen_if_due(matched["id"], client_ip)
     return matched
 
 
