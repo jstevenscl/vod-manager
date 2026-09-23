@@ -17,6 +17,7 @@ walkthrough, see [README.md](README.md).
 3. [Installation](#3-installation)
 4. [First-run setup](#4-first-run-setup)
 5. [Adding your first provider](#5-adding-your-first-provider)
+   - [Library sources — local folders, SMB, SFTP, and cloud storage](#library-sources--local-folders-smb-sftp-and-cloud-storage)
 6. [Connecting Dispatcharr](#6-connecting-dispatcharr)
 7. [DVR recordings](#7-dvr-recordings)
 8. [Security hardening](#8-security-hardening)
@@ -240,6 +241,94 @@ config) only accept one or the other. If a Jellyfin provider still can't
 import after this, it's worth checking whether anything sits in front of
 your Jellyfin server (a reverse proxy, an auth gateway) that might be
 altering the request before it reaches Jellyfin itself.
+
+### Library sources — local folders, SMB, SFTP, and cloud storage
+
+Besides XC/Plex/Emby/Jellyfin, a provider can also be a **Folder** — your own
+media files, read directly instead of pulled from an IPTV panel. Pick
+**Folder / SMB / SFTP / Cloud** as the provider type, then pick which of
+seven backends it actually is:
+
+- **Local folder / mounted path** — a directory already reachable inside the
+  VOD & DVR Manager container (a bind mount, or a Docker named volume — an NFS
+  share works this way too, mounted via a Docker volume with the `nfs`
+  driver, or a plain OS-level NFS mount bind-mounted in). Same "what path
+  goes in the field" rule as DVR's path field above: it's the path *as seen
+  from inside the container*, not on your host.
+- **SMB / CIFS share** and **SFTP server** — reached directly, no host mount
+  needed. Give it the host, and for SMB the share name; a username/password
+  and an optional path-within-the-share round it out.
+- **S3-compatible** (AWS, MinIO, Wasabi, Backblaze B2, and similar) — an
+  access key/secret key pair, a bucket, and for anything other than AWS
+  itself, that provider's own endpoint URL.
+- **Google Drive**, **Dropbox**, **Box** — see *Connecting a cloud account*
+  below.
+
+![Library provider form showing the backend selector](docs/screenshots/library-provider-form.jpg)
+
+Whichever backend, **Import catalog** works the same as any other
+provider: it walks the folder/share/bucket, parses each file's name for a
+title, year, and season/episode, and matches it against TMDB. A rescan
+picks up new and removed files; your media itself is **never deleted or
+modified** by anything in VOD & DVR Manager, regardless of what happens on the
+catalog side.
+
+**Matching is intentionally conservative.** A file's name has to match a
+TMDB title (and year, if one's in the name) exactly before it's
+auto-matched — anything less certain, or genuinely ambiguous (two different
+real titles sharing a name), lands in **Missing Artwork** or **Needs
+Review** (§11) like any provider-side unmatched item, for you to pick from
+or correct by hand. Once fixed there, that decision survives future
+rescans — it won't get silently re-matched to something else, or re-run
+through TMDB again. For certainty with zero ambiguity, name/tag files the
+way Plex and Jellyfin already do: a trailing `{tmdb-12345}` (or
+`[tmdbid=12345]`) in the folder or file name skips matching entirely and
+uses that id directly.
+
+**NFS has no equivalent of its own here** — there's no "NFS" option in the
+backend list, because the tool this feature is built on (rclone) has no NFS
+client at all. An NFS share is still fully supported, just through the
+**Local folder** backend above: mount it as a Docker named volume (`driver:
+local`, `opt: type=nfs`) or an OS-level NFS mount, bind-mount that into the
+container, and point Local folder at wherever it lands inside the
+container.
+
+#### Connecting a cloud account
+
+Google Drive, Dropbox, and Box all use the same OAuth-token approach, and
+VOD & DVR Manager never sees your actual login for any of them — you run a
+one-time command yourself, on your own machine, that opens your real
+browser to that provider's own real login page:
+
+```
+rclone authorize "drive"      # Google Drive
+rclone authorize "dropbox"    # Dropbox
+rclone authorize "box"        # Box
+```
+
+(Install rclone from [rclone.org/downloads](https://rclone.org/downloads/),
+or run it via Docker: `docker run --rm -p 53682:53682 rclone/rclone
+authorize "dropbox"`.) Log in and approve access in the browser window that
+opens; the command then prints a JSON token. Paste that whole blob into the
+**token** field on the provider form, along with an optional path if you
+only want a specific folder within that account. Nothing else is needed —
+VOD & DVR Manager stores the token encrypted at rest, the same way it already
+stores every other provider credential.
+
+**Google Drive specifically:** rclone's own default app registration is
+being retired during 2026 (`rclone authorize "drive"` prints a warning
+about this). If Drive access stops working, the fix is registering your
+own small OAuth client in Google Cloud Console and supplying its client ID
+in the provider form's optional **client ID** field — see
+[rclone.org/drive/#making-your-own-client-id](https://rclone.org/drive/#making-your-own-client-id).
+
+**Box** uses the identical mechanism as Drive/Dropbox but hasn't been
+verified against a real Box account as of this release — it should work,
+but if you hit anything odd, that's the one to report first.
+
+**MediaFire is not supported.** It isn't one of the storage backends rclone
+(the tool this feature is built on) implements, so there's no way to add it
+as a provider through this mechanism.
 
 ### Excluding content on import
 

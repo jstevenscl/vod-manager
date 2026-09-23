@@ -1,9 +1,11 @@
 # VOD & DVR Manager
 
 Curates movies and TV shows from multiple real sources — Xtream-Codes (XC)
-IPTV providers, Plex, and Emby/Jellyfin — into one deduplicated pool, then
-re-exposes that pool as its own XC-compatible catalog server so one or more
-Dispatcharr instances can pull it like any other provider.
+IPTV providers, Plex, Emby/Jellyfin, and your own media files (a local
+folder, SMB, SFTP, S3-compatible storage, Google Drive, Dropbox, or Box) —
+into one deduplicated pool, then re-exposes that pool as its own
+XC-compatible catalog server so one or more Dispatcharr instances can pull
+it like any other provider.
 
 Same real content is often available from several sources at once (a movie
 on both an XC reseller and your own Plex library, or the same title from two
@@ -60,6 +62,26 @@ one rather than skip it.
 From there: add your real providers (Curation & Maintenance → Providers)
 and import their catalogs, then connect Dispatcharr (below). Full
 walkthrough with screenshots in [USERGUIDE.md](USERGUIDE.md).
+
+## Library sources — your own media files
+
+Besides XC/Plex/Emby/Jellyfin, a provider can also be your own files,
+read directly instead of pulled from an IPTV panel: a **local folder** or
+mounted path (including NFS, via a Docker volume or host mount — there's
+no separate "NFS" backend since the underlying tool this feature is built
+on, [rclone](https://rclone.org), has no NFS client), an **SMB/CIFS
+share**, an **SFTP server**, **S3-compatible storage** (AWS, MinIO, Wasabi,
+B2, and similar), or **Google Drive / Dropbox / Box**. Each file's name is
+parsed for a title/year/season/episode and matched against TMDB
+conservatively — anything uncertain lands in the existing Missing
+Artwork/Needs Review queues instead of guessing, and your files are never
+deleted or modified by anything in VOD & DVR Manager. The three cloud
+providers use an OAuth token you generate yourself with `rclone authorize`
+on your own machine — VOD & DVR Manager never sees your real login for any of
+them. MediaFire isn't supported (not an rclone backend); Box uses the same
+mechanism as Drive/Dropbox but is less thoroughly tested. Full setup for
+each backend in
+[USERGUIDE.md](USERGUIDE.md#library-sources--local-folders-smb-sftp-and-cloud-storage).
 
 ## Connecting Dispatcharr instances
 
