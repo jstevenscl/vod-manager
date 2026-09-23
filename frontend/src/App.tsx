@@ -136,6 +136,20 @@ export default function App() {
     retry: false,
   })
   const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
+  const runtime = runtimeStatusQuery.data
+  const catalogBusy = !!(runtime?.import.running || runtime?.import.queued || runtime?.bulk_ai.running || runtime?.tmdb.running || runtime?.enrichment.running)
+  const catalogFailed = !catalogBusy && !!runtime?.import.error
+  const catalogDetail = runtime?.import.running
+    ? `Importing ${runtime.import.provider_name ?? 'provider'}…`
+    : runtime?.import.queued
+      ? `${runtime.import.provider_name ?? 'Provider'} import queued${runtime.import.queue_position && runtime.import.queue_position > 1 ? ` (${runtime.import.queue_position - 1} ahead)` : ''}…`
+      : runtime?.bulk_ai.running
+        ? `AI review: ${runtime.bulk_ai.done}/${runtime.bulk_ai.total}`
+        : runtime?.tmdb.running
+          ? `TMDB: ${runtime.tmdb.done}/${runtime.tmdb.total}`
+          : runtime?.enrichment.running
+            ? `Enriching: ${runtime.enrichment.movies_done}/${runtime.enrichment.movies_total} movies · ${runtime.enrichment.series_done}/${runtime.enrichment.series_total} series`
+            : catalogFailed ? 'Import needs attention. Check the provider and retry.' : 'Idle'
 
   useEffect(() => {
     if (isLoading) return
@@ -215,8 +229,8 @@ export default function App() {
           <div className="min-w-0">
             <div className="text-sm font-bold tracking-tight leading-tight">VOD & DVR Manager</div>
             {versionQuery.data && (
-              <div className="text-[10px] text-muted-foreground font-mono truncate" title={`ref: ${versionQuery.data.ref}`}>
-                v{versionQuery.data.version} · {versionQuery.data.commit}
+              <div className="text-[11px] text-foreground/80 font-mono font-medium truncate" title={`ref: ${versionQuery.data.ref}`}>
+                <span className="text-foreground">v{versionQuery.data.version}</span> <span className="text-primary">· {versionQuery.data.commit}</span>
               </div>
             )}
           </div>
@@ -246,34 +260,37 @@ export default function App() {
           ))}
           <div className="rounded-md border border-border bg-background/60 px-2.5 py-2 text-[11px] text-muted-foreground">
             <div className="flex items-center gap-1.5 font-semibold text-foreground">
-              <Activity size={13} className={runtimeStatusQuery.data?.import.running || runtimeStatusQuery.data?.import.queued || runtimeStatusQuery.data?.enrichment.running || runtimeStatusQuery.data?.tmdb.running || runtimeStatusQuery.data?.bulk_ai.running ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
+              <Activity size={13} className={catalogBusy ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
               Status
             </div>
-            {runtimeStatusQuery.data?.import.running ? (
-              <p className="mt-1">Importing {runtimeStatusQuery.data.import.provider_name ?? 'provider'}…</p>
-            ) : runtimeStatusQuery.data?.import.queued ? (
-              <p className="mt-1">{runtimeStatusQuery.data.import.provider_name ?? 'Provider'} import queued{runtimeStatusQuery.data.import.queue_position && runtimeStatusQuery.data.import.queue_position > 1 ? ` (${runtimeStatusQuery.data.import.queue_position} ahead)` : ''}…</p>
-            ) : runtimeStatusQuery.data?.bulk_ai.running ? (
-              <p className="mt-1">AI review: {runtimeStatusQuery.data.bulk_ai.done}/{runtimeStatusQuery.data.bulk_ai.total}</p>
-            ) : runtimeStatusQuery.data?.tmdb.running ? (
-              <p className="mt-1">TMDB: {runtimeStatusQuery.data.tmdb.done}/{runtimeStatusQuery.data.tmdb.total}</p>
-            ) : runtimeStatusQuery.data?.enrichment.running ? (
-              <p className="mt-1">Enriching: {runtimeStatusQuery.data.enrichment.movies_done}/{runtimeStatusQuery.data.enrichment.movies_total} movies · {runtimeStatusQuery.data.enrichment.series_done}/{runtimeStatusQuery.data.enrichment.series_total} series</p>
-            ) : (
-              <p className="mt-1">Idle</p>
-            )}
+            <p className="mt-1">{catalogDetail}</p>
             <p className="mt-1 text-[10px] text-muted-foreground/80">App CPU: {runtimeStatusQuery.data?.process_cpu_percent == null ? 'sampling…' : `${runtimeStatusQuery.data.process_cpu_percent}%`}</p>
           </div>
         </nav>
       </aside>
 
       <div className="flex flex-col min-w-0">
-        <header className="sticky top-0 z-10 flex items-center gap-3.5 px-5 py-2.5 border-b border-border bg-card">
+        <header className="sticky top-0 z-10 flex flex-wrap items-center gap-3.5 px-5 py-2.5 border-b border-border bg-card">
           <div className="flex-1 max-w-[380px] flex items-center gap-2 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-muted-foreground/70">
             <Search size={13} className="flex-shrink-0" />
             Search coming soon…
           </div>
-          <div className="flex-1" />
+          {runtime ? (
+            <div
+              role="status"
+              aria-label="Catalog status"
+              aria-atomic="true"
+              className={`order-last min-w-0 basis-full flex-1 rounded-md border px-4 py-1.5 text-center 2xl:order-none 2xl:basis-auto ${
+                catalogFailed ? 'border-destructive/40 bg-destructive/10' : 'border-primary/35 bg-primary/10'
+              }`}
+            >
+              <div className="flex items-center justify-center gap-1.5 text-[12px] font-semibold text-foreground">
+                <Activity size={14} aria-hidden="true" className={catalogFailed ? 'text-destructive' : 'text-primary'} />
+                <span>Catalog status</span>
+              </div>
+              <p className="mt-0.5 break-words text-[11px] text-foreground/80">{catalogDetail}</p>
+            </div>
+          ) : <div className="flex-1" />}
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             {(THEMES as readonly Theme[]).map((t) => {
               const meta = THEME_META[t]
