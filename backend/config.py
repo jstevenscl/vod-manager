@@ -44,8 +44,10 @@ LOG_BACKUP_COUNT = 5
 # loop and not wrapped in asyncio.to_thread, stall every concurrent
 # request in the whole app, not just the slow one. Caching removes the
 # disk read from the hot path entirely for every call after the first.
-# Nothing else writes this file (single-process, single-container app), so
-# there's no external-invalidation case to handle.
+#
+# Reads staying cached (possibly stale) is fine -- config values rarely
+# need to be instantaneously fresh across processes. WRITES are a
+# different story: see _update_raw below.
 _raw_cache: dict | None = None
 
 
@@ -69,6 +71,76 @@ def _write_raw(data: dict) -> None:
     _raw_cache = data
 
 
+# Guards every config.json WRITE (not reads -- see _raw_cache's own
+# docstring) against two different processes stepping on each other.
+# _CONFIG_WRITE_LOCK (in-process) and an flock on a sibling lock file
+# (cross-process, POSIX only) together close both halves of the race --
+# flock alone doesn't serialize two threads in the SAME process (POSIX
+# advisory locks are per-process), and the in-process lock obviously can't
+# reach a separate process.
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+def _config_write_window_hook() -> None:
+    """No-op in production. Sits at the exact point a racing writer has
+    already read a (possibly stale) config dict but before it has acquired
+    the lock below -- tests monkeypatch this to force genuine interleaving
+    right at that window, rather than relying on OS scheduling luck to
+    (rarely, flakily) hit a race this narrow."""
+    pass
+
+
+def _update_raw(mutate) -> dict:
+    """The only correct way to WRITE any part of config.json. Every
+    `data = _read_raw(); data[...] = x; _write_raw(data)` call site used to
+    read from (and write back) this PROCESS's own possibly-stale in-memory
+    cache -- if a DIFFERENT process had written config.json since this
+    process's cache was last populated, that write blindly overwrites the
+    whole file with a dict that never saw the other process's change,
+    silently erasing it. Not a narrow one-time race: it can happen on ANY
+    write, at ANY time, any time two processes touch config.json around
+    the same time (a one-off `docker exec`/`docker run --rm` script against
+    the same data volume while the app is up is an explicitly supported
+    pattern -- see _raw_cache's own docstring).
+
+    Found live 2026-09-23 testing playback after merging three PRs: a
+    `docker exec` script created an XC client (encrypting its password
+    under a freshly-generated key K1, written to config.json). Moments
+    later the app's own background enrichment scheduler called
+    save_last_enrichment_run from ITS process, whose cache had been
+    populated as {} (no key) before the script ran -- that write blindly
+    overwrote config.json with its stale dict, erasing K1. The client's
+    password was left permanently encrypted under a key nothing could
+    reconstruct; the very next credential encrypted anywhere in the app
+    silently generated ANOTHER new key, masking the loss with no error at
+    all until playback failed with an inexplicable 401.
+
+    mutate(data) is called with a dict freshly read from disk under the
+    lock (bypassing every process's stale cache, including this one's) and
+    should mutate it in place; the result is then written back and
+    returned. This subsumes get_or_create_encryption_key's own former
+    bespoke lock+fresh-read, which is now just one caller of this same
+    general mechanism."""
+    _config_write_window_hook()
+    with _CONFIG_WRITE_LOCK:
+        lock_path = CONFIG_FILE.parent / ".config.lock"
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+")
+        try:
+            if fcntl:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+            global _raw_cache
+            _raw_cache = None  # force a genuine disk read, not this process's stale cache
+            data = _read_raw()
+            mutate(data)
+            _write_raw(data)
+            return data
+        finally:
+            if fcntl:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+
+
 # ── Dispatcharr connection ───────────────────────────────────────────────────
 
 def get_config() -> tuple[str, str]:
@@ -81,9 +153,7 @@ def get_config() -> tuple[str, str]:
 
 
 def save_config(url: str, token: str) -> None:
-    data = _read_raw()
-    data.update({"dispatcharr_url": url.rstrip("/"), "dispatcharr_token": token})
-    _write_raw(data)
+    _update_raw(lambda data: data.update({"dispatcharr_url": url.rstrip("/"), "dispatcharr_token": token}))
 
 
 def config_from_env() -> bool:
@@ -105,23 +175,6 @@ def is_configured() -> bool:
 # destroying the Dispatcharr connection / TMDB key / admin login, not a new
 # separate footgun.
 
-# Guards get_or_create_encryption_key's check-then-generate-then-write against
-# two callers racing to create the FIRST key (see that function's docstring)
-# -- this half covers callers within this one process (concurrent requests
-# each encrypting a credential for the first time run on separate
-# asyncio.to_thread worker threads, not serialized by the event loop).
-_ENCRYPTION_KEY_LOCK = threading.Lock()
-
-
-def _race_window_hook() -> None:
-    """No-op in production. Sits at the exact point every racing caller has
-    already observed "no key yet" but before any of them has acquired the
-    lock below -- tests monkeypatch this to force genuine thread
-    interleaving right at that window, rather than relying on OS scheduling
-    luck to (rarely, flakily) hit a race this narrow."""
-    pass
-
-
 def get_or_create_encryption_key() -> bytes:
     """Generating this key is a one-time, NOT-safely-repeatable event: unlike
     every other config.json field, once ANYTHING has been encrypted under a
@@ -129,57 +182,21 @@ def get_or_create_encryption_key() -> bytes:
     cleanly -- decrypt_value's InvalidToken fallback returns that old
     ciphertext unchanged with no error, so the credential just quietly stops
     working (surfaces later as an inexplicable "wrong password", not an
-    error pointing at the real cause).
-
-    Without locking, two callers reading config.json before either has
-    written a key each generate their OWN key and write it, last-writer-wins
-    -- orphaning whatever the other one encrypted moments before. Found live
-    2026-09-22: a one-off script (`docker exec`/`docker run --rm` against
-    the same data volume while the app is up -- an explicitly supported
-    pattern, see this module's _raw_cache docstring and the project's own
-    "isolated docker run for tests" convention) created an XC client that
-    the running app's own decrypt then silently rejected, because the two
-    processes' first-ever encrypt/decrypt calls raced this exact check.
-
-    _ENCRYPTION_KEY_LOCK (in-process) and an flock on a sibling lock file
-    (cross-process, POSIX only) together close both halves of that race --
-    flock alone doesn't serialize two threads in the SAME process (POSIX
-    advisory locks are per-process), and the in-process lock obviously can't
-    reach a separate process."""
+    error pointing at the real cause). See _update_raw's own docstring for
+    the two distinct races this guards against (creating the key at all,
+    and a later unrelated write silently erasing an already-created one)."""
     data = _read_raw()
     key = data.get("encryption_key")
     if key:
         return key.encode()
 
-    _race_window_hook()
-    with _ENCRYPTION_KEY_LOCK:
-        # Next to CONFIG_FILE (not the DATA_DIR module global) so it tracks
-        # wherever config.json actually lives, including when a test
-        # monkeypatches CONFIG_FILE to an isolated path.
-        lock_path = CONFIG_FILE.parent / ".encryption_key.lock"
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = open(lock_path, "a+")
-        try:
-            if fcntl:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-            # Re-read from disk, bypassing the in-process cache -- another
-            # process may have written a key while we waited for the lock,
-            # and trusting our stale pre-lock read here would regenerate one
-            # anyway, defeating the whole point of taking the lock.
-            global _raw_cache
-            _raw_cache = None
-            data = _read_raw()
-            key = data.get("encryption_key")
-            if key:
-                return key.encode()
-            new_key = Fernet.generate_key()
-            data["encryption_key"] = new_key.decode()
-            _write_raw(data)
-            return new_key
-        finally:
-            if fcntl:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
+    result = {}
+    def _mutate(d: dict) -> None:
+        if not d.get("encryption_key"):
+            d["encryption_key"] = Fernet.generate_key().decode()
+        result["key"] = d["encryption_key"]
+    _update_raw(_mutate)
+    return result["key"].encode()
 
 
 # ── VOD manager ──────────────────────────────────────────────────────────────
@@ -194,9 +211,7 @@ def get_vod_xc_account_id() -> int | None:
 
 
 def save_vod_xc_account_id(account_id: int) -> None:
-    data = _read_raw()
-    data["vod_xc_account_id"] = int(account_id)
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("vod_xc_account_id", int(account_id)))
 
 
 def get_last_enrichment_run() -> float | None:
@@ -209,9 +224,7 @@ def get_last_enrichment_run() -> float | None:
 
 
 def save_last_enrichment_run(timestamp: float) -> None:
-    data = _read_raw()
-    data["last_enrichment_run"] = timestamp
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("last_enrichment_run", timestamp))
 
 
 def get_tmdb_api_key() -> str | None:
@@ -220,9 +233,7 @@ def get_tmdb_api_key() -> str | None:
 
 
 def save_tmdb_api_key(api_key: str) -> None:
-    data = _read_raw()
-    data["tmdb_api_key"] = api_key
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("tmdb_api_key", api_key))
 
 
 def get_mdblist_api_key() -> str | None:
@@ -231,9 +242,7 @@ def get_mdblist_api_key() -> str | None:
 
 
 def save_mdblist_api_key(api_key: str) -> None:
-    data = _read_raw()
-    data["mdblist_api_key"] = api_key
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("mdblist_api_key", api_key))
 
 
 def get_anthropic_api_key() -> str | None:
@@ -242,9 +251,7 @@ def get_anthropic_api_key() -> str | None:
 
 
 def save_anthropic_api_key(api_key: str) -> None:
-    data = _read_raw()
-    data["anthropic_api_key"] = api_key
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("anthropic_api_key", api_key))
 
 
 # ── SMTP / notifications ─────────────────────────────────────────────────────
@@ -275,21 +282,21 @@ def save_smtp_settings(
     from_address: str | None, use_tls: bool, admin_recipients: list[str],
 ) -> None:
     import secrets_util
-    data = _read_raw()
-    existing = data.get("smtp") or {}
-    data["smtp"] = {
-        "host": host,
-        "port": port,
-        "username": username,
-        # A blank password on save means "leave the existing one alone" --
-        # the settings form never round-trips the real decrypted password
-        # back to the browser, so an empty submit must not wipe it.
-        "password": secrets_util.encrypt_value(password) if password else existing.get("password"),
-        "from_address": from_address,
-        "use_tls": use_tls,
-        "admin_recipients": admin_recipients,
-    }
-    _write_raw(data)
+    def _mutate(data: dict) -> None:
+        existing = data.get("smtp") or {}
+        data["smtp"] = {
+            "host": host,
+            "port": port,
+            "username": username,
+            # A blank password on save means "leave the existing one alone" --
+            # the settings form never round-trips the real decrypted password
+            # back to the browser, so an empty submit must not wipe it.
+            "password": secrets_util.encrypt_value(password) if password else existing.get("password"),
+            "from_address": from_address,
+            "use_tls": use_tls,
+            "admin_recipients": admin_recipients,
+        }
+    _update_raw(_mutate)
 
 
 # ── Stream source priority mode ──────────────────────────────────────────────
@@ -309,9 +316,7 @@ def get_stream_priority_mode() -> str:
 def save_stream_priority_mode(mode: str) -> None:
     if mode not in STREAM_PRIORITY_MODES:
         raise ValueError(f"invalid stream_priority_mode: {mode!r}")
-    data = _read_raw()
-    data["stream_priority_mode"] = mode
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("stream_priority_mode", mode))
 
 
 # ── XC title display format (GH issue #1) ────────────────────────────────────
@@ -327,9 +332,7 @@ def get_xc_title_include_year() -> bool:
 
 
 def save_xc_title_include_year(enabled: bool) -> None:
-    data = _read_raw()
-    data["xc_title_include_year"] = bool(enabled)
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("xc_title_include_year", bool(enabled)))
 
 
 # ── Duplicate Finder: quality-prefix matching ────────────────────────────────
@@ -350,9 +353,7 @@ def get_duplicate_finder_quality_prefix_matching() -> bool:
 
 
 def save_duplicate_finder_quality_prefix_matching(enabled: bool) -> None:
-    data = _read_raw()
-    data["duplicate_finder_quality_prefix_matching"] = bool(enabled)
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("duplicate_finder_quality_prefix_matching", bool(enabled)))
 
 
 def get_duplicate_finder_auto_merge_tmdb() -> bool:
@@ -360,9 +361,7 @@ def get_duplicate_finder_auto_merge_tmdb() -> bool:
 
 
 def save_duplicate_finder_auto_merge_tmdb(enabled: bool) -> None:
-    data = _read_raw()
-    data["duplicate_finder_auto_merge_tmdb"] = bool(enabled)
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("duplicate_finder_auto_merge_tmdb", bool(enabled)))
 
 
 # ── AI provider selection ────────────────────────────────────────────────────
@@ -393,10 +392,10 @@ def get_ai_model() -> str:
 def save_ai_provider(provider: str, model: str | None = None) -> None:
     if provider not in AI_PROVIDERS:
         raise ValueError(f"unknown AI provider '{provider}'")
-    data = _read_raw()
-    data["ai_provider"] = provider
-    data["ai_model"] = model.strip() if model and model.strip() else _AI_DEFAULT_MODELS[provider]
-    _write_raw(data)
+    def _mutate(data: dict) -> None:
+        data["ai_provider"] = provider
+        data["ai_model"] = model.strip() if model and model.strip() else _AI_DEFAULT_MODELS[provider]
+    _update_raw(_mutate)
 
 
 def get_import_language_exclusion() -> dict:
@@ -411,10 +410,10 @@ def get_import_language_exclusion() -> dict:
 
 
 def save_import_language_exclusion(exclude_prefixes: list[str], exclude_non_latin: bool) -> None:
-    data = _read_raw()
-    data["import_exclude_language_prefixes"] = [p.strip().upper() for p in exclude_prefixes if p.strip()]
-    data["import_exclude_non_latin"] = bool(exclude_non_latin)
-    _write_raw(data)
+    def _mutate(data: dict) -> None:
+        data["import_exclude_language_prefixes"] = [p.strip().upper() for p in exclude_prefixes if p.strip()]
+        data["import_exclude_non_latin"] = bool(exclude_non_latin)
+    _update_raw(_mutate)
 
 
 def get_import_country_exclusion() -> list[str]:
@@ -430,9 +429,8 @@ def get_import_country_exclusion() -> list[str]:
 
 
 def save_import_country_exclusion(exclude_country_codes: list[str]) -> None:
-    data = _read_raw()
-    data["import_exclude_country_codes"] = [c.strip().upper() for c in exclude_country_codes if c.strip()]
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__(
+        "import_exclude_country_codes", [c.strip().upper() for c in exclude_country_codes if c.strip()]))
 
 
 def get_enabled_languages() -> list[str]:
@@ -453,9 +451,8 @@ def get_enabled_languages() -> list[str]:
 
 
 def save_enabled_languages(codes: list[str]) -> None:
-    data = _read_raw()
-    data["enabled_playback_languages"] = [c.strip().upper() for c in codes if c.strip()]
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__(
+        "enabled_playback_languages", [c.strip().upper() for c in codes if c.strip()]))
 
 
 def get_default_categories_prompt_dismissed() -> bool:
@@ -468,9 +465,7 @@ def get_default_categories_prompt_dismissed() -> bool:
 
 
 def set_default_categories_prompt_dismissed() -> None:
-    data = _read_raw()
-    data["default_categories_prompt_dismissed"] = True
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("default_categories_prompt_dismissed", True))
 
 
 def get_hide_dvr_tab() -> bool:
@@ -483,9 +478,7 @@ def get_hide_dvr_tab() -> bool:
 
 
 def set_hide_dvr_tab(hidden: bool) -> None:
-    data = _read_raw()
-    data["hide_dvr_tab"] = hidden
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("hide_dvr_tab", hidden))
 
 
 def get_openai_api_key() -> str | None:
@@ -494,9 +487,7 @@ def get_openai_api_key() -> str | None:
 
 
 def save_openai_api_key(api_key: str) -> None:
-    data = _read_raw()
-    data["openai_api_key"] = api_key
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("openai_api_key", api_key))
 
 
 def get_gemini_api_key() -> str | None:
@@ -505,9 +496,7 @@ def get_gemini_api_key() -> str | None:
 
 
 def save_gemini_api_key(api_key: str) -> None:
-    data = _read_raw()
-    data["gemini_api_key"] = api_key
-    _write_raw(data)
+    _update_raw(lambda data: data.__setitem__("gemini_api_key", api_key))
 
 
 # ── XC login lockout ─────────────────────────────────────────────────────────
@@ -530,13 +519,11 @@ def get_lockout_settings() -> dict:
 
 
 def save_lockout_settings(max_attempts: int, window_seconds: int, duration_seconds: int) -> None:
-    data = _read_raw()
-    data.update({
+    _update_raw(lambda data: data.update({
         "lockout_max_attempts":     max(1, int(max_attempts)),
         "lockout_window_seconds":   max(1, int(window_seconds)),
         "lockout_duration_seconds": max(1, int(duration_seconds)),
-    })
-    _write_raw(data)
+    }))
 
 
 # ── Background refresh scheduling ───────────────────────────────────────────
@@ -573,16 +560,14 @@ def save_refresh_settings(
     enrichment_ttl_seconds: int,
     tmdb_sync_interval_seconds: int | None,
 ) -> None:
-    data = _read_raw()
-    data.update({
+    _update_raw(lambda data: data.update({
         "catalog_refresh_seconds_xc":       max(60, int(catalog_refresh_seconds_xc)),
         "catalog_refresh_seconds_plex":     max(60, int(catalog_refresh_seconds_plex)),
         "catalog_refresh_seconds_emby":     max(60, int(catalog_refresh_seconds_emby)),
         "catalog_refresh_seconds_jellyfin": max(60, int(catalog_refresh_seconds_jellyfin)),
         "enrichment_ttl_seconds":           max(60, int(enrichment_ttl_seconds)),
         "tmdb_sync_interval_seconds":       max(60, int(tmdb_sync_interval_seconds)) if tmdb_sync_interval_seconds else None,
-    })
-    _write_raw(data)
+    }))
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -643,6 +628,5 @@ def verify_credentials(username: str, password: str) -> bool:
 def set_credentials(username: str, password: str) -> None:
     salt   = secrets.token_hex(16)
     hashed = _hash_password(password, salt)
-    data   = _read_raw()
-    data.update({"auth_username": username, "auth_salt": salt, "auth_hash": hashed, "auth_scheme": "pbkdf2"})
-    _write_raw(data)
+    _update_raw(lambda data: data.update(
+        {"auth_username": username, "auth_salt": salt, "auth_hash": hashed, "auth_scheme": "pbkdf2"}))
