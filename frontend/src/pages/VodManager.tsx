@@ -4738,6 +4738,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [syncHistorySelected, setSyncHistorySelected] = useState<Set<number>>(new Set())
   const [syncHistoryOpen, setSyncHistoryOpen] = useState<number | null>(null)
+  const [syncHistoryEventTab, setSyncHistoryEventTab] = useState<'movie' | 'series'>('movie')
   const syncHistoryDetailQuery = useQuery<CatalogSyncRun>({
     queryKey: ['vod-sync-history-detail', syncHistoryOpen],
     queryFn: () => api.get(`/vod/sync-history/${syncHistoryOpen}/`).then((r) => r.data),
@@ -7833,7 +7834,23 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                         ['Review', syncDuration(detail.reconciliation_started_at, detail.reconciliation_finished_at)],
                       ].map(([label, value]) => <div key={label} className="rounded border border-border/50 bg-background/40 px-2 py-1.5"><div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div><div className="font-semibold tabular-nums">{value}</div></div>)}</div>
                       <div className="rounded border border-border/50 bg-background/30 p-2"><div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">What this run did</div>{summaryEntries.length ? <div className="grid gap-x-4 gap-y-1 sm:grid-cols-3">{summaryEntries.map(([key, value]) => <div key={key} className="flex justify-between gap-2"><span className="text-muted-foreground">{syncLabel(key)}</span><span className="font-medium tabular-nums">{String(value)}</span></div>)}</div> : <div className="text-muted-foreground">No summary counters were recorded.</div>}</div>
-                      {detail.events?.length ? <div className="space-y-1.5"><div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Catalog changes and actions</div><ul className="space-y-1.5">{detail.events.map((event) => <li key={event.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border/40 bg-background/25 px-2 py-1.5"><span className="text-muted-foreground">{event.content_type === 'movie' ? 'Movie' : 'TV'}</span><span className="font-medium">{event.title}{event.year ? ` (${event.year})` : ''}</span><span className="text-cyan-300">{syncLabel(event.action)}</span><span className="text-muted-foreground">{syncEventDescription(event)}</span><Button size="sm" variant="ghost" className="ml-auto h-6 px-1.5 text-[10px]" onClick={() => setActiveTab(event.content_type === 'movie' ? 'movies' : 'series')}>Open {event.content_type === 'movie' ? 'Movies' : 'TV Shows'}</Button></li>)}</ul></div> : <div className="rounded border border-dashed border-border/60 p-2 text-muted-foreground">No catalog cards changed in this run. The provider refresh completed without enrichment, automatic merges, or review work.</div>}
+                      {(() => {
+                        const events = detail.events ?? []
+                        const movieEvents = events.filter((event) => event.content_type === 'movie')
+                        const seriesEvents = events.filter((event) => event.content_type === 'series')
+                        const visibleEvents = syncHistoryEventTab === 'movie' ? movieEvents : seriesEvents
+                        return <div className="space-y-1.5">
+                          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Catalog changes and actions</div>
+                          <div className="flex items-center gap-1 border-b border-border/50">
+                            {([['movie', 'Movies', movieEvents.length], ['series', 'Series', seriesEvents.length]] as const).map(([tab, label, count]) => (
+                              <button key={tab} type="button" className={`border-b-2 px-2.5 py-1.5 text-xs font-medium transition-colors ${syncHistoryEventTab === tab ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setSyncHistoryEventTab(tab)}>
+                                {label} <span className="ml-1 tabular-nums text-[10px]">{count.toLocaleString()}</span>
+                              </button>
+                            ))}
+                          </div>
+                          {visibleEvents.length ? <ul className="space-y-1.5">{visibleEvents.map((event) => <li key={event.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border/40 bg-background/25 px-2 py-1.5"><span className="text-muted-foreground">{event.content_type === 'movie' ? 'Movie' : 'TV'}</span><span className="font-medium">{event.title}{event.year ? ` (${event.year})` : ''}</span><span className="text-cyan-300">{syncLabel(event.action)}</span><span className="text-muted-foreground">{syncEventDescription(event)}</span><Button size="sm" variant="ghost" className="ml-auto h-6 px-1.5 text-[10px]" onClick={() => setActiveTab(event.content_type === 'movie' ? 'movies' : 'series')}>Open {event.content_type === 'movie' ? 'Movies' : 'TV Shows'}</Button></li>)}</ul> : <div className="rounded border border-dashed border-border/60 p-2 text-muted-foreground">No {syncHistoryEventTab === 'movie' ? 'movie' : 'series'} cards changed in this run.</div>}
+                        </div>
+                      })()}
                     </>
                   })()}
                 </div>}</td></tr>}
