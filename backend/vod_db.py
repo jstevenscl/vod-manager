@@ -8910,6 +8910,11 @@ def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> N
                 (into_id, from_id, p["category_id"]),
             )
 
+    # series_sources cascades on the series delete below -- move them first,
+    # or the next import no longer recognises from's provider shows and
+    # re-creates them. UNIQUE is (provider_id, provider_series_id), so this
+    # can't conflict.
+    conn.execute("UPDATE series_sources SET series_id=? WHERE series_id=?", (into_id, from_id))
     conn.execute("DELETE FROM series WHERE id=?", (from_id,))
 
 
