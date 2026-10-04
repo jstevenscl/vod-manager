@@ -200,16 +200,35 @@ def _coerce_int(value) -> int | None:
         return None
 
 
-def _catalog_fingerprint(kind: str, item: dict, provider_category_name: str | None = None) -> str:
-    """Hash only provider-owned list fields that can change catalog state."""
-    fields = (
-        ("stream_id", "name", "category_id", "container_extension", "tmdb", "stream_icon", "cover", "cover_big", "movie_image")
-        if kind == "movie" else
-        ("series_id", "name", "year", "category_id", "genre", "plot", "cast", "director", "cover", "rating", "releaseDate", "release_date", "tmdb", "tmdb_id", "last_modified")
-    )
+# KNM: 2026-10-04 -- artwork and descriptive metadata come from TMDB after
+# import, so provider image-URL rotation was flagging ~25K titles "changed"
+# on one refresh and re-running enrichment for all of them. Only fields that
+# decide playback, identity or placement count; last_modified stays because
+# it is a series' new-episodes signal.
+_CATALOG_FINGERPRINT_FIELDS = {
+    "movie": ("stream_id", "name", "category_id", "container_extension", "tmdb", "tmdb_id"),
+    "series": ("series_id", "name", "year", "category_id", "tmdb", "tmdb_id", "last_modified"),
+}
+_LEGACY_CATALOG_FINGERPRINT_FIELDS = {
+    "movie": ("stream_id", "name", "category_id", "container_extension", "tmdb", "stream_icon", "cover", "cover_big", "movie_image"),
+    "series": ("series_id", "name", "year", "category_id", "genre", "plot", "cast", "director", "cover", "rating", "releaseDate", "release_date", "tmdb", "tmdb_id", "last_modified"),
+}
+
+
+def _hash_catalog_fields(fields, item: dict, provider_category_name: str | None) -> str:
     payload = {field: item.get(field) for field in fields}
     payload["provider_category_name"] = provider_category_name
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _catalog_fingerprint(kind: str, item: dict, provider_category_name: str | None = None) -> str:
+    """Hash only provider-owned list fields that can change catalog state."""
+    return _hash_catalog_fields(_CATALOG_FINGERPRINT_FIELDS[kind], item, provider_category_name)
+
+
+def _legacy_catalog_fingerprint(kind: str, item: dict, provider_category_name: str | None = None) -> str:
+    """Pre-2026-10-04 fingerprint, used only to upgrade stored values in place."""
+    return _hash_catalog_fields(_LEGACY_CATALOG_FINGERPRINT_FIELDS[kind], item, provider_category_name)
 
 
 def _coerce_year(value) -> int | None:
@@ -645,6 +664,7 @@ def _build_movie_import_items(streams, category_names, exclude_categories, exclu
             # priority feature would need (see vod_manager-ghi).
             "raw_name": s.get("name") or "",
             "catalog_fingerprint": _catalog_fingerprint("movie", s, category_name),
+            "legacy_catalog_fingerprint": _legacy_catalog_fingerprint("movie", s, category_name),
             # Some providers' bulk get_vod_streams list already includes
             # this (confirmed live 2026-09-05: 3 of 5 real providers) --
             # capturing it lets enrich_movie's TMDB-first fallback kick in
@@ -733,6 +753,7 @@ def _build_series_import_items(series_list, series_category_names, exclude_categ
             # Title & Metadata Rules clean it up.
             "raw_name": s.get("name") or "",
             "catalog_fingerprint": _catalog_fingerprint("series", s, category_name),
+            "legacy_catalog_fingerprint": _legacy_catalog_fingerprint("series", s, category_name),
             "_has_detail": True,
             "genre": vod_db.apply_rules_to_value(s.get("genre") or None, detail_rules["genre"]),
             "description": vod_db.apply_rules_to_value(s.get("plot") or None, detail_rules["description"]),

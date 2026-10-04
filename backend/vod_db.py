@@ -7666,15 +7666,30 @@ def _looks_adult(*category_names) -> bool:
     return False
 
 
-def _catalog_fingerprint_from_item(kind: str, item: dict) -> str:
+# KNM: 2026-10-04 -- artwork/descriptive metadata dropped to match the
+# importer's _catalog_fingerprint; the legacy set only upgrades stored values.
+_ITEM_FINGERPRINT_FIELDS = {
+    "movie": ("provider_stream_id", "name", "year", "container_extension", "provider_category_name", "raw_name", "tmdb_id"),
+    "series": ("provider_series_id", "name", "year", "provider_category_name", "raw_name", "tmdb_id", "provider_last_modified"),
+}
+_LEGACY_ITEM_FINGERPRINT_FIELDS = {
+    "movie": ("provider_stream_id", "name", "year", "container_extension", "provider_category_name", "raw_name", "tmdb_id", "poster_url"),
+    "series": ("provider_series_id", "name", "year", "provider_category_name", "raw_name", "genre", "description", "cast_list", "director", "poster_url", "rating", "release_date", "tmdb_id", "provider_last_modified"),
+}
+
+
+def _catalog_fingerprint_from_item(kind: str, item: dict, legacy: bool = False) -> str:
     """Fallback for direct/test callers that predate importer fingerprints."""
-    fields = (
-        ("provider_stream_id", "name", "year", "container_extension", "provider_category_name", "raw_name", "tmdb_id", "poster_url")
-        if kind == "movie" else
-        ("provider_series_id", "name", "year", "provider_category_name", "raw_name", "genre", "description", "cast_list", "director", "poster_url", "rating", "release_date", "tmdb_id", "provider_last_modified")
-    )
+    fields = (_LEGACY_ITEM_FINGERPRINT_FIELDS if legacy else _ITEM_FINGERPRINT_FIELDS)[kind]
     payload = {field: item.get(field) for field in fields}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _source_fingerprints(kind: str, item: dict) -> tuple[str, str]:
+    """(current, legacy) fingerprints for an import item."""
+    if item.get("catalog_fingerprint"):
+        return item["catalog_fingerprint"], item.get("legacy_catalog_fingerprint")
+    return _catalog_fingerprint_from_item(kind, item), _catalog_fingerprint_from_item(kind, item, legacy=True)
 
 
 def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 0) -> dict:
@@ -7899,8 +7914,12 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
 
                     item_lang = _source_language(item.get("raw_name"))
                     existing_source = sources_by_stream_id.get(item["provider_stream_id"])
-                    source_fingerprint = item.get("catalog_fingerprint") or _catalog_fingerprint_from_item("movie", item)
+                    source_fingerprint, legacy_fingerprint = _source_fingerprints("movie", item)
                     source_changed = not existing_source or existing_source["catalog_fingerprint"] != source_fingerprint
+                    fingerprint_upgrade = bool(source_changed and existing_source and legacy_fingerprint
+                                               and existing_source["catalog_fingerprint"] == legacy_fingerprint)
+                    if fingerprint_upgrade:
+                        source_changed = False
                     if existing_source and _movie_language_ok(existing_source["movie_id"], item_lang):
                         movie_id = existing_source["movie_id"]
                         did_match = True
@@ -8004,6 +8023,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         "did_create": did_create, "did_match": did_match, "did_flag": did_flag,
                         "did_archive": did_archive, "did_unarchive": did_unarchive,
                         "source_fingerprint": source_fingerprint, "source_changed": source_changed,
+                        "fingerprint_upgrade": fingerprint_upgrade,
                     })
                 except Exception as exc:
                     errors += 1
@@ -8089,6 +8109,11 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                  int(not item.get("tmdb_id")), now, now),
                             )
                             sources_changed += 1
+                        elif entry["fingerprint_upgrade"]:
+                            conn.execute(
+                                "UPDATE movie_sources SET catalog_fingerprint=? WHERE provider_id=? AND provider_stream_id=?",
+                                (entry["source_fingerprint"], provider_id, item["provider_stream_id"]),
+                            )
                         created += entry["did_create"]
                         matched += entry["did_match"]
                         flagged += entry["did_flag"]
@@ -8306,9 +8331,13 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                     cat_update_needed = False
 
                     item_lang = _source_language(item.get("raw_name"))
-                    source_fingerprint = item.get("catalog_fingerprint") or _catalog_fingerprint_from_item("series", item)
+                    source_fingerprint, legacy_fingerprint = _source_fingerprints("series", item)
                     previous_fingerprint = source_fingerprints.get(item.get("provider_series_id"))
                     source_changed = item.get("provider_series_id") not in source_fingerprints or previous_fingerprint != source_fingerprint
+                    fingerprint_upgrade = bool(source_changed and previous_fingerprint and legacy_fingerprint
+                                               and previous_fingerprint == legacy_fingerprint)
+                    if fingerprint_upgrade:
+                        source_changed = False
                     existing = existing_by_series_id.get(item.get("provider_series_id"))
                     if existing and _series_language_ok(existing["id"], item_lang):
                         series_id = existing["id"]
@@ -8403,6 +8432,7 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         "did_archive": did_archive, "did_unarchive": did_unarchive,
                         "cat_update_needed": cat_update_needed,
                         "source_fingerprint": source_fingerprint, "source_changed": source_changed,
+                        "fingerprint_upgrade": fingerprint_upgrade,
                     })
                 except Exception as exc:
                     errors += 1
@@ -8476,6 +8506,11 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                                 (series_id, provider_id, item.get("provider_series_id"), item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name")), entry["source_fingerprint"], int(not item.get("tmdb_id")), now, now),
                             )
                             sources_changed += 1
+                        elif entry["fingerprint_upgrade"]:
+                            conn.execute(
+                                "UPDATE series_sources SET catalog_fingerprint=? WHERE provider_id=? AND provider_series_id=?",
+                                (entry["source_fingerprint"], provider_id, item.get("provider_series_id")),
+                            )
                         if entry["cat_update_needed"]:
                             # Real bug found live 2026-07-29: this value was captured
                             # in `item` on every single import pass but never
