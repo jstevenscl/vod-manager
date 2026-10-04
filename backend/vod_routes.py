@@ -1598,6 +1598,25 @@ async def set_provider_import_exclude_categories(provider_id: int, body: Provide
     return {"ok": True}
 
 
+@router.post("/providers/{provider_id}/purge-excluded-content/", dependencies=_GUARDS)
+async def purge_excluded_content(provider_id: int, dry_run: bool = True):
+    """Preview (default) or apply removal of content already imported in this
+    provider's now-excluded categories. The next catalog import applies the
+    same purge automatically."""
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(404, detail="provider not found")
+    result = await asyncio.to_thread(
+        vod_db.purge_excluded_category_sources, provider_id,
+        provider.get("import_exclude_categories") or [],
+        bool(provider.get("import_exclude_uncategorized")),
+        dry_run=dry_run,
+    )
+    result.pop("affected_movie_ids", None)
+    result.pop("affected_series_ids", None)
+    return result
+
+
 @router.post("/providers/{provider_id}/deactivate/", dependencies=_GUARDS)
 async def deactivate_provider(provider_id: int):
     if not vod_db.get_provider(provider_id):
@@ -3049,7 +3068,7 @@ async def year_review_suggestions(content_type: str, item_id: int, q: Optional[s
         # different region (e.g. international vs. North American title),
         # and the default search (item's own stored name) won't find a match
         # TMDB's index doesn't already associate with that exact string.
-        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        return await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3068,7 +3087,7 @@ async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[st
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3224,7 +3243,7 @@ async def missing_artwork_suggestions(content_type: str, item_id: int, q: Option
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        return await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3243,7 +3262,7 @@ async def missing_artwork_ai_suggest(content_type: str, item_id: int, q: Optiona
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:

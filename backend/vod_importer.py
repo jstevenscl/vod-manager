@@ -920,6 +920,21 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
             reconcile_result["episode_sources_removed"],
         )
 
+    # Reconcile above keeps sources the provider still lists, including ones
+    # in categories excluded after they were imported. Remove those now (see
+    # vod_db.purge_excluded_category_sources).
+    category_purge = await asyncio.to_thread(
+        vod_db.purge_excluded_category_sources, provider_id, exclude_categories, exclude_uncategorized,
+    )
+    category_purge.pop("affected_movie_ids", None)
+    category_purge.pop("affected_series_ids", None)
+    if category_purge["movie_sources_removed"] or category_purge["series_sources_removed"]:
+        logger.info(
+            "[vod_importer] provider=%s removed %d movie/%d series source(s) in excluded categories; deleted %d movie(s)/%d series",
+            provider["name"], category_purge["movie_sources_removed"], category_purge["series_sources_removed"],
+            category_purge["movies_deleted"], category_purge["series_deleted"],
+        )
+
     # A successful catalog pass is a safe opportunity to remove any legacy
     # rows with neither a provider source nor a playable episode source
     # (ported from knmplace's fork) -- catches whatever slips through the
@@ -998,6 +1013,7 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
         "series_categories": len(series_categories),
         **movie_result,
         **series_result,
+        "excluded_category_purge": category_purge,
     }
 
 
