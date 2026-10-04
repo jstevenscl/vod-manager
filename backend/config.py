@@ -479,6 +479,14 @@ _REFRESH_DEFAULTS = {
     "catalog_refresh_seconds_jellyfin": 6 * 3600,
     "enrichment_ttl_seconds":           24 * 3600,
     "tmdb_sync_interval_seconds":       None,
+    # KNM: 2026-10-03 -- paced episode trickle: at most this many pending
+    # series sources per provider per batch, one request at a time with a
+    # few seconds between them, so a big backlog never looks like a burst.
+    # KNM: 2026-10-04 -- pause 45 -> 15 min: ~300 shows/hr instead of ~100,
+    # same per-request pace (the part a provider actually feels).
+    "episode_trickle_batch":            100,
+    "episode_trickle_interval_seconds": 15 * 60,
+    "episode_trickle_spacing_seconds":  3,
 }
 
 
@@ -494,9 +502,22 @@ def save_refresh_settings(
     catalog_refresh_seconds_jellyfin: int,
     enrichment_ttl_seconds: int,
     tmdb_sync_interval_seconds: int | None,
+    episode_trickle_batch: int | None = None,
+    episode_trickle_interval_seconds: int | None = None,
+    episode_trickle_spacing_seconds: float | None = None,
 ) -> None:
+    # KNM: 2026-10-04 -- trickle pacing is tunable from Settings; the floors
+    # keep it gentle on providers (>=1 s between requests, >=5 min pause).
+    trickle = {}
+    if episode_trickle_batch is not None:
+        trickle["episode_trickle_batch"] = min(500, max(0, int(episode_trickle_batch)))
+    if episode_trickle_interval_seconds is not None:
+        trickle["episode_trickle_interval_seconds"] = min(86400, max(300, int(episode_trickle_interval_seconds)))
+    if episode_trickle_spacing_seconds is not None:
+        trickle["episode_trickle_spacing_seconds"] = min(60, max(1, float(episode_trickle_spacing_seconds)))
     data = _read_raw()
     data.update({
+        **trickle,
         "catalog_refresh_seconds_xc":       max(60, int(catalog_refresh_seconds_xc)),
         "catalog_refresh_seconds_plex":     max(60, int(catalog_refresh_seconds_plex)),
         "catalog_refresh_seconds_emby":     max(60, int(catalog_refresh_seconds_emby)),

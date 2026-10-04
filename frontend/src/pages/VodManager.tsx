@@ -276,6 +276,9 @@ interface RefreshSettings {
   catalog_refresh_seconds_jellyfin: number
   enrichment_ttl_seconds: number
   tmdb_sync_interval_seconds: number | null
+  episode_trickle_batch: number
+  episode_trickle_interval_seconds: number
+  episode_trickle_spacing_seconds: number
 }
 
 interface BackupComponent {
@@ -5099,6 +5102,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: string
     enrichment_ttl_hours: string
     tmdb_sync_hours: string
+    trickle_batch: string
+    trickle_pause_minutes: string
+    trickle_spacing_seconds: string
   } | null>(null)
   const secToHrStr = (s: number | null | undefined) => (s == null ? '' : String(s / 3600))
   const refreshValues = refreshForm ?? (refreshSettingsQuery.data ? {
@@ -5108,7 +5114,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_jellyfin),
     enrichment_ttl_hours:           secToHrStr(refreshSettingsQuery.data.enrichment_ttl_seconds),
     tmdb_sync_hours:                secToHrStr(refreshSettingsQuery.data.tmdb_sync_interval_seconds),
+    trickle_batch:                  String(refreshSettingsQuery.data.episode_trickle_batch),
+    trickle_pause_minutes:          String(refreshSettingsQuery.data.episode_trickle_interval_seconds / 60),
+    trickle_spacing_seconds:        String(refreshSettingsQuery.data.episode_trickle_spacing_seconds),
   } : null)
+  // KNM: 2026-10-04 -- live estimate for the episode preloading fields, so the
+  // effect of a change on the provider is visible before saving.
+  const trickleEstimate = (() => {
+    if (!refreshValues) return null
+    const batch = Number(refreshValues.trickle_batch)
+    const pause = Math.max(5, Number(refreshValues.trickle_pause_minutes)) * 60
+    const spacing = Math.max(1, Number(refreshValues.trickle_spacing_seconds))
+    if (!Number.isFinite(batch) || !Number.isFinite(pause) || !Number.isFinite(spacing)) return null
+    if (batch <= 0) return 'Off: episode lists load only when someone clicks Enrich on a show.'
+    const perHour = Math.round((batch * 3600) / (batch * spacing + pause))
+    return `About ${perHour.toLocaleString()} shows per hour per provider (up to ~${(perHour * 24).toLocaleString()} requests a day), one request every ${spacing} s while a batch runs.`
+  })()
   const saveRefreshSettings = useMutation({
     mutationFn: () => {
       const hrToSec = (v: string) => Math.round(Number(v) * 3600)
@@ -5119,6 +5140,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         catalog_refresh_seconds_jellyfin: hrToSec(refreshValues!.catalog_refresh_hours_jellyfin),
         enrichment_ttl_seconds:           hrToSec(refreshValues!.enrichment_ttl_hours),
         tmdb_sync_interval_seconds:       refreshValues!.tmdb_sync_hours.trim() ? hrToSec(refreshValues!.tmdb_sync_hours) : null,
+        episode_trickle_batch:            Math.round(Number(refreshValues!.trickle_batch)),
+        episode_trickle_interval_seconds: Math.round(Number(refreshValues!.trickle_pause_minutes) * 60),
+        episode_trickle_spacing_seconds:  Number(refreshValues!.trickle_spacing_seconds),
       })
     },
     onSuccess: () => {
@@ -6811,7 +6835,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </SectionCard>
 
       <SectionCard title="Refresh Schedule" icon={<RefreshCw size={14} />}>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-xs text-foreground/85">
           How often each provider type's catalog gets automatically re-imported, how long enrichment (posters,
           cast, genre) is cached before refetching, and how often TMDB Lists auto-sync. Plex/Emby libraries can
           take much longer to scan than a cheap XC catalog pull, so each provider type has its own interval.
@@ -6875,6 +6899,57 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </label>
           </div>
         )}
+        {refreshValues && (
+          <div className="space-y-2 border-t border-border pt-3">
+            <h4 className="text-sm font-semibold text-foreground">Episode list preloading</h4>
+            <p className="text-xs text-foreground/85 leading-relaxed">
+              In the background, the app slowly asks each provider for the episode lists of shows nobody has
+              opened yet, so they're ready when someone does. A show that hasn't been reached yet can still be
+              loaded any time with its Enrich button, so this only decides how fast the backlog fills in. It works in small batches: one
+              request at a time, a short gap between requests, then a pause before the next batch. Each
+              provider runs in its own lane and is only asked about its own shows.
+            </p>
+            <p className="text-xs text-foreground/85 leading-relaxed">
+              Go gently: a provider that sees too many requests may slow down or block the account. The gap
+              between requests matters most, so raise the batch size or shorten the pause before lowering it.
+              A provider that fails 3 times in a row is skipped until the next batch.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-2">
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Shows per batch
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={0} max={500} step="10"
+                  value={refreshValues.trickle_batch}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_batch: e.target.value })}
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Pause between batches (min)
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={5} max={1440} step="5"
+                  value={refreshValues.trickle_pause_minutes}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_pause_minutes: e.target.value })}
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Gap between requests (sec)
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={1} max={60} step="1"
+                  value={refreshValues.trickle_spacing_seconds}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_spacing_seconds: e.target.value })}
+                />
+              </label>
+            </div>
+            <p className="text-xs text-foreground/85">
+              Allowed: 0–500 shows (0 turns preloading off), 5 min–24 h pause, 1–60 s gap.
+              Defaults: 100 shows, 15 min, 3 s.
+            </p>
+            {trickleEstimate && <p className="text-xs font-medium text-primary">{trickleEstimate}</p>}
+          </div>
+        )}
         <div className="flex items-center gap-1.5">
           <Button
             size="sm"
@@ -6886,7 +6961,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {refreshForm && (
             <Button size="sm" variant="outline" onClick={() => setRefreshForm(null)}>Cancel</Button>
           )}
-          <span className="text-xs text-muted-foreground">Leave TMDB Lists sync blank to keep it manual-only.</span>
+          <span className="text-xs text-foreground/85">Leave TMDB Lists sync blank to keep it manual-only.</span>
         </div>
       </SectionCard>
 

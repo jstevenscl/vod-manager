@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 import ai_assist
 from backup import router as backup_router
-from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, save_last_enrichment_run
+from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, save_last_enrichment_run, get_refresh_settings
 from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
@@ -273,6 +273,21 @@ async def _watch_session_poller() -> None:
         await asyncio.sleep(_WATCH_SESSION_POLL_SECONDS)
 
 
+async def _episode_trickle_scheduler() -> None:
+    """KNM: 2026-10-03 -- paced background episode discovery. Every
+    episode_trickle_interval_seconds (default 15 min), fetch at most
+    episode_trickle_batch pending series sources per provider, spaced out;
+    see vod_importer.run_episode_trickle_tick."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await vod_importer.run_episode_trickle_tick()
+        except Exception as exc:
+            logger.warning("[episode_trickle] tick failed: %s", exc)
+        interval = get_refresh_settings()["episode_trickle_interval_seconds"]
+        await asyncio.sleep(max(300, int(interval)))
+
+
 async def _vod_enrichment_scheduler() -> None:
     """Recover pending ingestion after startup without re-polling providers.
 
@@ -439,6 +454,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
+        asyncio.create_task(_episode_trickle_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(_category_schedule_loop()),
         asyncio.create_task(_uncategorized_sweep_loop()),
