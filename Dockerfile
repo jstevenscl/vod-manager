@@ -1,5 +1,7 @@
 # ── Stage 1: Build React frontend ────────────────────────────────────────────
-FROM node:20-alpine AS frontend-build
+# Built once on the runner's native platform: the output is static files, so
+# there is no need to run npm under QEMU emulation for every target arch.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
