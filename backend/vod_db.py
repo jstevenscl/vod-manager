@@ -6873,6 +6873,9 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
     return row is not None
 
 
+_SERIES_SOURCE_RETRY_COOLDOWN = 24 * 3600
+
+
 def list_pending_series_sources(
     provider_id: int | None = None, limit: int | None = None, series_ids: set[int] | None = None,
 ) -> list[dict]:
@@ -6881,13 +6884,25 @@ def list_pending_series_sources(
     A canonical series can retain several source variants from one provider.
     Automatic intake must visit every unstamped source so each fallback has
     its own episode stream rows.
+
+    Failed sources are queued after clean ones and, for automatic intake
+    (no series_ids), retried at most once per _SERIES_SOURCE_RETRY_COOLDOWN.
     """
     conn = _connect()
     provider_clause = ""
     params: tuple = ()
+    # KNM: 2026-10-04 -- failed fetches kept their id-order slot at the front,
+    # so every trickle batch re-hit the same dead shows first.
+    cooldown_clause = ""
+    if series_ids is None:
+        cooldown_clause = (
+            "AND (ss.consecutive_failures=0 OR ss.last_failed_at IS NULL "
+            "OR CAST(ss.last_failed_at AS REAL) < ?)"
+        )
+        params = (time.time() - _SERIES_SOURCE_RETRY_COOLDOWN,)
     if provider_id is not None:
         provider_clause = "AND ss.provider_id=?"
-        params = (provider_id,)
+        params = (*params, provider_id)
     series_clause = ""
     if series_ids is not None:
         ids = sorted({int(series_id) for series_id in series_ids})
@@ -6905,9 +6920,10 @@ def list_pending_series_sources(
         JOIN series s ON s.id=ss.series_id
         WHERE ss.episodes_last_enriched_at IS NULL
            AND s.review_excluded=0
+           {cooldown_clause}
            {provider_clause}
            {series_clause}
-        ORDER BY ss.id
+        ORDER BY (ss.consecutive_failures > 0), CAST(ss.last_failed_at AS REAL), ss.id
         {limit_clause}
     """, params).fetchall()
     conn.close()

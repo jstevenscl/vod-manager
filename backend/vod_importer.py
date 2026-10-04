@@ -1661,6 +1661,7 @@ async def _enrich_one_series_source(
             "fetched": False,
             "reason": f"get_series_info failed for provider {provider.get('name') or provider['id']}",
             "detail_written": False,
+            "failed": True,
         }
 
     detail = _as_dict(info.get("info"))
@@ -1817,7 +1818,7 @@ async def enrich_series_source_only(
     if outcome["fetched"] and outcome["detail_written"] and not skip_auto_merge:
         await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
 
-    return {"fetched": outcome["fetched"], "reason": outcome["reason"]}
+    return {"fetched": outcome["fetched"], "reason": outcome["reason"], "failed": outcome.get("failed", False)}
 
 
 # ── Bulk enrichment ──────────────────────────────────────────────────────────
@@ -2307,6 +2308,11 @@ def get_enrich_progress() -> dict:
 _PROGRESS_PREFIX = {"movie": "movies", "series": "series"}  # "series" pluralizes to itself, not "seriess"
 
 
+# Returned by _enrich_one when a series source's provider fetch failed (truthy,
+# so callers that only check `is False` keep their behavior).
+_SOURCE_FETCH_FAILED = "source_fetch_failed"
+
+
 async def _enrich_one(
     kind: str, sem: asyncio.Semaphore, item_id: int, force: bool, *,
     skip_auto_merge: bool = False, movie_batch: list | None = None, provider_id: int | None = None,
@@ -2348,7 +2354,12 @@ async def _enrich_one(
                     # accounting; source_id identifies the provider-specific
                     # series_sources row being fetched.
                     series_kwargs["source_id"] = source_id if source_id is not None else item_id
-                await enrich_series_source_only(series_id or item_id, provider_id, **series_kwargs)
+                result = await enrich_series_source_only(series_id or item_id, provider_id, **series_kwargs)
+                # KNM: 2026-10-04 -- a provider fetch failure comes back as a
+                # result, not an exception; surface it so the trickle's
+                # consecutive-failure stop can see it.
+                if isinstance(result, dict) and result.get("failed"):
+                    return _SOURCE_FETCH_FAILED
             else:
                 await enrich_series(item_id, force=force, skip_auto_merge=skip_auto_merge)
             return True
@@ -2598,6 +2609,9 @@ async def _run_provider_series_phase(
                 consecutive_failures += 1
                 if max_consecutive_failures and _provider_backoff_remaining(provider["id"]) > 0:
                     consecutive_failures = max_consecutive_failures
+            elif outcome == _SOURCE_FETCH_FAILED:
+                # Already recorded on the source row; only the lane's stop counts it.
+                consecutive_failures += 1
             else:
                 consecutive_failures = 0
 
