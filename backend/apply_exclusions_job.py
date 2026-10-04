@@ -18,6 +18,7 @@ import uuid
 
 import dispatcharr_dvr_importer
 import emby_vod_importer
+import library_importer
 import plex_importer
 import vod_db
 import vod_importer
@@ -41,6 +42,8 @@ async def _run_job(job_id: str) -> None:
                     result = await plex_importer.import_plex_library(p["id"])
                 elif p.get("provider_type") in ("emby", "jellyfin"):
                     result = await emby_vod_importer.import_emby_library(p["id"])
+                elif p.get("provider_type") == "library":
+                    result = await library_importer.import_library(p["id"])
                 elif p.get("provider_type") == "dispatcharr_dvr":
                     # DVR recordings have no language/category exclusion rules
                     # to retroactively apply yet -- this just re-runs the same
@@ -49,6 +52,9 @@ async def _run_job(job_id: str) -> None:
                     result = await dispatcharr_dvr_importer.import_dvr_recordings(p["id"])
                 else:
                     result = await vod_importer.import_provider_catalog(p["id"])
+                # This was a full re-import; without the stamp the periodic
+                # refresher still sees the provider as due and imports it again.
+                await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                 job["results"].append({"provider": p["name"], **result})
             except Exception as exc:
                 logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], exc)
