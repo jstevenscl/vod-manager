@@ -4912,6 +4912,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
   const applyExclusionsJobQuery = useQuery<{
     status: string; total: number; completed: number; current_provider: string | null
+    phase?: string
     results: ApplyExclusionsProviderResult[]; error: string | null
   }>({
     queryKey: ['vod-apply-exclusions-job', applyExclusionsJobId],
@@ -8641,8 +8642,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
           {applyExclusionsJobQuery.data?.status === 'running' && (
             <span className="text-xs text-muted-foreground">
-              Provider {applyExclusionsJobQuery.data.completed + 1} of {applyExclusionsJobQuery.data.total}
-              {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+              {applyExclusionsJobQuery.data.phase === 'finalizing'
+                ? `All ${applyExclusionsJobQuery.data.total} provider(s) synced — finalizing…`
+                : <>
+                    Provider {Math.min(applyExclusionsJobQuery.data.completed + 1, applyExclusionsJobQuery.data.total)} of {applyExclusionsJobQuery.data.total}
+                    {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+                  </>}
             </span>
           )}
           {applyExclusionsJobQuery.data?.status === 'error' && (
