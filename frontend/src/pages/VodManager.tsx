@@ -2870,6 +2870,19 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     mutationFn: () => api.post(`/vod/series/${series.id}/enrich/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
+  const autoFetchStarted = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      autoFetchStarted.current = false
+      return
+    }
+    if (!autoFetchStarted.current && !enrich.isPending) {
+      autoFetchStarted.current = true
+      // The backend checks every provider source and only requests episode
+      // data for sources that have not been fetched yet.
+      enrich.mutate()
+    }
+  }, [open])
   const deleteSeries = useMutation({
     mutationFn: () => api.delete(`/vod/series/${series.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
@@ -3078,6 +3091,16 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 
       <div>
         <p className="font-medium mb-1">Episodes</p>
+        {enrich.isPending && (
+          <p className="text-muted-foreground flex items-center gap-1.5 mb-1">
+            <Loader2 size={12} className="animate-spin" /> Checking providers for missing episodes...
+          </p>
+        )}
+        {enrich.isError && (
+          <p className="text-destructive mb-1">
+            Could not load missing provider episodes. Retry with “Fetch episodes &amp; detail”.
+          </p>
+        )}
         {series.episodes.length === 0 && (
           <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
         )}

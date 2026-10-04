@@ -83,6 +83,28 @@ def test_enrich_series_source_only_never_fetches_a_different_providers_source(db
     )
 
 
+def test_on_demand_series_enrichment_fetches_only_the_missing_provider_source(db, monkeypatch):
+    provider_a, provider_b, series_id = _import_series_with_two_sources(db)
+    source_a = next(s for s in db.list_series_sources(series_id) if s["provider_id"] == provider_a)
+    db.set_series_source_enrichment(series_id, provider_a, source_a["provider_series_id"])
+
+    fetched_provider_ids = []
+
+    class FakeClient:
+        def __init__(self, provider):
+            fetched_provider_ids.append(provider["id"])
+
+        async def get_series_info(self, provider_series_id):
+            return {"info": {}, "episodes": {}}
+
+    monkeypatch.setattr(vod_importer, "XCProviderClient", FakeClient)
+
+    result = asyncio.run(vod_importer.enrich_series(series_id))
+
+    assert result["fetched"] is True
+    assert fetched_provider_ids == [provider_b]
+
+
 def test_bulk_series_phase_only_touches_its_own_provider_source(db, monkeypatch):
     """End-to-end through the real bulk coordinator (_run_provider_series_phase
     / _enrich_one), not just the new helper in isolation -- proves the wiring,

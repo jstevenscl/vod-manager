@@ -152,7 +152,7 @@ def test_adult_known_tmdb_ids_are_not_retried(db):
     assert db.list_movie_ids_pending_tmdb_enrichment() == []
 
 
-def test_post_import_runs_series_episode_phase_after_tmdb_phases(monkeypatch):
+def test_post_import_defers_series_episode_phase_after_tmdb_phases(monkeypatch):
     calls = []
 
     async def movie_phase(**_kwargs):
@@ -161,19 +161,15 @@ def test_post_import_runs_series_episode_phase_after_tmdb_phases(monkeypatch):
     async def series_metadata_phase(**_kwargs):
         calls.append("series-tmdb")
 
-    async def episode_phase(**_kwargs):
-        calls.append("series-episodes")
-
     monkeypatch.setattr(vod_importer, "bulk_enrich_tmdb_movies", movie_phase)
     monkeypatch.setattr(vod_importer, "bulk_enrich_tmdb_series_metadata", series_metadata_phase)
-    monkeypatch.setattr(vod_importer, "bulk_enrich_series_episodes", episode_phase)
     monkeypatch.setattr(vod_importer.vod_db, "count_movies_pending_tmdb_enrichment", lambda: 0)
     monkeypatch.setattr(vod_importer.vod_db, "count_series_pending_tmdb_metadata_enrichment", lambda: 0)
     monkeypatch.setattr(vod_importer, "_schedule_background_tmdb_work", lambda: None)
 
     asyncio.run(vod_importer._post_import_enrichment(track_catalog_workflow=False))
 
-    assert calls == ["movie-tmdb", "series-tmdb", "series-episodes"]
+    assert calls == ["movie-tmdb", "series-tmdb"]
 
 
 def test_episode_only_series_phase_preserves_tmdb_metadata(db, monkeypatch):

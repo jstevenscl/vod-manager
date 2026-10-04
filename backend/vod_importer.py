@@ -1568,9 +1568,6 @@ async def enrich_series(series_id: int, *, force: bool = False, skip_auto_merge:
     unrelated concurrent work like a video stream relay. That's what was
     causing playback to stall mid-stream even though the network path to
     the source was fine."""
-    if not force and not await asyncio.to_thread(vod_db.series_needs_enrichment, series_id):
-        return {"fetched": False, "reason": "already up to date"}
-
     series = await asyncio.to_thread(vod_db.get_series, series_id)
     if not series:
         return {"fetched": False, "reason": "series not found"}
@@ -2091,39 +2088,32 @@ async def _post_import_enrichment(
     changed_movie_ids: set[int] | None = None,
     changed_series_ids: set[int] | None = None,
 ) -> None:
-    """Run the ordered metadata and series-episode phases after import.
+    """Run the ordered metadata phases after import.
 
     Movie provider detail is never part of this handoff. Series provider
-    detail is used only for episode discovery after TMDB metadata completes.
+    detail is deliberately not part of this handoff either. Episode discovery
+    is lazy on show open, with a small scheduled trickle handled separately.
     """
     try:
         if track_catalog_workflow:
             _set_catalog_workflow_phase("Resolving known TMDB identities")
         movie_count = await asyncio.to_thread(vod_db.count_movies_pending_tmdb_enrichment) if changed_movie_ids is None else await asyncio.to_thread(vod_db.count_movies_pending_tmdb_enrichment, changed_movie_ids)
         series_count = await asyncio.to_thread(vod_db.count_series_pending_tmdb_metadata_enrichment) if changed_series_ids is None else await asyncio.to_thread(vod_db.count_series_pending_tmdb_metadata_enrichment, changed_series_ids)
-        episode_count = await asyncio.to_thread(vod_db.count_pending_series_sources) if changed_series_ids is None else await asyncio.to_thread(vod_db.count_pending_series_sources, changed_series_ids)
         movie_limit = min(_TMDB_INITIAL_MOVIE_CAP, max(1, math.ceil(movie_count * _TMDB_INITIAL_FRACTION))) if movie_count else 0
         series_limit = min(_TMDB_INITIAL_SERIES_CAP, max(1, math.ceil(series_count * _TMDB_INITIAL_FRACTION))) if series_count else 0
-        episode_limit = min(_TMDB_INITIAL_SERIES_CAP, max(1, math.ceil(episode_count * _TMDB_INITIAL_FRACTION))) if episode_count else 0
         logger.info(
-            "[vod_importer] bounded initial pass: movies=%s/%s series_tmdb=%s/%s episodes=%s/%s",
-            movie_limit, movie_count, series_limit, series_count, episode_limit, episode_count,
+            "[vod_importer] bounded initial pass: movies=%s/%s series_tmdb=%s/%s; episode discovery deferred",
+            movie_limit, movie_count, series_limit, series_count,
         )
         movie_events = await bulk_enrich_tmdb_movies(limit=movie_limit or 1, item_ids=changed_movie_ids) or []
         series_events = await bulk_enrich_tmdb_series_metadata(limit=series_limit or 1, item_ids=changed_series_ids) or []
-        if track_catalog_workflow:
-            _set_catalog_workflow_phase("Synchronizing series episodes")
-        # Episode data is the final provider-sync stage.  It is source-gated
-        # and therefore only calls providers for series sources that have not
-        # yet been imported or that an import explicitly invalidated.
-        episode_events = await bulk_enrich_series_episodes(limit=episode_limit or 1, series_ids=changed_series_ids) or []
         run_id = _CATALOG_WORKFLOW_PROGRESS.get("run_id")
         await _append_catalog_sync_events(
             run_id,
-            movie_events + series_events + episode_events,
+            movie_events + series_events,
             {
-                "automatic_merges": sum(event.get("action") == "merged" for event in movie_events + series_events + episode_events),
-                "series_episode_reports": sum(event.get("action") == "episodes_synced" for event in episode_events),
+                "automatic_merges": sum(event.get("action") == "merged" for event in movie_events + series_events),
+                "series_episode_reports": 0,
             },
         )
         if track_catalog_workflow:
