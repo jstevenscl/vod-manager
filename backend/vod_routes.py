@@ -1606,6 +1606,10 @@ async def purge_excluded_content(provider_id: int, dry_run: bool = True):
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise HTTPException(404, detail="provider not found")
+    # Plex/Emby/library sources may carry no category name, so "exclude
+    # uncategorized" could match everything they provide.
+    if (provider.get("provider_type") or "xc") != "xc":
+        raise HTTPException(400, detail="purge-excluded-content supports XC providers only")
     result = await asyncio.to_thread(
         vod_db.purge_excluded_category_sources, provider_id,
         provider.get("import_exclude_categories") or [],
