@@ -1052,6 +1052,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("episode_sources", "last_failed_at", "TEXT"),
         ("providers", "archive_new_categories", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "known_import_categories", "TEXT"),
+        ("providers", "auto_archived_categories", "TEXT"),
         # Nullable, ON DELETE SET NULL -- foreign_keys=ON is enforced (see
         # _connect), so a plain REFERENCES without an ON DELETE action would
         # block deleting a movie/episode that still has an old failure row
@@ -1193,11 +1194,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("series", "trailer_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "trailer_checked_at", "TEXT"),
         ("series", "trailer_last_error", "TEXT"),
+        # Set when archive_disabled_language_content archived the row, so that
+        # sweep only un-archives its own archives. See its docstring.
+        ("movies", "review_excluded_language", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "review_excluded_language", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            if column == "review_excluded_language":
+                # Existing auto-archives can't be told apart, so keep the old
+                # behaviour for them: the sweep may still un-archive them once.
+                conn.execute(
+                    f"UPDATE {table} SET review_excluded_language=1 "
+                    "WHERE review_excluded=1 AND review_excluded_manual=0"
+                )
 
     # Found live 2026-09-15: list_metadata_review's WHERE clause
     # (review_excluded=0 AND (needs_year_review=1 OR (tmdb_id IS NULL AND
@@ -3276,6 +3288,23 @@ def set_provider_archive_new_categories(provider_id: int, enabled: bool) -> None
         conn.close()
 
 
+def set_provider_auto_archived_categories(provider_id: int, category_names: list[str]) -> None:
+    """Categories archive_new_categories has archived on this provider. Kept
+    so their content stays archived on later imports (known_import_categories
+    alone stops treating them as new after the first run). Separate from
+    import_exclude_categories, whose content purge_excluded_archived_content
+    deletes rather than archives."""
+    with _WRITE_LOCK:
+        import json
+        conn = _connect()
+        conn.execute(
+            "UPDATE providers SET auto_archived_categories=?, updated_at=? WHERE id=?",
+            (json.dumps(sorted({c.strip() for c in category_names if c.strip()})), _now(), provider_id),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
 def set_provider_known_import_categories(provider_id: int, category_names: list[str]) -> None:
     """Bookkeeping for archive_new_categories -- the full set of category
     names this provider has ever reported, so the next import can tell
@@ -3323,6 +3352,7 @@ def get_provider(provider_id: int) -> dict | None:
     d["password"] = decrypt_value(d["password"])
     d["import_exclude_categories"] = _parse_json_list(d.get("import_exclude_categories"))
     d["known_import_categories"] = _parse_json_list(d.get("known_import_categories"))
+    d["auto_archived_categories"] = _parse_json_list(d.get("auto_archived_categories"))
     d["library_remote_config"] = get_library_remote_config(d)
     return d
 
@@ -9568,8 +9598,10 @@ def archive_disabled_language_content() -> dict:
     merge gate's "shares at least one language" standard. A human's manual
     archive/unarchive (review_excluded_manual=1) is never touched in either
     direction -- and re-enabling a language later un-archives the same rows
-    it archived, since the check re-evaluates review_excluded both ways
-    instead of only ever setting it.
+    it archived. Only those: review_excluded_language marks rows this sweep
+    archived, so a row archived for another reason (an excluded or newly
+    discovered category at import) is not un-archived just because it has
+    an enabled-language source.
 
     Holds _WRITE_LOCK for the whole call (found live 2026-09-15, same
     reasoning as bulk_place_movies_in_category): called from
@@ -9585,30 +9617,32 @@ def archive_disabled_language_content() -> dict:
         movies_archived = 0
         movies_unarchived = 0
         for row in conn.execute(
-            "SELECT id, review_excluded FROM movies WHERE review_excluded_manual=0"
+            "SELECT id, review_excluded, review_excluded_language FROM movies WHERE review_excluded_manual=0"
         ).fetchall():
             langs = _source_languages(conn, "movie_sources", "movie_id", row["id"])
             eligible = bool(langs & enabled)
             if not eligible and not row["review_excluded"]:
-                conn.execute("UPDATE movies SET review_excluded=1 WHERE id=?", (row["id"],))
+                conn.execute("UPDATE movies SET review_excluded=1, review_excluded_language=1 WHERE id=?", (row["id"],))
                 movies_archived += 1
-            elif eligible and row["review_excluded"]:
-                conn.execute("UPDATE movies SET review_excluded=0 WHERE id=?", (row["id"],))
-                movies_unarchived += 1
+            elif eligible and row["review_excluded_language"]:
+                if row["review_excluded"]:
+                    movies_unarchived += 1
+                conn.execute("UPDATE movies SET review_excluded=0, review_excluded_language=0 WHERE id=?", (row["id"],))
 
         series_archived = 0
         series_unarchived = 0
         for row in conn.execute(
-            "SELECT id, review_excluded FROM series WHERE review_excluded_manual=0"
+            "SELECT id, review_excluded, review_excluded_language FROM series WHERE review_excluded_manual=0"
         ).fetchall():
             langs = _source_languages(conn, "series_sources", "series_id", row["id"])
             eligible = bool(langs & enabled)
             if not eligible and not row["review_excluded"]:
-                conn.execute("UPDATE series SET review_excluded=1 WHERE id=?", (row["id"],))
+                conn.execute("UPDATE series SET review_excluded=1, review_excluded_language=1 WHERE id=?", (row["id"],))
                 series_archived += 1
-            elif eligible and row["review_excluded"]:
-                conn.execute("UPDATE series SET review_excluded=0 WHERE id=?", (row["id"],))
-                series_unarchived += 1
+            elif eligible and row["review_excluded_language"]:
+                if row["review_excluded"]:
+                    series_unarchived += 1
+                conn.execute("UPDATE series SET review_excluded=0, review_excluded_language=0 WHERE id=?", (row["id"],))
 
         _commit_with_retry(conn)
         conn.close()
