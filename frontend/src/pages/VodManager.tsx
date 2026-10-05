@@ -440,6 +440,7 @@ interface DuplicateGroupItem {
 
 interface DuplicateGroup {
   items: DuplicateGroupItem[]
+  auto_merge_reasons?: string[]
 }
 
 interface XcClient {
@@ -2185,6 +2186,11 @@ function DuplicateGroupRow({ group, contentType, xcCredentials, onMerge, isPendi
           </span>
         )}
       </div>
+      {group.auto_merge_reasons && group.auto_merge_reasons.length > 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          {group.auto_merge_reasons[0].startsWith('Qualifies') ? '' : 'Not auto-merged: '}{group.auto_merge_reasons.join(' · ')}
+        </p>
+      )}
       {group.items.map((item) => {
         // trueYear is TMDB's own canonical release year for this item's
         // tmdb_id -- undefined while loading, null if the lookup failed, a
@@ -6547,6 +6553,26 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
     onError: (e: any) => setDuplicatesConfirmMergeResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
   })
+  // KNM: 2026-10-05 -- same-TMDB-ID auto-merge year tolerance + one-off catalog-wide merge.
+  const dupAutoMergeYearToleranceQuery = useQuery<{ years: number }>({
+    queryKey: ['vod-duplicates-auto-merge-year-tolerance'],
+    queryFn:  () => api.get('/vod/duplicates/auto-merge-year-tolerance/').then((r) => r.data),
+  })
+  const setDupAutoMergeYearTolerance = useMutation({
+    mutationFn: (years: number) => api.post('/vod/duplicates/auto-merge-year-tolerance/', { years }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-duplicates-auto-merge-year-tolerance'] }),
+  })
+  const [duplicatesMergeExistingResult, setDuplicatesMergeExistingResult] = useState<string | null>(null)
+  const mergeExistingTmdbDuplicates = useMutation({
+    mutationFn: () => api.post('/vod/duplicates/merge-existing/'),
+    onSuccess: (r) => {
+      setDuplicatesMergeExistingResult(`Merged ${r.data.movies_merged} movie${r.data.movies_merged === 1 ? '' : 's'} and ${r.data.series_merged} TV show${r.data.series_merged === 1 ? '' : 's'}.`)
+      if (duplicatesQuery.data) duplicatesQuery.refetch()
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setDuplicatesMergeExistingResult(`Merge failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
   const [duplicatesSecondPassMergeResult, setDuplicatesSecondPassMergeResult] = useState<string | null>(null)
   const mergeSecondPassDuplicates = useMutation({
     mutationFn: () => api.post('/vod/duplicates/merge-confirmed/', {
@@ -10500,6 +10526,33 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           Also group quality-tagged titles together (e.g. "4K: Predator" with "Predator") — off by default; once
           merged, Stream Priority's "quality" mode (above) picks the best source automatically
         </label>
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span>Auto-merge cards with the same TMDB ID when their years are within</span>
+          <select
+            className="rounded border border-border bg-background px-1 py-0.5 text-xs"
+            value={dupAutoMergeYearToleranceQuery.data?.years ?? 2}
+            disabled={dupAutoMergeYearToleranceQuery.isLoading || setDupAutoMergeYearTolerance.isPending}
+            onChange={(e) => setDupAutoMergeYearTolerance.mutate(Number(e.target.value))}
+          >
+            {[0, 1, 2, 3].map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <span className="text-muted-foreground">years and they share a language (0 = exact year only).</span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={mergeExistingTmdbDuplicates.isPending}
+            onClick={() => {
+              if (window.confirm('Merge every existing movie and TV show pair that already qualifies for auto-merge (same TMDB ID, shared language, years within the setting above)? Merges cannot be undone — download a database backup first if you may want to roll back.')) {
+                setDuplicatesMergeExistingResult(null)
+                mergeExistingTmdbDuplicates.mutate()
+              }
+            }}
+          >
+            {mergeExistingTmdbDuplicates.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Copy size={12} className="mr-1" />}
+            Merge existing duplicates now
+          </Button>
+          {duplicatesMergeExistingResult && <span className="text-muted-foreground">{duplicatesMergeExistingResult}</span>}
+        </div>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             <button

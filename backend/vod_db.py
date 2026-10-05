@@ -27,6 +27,7 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb,
+    get_duplicate_finder_auto_merge_year_tolerance,
     get_duplicate_finder_quality_prefix_matching, get_enabled_languages,
     get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id,
 )
@@ -9974,6 +9975,21 @@ def merge_movie(from_id: int, into_id: int) -> None:
             conn.close()
 
 
+# KNM: 2026-10-05 -- cards sharing a tmdb_id whose years differ by at most
+# the configured tolerance (default 2) auto-merge: TMDB already identifies
+# them as one title, and a 1-2 year gap is almost always a provider using a
+# festival/regional year. Live catalog check 2026-10-04: 212 same-id movie
+# pairs 1y apart, 31 at 2y.
+def _tmdb_merge_year_status(this_year, other_year) -> str:
+    if this_year is None or other_year is None:
+        return "one_missing"
+    if this_year == other_year:
+        return "agree"
+    if abs(this_year - other_year) <= get_duplicate_finder_auto_merge_year_tolerance():
+        return "near"
+    return "MISMATCH"
+
+
 def _source_languages(conn: sqlite3.Connection, sources_table: str, fk_column: str, row_id: int) -> set[str]:
     """Distinct COALESCE(language,'EN') values across a movie's/series'
     _sources rows -- the merge-gate's view of "what language(s)
@@ -10133,14 +10149,12 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> list[dict]:
             continue
 
         other_year = row["year"]
-        if this_year is None or other_year is None:
-            year_status = "one_missing"
-        elif this_year == other_year:
-            year_status = "agree"
-        else:
-            year_status = "MISMATCH"
+        year_status = _tmdb_merge_year_status(this_year, other_year)
         same_name = _dedup_name_key(movie.get("name") or "") == _dedup_name_key(row.get("name") or "")
-        if year_status != "agree" and not (match_type == "tmdb_id" and same_name and year_status == "one_missing"):
+        if year_status != "agree" and not (
+            match_type == "tmdb_id"
+            and (year_status == "near" or (same_name and year_status == "one_missing"))
+        ):
             logger.warning(
                 "[auto_merge_movie_by_tmdb] tmdb_id=%s year_status=%s -- skipping id=%s -> id=%s",
                 tmdb_id, year_status, row["id"], movie_id,
@@ -10168,6 +10182,64 @@ def auto_merge_movie_by_tmdb(movie_id: int) -> list[dict]:
         })
         merge_movie(row["id"], movie_id)
     return merge_events
+
+
+# KNM: 2026-10-05 -- tell the Duplicate Finder reviewer why a group was not
+# auto-merged, using the same gates as auto_merge_movie_by_tmdb /
+# auto_merge_series_by_tmdb.
+def _auto_merge_pair_reason(a: dict, b: dict, langs: dict) -> str | None:
+    label_a = f"{a.get('name')} ({a.get('year') or '?'})"
+    label_b = f"{b.get('name')} ({b.get('year') or '?'})"
+    tmdb_a, tmdb_b = (str(x["tmdb_id"]).strip() if x.get("tmdb_id") else "" for x in (a, b))
+    if not tmdb_a and not tmdb_b:
+        return "No TMDB ID on either card"
+    if not tmdb_a or not tmdb_b:
+        missing = label_a if not tmdb_a else label_b
+        if a.get("year") is not None and a.get("year") == b.get("year")                 and _dedup_name_key(a.get("name") or "") == _dedup_name_key(b.get("name") or ""):
+            return None
+        return f"No TMDB ID on {missing}; without one, title and year must match exactly"
+    if tmdb_a != tmdb_b:
+        return f"Different TMDB IDs (#{tmdb_a} vs #{tmdb_b})"
+    langs_a, langs_b = langs.get(a["id"]) or set(), langs.get(b["id"]) or set()
+    if langs_a and langs_b and not (langs_a & langs_b):
+        return f"No shared language ({', '.join(sorted(langs_a))} vs {', '.join(sorted(langs_b))})"
+    status = _tmdb_merge_year_status(a.get("year"), b.get("year"))
+    if status == "MISMATCH":
+        tolerance = get_duplicate_finder_auto_merge_year_tolerance()
+        if not tolerance:
+            return f"Years {a.get('year')} vs {b.get('year')} differ (exact year required)"
+        return (f"Years {a.get('year')} vs {b.get('year')} are more than "
+                f"{tolerance} year{'s' if tolerance != 1 else ''} apart")
+    if status == "one_missing" and _dedup_name_key(a.get("name") or "") != _dedup_name_key(b.get("name") or ""):
+        return "Year missing and titles differ"
+    return None
+
+
+def annotate_auto_merge_reasons(content_type: str, groups: list[dict]) -> list[dict]:
+    """Adds group["auto_merge_reasons"]: short reasons the group's cards were
+    not auto-merged, or a note that they qualify on the next refresh."""
+    if not get_duplicate_finder_auto_merge_tmdb():
+        for group in groups:
+            group["auto_merge_reasons"] = ["Auto-merge by TMDB ID is turned off in settings"]
+        return groups
+    sources_table, fk = ("movie_sources", "movie_id") if content_type == "movie" else ("series_sources", "series_id")
+    conn = _connect()
+    try:
+        for group in groups:
+            items = group.get("items") or []
+            langs = {i["id"]: _source_languages(conn, sources_table, fk, i["id"]) for i in items}
+            reasons: list[str] = []
+            for idx, a in enumerate(items):
+                for b in items[idx + 1:]:
+                    reason = _auto_merge_pair_reason(a, b, langs)
+                    if reason and reason not in reasons:
+                        reasons.append(reason)
+            group["auto_merge_reasons"] = reasons[:3] or [
+                "Qualifies for auto-merge; merges on the next refresh of either card"
+            ]
+    finally:
+        conn.close()
+    return groups
 
 
 def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> None:
@@ -10409,15 +10481,13 @@ def auto_merge_series_by_tmdb(series_id: int) -> list[dict]:
 
         this_year = current.get("year")
         other_year = other.get("year")
-        if this_year is None or other_year is None:
-            year_status = "one_missing"
-        elif this_year == other_year:
-            year_status = "agree"
-        else:
-            year_status = "MISMATCH"
+        year_status = _tmdb_merge_year_status(this_year, other_year)
 
         same_name = _dedup_name_key(current.get("name") or "") == _dedup_name_key(other.get("name") or "")
-        if year_status != "agree" and not (match_type == "tmdb_id" and same_name and year_status == "one_missing"):
+        if year_status != "agree" and not (
+            match_type == "tmdb_id"
+            and (year_status == "near" or (same_name and year_status == "one_missing"))
+        ):
             logger.warning(
                 "[auto_merge_series_by_tmdb] tmdb_id=%s year_status=%s -- skipping id=%s -> id=%s",
                 tmdb_id, year_status, row["id"], series_id,

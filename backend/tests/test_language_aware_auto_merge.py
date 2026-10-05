@@ -209,7 +209,7 @@ def test_auto_merge_movie_skips_same_tmdb_id_when_year_differs(db):
     config.save_duplicate_finder_auto_merge_tmdb(True)
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
     first = _import_movie(db, provider_id, "Example Movie", 2020, "one", "Example Movie", tmdb_id=777)
-    second = _import_movie(db, provider_id, "Example Movie", 2021, "two", "Example Movie", tmdb_id=777)
+    second = _import_movie(db, provider_id, "Example Movie", 2023, "two", "Example Movie", tmdb_id=777)
 
     db.auto_merge_movie_by_tmdb(first["id"])
 
@@ -223,7 +223,7 @@ def test_auto_merge_series_skips_same_tmdb_id_when_year_differs(db):
     db.bulk_import_series(provider_id, [
         {"name": "Example Show", "year": 2020, "provider_series_id": "one",
          "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
-        {"name": "Example Show", "year": 2021, "provider_series_id": "two",
+        {"name": "Example Show", "year": 2023, "provider_series_id": "two",
          "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
     ])
     rows = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "778"]

@@ -376,6 +376,25 @@ def save_duplicate_finder_auto_merge_tmdb(enabled: bool) -> None:
     _update_raw(lambda data: data.__setitem__("duplicate_finder_auto_merge_tmdb", bool(enabled)))
 
 
+# KNM: 2026-10-05 -- max year gap for a same-tmdb_id auto-merge (0 = exact
+# year). Capped at 3: wider gaps are more often a wrong TMDB match than a
+# provider's festival/regional year.
+_AUTO_MERGE_YEAR_TOLERANCE_MAX = 3
+
+
+def get_duplicate_finder_auto_merge_year_tolerance() -> int:
+    try:
+        value = int(_read_raw().get("duplicate_finder_auto_merge_year_tolerance", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(_AUTO_MERGE_YEAR_TOLERANCE_MAX, value))
+
+
+def save_duplicate_finder_auto_merge_year_tolerance(years: int) -> None:
+    years = max(0, min(_AUTO_MERGE_YEAR_TOLERANCE_MAX, int(years)))
+    _update_raw(lambda data: data.__setitem__("duplicate_finder_auto_merge_year_tolerance", years))
+
+
 # ── AI provider selection ────────────────────────────────────────────────────
 # ai_assist.py can talk to any of these three -- a user might already have a
 # key for one and not another, or want to compare quality/cost, so the key
