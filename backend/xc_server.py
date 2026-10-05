@@ -441,6 +441,7 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                 "container_extension": row["container_extension"] or "mp4",
                 "tmdb_id": row.get("tmdb_id") or "",
                 "imdb_id": row.get("imdb_id") or "",
+                "youtube_trailer": row.get("trailer_key") or "",
             },
         }
 

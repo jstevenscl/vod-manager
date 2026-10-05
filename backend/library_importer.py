@@ -168,7 +168,7 @@ async def _import_library_locked(provider_id: int) -> dict:
 
     exclude_categories = provider.get("import_exclude_categories") or []
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
-    lang = config.get_import_language_exclusion()
+    lang = vod_importer._current_lang_settings()
     country = config.get_import_country_exclusion()
 
     movie_items: list[dict] = []
@@ -200,13 +200,20 @@ async def _import_library_locked(provider_id: int) -> dict:
         # simply stays NULL for these rows. That NULL is also what keeps
         # them out of _delete_file_if_present's reach entirely -- nothing to
         # accidentally delete since there never was a local file.
-        archive = vod_importer._should_auto_archive(name, None, exclude_categories, exclude_uncategorized, lang, country)
+        # KNM: 2026-10-03 fork skips excluded items at import (never stored)
+        # rather than storing them auto-archived; still counted as seen so the
+        # removal reconcile below treats them as present on the share.
+        excluded = vod_importer._should_auto_archive(
+            name, None, exclude_categories, exclude_uncategorized, lang, country=country, raw_name=parsed.title,
+        )
 
         if parsed.kind == "movie":
             seen_movie_ids.add(rel)
+            if excluded:
+                continue
             movie_items.append({
                 "name": name, "year": year, "provider_stream_id": rel, "container_extension": ext,
-                "tmdb_id": tmdb_id, "file_size_bytes": size, "auto_archive": archive,
+                "tmdb_id": tmdb_id, "file_size_bytes": size,
                 "preserve_existing_detail": True,
                 # last_enriched_at deliberately unset: the lazy enrichment pass
                 # (vod_importer.enrich_movie) fills description/poster/cast from
@@ -217,9 +224,12 @@ async def _import_library_locked(provider_id: int) -> dict:
         show_key = parsed.show_key or parsed.title.lower()
         series_id = f"lib-{show_key}"
         seen_series_ids.add(series_id)
+        if excluded:
+            seen_episode_ids.add(rel)
+            continue
         item = series_items.setdefault(series_id, {
             "name": name, "year": year, "provider_series_id": series_id, "tmdb_id": tmdb_id,
-            "auto_archive": archive, "preserve_existing_detail": True, "episodes": [],
+            "preserve_existing_detail": True, "episodes": [],
         })
         seen_episode_ids.add(rel)
         item["episodes"].append({

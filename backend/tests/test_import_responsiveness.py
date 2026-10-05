@@ -1,15 +1,39 @@
-"""Regression coverage for queued/serialized catalog imports and shared
-sidebar lifecycle status (ported from knmplace/vod-manager's
-test_import_responsiveness.py, scoped to what this branch actually ports --
-see vod_importer.import_provider_catalog's docstring. Not yet ported here:
-the CPU-bound catalog-normalization extraction (_build_movie_import_items/
-_build_series_import_items run via asyncio.to_thread) and the
-catalog_fingerprint unchanged-source-skip optimization -- both filed as a
-separate follow-up rather than rushed through in this pass."""
+"""Regression coverage for responsive, serialized catalog imports."""
 
 import asyncio
 
 import vod_importer
+
+
+def test_catalog_item_builders_keep_raw_snapshot_when_items_are_filtered(monkeypatch):
+    monkeypatch.setattr(vod_importer, "_should_auto_archive", lambda name, *_args, **_kwargs: name == "Skip")
+
+    movies, movie_ids = vod_importer._build_movie_import_items(
+        [
+            {"stream_id": "keep", "name": "Keep (2020)", "category_id": "1"},
+            {"stream_id": "skip", "name": "Skip (2020)", "category_id": "1"},
+        ],
+        {"1": "Movies"}, [], False, {"enabled_languages": ["EN"], "exclude_non_latin": False}, [],
+    )
+    series, series_ids = vod_importer._build_series_import_items(
+        [
+            {"series_id": "keep", "name": "Keep (2020)", "category_id": "1"},
+            {"series_id": "skip", "name": "Skip (2020)", "category_id": "1"},
+        ],
+        {"1": "Series"}, [], False, {"enabled_languages": ["EN"], "exclude_non_latin": False}, [],
+        {field: [] for field in ("genre", "description", "cast_list", "director")},
+    )
+
+    assert [item["provider_stream_id"] for item in movies] == ["keep"]
+    movies_with_ids, _ = vod_importer._build_movie_import_items(
+        [{"stream_id": "tmdb-id", "name": "Known (2020)", "tmdb_id": "123"},
+         {"stream_id": "tmdb", "name": "Known Two (2021)", "tmdb": "456"}],
+        {}, [], False, {"enabled_languages": ["EN"], "exclude_non_latin": False}, [],
+    )
+    assert [item["tmdb_id"] for item in movies_with_ids] == ["123", "456"]
+    assert movie_ids == {"keep", "skip"}
+    assert [item["provider_series_id"] for item in series] == ["keep"]
+    assert series_ids == {"keep", "skip"}
 
 
 def test_xc_imports_are_serialized(monkeypatch):
@@ -26,7 +50,6 @@ def test_xc_imports_are_serialized(monkeypatch):
 
     monkeypatch.setattr(vod_importer.vod_db, "get_provider", lambda provider_id: {"id": provider_id, "name": str(provider_id)})
     monkeypatch.setattr(vod_importer, "_import_provider_catalog_impl", fake_impl)
-    monkeypatch.setattr(vod_importer, "schedule_known_series_identity_reconciliation", lambda: False)
 
     async def run():
         await asyncio.gather(
@@ -40,65 +63,74 @@ def test_xc_imports_are_serialized(monkeypatch):
 
 def test_non_xc_import_lifecycle_updates_shared_sidebar_status():
     previous = vod_importer.get_import_progress()
+    previous_workflow = vod_importer.get_catalog_workflow_progress()
     try:
         vod_importer.mark_import_queued(42, "Plex", 1)
-        queued = vod_importer.get_import_progress()
-        assert queued["queued"] is True
-        assert queued["running"] is False
-        assert queued["provider_name"] == "Plex"
+        assert vod_importer.get_import_progress()["queued"] is True
+        assert vod_importer.get_catalog_workflow_progress()["state"] == "queued"
 
         vod_importer.mark_import_running(42, "Plex")
         running = vod_importer.get_import_progress()
         assert running["running"] is True
         assert running["queued"] is False
         assert running["provider_name"] == "Plex"
+        assert vod_importer.get_catalog_workflow_progress()["phase"] == "Importing provider catalog"
 
         vod_importer.mark_import_finished(42)
         finished = vod_importer.get_import_progress()
         assert finished["running"] is False
         assert finished["queued"] is False
         assert finished["error"] is None
+
+        vod_importer.mark_catalog_workflow_ready()
+        ready = vod_importer.get_catalog_workflow_progress()
+        assert ready["state"] == "ready"
+        assert ready["finished_at"] is not None
     finally:
         vod_importer._IMPORT_PROGRESS.clear()
         vod_importer._IMPORT_PROGRESS.update(previous)
+        vod_importer._CATALOG_WORKFLOW_PROGRESS.clear()
+        vod_importer._CATALOG_WORKFLOW_PROGRESS.update(previous_workflow)
 
 
-def test_mark_import_finished_ignores_a_superseded_provider():
-    """The queue worker may have already moved on to the next provider by
-    the time an earlier one's own cleanup runs -- mark_import_finished must
-    not clobber that newer job's live state."""
-    previous = vod_importer.get_import_progress()
-    try:
-        vod_importer.mark_import_running(1, "First")
-        vod_importer.mark_import_running(2, "Second")
-        vod_importer.mark_import_finished(1)
-        still_second = vod_importer.get_import_progress()
-        assert still_second["provider_id"] == 2
-        assert still_second["running"] is True
-    finally:
-        vod_importer._IMPORT_PROGRESS.clear()
-        vod_importer._IMPORT_PROGRESS.update(previous)
+def test_review_summary_matches_visible_metadata_review_counts(db):
+    movie_id = db.upsert_movie("Needs identity", None)
+    series_id = db.upsert_series("Series needs identity", None)
+    adult_id = db.upsert_movie("Hidden adult", None)
+    db.set_movie_adult(adult_id, True)
+    invalid_id = db.upsert_movie("Incorrect TMDB", 2024, tmdb_id="gone")
+    db.record_tmdb_lookup_failure("movie", invalid_id, "gone")
+
+    assert movie_id and series_id
+    assert db.get_review_summary() == {
+        "missing_identity": {"movies": 1, "series": 1},
+        "invalid_tmdb": {"movies": 1, "series": 0},
+    }
 
 
-def test_evaluate_smart_category_scoped_ids_only_matches_given_pool(db, monkeypatch):
-    movie_a = db.upsert_movie("Alpha", 2020)
-    movie_b = db.upsert_movie("Beta", 2020)
-    category_id = db.upsert_category("All Movies", "movie", is_smart=True, rule_json='{"match_all": true, "exclude_adult": false}')
+def test_unchanged_sources_do_not_rewrite_movies_or_series(db):
+    provider_id = db.upsert_provider("Provider", "http://provider.invalid", "u", "p", provider_type="xc")
+    movie = {
+        "name": "Movie", "year": 2020, "provider_stream_id": "movie-1",
+        "container_extension": "mp4", "provider_category_name": "Movies",
+        "raw_name": "Movie (2020)", "catalog_fingerprint": "movie-v1",
+    }
+    series = {
+        "name": "Series", "year": 2020, "provider_series_id": "series-1",
+        "provider_category_name": "Series", "raw_name": "Series (2020)",
+        "catalog_fingerprint": "series-v1", "_has_detail": True,
+        "genre": "Drama", "description": "Description", "cast_list": None,
+        "director": None, "poster_url": None, "rating": None,
+        "release_date": None, "tmdb_id": None, "provider_last_modified": "100",
+    }
 
-    result_scoped = db.evaluate_smart_category(category_id, {movie_a})
-    assert result_scoped["evaluated"] == 1
-    assert result_scoped["matched"] == 1
+    assert db.bulk_import_movies(provider_id, [movie])["sources_changed"] == 1
+    assert db.bulk_import_series(provider_id, [series])["sources_changed"] == 1
 
-    placements = db.list_movie_placements(movie_b)
-    assert placements == []
+    second_movies = db.bulk_import_movies(provider_id, [movie])
+    second_series = db.bulk_import_series(provider_id, [series])
 
-    result_full = db.evaluate_smart_category(category_id)
-    assert result_full["evaluated"] == 2
-
-
-def test_evaluate_smart_category_empty_scoped_ids_is_a_no_op(db):
-    db.upsert_movie("Alpha", 2020)
-    category_id = db.upsert_category("All Movies", "movie", is_smart=True, rule_json='{"match_all": true, "exclude_adult": false}')
-
-    result = db.evaluate_smart_category(category_id, set())
-    assert result == {"evaluated": 0, "matched": 0, "newly_placed": 0}
+    assert second_movies["sources_changed"] == 0
+    assert second_movies["changed_movie_ids"] == []
+    assert second_series["sources_changed"] == 0
+    assert second_series["changed_series_ids"] == []

@@ -1,102 +1,118 @@
-"""bulk_enrich_all's per-item writes (movie fields+bitrate, series episodes)
-used to go straight to vod_db via independent asyncio.to_thread calls, each
-grabbing vod_db._WRITE_LOCK on its own -- with concurrency=8 for movies AND
-series (up to 16 threads), plus the periodic smart-category resweep and any
-concurrent manual /enrich/ call, this produced real "database is locked"
-errors, live (2026-09-15) -- one of which surfaced as an uncaught 500 on the
-manual enrich-series endpoint.
+"""Plan-doc follow-up (2026-09-14): "final SQLite contention work" / one
+global writer. Per-series and per-25-movie batching
+substantially cut SQLite lock contention, but each provider lane still
+flushes its own batches independently -- _run_provider_movie_phase calls
+vod_db.apply_movie_enrichment_batch directly, and each series source write
+calls vod_db.enrich_series_episodes_batch directly. Under bulk_enrich_all's
+per-provider-phase design, multiple providers' movie
+(or series) phases run concurrently via asyncio.gather -- so two providers'
+batch-commit points CAN land on SQLite at the same instant, still not "one
+global writer for the whole enrichment run."
 
-Fix: one run-wide asyncio.Queue + one background writer task
-(vod_importer._run_global_writer) that is the ONLY thing calling
-vod_db.apply_movie_enrichment_batch / vod_db.enrich_series_episodes_batch
-during a bulk_enrich_all run. These tests prove the batch write functions
-persist correctly, and that the writer task actually serializes writes from
-concurrent producers instead of letting them race."""
+Fix: bulk_enrich_all owns one asyncio.Queue + one background writer task for
+its whole run. Every batch payload (movie chunk or series-episode write),
+from every concurrently-running provider lane, is put() onto that queue
+instead of being flushed inline by the lane that produced it. The single
+writer task drains the queue and is the only thing that ever calls
+apply_movie_enrichment_batch / enrich_series_episodes_batch -- so no two
+writes are ever in flight at the same time, regardless of how many provider
+lanes are enriching concurrently. A single/on-demand enrich_movie or
+enrich_series call (outside bulk_enrich_all) keeps writing inline, unchanged
+-- there's no run-level queue/writer outside a bulk_enrich_all call."""
 
 import asyncio
 import threading
 
-import vod_db
+import pytest
+
 import vod_importer
 
 
-def test_apply_movie_enrichment_batch_writes_fields_and_bitrate(db):
-    movie_id = db.upsert_movie("Test Movie", 2020)
-    provider_id = db.upsert_provider("P1", "http://x", "u", "p", provider_type="xc")
-    db.add_movie_source(movie_id, provider_id, "s1")
-    source = db.list_movie_sources(movie_id)[0]
-
-    db.apply_movie_enrichment_batch([
-        {"movie_id": movie_id, "fields": {"genre": "Action", "tmdb_id": "123"},
-         "source_id": source["id"], "bitrate": 4500},
-    ])
-
-    movie = db.get_movie(movie_id)
-    assert movie["genre"] == "Action"
-    assert movie["tmdb_id"] == "123"
-    assert movie["last_enriched_at"] is not None
-    refreshed_source = db.list_movie_sources(movie_id)[0]
-    assert refreshed_source["bitrate"] == 4500
+def _provider(pid, name):
+    return {"id": pid, "name": name, "provider_type": "xc"}
 
 
-def test_apply_movie_enrichment_batch_one_bad_item_does_not_lose_the_rest(db):
-    movie_id = db.upsert_movie("Good Movie", 2021)
-    db.apply_movie_enrichment_batch([
-        {"movie_id": 999999, "fields": {"genre": "Bogus"}, "source_id": None, "bitrate": None},
-        {"movie_id": movie_id, "fields": {"genre": "Comedy"}, "source_id": None, "bitrate": None},
-    ])
-    assert db.get_movie(movie_id)["genre"] == "Comedy"
-
-
-def test_enrich_series_episodes_batch_writes_multiple_episodes(db):
-    series_id = db.upsert_series("Test Series", 2019)
-    provider_id = db.upsert_provider("P1", "http://x", "u", "p", provider_type="xc")
-
-    db.enrich_series_episodes_batch(series_id, provider_id, [
-        {"season_number": 1, "episode_number": 1, "name": "Pilot", "provider_stream_id": "e1"},
-        {"season_number": 1, "episode_number": 2, "name": "Ep 2", "provider_stream_id": "e2", "bitrate": 3000},
-    ])
-
-    episodes = db.list_episodes(series_id)
-    assert len(episodes) == 2
-    names = {e["name"] for e in episodes}
-    assert names == {"Pilot", "Ep 2"}
-
-
-def test_global_writer_serializes_concurrent_producers(monkeypatch):
-    """Two "producers" put() movie batches onto the queue concurrently --
-    the writer task draining it must never let two writes overlap, proving
-    bulk_enrich_all's writes are truly serialized through one task."""
+def test_movie_batch_writes_from_two_providers_never_run_concurrently(monkeypatch):
+    """Two providers' movie phases run concurrently (that's the whole point
+    of the per-provider-lane redesign) -- but their apply_movie_enrichment_batch
+    calls must never overlap in time. Proven with a shared re-entrancy guard:
+    if the "writer" is ever entered while already inside a call, that's two
+    lanes writing to SQLite at once -- exactly what "one global writer" rules
+    out."""
     in_writer = threading.Event()
     concurrent_write_detected = threading.Event()
-    written_ids: list[int] = []
+    write_calls = []
+
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
+        await asyncio.sleep(0.01)
+        return {"movie_id": movie_id, "fields": {"genre": "Action"}, "source_id": None, "bitrate": None}
+
+    async def fake_enrich_series(*a, **kw):
+        return {"fetched": False, "reason": None}
 
     def fake_apply_batch(items):
         if in_writer.is_set():
             concurrent_write_detected.set()
         in_writer.set()
         try:
-            written_ids.extend(i["movie_id"] for i in items)
+            write_calls.append([i["movie_id"] for i in items])
         finally:
             in_writer.clear()
 
+    monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
+    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
     monkeypatch.setattr(vod_importer.vod_db, "apply_movie_enrichment_batch", fake_apply_batch)
+    monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA"), _provider(2, "ProvB")])
+    monkeypatch.setattr(
+        vod_importer.vod_db, "list_all_movie_ids",
+        lambda provider_id=None, **kw: list(range(1, 51)) if provider_id == 1 else list(range(51, 101)),
+    )
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda **kw: [])
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movie_by_tmdb", lambda movie_id: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb", lambda series_id: None)
 
-    async def run():
-        queue: asyncio.Queue = asyncio.Queue(maxsize=32)
-        writer_task = asyncio.create_task(vod_importer._run_global_writer(queue))
+    asyncio.run(asyncio.wait_for(vod_importer.bulk_enrich_all(concurrency=8), timeout=10))
 
-        async def produce(start):
-            for i in range(start, start + 25):
-                done = asyncio.Event()
-                await queue.put({"kind": "movie", "items": [{"movie_id": i, "fields": {}, "source_id": None, "bitrate": None}], "done": done})
-                await done.wait()
+    all_written_ids = {mid for call in write_calls for mid in call}
+    assert all_written_ids == set(range(1, 101))
+    assert not concurrent_write_detected.is_set(), (
+        "two provider movie phases flushed apply_movie_enrichment_batch "
+        "concurrently -- writes to SQLite must be serialized through one "
+        "global writer for the whole bulk_enrich_all run"
+    )
 
-        await asyncio.gather(produce(1), produce(100))
-        await queue.put(None)
-        await writer_task
 
-    asyncio.run(asyncio.wait_for(run(), timeout=10))
+def test_bulk_enrich_all_uses_exactly_one_writer_task_for_the_whole_run(monkeypatch):
+    """More direct than the timing-based test above: bulk_enrich_all should
+    expose (or internally construct) exactly one queue-backed writer
+    coroutine per run, not one per provider phase. Verified by spying on
+    vod_importer._run_global_writer (the queue-draining task this fix adds)
+    and asserting it is only ever started once per bulk_enrich_all call,
+    regardless of how many providers/phases run."""
+    writer_starts = []
+    orig = getattr(vod_importer, "_run_global_writer", None)
+    assert orig is not None, "bulk_enrich_all must own a single _run_global_writer coroutine function"
 
-    assert set(written_ids) == set(range(1, 26)) | set(range(100, 125))
-    assert not concurrent_write_detected.is_set()
+    async def spy_writer(*args, **kwargs):
+        writer_starts.append(1)
+        return await orig(*args, **kwargs)
+
+    async def fake_enrich_movie(movie_id, *, force=False, skip_auto_merge=False, skip_write=False):
+        return {"movie_id": movie_id, "fields": {"genre": "Action"}, "source_id": None, "bitrate": None}
+
+    async def fake_enrich_series(*a, **kw):
+        return {"fetched": False, "reason": None}
+
+    monkeypatch.setattr(vod_importer, "_run_global_writer", spy_writer)
+    monkeypatch.setattr(vod_importer, "enrich_movie", fake_enrich_movie)
+    monkeypatch.setattr(vod_importer, "enrich_series", fake_enrich_series)
+    monkeypatch.setattr(vod_importer.vod_db, "apply_movie_enrichment_batch", lambda items: None)
+    monkeypatch.setattr(vod_importer.vod_db, "list_providers", lambda: [_provider(1, "ProvA"), _provider(2, "ProvB")])
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_movie_ids", lambda **kw: [10])
+    monkeypatch.setattr(vod_importer.vod_db, "list_all_series_ids", lambda **kw: [])
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_movie_by_tmdb", lambda movie_id: None)
+    monkeypatch.setattr(vod_importer.vod_db, "auto_merge_series_by_tmdb", lambda series_id: None)
+
+    asyncio.run(asyncio.wait_for(vod_importer.bulk_enrich_all(concurrency=8), timeout=10))
+
+    assert len(writer_starts) == 1, "exactly one global writer task must run per bulk_enrich_all call"

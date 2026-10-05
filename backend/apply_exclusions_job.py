@@ -18,9 +18,11 @@ import uuid
 
 import dispatcharr_dvr_importer
 import emby_vod_importer
+import library_importer
 import plex_importer
 import vod_db
 import vod_importer
+from xc_server import _redact_upstream_url
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +39,13 @@ async def _run_job(job_id: str) -> None:
         for p in providers:
             job["current_provider"] = p["name"]
             try:
+                # KNM: 2026-10-04 -- tracked so these show in Sync History too.
                 if p.get("provider_type") == "plex":
-                    result = await plex_importer.import_plex_library(p["id"])
+                    result = await vod_importer.run_tracked_import(p["id"], plex_importer.import_plex_library)
                 elif p.get("provider_type") in ("emby", "jellyfin"):
-                    result = await emby_vod_importer.import_emby_library(p["id"])
+                    result = await vod_importer.run_tracked_import(p["id"], emby_vod_importer.import_emby_library)
+                elif p.get("provider_type") == "library":
+                    result = await vod_importer.run_tracked_import(p["id"], library_importer.import_library)
                 elif p.get("provider_type") == "dispatcharr_dvr":
                     # DVR recordings have no language/category exclusion rules
                     # to retroactively apply yet -- this just re-runs the same
@@ -48,12 +53,25 @@ async def _run_job(job_id: str) -> None:
                     # fall into the XC branch below and error out.
                     result = await dispatcharr_dvr_importer.import_dvr_recordings(p["id"])
                 else:
-                    result = await vod_importer.import_provider_catalog(p["id"])
+                    # KNM: 2026-10-04 -- the background TMDB pass picks up
+                    # pending items; scheduling a sweep per provider here was
+                    # redundant.
+                    result = await vod_importer.import_provider_catalog(p["id"], schedule_enrichment=False)
+                # KNM: 2026-10-04 -- this is a full re-import; without the stamp
+                # the scheduled refresher imported the provider again right after.
+                await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                 job["results"].append({"provider": p["name"], **result})
             except Exception as exc:
-                logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], exc)
-                job["results"].append({"provider": p["name"], "error": str(exc)})
+                # KNM: 2026-10-03 -- httpx errors embed the request URL with the
+                # provider login; this text is shown in the UI, so redact it.
+                detail = _redact_upstream_url(str(exc)) or type(exc).__name__
+                logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], detail)
+                job["results"].append({"provider": p["name"], "error": detail})
             job["completed"] += 1
+        # KNM: 2026-10-04 -- the re-sweep below can take a while; without a
+        # phase the UI showed "Provider 5 of 4 -- syncing <last provider>".
+        job["current_provider"] = None
+        job["phase"] = "finalizing"
         # Real gap found live 2026-07-29: without this, an item newly
         # un-excluded by re-running import exclusions doesn't reappear in
         # All Movies/All TV Shows (and therefore stays invisible to
