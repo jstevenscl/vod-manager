@@ -42,6 +42,71 @@ interface Provider {
   has_library_remote_secret: boolean
 }
 
+interface CatalogSyncEvent {
+  id: number
+  content_type: 'movie' | 'series'
+  content_id: number | null
+  title: string
+  year: number | null
+  action: string
+  detail: Record<string, any>
+  created_at: string
+}
+
+function syncLabel(value: string): string {
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function syncDuration(start: string | null | undefined, finish: string | null | undefined): string {
+  if (!start || !finish) return 'pending'
+  const seconds = Math.max(0, Math.round(Number(finish) - Number(start)))
+  return `${seconds}s`
+}
+
+function syncEventDescription(event: CatalogSyncEvent): string {
+  const detail = event.detail ?? {}
+  if (event.action === 'merged') {
+    if (detail.match_type === 'name_year_missing_tmdb') {
+      return `Merged “${detail.merged_title ?? 'duplicate'}” into “${detail.survivor_title ?? event.title}” after matching the normalized title and exact year; the duplicate had no TMDB ID.`
+    }
+    return `Merged “${detail.merged_title ?? 'duplicate'}” into “${detail.survivor_title ?? event.title}”.`
+  }
+  if (event.action === 'episodes_synced') {
+    const added = Number(detail.episodes_added ?? 0)
+    const sources = Number(detail.episode_sources_added ?? 0)
+    return `${Number(detail.after?.episode_count ?? 0).toLocaleString()} episodes across ${Number(detail.after?.season_count ?? 0).toLocaleString()} seasons${added ? ` · ${added > 0 ? '+' : ''}${added} episode${Math.abs(added) === 1 ? '' : 's'}` : ''}${sources ? ` · ${sources > 0 ? '+' : ''}${sources} source${Math.abs(sources) === 1 ? '' : 's'}` : ''}.`
+  }
+  if (event.action === 'source_removed') return 'A provider source was removed from this catalog item.'
+  if (event.action === 'archived') return 'Archived from active review/playback queues by the import rules.'
+  if (event.action === 'unarchived') return 'Returned to the active review/playback queues.'
+  const sourceCount = detail.source_count
+  const sources = sourceCount != null ? `${Number(sourceCount).toLocaleString()} source${Number(sourceCount) === 1 ? '' : 's'}` : null
+  const identity = detail.identity_state ? ` ${detail.identity_state}.` : ''
+  if (event.action === 'added') return `Added from the provider feed.${sources ? ` ${sources} attached.` : ''}${identity}`
+  if (detail.reason_code === 'provider_source_refresh') {
+    return `Provider feed/source refreshed.${sources ? ` ${sources} attached.` : ''}${identity}`
+  }
+  return `Catalog record updated.${sources ? ` ${sources} attached.` : ''}${identity}`
+}
+
+interface CatalogSyncRun {
+  id: number
+  provider_name: string
+  run_type: string
+  queued_at: string
+  import_started_at: string | null
+  import_finished_at: string | null
+  reconciliation_started_at: string | null
+  reconciliation_finished_at: string | null
+  enrichment_started_at: string | null
+  enrichment_finished_at: string | null
+  ready_at: string | null
+  status: string
+  summary: Record<string, unknown>
+  event_count: number
+  events?: CatalogSyncEvent[]
+}
+
 interface RecordingProfile {
   id: number
   provider_id: number
@@ -220,6 +285,9 @@ interface RefreshSettings {
   catalog_refresh_seconds_jellyfin: number
   enrichment_ttl_seconds: number
   tmdb_sync_interval_seconds: number | null
+  episode_trickle_batch: number
+  episode_trickle_interval_seconds: number
+  episode_trickle_spacing_seconds: number
 }
 
 interface BackupComponent {
@@ -303,6 +371,19 @@ interface NeedsReviewItem {
   sample_episode_source_id?: number | null
   imported_season_count?: number
   imported_episode_count?: number
+  invalid_tmdb_id?: string
+  last_error?: string
+  last_failed_at?: string
+  attempts?: number
+}
+
+interface ExistingMetadataMatch {
+  id: number
+  name: string
+  year: number | null
+  tmdb_id: string | null
+  source_count: number
+  match_reason: string
 }
 
 interface NeedsReviewData {
@@ -326,26 +407,6 @@ interface UncategorizedReport {
   series_needing_year_review: OrphanGroup
   movies_uncategorized: OrphanGroup
   series_uncategorized: OrphanGroup
-}
-
-interface LanguageBackfillBucket {
-  count: number
-  sample_titles: string[]
-}
-interface LanguageBackfillReport {
-  missing: Record<string, Record<string, LanguageBackfillBucket>>
-  outdated: Record<string, Record<string, LanguageBackfillBucket>>
-}
-
-interface LanguageSplitCandidate {
-  movie_id?: number
-  series_id?: number
-  name: string
-  groups: { languages: string[]; source_count: number }[]
-}
-interface LanguageSplitReport {
-  count: number
-  sample: LanguageSplitCandidate[]
 }
 
 interface TmdbSuggestion {
@@ -1232,7 +1293,7 @@ interface BulkAiJobStatus {
   resolved: number
   skipped: number
   errors: number
-  results: BulkAiJobResult[]
+  results?: BulkAiJobResult[]
   error: string | null
 }
 
@@ -1246,13 +1307,23 @@ function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
     queryKey: ['vod-bulk-ai-job', progressEndpointPrefix, jobId],
     queryFn: () => api.get(`${progressEndpointPrefix}${jobId}/`).then((r) => r.data),
     enabled: !!jobId,
-    refetchInterval: (query) => (query.state.data?.running ? 800 : false),
+    // Keep polling until the server explicitly reports completion.  The old
+    // check returned false before the first response, so one transient 404/
+    // 5xx left the UI looking frozen forever with no explanation.
+    retry: 3,
+    refetchInterval: (query) => {
+      if (!jobId || query.state.data?.running === false) return false
+      return 1000
+    },
   })
   return {
     start: startMutation.mutate,
     starting: startMutation.isPending,
     startError: (startMutation.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? null,
     job: progressQuery.data ?? null,
+    progressError: progressQuery.error
+      ? ((progressQuery.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Could not read AI job progress. The job may have expired; start it again.')
+      : null,
     reset: () => setJobId(null),
   }
 }
@@ -1261,6 +1332,7 @@ function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
 // detail list, shared by all three bulk-AI panels below.
 function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (r: BulkAiJobResult) => string }) {
   const [expanded, setExpanded] = useState(false)
+  const results = Array.isArray(job.results) ? job.results : []
   return (
     <div className="text-xs px-2 py-1.5 rounded border border-primary/30 bg-primary/5 space-y-1">
       <div className="flex items-center gap-2">
@@ -1272,7 +1344,7 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
             {job.errors > 0 && <> · <strong>{job.errors}</strong> error{job.errors === 1 ? '' : 's'}</>}
           </span>
         )}
-        {!job.running && job.results.length > 0 && (
+        {!job.running && results.length > 0 && (
           <button className="text-primary hover:underline ml-auto" onClick={() => setExpanded((v) => !v)}>
             {expanded ? 'Hide details' : 'Show details'}
           </button>
@@ -1281,7 +1353,7 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
       {job.error && <p className="text-destructive">{job.error}</p>}
       {expanded && (
         <div className="max-h-48 overflow-y-auto space-y-0.5 pt-1 border-t border-border/50">
-          {job.results.map((r, i) => (
+          {results.map((r, i) => (
             <div key={i} className="flex items-start gap-1.5">
               <span className={r.status === 'resolved' ? 'text-success' : r.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
                 {r.status === 'resolved' ? '✓' : r.status === 'error' ? '✗' : '—'}
@@ -1384,9 +1456,18 @@ interface EnrichProgress {
   running: boolean
   movies_total: number; movies_done: number; movies_errors: number; movies_backoff_skipped: number
   series_total: number; series_done: number; series_errors: number; series_backoff_skipped: number
+  series_sources_total: number; series_sources_done: number
+  progress_phase?: 'catalog' | 'series_episodes'
   started_at: number | null; finished_at: number | null
+  cancelled?: boolean
   providers_backing_off: { provider_id: number; seconds_remaining: number }[]
   providers_throttled: { provider_id: number; concurrency: number; max_concurrency: number }[]
+}
+
+interface TmdbEnrichProgress {
+  running: boolean
+  total: number; done: number; errors: number
+  started_at: number | null; finished_at: number | null
 }
 
 interface Page<T> { items: T[]; total: number; limit: number; offset: number }
@@ -1436,19 +1517,16 @@ function SeasonEpisodeMatch({ imported, candidate, label }: { imported?: number;
   )
 }
 
-function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateKey }: {
+function NeedsReviewRow({ contentType, item, qc, xcCredentials, queue = 'identity' }: {
   contentType: 'movie' | 'series'
   item: NeedsReviewItem
   qc: ReturnType<typeof useQueryClient>
   xcCredentials?: XcCredentials
-  // Metadata Review's own queue key invalidates by default below; a caller
-  // reusing this row for a different queue (e.g. Incorrect TMDB IDs) passes
-  // its own key here so resolving a row here also refreshes that queue,
-  // instead of leaving a now-stale row visible until a manual refresh.
-  extraInvalidateKey?: string
+  queue?: 'identity' | 'invalid_tmdb'
 }) {
   const [expanded, setExpanded] = useState(false)
   const [manualYear, setManualYear] = useState('')
+  const [manualTmdbId, setManualTmdbId] = useState('')
 
   // Movies preview directly off their own id; series need a specific episode
   // (see xc_server.py's /preview/series/ route) — sample_episode_id is the
@@ -1482,13 +1560,47 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
     enabled:  expanded,
     retry:    false,
   })
+  const existingMatchesQuery = useQuery<ExistingMetadataMatch[]>({
+    queryKey: ['vod-needs-review-existing-matches', contentType, item.id],
+    queryFn: () => api.get(`/vod/needs-review/${contentType}/${item.id}/existing-matches/`).then((r) => r.data),
+    enabled: expanded,
+    retry: false,
+  })
 
   const resolve = useMutation({
     mutationFn: (body: { year: number; tmdb_id?: string }) =>
       api.post(`/vod/needs-review/${contentType}/${item.id}/resolve/`, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
-      if (extraInvalidateKey) qc.invalidateQueries({ queryKey: [extraInvalidateKey] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  const setTmdbId = useMutation({
+    mutationFn: (tmdbId: number) => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/set/`, { tmdb_id: tmdbId }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  const manualMerge = useMutation({
+    mutationFn: (keepId: number) => api.post('/vod/duplicates/merge/', {
+      content_type: contentType, keep_id: keepId, merge_ids: [item.id],
+    }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+  })
+  const clearTmdbId = useMutation({
+    mutationFn: () => api.post(`/vod/${contentType === 'movie' ? 'movies' : 'series'}/${item.id}/tmdb-id/clear/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
+      qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -1531,6 +1643,9 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
         <span className="min-w-0 truncate flex items-center gap-1.5">
           <PlayButton url={previewUrl} transcodedUrl={transcodedUrl} hlsUrl={hlsUrl} title={item.name} />
           {item.name} {item.genre && <span className="text-muted-foreground">({item.genre})</span>}
+          {queue === 'invalid_tmdb' && <span className="text-destructive">invalid TMDB #{item.invalid_tmdb_id ?? item.tmdb_id}</span>}
+          {!item.tmdb_id && <span className="text-amber-500">no TMDB ID</span>}
+          {!item.year && <span className="text-amber-500">no year</span>}
           {contentType === 'series' && !!item.imported_episode_count && (
             <span className="text-muted-foreground">
               — imported: {item.imported_season_count} season{item.imported_season_count === 1 ? '' : 's'}, {item.imported_episode_count} episode{item.imported_episode_count === 1 ? '' : 's'}
@@ -1557,6 +1672,43 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
 
       {expanded && (
         <div className="mt-2 space-y-2">
+          {!!existingMatchesQuery.data?.length && (
+            <div className="rounded border border-amber-500/50 bg-amber-500/5 px-2.5 py-2 text-xs">
+              <div className="font-medium text-amber-600 dark:text-amber-400">Already in your catalog</div>
+              <p className="text-muted-foreground mt-0.5">A possible match from another provider is shown below. Verify it before applying.</p>
+              <div className="mt-1.5 space-y-1">
+                {existingMatchesQuery.data.map((match) => (
+                  <div key={match.id} className="flex items-center justify-between gap-2 rounded border border-border/60 px-2 py-1.5">
+                    <span className="min-w-0">
+                      <strong className="text-foreground">{match.name}</strong>{match.year != null && <span className="text-muted-foreground"> ({match.year})</span>}
+                      <span className="text-muted-foreground"> · {match.source_count || 0} provider source{match.source_count === 1 ? '' : 's'} · {match.match_reason}</span>
+                    </span>
+                    {match.tmdb_id ? (
+                      <Button size="sm" variant="outline" className="h-7 shrink-0" disabled={setTmdbId.isPending || resolve.isPending} onClick={() => {
+                        if (match.year != null) resolve.mutate({ year: match.year, tmdb_id: match.tmdb_id! })
+                        else setTmdbId.mutate(Number(match.tmdb_id))
+                      }}>
+                        {setTmdbId.isPending || resolve.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Use existing match'}
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm" variant="outline" className="h-7 shrink-0"
+                        disabled={manualMerge.isPending}
+                        onClick={() => {
+                          if (window.confirm(`Merge "${item.name}" into "${match.name}"? This moves its sources and cannot be undone.`)) {
+                            manualMerge.mutate(match.id)
+                          }
+                        }}
+                      >
+                        {manualMerge.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Merge into existing'}
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {existingMatchesQuery.isError && <p className="text-muted-foreground text-xs">Could not check for an existing catalog match.</p>}
           <div className="flex items-center gap-1.5">
             <span className="text-muted-foreground">search TMDB as:</span>
             <input
@@ -1571,6 +1723,14 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
               {aiSuggest.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} className="mr-1" />Ask AI</>}
             </Button>
           </div>
+          {queue === 'invalid_tmdb' && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-muted-foreground">TMDB returned 404{item.last_failed_at ? ` · last checked ${new Date(item.last_failed_at).toLocaleString()}` : ''}</span>
+              <Button size="sm" variant="outline" className="h-7 text-xs text-destructive" disabled={clearTmdbId.isPending} onClick={() => clearTmdbId.mutate()}>
+                Clear invalid ID
+              </Button>
+            </div>
+          )}
           {aiSuggest.isError && (
             <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
           )}
@@ -1586,12 +1746,17 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
           {suggestionsQuery.isError && <p className="text-destructive">TMDB search failed — check the API key in Rich Metadata settings.</p>}
           {!!suggestionsQuery.data?.length && (
             <div className="space-y-1.5">
-              {suggestionsQuery.data.map((s) => (
+              {suggestionsQuery.data.map((s) => {
+                const resolvedYear = s.year ?? item.year
+                return (
                 <button
                   key={s.tmdb_id}
-                  disabled={resolve.isPending}
-                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left"
-                  onClick={() => resolve.mutate({ year: s.year ?? 0, tmdb_id: s.tmdb_id })}
+                  disabled={resolve.isPending || resolvedYear == null}
+                  className="flex items-start gap-2 w-full border border-border rounded px-2 py-1.5 hover:bg-accent text-left disabled:opacity-50"
+                  title={resolvedYear == null ? 'This TMDB result has no release year; set a year manually instead.' : undefined}
+                  onClick={() => {
+                    if (resolvedYear != null) resolve.mutate({ year: resolvedYear, tmdb_id: s.tmdb_id })
+                  }}
                 >
                   <PosterThumb
                     url={s.poster_url}
@@ -1613,15 +1778,16 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
                     {s.overview && <p className="text-muted-foreground line-clamp-2">{s.overview}</p>}
                   </div>
                 </button>
-              ))}
+                )
+              })}
             </div>
           )}
           {suggestionsQuery.data && suggestionsQuery.data.length === 0 && (
             <p className="text-muted-foreground">No TMDB matches found for this name.</p>
           )}
 
-          <div className="flex items-center gap-1.5">
-            <span className="text-muted-foreground">or set year manually:</span>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-muted-foreground">or set manually:</span>
             <input
               className={inputCls('w-16')}
               type="number"
@@ -1629,12 +1795,25 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
               value={manualYear}
               onChange={(e) => setManualYear(e.target.value)}
             />
+            <input
+              className={inputCls('w-24')}
+              type="number"
+              placeholder="TMDB ID"
+              value={manualTmdbId}
+              onChange={(e) => setManualTmdbId(e.target.value)}
+            />
             <Button
               size="sm"
-              disabled={!manualYear || resolve.isPending}
-              onClick={() => resolve.mutate({ year: Number(manualYear) })}
+              disabled={(!manualYear && !manualTmdbId) || resolve.isPending || setTmdbId.isPending}
+              onClick={() => {
+                if (manualYear) {
+                  resolve.mutate({ year: Number(manualYear), tmdb_id: manualTmdbId || undefined })
+                } else if (manualTmdbId) {
+                  setTmdbId.mutate(Number(manualTmdbId))
+                }
+              }}
             >
-              Resolve
+              {resolve.isPending || setTmdbId.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Apply'}
             </Button>
           </div>
         </div>
@@ -1691,7 +1870,7 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
         <span className="min-w-0 truncate flex items-center gap-1.5">
           <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk action" />
           <ImageOff size={12} className="text-muted-foreground shrink-0" />
-          {item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}
+          {item.name} {item.year && !item.name.trim().endsWith(`(${item.year})`) && <span className="text-muted-foreground">({item.year})</span>}
         </span>
         <button className="text-muted-foreground hover:text-foreground shrink-0" onClick={() => setExpanded((e) => !e)}>
           {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
@@ -2649,7 +2828,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
-          {movie.name}{movie.year ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
+          {movie.name}{movie.year && !movie.name.trim().endsWith(`(${movie.year})`) ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
           {!!movie.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
@@ -2788,6 +2967,19 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     mutationFn: () => api.post(`/vod/series/${series.id}/enrich/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
+  const autoFetchStarted = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      autoFetchStarted.current = false
+      return
+    }
+    if (!autoFetchStarted.current && !enrich.isPending) {
+      autoFetchStarted.current = true
+      // The backend checks every provider source and only requests episode
+      // data for sources that have not been fetched yet.
+      enrich.mutate()
+    }
+  }, [open])
   const deleteSeries = useMutation({
     mutationFn: () => api.delete(`/vod/series/${series.id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
@@ -2996,6 +3188,16 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
 
       <div>
         <p className="font-medium mb-1">Episodes</p>
+        {enrich.isPending && (
+          <p className="text-muted-foreground flex items-center gap-1.5 mb-1">
+            <Loader2 size={12} className="animate-spin" /> Checking providers for missing episodes...
+          </p>
+        )}
+        {enrich.isError && (
+          <p className="text-destructive mb-1">
+            Could not load missing provider episodes. Retry with “Fetch episodes &amp; detail”.
+          </p>
+        )}
         {series.episodes.length === 0 && (
           <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
         )}
@@ -3187,7 +3389,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
       <div className="flex items-center justify-between">
         <span className="font-semibold text-[13px] flex items-center gap-1.5 cursor-pointer" onClick={() => setOpen(!open)}>
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
-          {series.name}{series.year ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
+          {series.name}{series.year && !series.name.trim().endsWith(`(${series.year})`) ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
           {!!series.is_adult && <Chip tone="rec">18+</Chip>}
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
@@ -4350,7 +4552,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
           {query.data?.items.map((item) => (
             <li key={item.id} className="border-b border-border/50 py-1.5 flex items-center gap-1.5">
               <input type="checkbox" checked={selectedIds.has(item.id)} onChange={() => toggleSelected(item.id)} />
-              <span className="min-w-0 truncate">{item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}</span>
+              <span className="min-w-0 truncate">{item.name} {item.year && !item.name.trim().endsWith(`(${item.year})`) && <span className="text-muted-foreground">({item.year})</span>}</span>
             </li>
           ))}
         </ul>
@@ -4362,6 +4564,107 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
 
 export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
+
+interface PossibleMetadataMatchCandidate {
+  id: number
+  name: string
+  year: number | null
+  tmdb_id: string | null
+  match_reason: string
+}
+
+interface PossibleMetadataMatchItem {
+  id: number
+  name: string
+  year: number | null
+  candidates: PossibleMetadataMatchCandidate[]
+}
+
+function PossibleMetadataMatches({ contentType }: { contentType: 'movie' | 'series' }) {
+  const qc = useQueryClient()
+  const [offset, setOffset] = useState(0)
+  const [selected, setSelected] = useState<Map<number, number>>(new Map())
+  const query = useQuery<{ items: PossibleMetadataMatchItem[]; total: number; limit: number; offset: number }>({
+    queryKey: ['vod-possible-matches', contentType, offset],
+    queryFn: () => api.get('/vod/possible-matches/', { params: { content_type: contentType, limit: 50, offset } }).then((r) => r.data),
+  })
+  const merge = useMutation({
+    mutationFn: (pairs: { item_id: number; candidate_id: number }[]) => api.post('/vod/possible-matches/bulk-merge/', { content_type: contentType, pairs }),
+    onSuccess: (r) => {
+      setSelected(new Map())
+      qc.invalidateQueries({ queryKey: ['vod-possible-matches', contentType] })
+      qc.invalidateQueries({ queryKey: [contentType === 'movie' ? 'vod-movies' : 'vod-series'] })
+      notify(`Merged ${r.data.merged}; skipped ${r.data.skipped.length}.`)
+    },
+    // KNM: 2026-10-03 a failed bulk merge used to fail silently; surface it and refresh the list.
+    onError: (e: any) => {
+      qc.invalidateQueries({ queryKey: ['vod-possible-matches', contentType] })
+      notify(e?.response?.data?.detail ?? 'Bulk merge failed.')
+    },
+  })
+  const items = query.data?.items ?? []
+  const allVisibleSelected = items.length > 0 && items.every((item) => selected.has(item.id))
+  const selectAllVisible = () => {
+    setSelected((current) => {
+      const next = new Map(current)
+      if (allVisibleSelected) items.forEach((item) => next.delete(item.id))
+      else items.forEach((item) => { if (item.candidates[0]) next.set(item.id, item.candidates[0].id) })
+      return next
+    })
+  }
+  return (
+    <SectionCard title={`Possible ${contentType === 'movie' ? 'Movie' : 'TV Show'} Matches`} icon={<ArrowRightLeft size={14} />}>
+      <p className="text-xs text-muted-foreground">
+        Review same-title candidates from other providers. Selecting a row approves the displayed candidate; final title and language checks still run on the server before merging.
+      </p>
+      <div className="flex items-center gap-2 flex-wrap rounded border border-border/50 bg-muted/30 px-2 py-1.5">
+        <span className="text-xs text-muted-foreground">{selected.size} selected</span>
+        <button className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={selectAllVisible}>
+          {allVisibleSelected ? 'Clear visible' : `Select all visible (${items.length})`}
+        </button>
+        <Button size="sm" disabled={!selected.size || merge.isPending} onClick={() => merge.mutate(Array.from(selected, ([item_id, candidate_id]) => ({ item_id, candidate_id })))}>
+          {merge.isPending ? <Loader2 size={12} className="mr-1 animate-spin" /> : <ArrowRightLeft size={12} className="mr-1" />}
+          Approve and merge ({selected.size})
+        </Button>
+        {query.data && <span className="ml-auto text-xs text-muted-foreground">{query.data.total.toLocaleString()} possible matches</span>}
+      </div>
+      {query.isLoading && <p className="text-xs text-muted-foreground">Finding possible matches…</p>}
+      {query.isError && <p className="text-xs text-destructive">Could not load possible matches.</p>}
+      {!query.isLoading && !items.length && <p className="text-xs text-muted-foreground">No possible matches found.</p>}
+      <div className="space-y-2">
+        {items.map((item) => {
+          const chosen = selected.get(item.id)
+          return (
+            <div key={item.id} className={`rounded border p-2 ${chosen ? 'border-primary/60 bg-primary/5' : 'border-border/50'}`}>
+              <div className="flex items-start gap-2">
+                <input type="checkbox" checked={chosen != null} onChange={() => setSelected((current) => {
+                  const next = new Map(current)
+                  if (next.has(item.id)) next.delete(item.id)
+                  else if (item.candidates[0]) next.set(item.id, item.candidates[0].id)
+                  return next
+                })} />
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium">{item.name} <span className="text-xs text-amber-400">missing TMDB/year</span></div>
+                  <div className="text-[11px] text-muted-foreground">Select the existing catalog card to receive this provider source.</div>
+                  <div className="mt-1 space-y-1">
+                    {item.candidates.map((candidate) => (
+                      <label key={candidate.id} className="flex items-center gap-2 rounded border border-border/40 bg-background/30 px-2 py-1 text-xs cursor-pointer">
+                        <input type="radio" name={`match-${contentType}-${item.id}`} checked={chosen === candidate.id} onChange={() => setSelected((current) => new Map(current).set(item.id, candidate.id))} />
+                        <span className="font-medium">{candidate.name}</span>
+                        <span className="text-muted-foreground">{candidate.year ?? 'no year'}{candidate.tmdb_id ? ` · TMDB ${candidate.tmdb_id}` : ''} · {candidate.match_reason}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      {query.data && <Pager total={query.data.total} limit={query.data.limit} offset={offset} onOffset={(value) => { setOffset(value); setSelected(new Map()) }} />}
+    </SectionCard>
+  )
+}
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
   activeTab: VodManagerTab
@@ -4388,12 +4691,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
+  const [metadataQueue, setMetadataQueue] = useState<'identity' | 'invalid_tmdb'>('identity')
   const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
-  const [metadataHideAdult, setMetadataHideAdult] = useState(false)
-  const [tmdbFailuresContentType, setTmdbFailuresContentType] = useState<'movie' | 'series'>('movie')
-  const [tmdbFailuresSelected, setTmdbFailuresSelected] = useState<Set<number>>(new Set())
+  const [metadataHideAdult, setMetadataHideAdult] = useState(true)
+  const [metadataOffset, setMetadataOffset] = useState(0)
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [movieSubTab, setMovieSubTab] = useState<'library' | 'matches'>('library')
+  const [seriesSubTab, setSeriesSubTab] = useState<'library' | 'matches'>('library')
 
   // ── Activity (currently open stream relays) ──
   const activityQuery = useQuery<ActivitySession[]>({
@@ -4420,7 +4725,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: () => api.delete('/vod/stream-failures/'),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-failures'] }),
   })
-  // ── Stream Recovery (movies hidden after every source repeatedly failed) ──
   const blockedMoviesQuery = useQuery<BlockedMovie[]>({
     queryKey: ['vod-stream-recovery-movies'],
     queryFn: () => api.get('/vod/stream-recovery/movies/').then((r) => r.data),
@@ -4641,7 +4945,38 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const enrichProgressQuery = useQuery<EnrichProgress>({
     queryKey: ['vod-enrich-progress'],
     queryFn:  () => api.get('/vod/enrich-all/status/').then((r) => r.data),
-    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
+    // Automatic post-import work is started server-side after the TMDB pass.
+    // Keep a light idle poll so an already-open Curation page sees that
+    // handoff without requiring a browser refresh.
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 10000),
+  })
+  const tmdbEnrichProgressQuery = useQuery<TmdbEnrichProgress>({
+    queryKey: ['vod-tmdb-enrich-progress'],
+    queryFn: () => api.get('/vod/enrich-tmdb/status/').then((r) => r.data),
+    // Imports start this job server-side, so retain a light idle poll in
+    // order to notice work that was not launched by this browser tab.
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 10000),
+  })
+  const syncHistoryQuery = useQuery<CatalogSyncRun[]>({
+    queryKey: ['vod-sync-history'],
+    queryFn: () => api.get('/vod/sync-history/').then((r) => r.data),
+    refetchInterval: 10000,
+  })
+  const [syncHistorySelected, setSyncHistorySelected] = useState<Set<number>>(new Set())
+  const [syncHistoryOpen, setSyncHistoryOpen] = useState<number | null>(null)
+  const [syncHistoryEventTab, setSyncHistoryEventTab] = useState<'movie' | 'series'>('movie')
+  const syncHistoryDetailQuery = useQuery<CatalogSyncRun>({
+    queryKey: ['vod-sync-history-detail', syncHistoryOpen],
+    queryFn: () => api.get(`/vod/sync-history/${syncHistoryOpen}/`).then((r) => r.data),
+    enabled: syncHistoryOpen != null,
+  })
+  const deleteSyncHistory = useMutation({
+    mutationFn: (runIds: number[]) => api.delete('/vod/sync-history/', { data: { run_ids: runIds } }),
+    onSuccess: () => {
+      setSyncHistorySelected(new Set())
+      setSyncHistoryOpen(null)
+      qc.invalidateQueries({ queryKey: ['vod-sync-history'] })
+    },
   })
   const xcCredentialsQuery = useQuery<XcCredentials>({
     queryKey: ['vod-xc-credentials'],
@@ -4796,6 +5131,131 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setLanguageDraft(next)
     setLanguageLastClickedIndex(index)
   }
+  // Enabled Playback Languages -- separate from the exclusion picker above:
+  // that one gates future imports by raw_name prefix; this is a live filter
+  // over the language already computed on every source row, so toggling it
+  // takes effect immediately on already-imported content in both directions.
+  const enabledLanguagesQuery = useQuery<{ codes: string[] }>({
+    queryKey: ['vod-enabled-languages'],
+    queryFn:  () => api.get('/vod/enabled-languages/').then((r) => r.data),
+  })
+  const saveEnabledLanguages = useMutation({
+    mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
+  })
+
+  // Language backfill + retroactive movie/series language split:
+  // one-off maintenance actions, previously only runnable via a
+  // direct backend/SSH call. Each preview query runs the read-only
+  // *_dry_run_report(), and the matching mutation runs the real apply_*().
+  const languageBackfillPreview = useQuery<{ movie_sources?: number; series_sources?: number; episode_sources?: number }>({
+    queryKey: ['vod-language-backfill-preview'],
+    queryFn: () => api.get('/vod/language-backfill/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageBackfillApply = useMutation({
+    mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
+  // Recompute: distinct from backfill above. Backfill only fills
+  // in rows that were never classified (language IS NULL). This instead
+  // catches rows that WERE classified but by a since-fixed bug, e.g. "IR -"
+  // prefixed sources written as language='EN' before "IR" was added to
+  // _KNOWN_LANGUAGE_CODES. Report shape: { [table]: { [code]: { count, sample_titles } } }.
+  const languageRecomputePreview = useQuery<Record<string, Record<string, { count: number; sample_titles: string[] }>>>({
+    queryKey: ['vod-language-recompute-preview'],
+    queryFn: () => api.get('/vod/language-recompute/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const languageRecomputeApply = useMutation({
+    mutationFn: () => api.post('/vod/language-recompute/apply/').then((r) => r.data as { updated: number }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) },
+  })
+  const movieLanguageSplitPreview = useQuery<{ movies: any[] }>({
+    queryKey: ['vod-movie-language-split-preview'],
+    queryFn: () => api.get('/vod/movie-language-split/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const movieLanguageSplitApply = useMutation({
+    mutationFn: () => api.post('/vod/movie-language-split/apply/').then((r) => r.data as { movies_split: number; new_rows_created: number }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-movies'] }),
+  })
+  const seriesLanguageSplitPreview = useQuery<{ series: any[] }>({
+    queryKey: ['vod-series-language-split-preview'],
+    queryFn: () => api.get('/vod/series-language-split/preview/').then((r) => r.data),
+    enabled: false,
+  })
+  const seriesLanguageSplitApply = useMutation({
+    mutationFn: () => api.post('/vod/series-language-split/apply/').then((r) => r.data as { series_split: number; new_rows_created: number }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
+  })
+
+  const [enabledLanguageSearch, setEnabledLanguageSearch] = useState('')
+  const [enabledLanguageShowFilter, setEnabledLanguageShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
+  const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
+  const [enabledLanguageLastClickedIndex, setEnabledLanguageLastClickedIndex] = useState<number | null>(null)
+  const enabledLanguageDraftInitialized = useRef(false)
+  useEffect(() => {
+    if (enabledLanguageDraftInitialized.current || !enabledLanguagesQuery.data) return
+    enabledLanguageDraftInitialized.current = true
+    setEnabledLanguageDraft(new Set(enabledLanguagesQuery.data.codes))
+  }, [enabledLanguagesQuery.data])
+  // Same pool-prefix data source as the exclusion picker -- these are the
+  // same per-source language codes, just gated by a different setting.
+  const allEnabledLanguageCodes = (() => {
+    const counts = new Map((languagePrefixesQuery.data ?? []).map((p) => [p.code, p.count]))
+    for (const code of enabledLanguagesQuery.data?.codes ?? []) {
+      if (!counts.has(code)) counts.set(code, 0)
+    }
+    if (!counts.has('EN')) counts.set('EN', 0)
+    if (!counts.has('ES')) counts.set('ES', 0)
+    return [...counts.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
+  })()
+  const visibleEnabledLanguageCodes = allEnabledLanguageCodes.filter((c) => {
+    const label = `${c.code} ${LANGUAGE_CODE_NAMES[c.code] ?? ''}`.toLowerCase()
+    if (enabledLanguageSearch && !label.includes(enabledLanguageSearch.toLowerCase())) return false
+    if (enabledLanguageShowFilter === 'selected' && !enabledLanguageDraft.has(c.code)) return false
+    if (enabledLanguageShowFilter === 'unselected' && enabledLanguageDraft.has(c.code)) return false
+    return true
+  })
+  function toggleEnabledLanguageSelected(code: string, index: number, shiftKey: boolean) {
+    const willBeChecked = !enabledLanguageDraft.has(code)
+    const next = new Set(enabledLanguageDraft)
+    if (shiftKey && enabledLanguageLastClickedIndex != null) {
+      const [start, end] = [enabledLanguageLastClickedIndex, index].sort((a, b) => a - b)
+      for (let j = start; j <= end; j++) {
+        const c = visibleEnabledLanguageCodes[j]?.code
+        if (c == null) continue
+        if (willBeChecked) next.add(c); else next.delete(c)
+      }
+    } else {
+      if (willBeChecked) next.add(code); else next.delete(code)
+    }
+    setEnabledLanguageDraft(next)
+    setEnabledLanguageLastClickedIndex(index)
+  }
+  function saveEnabledLanguagesWithImpactCheck() {
+    const nextCodes = [...enabledLanguageDraft]
+    const currentCodes = enabledLanguagesQuery.data?.codes ?? []
+    const removed = currentCodes.filter((c) => !nextCodes.includes(c))
+    if (!removed.length) {
+      saveEnabledLanguages.mutate(nextCodes)
+      return
+    }
+    api.post('/vod/enabled-languages/impact/', { codes: nextCodes }).then((r) => {
+      const { movies_losing_access, episodes_losing_access } = r.data
+      if (!movies_losing_access && !episodes_losing_access) {
+        saveEnabledLanguages.mutate(nextCodes)
+        return
+      }
+      askConfirm(
+        `Removing ${removed.join(', ')} will immediately take ${movies_losing_access} movie(s) and ${episodes_losing_access} episode(s) out of playback/export — they'll have no remaining source in an enabled language. Nothing is deleted; re-enabling the language brings them back instantly. Continue?`,
+        () => saveEnabledLanguages.mutate(nextCodes),
+      )
+    })
+  }
   // Import Country Exclusion -- sibling to Import Language Exclusion above,
   // same shape/pattern, keyed on a title's trailing "(<country code>)" tag
   // instead of a leading language prefix. Real motivating case: an
@@ -4857,49 +5317,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setCountryDraft(next)
     setCountryLastClickedIndex(index)
   }
-  // Enabled Playback Languages -- separate from the exclusion picker above:
-  // that one gates future imports by raw_name prefix (archives on import,
-  // via _should_auto_archive); this is a live filter over the language
-  // already computed on every source row (see config.get_enabled_languages),
-  // so toggling it takes effect immediately on already-imported content in
-  // both directions (see vod_db.archive_disabled_language_content, which
-  // re-evaluates review_excluded both ways).
-  const enabledLanguagesQuery = useQuery<{ codes: string[] }>({
-    queryKey: ['vod-enabled-languages'],
-    queryFn:  () => api.get('/vod/enabled-languages/').then((r) => r.data),
-  })
-  const saveEnabledLanguages = useMutation({
-    mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
-  })
-  const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
-  const enabledLanguageDraftInitialized = useRef(false)
-  useEffect(() => {
-    if (enabledLanguageDraftInitialized.current || !enabledLanguagesQuery.data) return
-    enabledLanguageDraftInitialized.current = true
-    setEnabledLanguageDraft(new Set(enabledLanguagesQuery.data.codes))
-  }, [enabledLanguagesQuery.data])
-  // Same pool-prefix data source as the exclusion picker above -- these are
-  // the same per-source language codes, just gated by a different setting.
-  // EN/ES always shown even at zero count: they're the default-enabled
-  // pair (see config.get_enabled_languages), so a fresh install shouldn't
-  // have to hunt for them in an empty list.
-  const allEnabledLanguageCodes = (() => {
-    const counts = new Map((languagePrefixesQuery.data ?? []).map((p) => [p.code, p.count]))
-    for (const code of enabledLanguagesQuery.data?.codes ?? []) {
-      if (!counts.has(code)) counts.set(code, 0)
-    }
-    if (!counts.has('EN')) counts.set('EN', 0)
-    if (!counts.has('ES')) counts.set('ES', 0)
-    return [...counts.entries()]
-      .map(([code, count]) => ({ code, count }))
-      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code))
-  })()
-  function toggleEnabledLanguage(code: string) {
-    const next = new Set(enabledLanguageDraft)
-    if (next.has(code)) next.delete(code); else next.add(code)
-    setEnabledLanguageDraft(next)
-  }
   const [applyExclusionsJobId, setApplyExclusionsJobId] = useState<string | null>(null)
   const applyImportExclusionsNow = useMutation({
     mutationFn: () => api.post('/vod/import-exclusions/apply-now/'),
@@ -4912,6 +5329,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
   const applyExclusionsJobQuery = useQuery<{
     status: string; total: number; completed: number; current_provider: string | null
+    phase?: string
     results: ApplyExclusionsProviderResult[]; error: string | null
   }>({
     queryKey: ['vod-apply-exclusions-job', applyExclusionsJobId],
@@ -4970,6 +5388,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: string
     enrichment_ttl_hours: string
     tmdb_sync_hours: string
+    trickle_batch: string
+    trickle_pause_minutes: string
+    trickle_spacing_seconds: string
   } | null>(null)
   const secToHrStr = (s: number | null | undefined) => (s == null ? '' : String(s / 3600))
   const refreshValues = refreshForm ?? (refreshSettingsQuery.data ? {
@@ -4979,7 +5400,22 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_jellyfin),
     enrichment_ttl_hours:           secToHrStr(refreshSettingsQuery.data.enrichment_ttl_seconds),
     tmdb_sync_hours:                secToHrStr(refreshSettingsQuery.data.tmdb_sync_interval_seconds),
+    trickle_batch:                  String(refreshSettingsQuery.data.episode_trickle_batch),
+    trickle_pause_minutes:          String(refreshSettingsQuery.data.episode_trickle_interval_seconds / 60),
+    trickle_spacing_seconds:        String(refreshSettingsQuery.data.episode_trickle_spacing_seconds),
   } : null)
+  // KNM: 2026-10-04 -- live estimate for the episode preloading fields, so the
+  // effect of a change on the provider is visible before saving.
+  const trickleEstimate = (() => {
+    if (!refreshValues) return null
+    const batch = Number(refreshValues.trickle_batch)
+    const pause = Math.max(5, Number(refreshValues.trickle_pause_minutes)) * 60
+    const spacing = Math.max(1, Number(refreshValues.trickle_spacing_seconds))
+    if (!Number.isFinite(batch) || !Number.isFinite(pause) || !Number.isFinite(spacing)) return null
+    if (batch <= 0) return 'Off: episode lists load only when someone opens a show.'
+    const perHour = Math.round((batch * 3600) / (batch * spacing + pause))
+    return `About ${perHour.toLocaleString()} shows per hour per provider (up to ~${(perHour * 24).toLocaleString()} requests a day), one request every ${spacing} s while a batch runs.`
+  })()
   const saveRefreshSettings = useMutation({
     mutationFn: () => {
       const hrToSec = (v: string) => Math.round(Number(v) * 3600)
@@ -4990,6 +5426,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         catalog_refresh_seconds_jellyfin: hrToSec(refreshValues!.catalog_refresh_hours_jellyfin),
         enrichment_ttl_seconds:           hrToSec(refreshValues!.enrichment_ttl_hours),
         tmdb_sync_interval_seconds:       refreshValues!.tmdb_sync_hours.trim() ? hrToSec(refreshValues!.tmdb_sync_hours) : null,
+        episode_trickle_batch:            Math.round(Number(refreshValues!.trickle_batch)),
+        episode_trickle_interval_seconds: Math.round(Number(refreshValues!.trickle_pause_minutes) * 60),
+        episode_trickle_spacing_seconds:  Number(refreshValues!.trickle_spacing_seconds),
       })
     },
     onSuccess: () => {
@@ -5071,7 +5510,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
   })
+  const cancelBulkEnrich = useMutation({
+    mutationFn: () => api.post('/vod/enrich-all/cancel/'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enrich-progress'] }),
+  })
   const enrichProgress = enrichProgressQuery.data
+  const tmdbEnrichProgress = tmdbEnrichProgressQuery.data
   const wasEnrichRunning = useRef(false)
   useEffect(() => {
     if (wasEnrichRunning.current && enrichProgress && !enrichProgress.running) {
@@ -5734,30 +6178,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [importingId, setImportingId] = useState<number | null>(null)
   const [importResult, setImportResult] = useState<string | null>(null)
   const importCatalog = useMutation({
-    // Real bug found live: import is one synchronous backend call (network
-    // pull + per-item DB upsert for the whole catalog, no background-job/
-    // poll pattern), and a 100K+/50K+ movie/series library can genuinely
-    // take longer than a few minutes -- the old 180s cap turned a slow but
-    // successful import into a spurious "Import failed" every time on a
-    // catalog this size. 30 minutes is generous enough for even a very
-    // large library while still eventually giving up on something truly
-    // stuck, rather than removing the cap outright.
-    // XC catalog imports are now queued server-side and return immediately
-    // (see backend/vod_routes.py's _manual_import_worker) so this browser
-    // can keep using the app -- live progress appears in the sidebar
-    // status widget -- instead of holding this request open for the whole
-    // catalog pull. Non-XC imports (Plex/Emby/Jellyfin) still run
-    // synchronously and return their final counts directly, same as
-    // before, so both response shapes are handled below.
+    // The server queues catalog imports and returns immediately, so this
+    // browser can keep using Metadata Review while a provider refresh runs.
     mutationFn: (id: number) => { setImportingId(id); return api.post(`/vod/providers/${id}/import/`, null, { timeout: 1_800_000 }) },
     onSuccess: (r) => {
       if (r.data.queued) {
-        setImportResult(r.data.already_queued
-          ? `${r.data.provider ?? 'Provider'} is already queued for import.`
-          : `${r.data.provider ?? 'Provider'} import queued${r.data.position > 1 ? ` (position ${r.data.position})` : ''}. You can keep using the app; live progress appears in the sidebar.`)
-        qc.invalidateQueries({ queryKey: ['vod-providers'] })
-        return
-      }
+      setImportResult(r.data.already_queued
+        ? `${r.data.provider ?? 'Provider'} is already queued for import.`
+        : `${r.data.provider ?? 'Provider'} import queued${r.data.position > 1 ? ` (position ${r.data.position})` : ''}. You can keep using the app; live progress appears in the sidebar.`)
+      qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      } else {
       const archived = (r.data.movies_archived ?? 0) + (r.data.series_archived ?? 0)
       const unarchived = (r.data.movies_unarchived ?? 0) + (r.data.series_unarchived ?? 0)
       const skipped: { name: string; collection_type: string | null }[] = r.data.skipped_libraries ?? []
@@ -5773,6 +6203,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      }
     },
     onError: (e: any) => {
       // A client-side timeout doesn't mean the import actually failed --
@@ -5911,21 +6342,41 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryKey: ['vod-needs-review'],
     queryFn:  () => api.get('/vod/needs-review/').then((r) => r.data),
   })
-  // ── Metadata review (broader queue: also covers no-tmdb_id+no-year titles
-  // that never triggered the ambiguity detector above) ──
   const metadataReviewQuery = useQuery<NeedsReviewData>({
     queryKey: ['vod-metadata-review'],
     queryFn:  () => api.get('/vod/metadata-review/').then((r) => r.data),
     enabled: activeTab === 'metadata',
   })
-  const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
-  const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
-  const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  const tmdbLookupFailuresQuery = useQuery<NeedsReviewData>({
+    queryKey: ['vod-tmdb-lookup-failures'],
+    queryFn: () => api.get('/vod/tmdb-lookup-failures/').then((r) => r.data),
+    enabled: activeTab === 'metadata',
+  })
+  const activeMetadataQuery = metadataQueue === 'identity' ? metadataReviewQuery : tmdbLookupFailuresQuery
+  const metadataMovieItems = activeMetadataQuery.data?.movies ?? []
+  const metadataSeriesItems = activeMetadataQuery.data?.series ?? []
+  const hideAdultsInMetadata = metadataQueue === 'identity' && metadataHideAdult
+  const visibleMetadataMovies = hideAdultsInMetadata ? metadataMovieItems.filter((item) => !item.is_adult) : metadataMovieItems
+  const visibleMetadataSeries = hideAdultsInMetadata ? metadataSeriesItems.filter((item) => !item.is_adult) : metadataSeriesItems
+  const metadataItems = metadataContentType === 'movie' ? metadataMovieItems : metadataSeriesItems
+  const filteredMetadataItems = metadataContentType === 'movie' ? visibleMetadataMovies : visibleMetadataSeries
+  const hiddenAdultMetadataCount = metadataItems.length - filteredMetadataItems.length
+  const METADATA_PAGE_SIZE = 50
+  const metadataPageItems = filteredMetadataItems.slice(metadataOffset, metadataOffset + METADATA_PAGE_SIZE)
+  const metadataBulkAi = useBulkAiJob(
+    metadataQueue === 'identity' ? '/vod/needs-review/bulk-resolve/' : '/vod/tmdb-lookup-failures/bulk-resolve/',
+    metadataQueue === 'identity' ? '/vod/needs-review/bulk-resolve/' : '/vod/tmdb-lookup-failures/bulk-resolve/',
+  )
+  const scanTmdbFailures = useMutation({
+    mutationFn: () => api.post('/vod/tmdb-lookup-failures/scan/'),
+    onSuccess: () => setTimeout(() => qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] }), 2500),
+  })
   const archiveMetadata = useMutation({
     mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
     onSuccess: () => {
       setMetadataSelected(new Set())
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     },
   })
@@ -5933,28 +6384,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     if (metadataBulkAi.job && !metadataBulkAi.job.running) {
       setMetadataSelected(new Set())
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
+      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
       qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metadataBulkAi.job?.running])
-  // ── Incorrect TMDB IDs (a stored id TMDB itself now confirms is gone,
-  // via a 404 -- distinct from Metadata Review above, which is no id at all) ──
-  const tmdbFailuresQuery = useQuery<NeedsReviewData>({
-    queryKey: ['vod-tmdb-lookup-failures'],
-    queryFn:  () => api.get('/vod/tmdb-lookup-failures/').then((r) => r.data),
-    enabled: activeTab === 'metadata',
-  })
-  const tmdbFailuresItems = (tmdbFailuresContentType === 'movie' ? tmdbFailuresQuery.data?.movies : tmdbFailuresQuery.data?.series) ?? []
-  const tmdbFailuresBulkAi = useBulkAiJob('/vod/tmdb-lookup-failures/bulk-resolve/', '/vod/tmdb-lookup-failures/bulk-resolve/')
-  useEffect(() => {
-    if (tmdbFailuresBulkAi.job && !tmdbFailuresBulkAi.job.running) {
-      setTmdbFailuresSelected(new Set())
-      qc.invalidateQueries({ queryKey: ['vod-tmdb-lookup-failures'] })
-      qc.invalidateQueries({ queryKey: tmdbFailuresContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tmdbFailuresBulkAi.job?.running])
 
   // ── Missing artwork counts (badge only -- the modal paginates its own list) ──
   const missingArtworkCountsQuery = useQuery<{ movies: number; series: number }>({
@@ -6012,52 +6447,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onSuccess: (data) => {
       qc.setQueryData(['vod-uncategorized'], data)
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
-      qc.invalidateQueries({ queryKey: ['vod-series'] })
-    },
-  })
-
-  // ── Language backfill (sources written, or last classified, before a
-  // language-detection fix landed -- movie_sources/episode_sources/
-  // series_sources) ──
-  const languageBackfillQuery = useQuery<LanguageBackfillReport>({
-    queryKey: ['vod-language-backfill'],
-    queryFn:  () => api.get('/vod/language-backfill/').then((r) => r.data),
-    enabled:  false,  // scan on demand only, same reasoning as Orphan Checker above
-  })
-  const applyLanguageBackfill = useMutation({
-    mutationFn: () => api.post('/vod/language-backfill/apply/').then((r) => r.data),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-language-backfill'] })
-      qc.invalidateQueries({ queryKey: ['vod-movies'] })
-      qc.invalidateQueries({ queryKey: ['vod-series'] })
-    },
-  })
-
-  // ── Language split (movies/series auto-merged across languages before
-  // the auto-merge language gate existed -- retroactive undo, run after
-  // Language Backfill above since it depends on accurate per-source
-  // language values) ──
-  const movieLanguageSplitQuery = useQuery<LanguageSplitReport>({
-    queryKey: ['vod-movie-language-split'],
-    queryFn:  () => api.get('/vod/language-split/movies/').then((r) => r.data),
-    enabled:  false,
-  })
-  const applyMovieLanguageSplit = useMutation({
-    mutationFn: () => api.post('/vod/language-split/movies/apply/').then((r) => r.data),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-movie-language-split'] })
-      qc.invalidateQueries({ queryKey: ['vod-movies'] })
-    },
-  })
-  const seriesLanguageSplitQuery = useQuery<LanguageSplitReport>({
-    queryKey: ['vod-series-language-split'],
-    queryFn:  () => api.get('/vod/language-split/series/').then((r) => r.data),
-    enabled:  false,
-  })
-  const applySeriesLanguageSplit = useMutation({
-    mutationFn: () => api.post('/vod/language-split/series/apply/').then((r) => r.data),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['vod-series-language-split'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
   })
@@ -6427,6 +6816,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         </Modal>
       )}
+      {activeTab !== 'metadata' && activeTab !== 'recovery' && <>
       <SectionCard title="Activity" icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
@@ -6542,6 +6932,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </>
         )}
       </SectionCard>
+
+      </>}
 
       {activeTab === 'config' && (
       <>
@@ -6764,7 +7156,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </SectionCard>
 
       <SectionCard title="Refresh Schedule" icon={<RefreshCw size={14} />}>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-xs text-foreground/85">
           How often each provider type's catalog gets automatically re-imported, how long enrichment (posters,
           cast, genre) is cached before refetching, and how often TMDB Lists auto-sync. Plex/Emby libraries can
           take much longer to scan than a cheap XC catalog pull, so each provider type has its own interval.
@@ -6828,6 +7220,57 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </label>
           </div>
         )}
+        {refreshValues && (
+          <div className="space-y-2 border-t border-border pt-3">
+            <h4 className="text-sm font-semibold text-foreground">Episode list preloading</h4>
+            <p className="text-xs text-foreground/85 leading-relaxed">
+              In the background, the app slowly asks each provider for the episode lists of shows nobody has
+              opened yet, so they're ready when someone does. Opening a show always loads its episodes right
+              away, so this only decides how fast the backlog fills in. It works in small batches: one
+              request at a time, a short gap between requests, then a pause before the next batch. Each
+              provider runs in its own lane and is only asked about its own shows.
+            </p>
+            <p className="text-xs text-foreground/85 leading-relaxed">
+              Go gently: a provider that sees too many requests may slow down or block the account. The gap
+              between requests matters most, so raise the batch size or shorten the pause before lowering it.
+              A provider that fails 3 times in a row is skipped until the next batch.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-2">
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Shows per batch
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={0} max={500} step="10"
+                  value={refreshValues.trickle_batch}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_batch: e.target.value })}
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Pause between batches (min)
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={5} max={1440} step="5"
+                  value={refreshValues.trickle_pause_minutes}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_pause_minutes: e.target.value })}
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                Gap between requests (sec)
+                <input
+                  className={inputCls('w-16')}
+                  type="number" min={1} max={60} step="1"
+                  value={refreshValues.trickle_spacing_seconds}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_spacing_seconds: e.target.value })}
+                />
+              </label>
+            </div>
+            <p className="text-xs text-foreground/85">
+              Allowed: 0–500 shows (0 turns preloading off), 5 min–24 h pause, 1–60 s gap.
+              Defaults: 100 shows, 15 min, 3 s.
+            </p>
+            {trickleEstimate && <p className="text-xs font-medium text-primary">{trickleEstimate}</p>}
+          </div>
+        )}
         <div className="flex items-center gap-1.5">
           <Button
             size="sm"
@@ -6839,7 +7282,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {refreshForm && (
             <Button size="sm" variant="outline" onClick={() => setRefreshForm(null)}>Cancel</Button>
           )}
-          <span className="text-xs text-muted-foreground">Leave TMDB Lists sync blank to keep it manual-only.</span>
+          <span className="text-xs text-foreground/85">Leave TMDB Lists sync blank to keep it manual-only.</span>
         </div>
       </SectionCard>
 
@@ -7538,54 +7981,79 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="Metadata Review" icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.
-          Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
-          identity already exists in the pool, its sources and categories merge into that existing title.
+          {metadataQueue === 'identity'
+            ? 'Fix titles the provider left without both a TMDB identity and release year, plus the held ambiguous-year queue.'
+            : 'Correct stored TMDB IDs that TMDB confirmed no longer exist. Search TMDB, choose the exact match, or clear the invalid ID.'}
         </p>
-        <div className="flex items-center gap-1.5 pt-1">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-1">
+          <span className="text-[11px] font-medium text-muted-foreground">Review issue</span>
+          <div className="flex items-center gap-1.5">
+            <Button size="sm" variant={metadataQueue === 'identity' ? 'default' : 'outline'} title="Titles with no usable TMDB ID and no release year" onClick={() => { setMetadataQueue('identity'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+              Missing identity
+            </Button>
+            <Button size="sm" variant={metadataQueue === 'invalid_tmdb' ? 'default' : 'outline'} title="Stored TMDB IDs that TMDB returned as not found" onClick={() => { setMetadataQueue('invalid_tmdb'); setMetadataSelected(new Set()); setMetadataOffset(0) }}>
+              Incorrect TMDB IDs{tmdbLookupFailuresQuery.data?.movies.length || tmdbLookupFailuresQuery.data?.series.length ? ` (${(tmdbLookupFailuresQuery.data?.movies.length ?? 0) + (tmdbLookupFailuresQuery.data?.series.length ?? 0)})` : ''}
+            </Button>
+          </div>
+          <span className="text-[11px] font-medium text-muted-foreground">Content type</span>
+          <div className="flex items-center gap-1.5">
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
-            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()) }}
+            onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
+            Movies{` (${visibleMetadataMovies.length})`}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
-            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()) }}
+            onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           >
-            TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
+            TV Shows{` (${visibleMetadataSeries.length})`}
           </Button>
-          <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
-            {metadataReviewQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+          <Button size="sm" variant="outline" disabled={activeMetadataQuery.isFetching} onClick={() => activeMetadataQuery.refetch()}>
+            {activeMetadataQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             <span className="ml-1">Refresh</span>
           </Button>
+          {metadataQueue === 'invalid_tmdb' && <Button size="sm" variant="outline" disabled={scanTmdbFailures.isPending} onClick={() => scanTmdbFailures.mutate()}>
+            {scanTmdbFailures.isPending ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+            <span className="ml-1">Scan pending IDs</span>
+          </Button>}
+          </div>
         </div>
-        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground rounded border border-border/60 bg-muted/20 px-2.5 py-2">
+          <span><strong className="text-foreground">Missing identity:</strong> no usable TMDB ID and no release year, or an ambiguous year held for review. A same-title row elsewhere is only a candidate until the year/identity is safe to copy.</span>
+          <span><strong className="text-foreground">Incorrect TMDB IDs:</strong> stored IDs TMDB returned as not found.</span>
+        </div>
+        {metadataQueue === 'identity' && <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
           <input
             type="checkbox"
             checked={metadataHideAdult}
-            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()) }}
+            onChange={(e) => { setMetadataHideAdult(e.target.checked); setMetadataSelected(new Set()); setMetadataOffset(0) }}
           />
           Hide adult titles
-          {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
-        </label>
-        {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
-        {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
-        {metadataReviewQuery.data && (
+          {metadataHideAdult && <span>({hiddenAdultMetadataCount} adult title{hiddenAdultMetadataCount === 1 ? '' : 's'} hidden; {filteredMetadataItems.length} shown of {metadataItems.length})</span>}
+        </label>}
+        {activeMetadataQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
+        {activeMetadataQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
+        {activeMetadataQuery.data && (
           <>
             {filteredMetadataItems.length === 0 ? (
-              <p className="text-xs text-muted-foreground pt-1">{metadataHideAdult ? 'No non-adult titles match this review queue.' : 'Clean — no active titles need identity review.'}</p>
+              <p className="text-xs text-muted-foreground pt-1">{hideAdultsInMetadata ? 'No non-adult titles match this review queue.' : 'Clean — no active titles need review.'}</p>
             ) : (
               <>
                 <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
                   <button
                     className="text-primary hover:underline"
-                    onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}
+                    onClick={() => setMetadataSelected(new Set(metadataPageItems.map((i) => i.id)))}
                   >
-                    Select all
+                    Select this page
                   </button>
+                  {metadataQueue === 'invalid_tmdb' && filteredMetadataItems.length > metadataPageItems.length && (
+                    <button className="text-primary hover:underline" onClick={() => setMetadataSelected(new Set(filteredMetadataItems.map((i) => i.id)))}>
+                      Select all {filteredMetadataItems.length}
+                    </button>
+                  )}
                   <button className="text-muted-foreground hover:underline" onClick={() => setMetadataSelected(new Set())}>Clear</button>
                   <span className="text-muted-foreground">{metadataSelected.size} selected</span>
                   <Button
@@ -7610,9 +8078,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </Button>
                 </div>
                 {metadataBulkAi.startError && <p className="text-xs text-destructive">{metadataBulkAi.startError}</p>}
+                {metadataBulkAi.progressError && <p className="text-xs text-destructive">{metadataBulkAi.progressError}</p>}
                 {metadataBulkAi.job && <BulkAiJobSummary job={metadataBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                <Pager total={filteredMetadataItems.length} limit={METADATA_PAGE_SIZE} offset={metadataOffset} onOffset={setMetadataOffset} />
                 <ul className="divide-y divide-border/50">
-                  {filteredMetadataItems.map((item) => (
+                  {metadataPageItems.map((item) => (
                     <Fragment key={item.id}>
                       <li className="pt-1.5 -mb-1.5">
                         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -7628,88 +8098,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                           Select
                         </label>
                       </li>
-                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} extraInvalidateKey="vod-metadata-review" />
-                    </Fragment>
-                  ))}
-                </ul>
-              </>
-            )}
-          </>
-        )}
-      </SectionCard>
-      <SectionCard title="Incorrect TMDB IDs" icon={<Search size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Titles whose stored TMDB ID TMDB itself has confirmed no longer exists (a 404 on lookup) — different from
-          Metadata Review above, which is for titles with no TMDB identity at all. Search TMDB and select the exact
-          result to replace the bad ID.
-        </p>
-        <div className="flex items-center gap-1.5 pt-1">
-          <Button
-            size="sm"
-            variant={tmdbFailuresContentType === 'movie' ? 'default' : 'outline'}
-            onClick={() => { setTmdbFailuresContentType('movie'); setTmdbFailuresSelected(new Set()) }}
-          >
-            Movies{tmdbFailuresQuery.data?.movies.length ? ` (${tmdbFailuresQuery.data.movies.length})` : ''}
-          </Button>
-          <Button
-            size="sm"
-            variant={tmdbFailuresContentType === 'series' ? 'default' : 'outline'}
-            onClick={() => { setTmdbFailuresContentType('series'); setTmdbFailuresSelected(new Set()) }}
-          >
-            TV Shows{tmdbFailuresQuery.data?.series.length ? ` (${tmdbFailuresQuery.data.series.length})` : ''}
-          </Button>
-          <Button size="sm" variant="outline" disabled={tmdbFailuresQuery.isFetching} onClick={() => tmdbFailuresQuery.refetch()}>
-            {tmdbFailuresQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-            <span className="ml-1">Refresh</span>
-          </Button>
-        </div>
-        {tmdbFailuresQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
-        {tmdbFailuresQuery.isError && <p className="text-xs text-destructive">Could not load the incorrect TMDB ID queue.</p>}
-        {tmdbFailuresQuery.data && (
-          <>
-            {tmdbFailuresItems.length === 0 ? (
-              <p className="text-xs text-muted-foreground pt-1">Clean — no stored TMDB IDs are currently confirmed invalid.</p>
-            ) : (
-              <>
-                <div className="flex items-center gap-2 flex-wrap rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
-                  <button
-                    className="text-primary hover:underline"
-                    onClick={() => setTmdbFailuresSelected(new Set(tmdbFailuresItems.map((i) => i.id)))}
-                  >
-                    Select all
-                  </button>
-                  <button className="text-muted-foreground hover:underline" onClick={() => setTmdbFailuresSelected(new Set())}>Clear</button>
-                  <span className="text-muted-foreground">{tmdbFailuresSelected.size} selected</span>
-                  <Button
-                    size="sm" variant="outline" className="h-7 text-xs ml-auto"
-                    disabled={tmdbFailuresSelected.size === 0 || tmdbFailuresBulkAi.starting || !!tmdbFailuresBulkAi.job?.running}
-                    title="Searches TMDB for each selected title and replaces the invalid ID only when AI is highly confident."
-                    onClick={() => tmdbFailuresBulkAi.start({ content_type: tmdbFailuresContentType, ids: Array.from(tmdbFailuresSelected) })}
-                  >
-                    {tmdbFailuresBulkAi.starting || tmdbFailuresBulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
-                    Resolve selected with AI ({tmdbFailuresSelected.size})
-                  </Button>
-                </div>
-                {tmdbFailuresBulkAi.startError && <p className="text-xs text-destructive">{tmdbFailuresBulkAi.startError}</p>}
-                {tmdbFailuresBulkAi.job && <BulkAiJobSummary job={tmdbFailuresBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
-                <ul className="divide-y divide-border/50">
-                  {tmdbFailuresItems.map((item) => (
-                    <Fragment key={item.id}>
-                      <li className="pt-1.5 -mb-1.5">
-                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                          <input
-                            type="checkbox"
-                            checked={tmdbFailuresSelected.has(item.id)}
-                            onChange={() => setTmdbFailuresSelected((selected) => {
-                              const next = new Set(selected)
-                              if (next.has(item.id)) next.delete(item.id); else next.add(item.id)
-                              return next
-                            })}
-                          />
-                          Select
-                        </label>
-                      </li>
-                      <NeedsReviewRow contentType={tmdbFailuresContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} extraInvalidateKey="vod-tmdb-lookup-failures" />
+                      <NeedsReviewRow contentType={metadataContentType} item={item} qc={qc} xcCredentials={xcCredentialsQuery.data} queue={metadataQueue} />
                     </Fragment>
                   ))}
                 </ul>
@@ -7723,16 +8112,31 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
+      {tmdbEnrichProgress?.running && (
+        <div className="mb-3 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-200">
+          <span className="inline-flex items-center gap-1.5">
+            <Loader2 size={13} className="animate-spin" />
+            TMDB metadata {tmdbEnrichProgress.done.toLocaleString()} / {tmdbEnrichProgress.total.toLocaleString()}
+            {tmdbEnrichProgress.errors > 0 && ` · ${tmdbEnrichProgress.errors} unavailable`}
+          </span>
+          <span className="ml-2 text-muted-foreground">Provider catalog connections are not used for these titles.</span>
+        </div>
+      )}
       <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
         <p className="text-xs text-muted-foreground">
-          Fetches detail (genre, poster, description, cast) from each item's source provider for every movie
-          and series in the pool. Runs in the background — safe to navigate away while it works.
+          Imported TMDB IDs are resolved without contacting providers. Provider detail is manual for
+          unmatched movies and series episode discovery. Runs in the background — safe to navigate away while it works.
         </p>
         <div className="flex items-center gap-1.5">
           <Button size="sm" disabled={!!enrichProgress?.running || startBulkEnrich.isPending} onClick={() => startBulkEnrich.mutate(false)}>
             {enrichProgress?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
             {enrichProgress?.running ? 'Enriching…' : 'Bulk Enrich All'}
           </Button>
+          {enrichProgress?.running && (
+            <Button size="sm" variant="outline" disabled={cancelBulkEnrich.isPending} onClick={() => cancelBulkEnrich.mutate()}>
+              Cancel enrichment
+            </Button>
+          )}
           <Button
             size="sm" variant="outline" disabled={!!enrichProgress?.running || startBulkEnrich.isPending}
             title="Re-fetches every movie/series from its provider even if it was already enriched -- use this once after an update adds new captured fields (e.g. rating, release date, bitrate), so existing items backfill them right away instead of waiting out the normal freshness window."
@@ -7740,7 +8144,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <RefreshCw size={12} className="mr-1" /> Force Re-Enrich All
           </Button>
-          {enrichProgress && !enrichProgress.running && enrichProgress.started_at && enrichProgress.finished_at && (
+          {enrichProgress && !enrichProgress.running && !enrichProgress.cancelled && enrichProgress.started_at && enrichProgress.finished_at && (
             <span className="text-xs text-muted-foreground">took {Math.round(enrichProgress.finished_at - enrichProgress.started_at)}s</span>
           )}
         </div>
@@ -7760,7 +8164,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             }).join(', ')} after recent errors — eases back up automatically as requests keep succeeding.
           </p>
         )}
-        {enrichProgress && (enrichProgress.running || enrichProgress.finished_at) && (
+        {enrichProgress && (enrichProgress.running || (enrichProgress.finished_at && !enrichProgress.cancelled)) && (
           <div className="space-y-1.5">
             {(() => {
               // Real bug found live: unclamped, so movies_done could exceed
@@ -7769,7 +8173,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               // syncing) and read "101%" -- same Math.min(100, ...) guard
               // the playback-progress bar already uses elsewhere.
               const mPct = enrichProgress.movies_total ? Math.min(100, Math.round((enrichProgress.movies_done / enrichProgress.movies_total) * 100)) : 100
-              const sPct = enrichProgress.series_total ? Math.min(100, Math.round((enrichProgress.series_done / enrichProgress.series_total) * 100)) : 100
+              const episodePhase = enrichProgress.progress_phase === 'series_episodes'
+              const sDone = episodePhase ? enrichProgress.series_sources_done : enrichProgress.series_done
+              const sTotal = episodePhase ? enrichProgress.series_sources_total : enrichProgress.series_total
+              const sPct = sTotal ? Math.min(100, Math.round((sDone / sTotal) * 100)) : 100
               return (
                 <>
                   <div>
@@ -7781,8 +8188,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </div>
                   <div>
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-0.5">
-                      <span>Series</span>
-                      <span className="tabular-nums">{enrichProgress.series_done.toLocaleString()} / {enrichProgress.series_total.toLocaleString()}{enrichProgress.series_errors > 0 && ` (${enrichProgress.series_errors} errors)`}{enrichProgress.series_backoff_skipped > 0 && ` (${enrichProgress.series_backoff_skipped} paused for backoff)`}</span>
+                      <span>{episodePhase ? 'Episode sources' : 'Series'}</span>
+                      <span className="tabular-nums">{sDone.toLocaleString()} / {sTotal.toLocaleString()}{enrichProgress.series_errors > 0 && ` (${enrichProgress.series_errors} errors)`}{enrichProgress.series_backoff_skipped > 0 && ` (${enrichProgress.series_backoff_skipped} paused for backoff)`}</span>
                     </div>
                     <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-primary" style={{ width: `${sPct}%` }} /></div>
                   </div>
@@ -7791,6 +8198,62 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             })()}
           </div>
         )}
+      </SectionCard>
+      <SectionCard title="Sync History" icon={<List size={14} />}>
+        <p className="text-xs text-muted-foreground">Persistent provider-run reports for catalog changes and automatic merges. Deleting reports never deletes catalog content.</p>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" disabled={!syncHistorySelected.size || deleteSyncHistory.isPending} onClick={() => askConfirm(`Delete ${syncHistorySelected.size} sync report${syncHistorySelected.size === 1 ? '' : 's'}? Catalog content will not be changed.`, () => deleteSyncHistory.mutate(Array.from(syncHistorySelected)))}>
+            {deleteSyncHistory.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Trash2 size={12} className="mr-1" />}Delete selected reports
+          </Button>
+          <span className="text-xs text-muted-foreground">{syncHistorySelected.size} selected</span>
+        </div>
+        <div className="overflow-x-auto rounded border border-border/60">
+          <table className="w-full text-xs"><thead className="text-left text-muted-foreground bg-muted/20"><tr><th className="p-2 w-8" /><th className="p-2">Run</th><th className="p-2">Provider</th><th className="p-2">Status</th><th className="p-2">Changes</th><th className="p-2">Duration</th></tr></thead>
+            <tbody>{(syncHistoryQuery.data ?? []).map((run) => {
+              const duration = syncDuration(run.import_started_at, run.ready_at)
+              // duration is sourced from the durable report timestamps above
+              const phaseDurations = [
+                run.import_started_at && run.import_finished_at ? `import ${syncDuration(run.import_started_at, run.import_finished_at)}` : null,
+                run.enrichment_started_at && run.enrichment_finished_at ? `enrich ${syncDuration(run.enrichment_started_at, run.enrichment_finished_at)}` : null,
+                run.reconciliation_started_at && run.reconciliation_finished_at ? `review ${syncDuration(run.reconciliation_started_at, run.reconciliation_finished_at)}` : null,
+              ].filter(Boolean).join(' · ')
+              return <Fragment key={run.id}><tr className="border-t border-border/40 hover:bg-muted/10"><td className="p-2"><input type="checkbox" checked={syncHistorySelected.has(run.id)} onChange={() => setSyncHistorySelected((current) => { const next = new Set(current); if (next.has(run.id)) next.delete(run.id); else next.add(run.id); return next })} /></td><td className="p-2"><button className="text-primary hover:underline" onClick={() => setSyncHistoryOpen(syncHistoryOpen === run.id ? null : run.id)}>{new Date(Number(run.queued_at) * 1000).toLocaleString()}</button></td><td className="p-2">{run.provider_name}</td><td className="p-2">{run.status}</td><td className="p-2">{run.event_count}</td><td className="p-2 tabular-nums"><span>{duration}</span>{phaseDurations && <span className="block text-[10px] text-muted-foreground">{phaseDurations}</span>}</td></tr>
+                {syncHistoryOpen === run.id && <tr className="border-t border-border/20 bg-muted/5"><td colSpan={6} className="p-3">{syncHistoryDetailQuery.isLoading ? <span className="text-muted-foreground">Loading report…</span> : syncHistoryDetailQuery.isError ? <span className="text-destructive">Could not load this report. Refresh and try again.</span> : syncHistoryDetailQuery.data && <div className="space-y-3">
+                  {(() => {
+                    const detail = syncHistoryDetailQuery.data
+                    const summaryEntries = Object.entries(detail.summary ?? {}).filter(([key, value]) => !['provider', 'catalog_changed', 'post_import_enrichment_queued'].includes(key) && typeof value !== 'object' && value !== null)
+                    return <>
+                      <div className="grid gap-2 sm:grid-cols-4">{[
+                        ['Total', syncDuration(detail.import_started_at, detail.ready_at)],
+                        ['Import', syncDuration(detail.import_started_at, detail.import_finished_at)],
+                        ['Enrichment', syncDuration(detail.enrichment_started_at, detail.enrichment_finished_at)],
+                        ['Review', syncDuration(detail.reconciliation_started_at, detail.reconciliation_finished_at)],
+                      ].map(([label, value]) => <div key={label} className="rounded border border-border/50 bg-background/40 px-2 py-1.5"><div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div><div className="font-semibold tabular-nums">{value}</div></div>)}</div>
+                      <div className="rounded border border-border/50 bg-background/30 p-2"><div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">What this run did</div>{summaryEntries.length ? <div className="grid gap-x-4 gap-y-1 sm:grid-cols-3">{summaryEntries.map(([key, value]) => <div key={key} className="flex justify-between gap-2"><span className="text-muted-foreground">{syncLabel(key)}</span><span className="font-medium tabular-nums">{String(value)}</span></div>)}</div> : <div className="text-muted-foreground">No summary counters were recorded.</div>}</div>
+                      {(() => {
+                        const events = detail.events ?? []
+                        const movieEvents = events.filter((event) => event.content_type === 'movie')
+                        const seriesEvents = events.filter((event) => event.content_type === 'series')
+                        const visibleEvents = syncHistoryEventTab === 'movie' ? movieEvents : seriesEvents
+                        return <div className="space-y-1.5">
+                          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Catalog changes and actions</div>
+                          <div className="flex items-center gap-1 border-b border-border/50">
+                            {([['movie', 'Movies', movieEvents.length], ['series', 'Series', seriesEvents.length]] as const).map(([tab, label, count]) => (
+                              <button key={tab} type="button" className={`border-b-2 px-2.5 py-1.5 text-xs font-medium transition-colors ${syncHistoryEventTab === tab ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setSyncHistoryEventTab(tab)}>
+                                {label} <span className="ml-1 tabular-nums text-[10px]">{count.toLocaleString()}</span>
+                              </button>
+                            ))}
+                          </div>
+                          {visibleEvents.length ? <ul className="space-y-1.5">{visibleEvents.map((event) => <li key={event.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border/40 bg-background/25 px-2 py-1.5"><span className="text-muted-foreground">{event.content_type === 'movie' ? 'Movie' : 'TV'}</span><span className="font-medium">{event.title}{event.year ? ` (${event.year})` : ''}</span><span className="text-cyan-300">{syncLabel(event.action)}</span><span className="text-muted-foreground">{syncEventDescription(event)}</span><Button size="sm" variant="ghost" className="ml-auto h-6 px-1.5 text-[10px]" onClick={() => setActiveTab(event.content_type === 'movie' ? 'movies' : 'series')}>Open {event.content_type === 'movie' ? 'Movies' : 'TV Shows'}</Button></li>)}</ul> : <div className="rounded border border-dashed border-border/60 p-2 text-muted-foreground">No {syncHistoryEventTab === 'movie' ? 'movie' : 'series'} cards changed in this run.</div>}
+                        </div>
+                      })()}
+                    </>
+                  })()}
+                </div>}</td></tr>}
+              </Fragment>
+            })}{!syncHistoryQuery.data?.length && <tr><td colSpan={6} className="p-3 text-muted-foreground">No sync reports yet.</td></tr>}</tbody>
+          </table>
+        </div>
       </SectionCard>
       </>
       )}
@@ -8508,240 +8971,365 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
-      <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Which source languages are allowed for playback/export, right now — a live filter, not an import-time rule
-          (that's "Import Language Exclusion" below). Unchecking a language immediately hides any movie/episode whose
-          only source is that language from playback and the exported catalog; nothing is deleted, and re-checking it
-          brings that content back instantly. A movie/series with at least one still-enabled-language source stays
-          fully visible.
-        </p>
-        <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
-          {allEnabledLanguageCodes.map((c) => (
-            <label key={c.code} className="flex items-center gap-1.5 select-none">
-              <input
-                type="checkbox"
-                checked={enabledLanguageDraft.has(c.code)}
-                onChange={() => toggleEnabledLanguage(c.code)}
-              />
-              <span className="font-mono">{c.code}</span>
-              {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
-              <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
-            </label>
-          ))}
-          {allEnabledLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages detected yet.</p>}
-        </div>
-        <Button
-          size="sm"
-          disabled={saveEnabledLanguages.isPending}
-          onClick={() => saveEnabledLanguages.mutate([...enabledLanguageDraft])}
-        >
-          {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-          Save enabled languages
-        </Button>
-      </SectionCard>
-      <SectionCard title="Import Language Exclusion" icon={<Trash2 size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Auto-archives matching movies/series the moment they're imported (or re-imported) — global across every
-          provider, since the languages you don't want almost never depend on which provider it came from. Per-provider
-          category exclusion is the "Exclude Categories" button on each provider above. Same rule either way: it
-          archives (still browsable/playable/categorizable if you change your mind), never deletes, and never
-          overrides an item you've manually un-archived.
-        </p>
-        {allLanguageCodes.length > 0 ? (
-          <>
-            <div className="flex items-center gap-1.5">
-              <input
-                className={inputCls('flex-1')}
-                placeholder="Search languages…"
-                value={languageSearch}
-                onChange={(e) => setLanguageSearch(e.target.value)}
-              />
-              <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
-                {(['all', 'selected', 'unselected'] as const).map((f) => (
-                  <button
-                    key={f}
-                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${languageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                    onClick={() => setLanguageShowFilter(f)}
-                  >
-                    {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="flex items-center gap-1.5 text-xs">
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                onClick={() => setLanguageDraft(new Set([...languageDraft, ...visibleLanguageCodes.map((c) => c.code)]))}
-              >
-                Select visible ({visibleLanguageCodes.length})
-              </button>
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                onClick={() => { const next = new Set(languageDraft); visibleLanguageCodes.forEach((c) => next.delete(c.code)); setLanguageDraft(next) }}
-              >
-                Deselect visible ({visibleLanguageCodes.filter((c) => languageDraft.has(c.code)).length})
-              </button>
-              <span className="text-muted-foreground ml-auto">{languageDraft.size} selected total · shift-click to select a range</span>
-            </div>
-            <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
-              {visibleLanguageCodes.map((c, i) => (
-                <label key={c.code} className="flex items-center gap-1.5 select-none">
-                  <input
-                    type="checkbox"
-                    checked={languageDraft.has(c.code)}
-                    onChange={() => {}}
-                    onClick={(e) => toggleLanguageSelected(c.code, i, e.shiftKey)}
-                  />
-                  <span className="font-mono">{c.code}</span>
-                  {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
-                  <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
-                </label>
-              ))}
-              {visibleLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
-            </div>
-          </>
-        ) : (
+      {/* KNM: 2026-10-03 -- the three import/playback language and country filters side by side as equal columns */}
+      <div className="grid gap-4 lg:grid-cols-3 items-stretch">
+        <SectionCard title="Import Language Exclusion" icon={<Trash2 size={14} />}>
           <p className="text-xs text-muted-foreground">
-            No titles in the pool carry a language prefix in the name itself (e.g. "AR| ...", "EN| ..."). If your
-            providers tag language by category name instead (e.g. "ARA: ...", "ENG: ..."), this panel has nothing to
-            catch — use that provider's own "Exclude Categories" button above instead.
+            Auto-archives matching movies/series the moment they're imported (or re-imported) — global across every
+            provider, since the languages you don't want almost never depend on which provider it came from. Per-provider
+            category exclusion is the "Exclude Categories" button on each provider above. Same rule either way: it
+            archives (still browsable/playable/categorizable if you change your mind), never deletes, and never
+            overrides an item you've manually un-archived.
           </p>
-        )}
-        <Button
-          size="sm"
-          disabled={saveImportLanguageExclusion.isPending}
-          onClick={() => saveImportLanguageExclusion.mutate({
-            exclude_prefixes: [...languageDraft],
-            exclude_non_latin: importLanguageExclusionQuery.data?.exclude_non_latin ?? false,
-          })}
-        >
-          {saveImportLanguageExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-          Save selected languages
-        </Button>
-        <label className="flex items-center gap-1.5 text-xs">
-          <input
-            type="checkbox"
-            checked={importLanguageExclusionQuery.data?.exclude_non_latin ?? false}
-            onChange={(e) => saveImportLanguageExclusion.mutate({
-              exclude_prefixes: [...languageDraft],
-              exclude_non_latin: e.target.checked,
-            })}
-          />
-          Also exclude non-Latin-script titles (Arabic, Thai, Chinese/Japanese/Korean, Cyrillic, Greek, Hebrew, Devanagari)
-        </label>
-        <div className="flex items-center gap-1.5 pt-1">
-          <Button
-            size="sm" variant="outline"
-            disabled={applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running'}
-            onClick={() => askConfirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.', () => applyImportExclusionsNow.mutate())}
-          >
-            {applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running' ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
-            Apply rules to existing catalog now
-          </Button>
-          {applyExclusionsJobQuery.data?.status === 'running' && (
-            <span className="text-xs text-muted-foreground">
-              Provider {applyExclusionsJobQuery.data.completed + 1} of {applyExclusionsJobQuery.data.total}
-              {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
-            </span>
-          )}
-          {applyExclusionsJobQuery.data?.status === 'error' && (
-            <span className="text-xs text-destructive">Failed: {applyExclusionsJobQuery.data.error}</span>
-          )}
-        </div>
-        {applyExclusionsJobQuery.data?.status === 'done' && !!applyExclusionsJobQuery.data.results.length && (
-          <div className="text-xs border border-border rounded p-2 space-y-1">
-            <p className="text-muted-foreground">
-              Done — {applyExclusionsJobQuery.data.results.length} provider(s), {
-                applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_archived ?? 0) + (r.series_archived ?? 0), 0)
-              } newly archived and {
-                applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0), 0)
-              } restored (no longer matched) by the current rules.
+          {allLanguageCodes.length > 0 ? (
+            <>
+              <div className="flex items-center gap-1.5">
+                <input
+                  className={inputCls('flex-1')}
+                  placeholder="Search languages…"
+                  value={languageSearch}
+                  onChange={(e) => setLanguageSearch(e.target.value)}
+                />
+                <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                  {(['all', 'selected', 'unselected'] as const).map((f) => (
+                    <button
+                      key={f}
+                      className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${languageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                      onClick={() => setLanguageShowFilter(f)}
+                    >
+                      {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 text-xs">
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                  onClick={() => setLanguageDraft(new Set([...languageDraft, ...visibleLanguageCodes.map((c) => c.code)]))}
+                >
+                  Select visible ({visibleLanguageCodes.length})
+                </button>
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                  onClick={() => { const next = new Set(languageDraft); visibleLanguageCodes.forEach((c) => next.delete(c.code)); setLanguageDraft(next) }}
+                >
+                  Deselect visible ({visibleLanguageCodes.filter((c) => languageDraft.has(c.code)).length})
+                </button>
+                <span className="text-muted-foreground ml-auto">{languageDraft.size} selected total · shift-click to select a range</span>
+              </div>
+              <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+                {visibleLanguageCodes.map((c, i) => (
+                  <label key={c.code} className="flex items-center gap-1.5 select-none">
+                    <input
+                      type="checkbox"
+                      checked={languageDraft.has(c.code)}
+                      onChange={() => {}}
+                      onClick={(e) => toggleLanguageSelected(c.code, i, e.shiftKey)}
+                    />
+                    <span className="font-mono">{c.code}</span>
+                    {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+                    <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+                  </label>
+                ))}
+                {visibleLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No titles in the pool carry a language prefix in the name itself (e.g. "AR| ...", "EN| ..."). If your
+              providers tag language by category name instead (e.g. "ARA: ...", "ENG: ..."), this panel has nothing to
+              catch — use that provider's own "Exclude Categories" button above instead.
             </p>
-            {applyExclusionsJobQuery.data.results.map((r) => (
-              <p key={r.provider} className="text-muted-foreground">
-                {r.provider}: {r.error
-                  ? <span className="text-destructive">{r.error}</span>
-                  : <>{(r.movies_archived ?? 0) + (r.series_archived ?? 0)} archived · {(r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0)} restored · {(r.movies_matched ?? 0) + (r.series_matched ?? 0)} matched · {(r.movies_created ?? 0) + (r.series_created ?? 0)} new</>}
-              </p>
-            ))}
+          )}
+          <Button
+            size="sm"
+            disabled={saveImportLanguageExclusion.isPending}
+            onClick={() => saveImportLanguageExclusion.mutate({
+              exclude_prefixes: [...languageDraft],
+              exclude_non_latin: importLanguageExclusionQuery.data?.exclude_non_latin ?? false,
+            })}
+          >
+            {saveImportLanguageExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            Save selected languages
+          </Button>
+          <label className="flex items-center gap-1.5 text-xs">
+            <input
+              type="checkbox"
+              checked={importLanguageExclusionQuery.data?.exclude_non_latin ?? false}
+              onChange={(e) => saveImportLanguageExclusion.mutate({
+                exclude_prefixes: [...languageDraft],
+                exclude_non_latin: e.target.checked,
+              })}
+            />
+            Also exclude non-Latin-script titles (Arabic, Thai, Chinese/Japanese/Korean, Cyrillic, Greek, Hebrew, Devanagari)
+          </label>
+          <div className="flex items-center gap-1.5 pt-1">
+            <Button
+              size="sm" variant="outline"
+              disabled={applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running'}
+              onClick={() => askConfirm('Re-import every active provider now to apply the current exclusion rules across your existing catalog? For a large catalog this can take a while.', () => applyImportExclusionsNow.mutate())}
+            >
+              {applyImportExclusionsNow.isPending || applyExclusionsJobQuery.data?.status === 'running' ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
+              Apply rules to existing catalog now
+            </Button>
+            {applyExclusionsJobQuery.data?.status === 'running' && (
+              <span className="text-xs text-muted-foreground">
+                {applyExclusionsJobQuery.data.phase === 'finalizing'
+                  ? `All ${applyExclusionsJobQuery.data.total} provider(s) synced — finalizing…`
+                  : <>
+                      Provider {Math.min(applyExclusionsJobQuery.data.completed + 1, applyExclusionsJobQuery.data.total)} of {applyExclusionsJobQuery.data.total}
+                      {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+                    </>}
+              </span>
+            )}
+            {applyExclusionsJobQuery.data?.status === 'error' && (
+              <span className="text-xs text-destructive">Failed: {applyExclusionsJobQuery.data.error}</span>
+            )}
           </div>
-        )}
-      </SectionCard>
-      <SectionCard title="Import Country Exclusion" icon={<Trash2 size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Sibling to Import Language Exclusion above, same rule either way (archives on import, never deletes, never
-          overrides a manual un-archive) — but keyed on a title's trailing "(XX)" country-of-origin tag instead of a
-          leading language prefix. Useful for an internationally-franchised show that imports several genuinely
-          different country editions under the same base title — check the ones you don't want and only those
-          editions get auto-archived, the rest of the catalog is untouched.
-        </p>
-        {allCountryCodes.length > 0 ? (
-          <>
-            <div className="flex items-center gap-1.5">
-              <input
-                className={inputCls('flex-1')}
-                placeholder="Search countries…"
-                value={countrySearch}
-                onChange={(e) => setCountrySearch(e.target.value)}
-              />
-              <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
-                {(['all', 'selected', 'unselected'] as const).map((f) => (
-                  <button
-                    key={f}
-                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${countryShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                    onClick={() => setCountryShowFilter(f)}
-                  >
-                    {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="flex items-center gap-1.5 text-xs">
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                onClick={() => setCountryDraft(new Set([...countryDraft, ...visibleCountryCodes.map((c) => c.code)]))}
-              >
-                Select visible ({visibleCountryCodes.length})
-              </button>
-              <button
-                className="text-muted-foreground hover:text-foreground underline decoration-dotted"
-                onClick={() => { const next = new Set(countryDraft); visibleCountryCodes.forEach((c) => next.delete(c.code)); setCountryDraft(next) }}
-              >
-                Deselect visible ({visibleCountryCodes.filter((c) => countryDraft.has(c.code)).length})
-              </button>
-              <span className="text-muted-foreground ml-auto">{countryDraft.size} selected total · shift-click to select a range</span>
-            </div>
-            <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
-              {visibleCountryCodes.map((c, i) => (
-                <label key={c.code} className="flex items-center gap-1.5 select-none">
-                  <input
-                    type="checkbox"
-                    checked={countryDraft.has(c.code)}
-                    onChange={() => {}}
-                    onClick={(e) => toggleCountrySelected(c.code, i, e.shiftKey)}
-                  />
-                  <span className="font-mono">{c.code}</span>
-                  {COUNTRY_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {COUNTRY_CODE_NAMES[c.code]}</span>}
-                  <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
-                </label>
+          {applyExclusionsJobQuery.data?.status === 'done' && !!applyExclusionsJobQuery.data.results.length && (
+            <div className="text-xs border border-border rounded p-2 space-y-1">
+              <p className="text-muted-foreground">
+                Done — {applyExclusionsJobQuery.data.results.length} provider(s), {
+                  applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_archived ?? 0) + (r.series_archived ?? 0), 0)
+                } newly archived and {
+                  applyExclusionsJobQuery.data.results.reduce((n, r) => n + (r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0), 0)
+                } restored (no longer matched) by the current rules.
+              </p>
+              {applyExclusionsJobQuery.data.results.map((r) => (
+                <p key={r.provider} className="text-muted-foreground">
+                  {r.provider}: {r.error
+                    ? <span className="text-destructive">{r.error}</span>
+                    : <>{(r.movies_archived ?? 0) + (r.series_archived ?? 0)} archived · {(r.movies_unarchived ?? 0) + (r.series_unarchived ?? 0)} restored · {(r.movies_matched ?? 0) + (r.series_matched ?? 0)} matched · {(r.movies_created ?? 0) + (r.series_created ?? 0)} new</>}
+                </p>
               ))}
-              {visibleCountryCodes.length === 0 && <p className="text-muted-foreground">No countries match.</p>}
             </div>
-          </>
-        ) : (
+          )}
+        </SectionCard>
+        <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
           <p className="text-xs text-muted-foreground">
-            No titles in the pool carry a recognized trailing country tag (e.g. "Title (US)", "Title (NZ)").
+            This is a different filter from "Import Language Exclusion". That one decides what gets imported in
+            the first place, so it only affects titles going forward (or when you click "Apply rules to existing
+            catalog now"). This one is a live backstop on top of everything already in the catalog: it gates which
+            language a movie/episode/export/failover is allowed to stream from right now, regardless of import
+            history. Checking a language back on instantly makes any matching source eligible again — no re-import
+            needed. Unchecking one instantly removes eligibility for sources in that language, which can take a title
+            out of streaming/export entirely if that was its only enabled-language source.
           </p>
-        )}
-        <Button
-          size="sm"
-          disabled={saveImportCountryExclusion.isPending}
-          onClick={() => saveImportCountryExclusion.mutate({ exclude_country_codes: [...countryDraft] })}
-        >
-          {saveImportCountryExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-          Save selected countries
-        </Button>
+          <div className="flex items-center gap-1.5">
+            <input
+              className={inputCls('flex-1')}
+              placeholder="Search languages…"
+              value={enabledLanguageSearch}
+              onChange={(e) => setEnabledLanguageSearch(e.target.value)}
+            />
+            <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+              {(['all', 'selected', 'unselected'] as const).map((f) => (
+                <button
+                  key={f}
+                  className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${enabledLanguageShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                  onClick={() => setEnabledLanguageShowFilter(f)}
+                >
+                  {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-xs">
+            <button
+              className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+              onClick={() => setEnabledLanguageDraft(new Set([...enabledLanguageDraft, ...visibleEnabledLanguageCodes.map((c) => c.code)]))}
+            >
+              Select visible ({visibleEnabledLanguageCodes.length})
+            </button>
+            <button
+              className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+              onClick={() => { const next = new Set(enabledLanguageDraft); visibleEnabledLanguageCodes.forEach((c) => next.delete(c.code)); setEnabledLanguageDraft(next) }}
+            >
+              Deselect visible ({visibleEnabledLanguageCodes.filter((c) => enabledLanguageDraft.has(c.code)).length})
+            </button>
+            <span className="text-muted-foreground ml-auto">{enabledLanguageDraft.size} selected total · shift-click to select a range</span>
+          </div>
+          <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+            {visibleEnabledLanguageCodes.map((c, i) => (
+              <label key={c.code} className="flex items-center gap-1.5 select-none">
+                <input
+                  type="checkbox"
+                  checked={enabledLanguageDraft.has(c.code)}
+                  onChange={() => {}}
+                  onClick={(e) => toggleEnabledLanguageSelected(c.code, i, e.shiftKey)}
+                />
+                <span className="font-mono">{c.code}</span>
+                {LANGUAGE_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {LANGUAGE_CODE_NAMES[c.code]}</span>}
+                <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+              </label>
+            ))}
+            {visibleEnabledLanguageCodes.length === 0 && <p className="text-muted-foreground">No languages match.</p>}
+          </div>
+          <Button
+            size="sm"
+            disabled={saveEnabledLanguages.isPending || enabledLanguageDraft.size === 0}
+            onClick={saveEnabledLanguagesWithImpactCheck}
+          >
+            {saveEnabledLanguages.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            Save enabled languages
+          </Button>
+        </SectionCard>
+        <SectionCard title="Import Country Exclusion" icon={<Trash2 size={14} />}>
+          <p className="text-xs text-muted-foreground">
+            Sibling to Import Language Exclusion, same rule either way (archives on import, never deletes, never
+            overrides a manual un-archive) — but keyed on a title's trailing "(XX)" country-of-origin tag instead of a
+            leading language prefix. Useful for an internationally-franchised show that imports several genuinely
+            different country editions under the same base title — check the ones you don't want and only those
+            editions get auto-archived, the rest of the catalog is untouched.
+          </p>
+          {allCountryCodes.length > 0 ? (
+            <>
+              <div className="flex items-center gap-1.5">
+                <input
+                  className={inputCls('flex-1')}
+                  placeholder="Search countries…"
+                  value={countrySearch}
+                  onChange={(e) => setCountrySearch(e.target.value)}
+                />
+                <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+                  {(['all', 'selected', 'unselected'] as const).map((f) => (
+                    <button
+                      key={f}
+                      className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${countryShowFilter === f ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                      onClick={() => setCountryShowFilter(f)}
+                    >
+                      {f === 'all' ? 'All' : f === 'selected' ? 'Selected' : 'Unselected'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 text-xs">
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                  onClick={() => setCountryDraft(new Set([...countryDraft, ...visibleCountryCodes.map((c) => c.code)]))}
+                >
+                  Select visible ({visibleCountryCodes.length})
+                </button>
+                <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted"
+                  onClick={() => { const next = new Set(countryDraft); visibleCountryCodes.forEach((c) => next.delete(c.code)); setCountryDraft(next) }}
+                >
+                  Deselect visible ({visibleCountryCodes.filter((c) => countryDraft.has(c.code)).length})
+                </button>
+                <span className="text-muted-foreground ml-auto">{countryDraft.size} selected total · shift-click to select a range</span>
+              </div>
+              <div className="max-h-48 overflow-y-auto space-y-0.5 border border-border rounded p-2 text-xs">
+                {visibleCountryCodes.map((c, i) => (
+                  <label key={c.code} className="flex items-center gap-1.5 select-none">
+                    <input
+                      type="checkbox"
+                      checked={countryDraft.has(c.code)}
+                      onChange={() => {}}
+                      onClick={(e) => toggleCountrySelected(c.code, i, e.shiftKey)}
+                    />
+                    <span className="font-mono">{c.code}</span>
+                    {COUNTRY_CODE_NAMES[c.code] && <span className="text-muted-foreground">— {COUNTRY_CODE_NAMES[c.code]}</span>}
+                    <span className="text-muted-foreground ml-auto">{c.count > 0 ? `${c.count} title${c.count === 1 ? '' : 's'}` : 'not currently in pool'}</span>
+                  </label>
+                ))}
+                {visibleCountryCodes.length === 0 && <p className="text-muted-foreground">No countries match.</p>}
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No titles in the pool carry a recognized trailing country tag (e.g. "Title (US)", "Title (NZ)").
+            </p>
+          )}
+          <Button
+            size="sm"
+            disabled={saveImportCountryExclusion.isPending}
+            onClick={() => saveImportCountryExclusion.mutate({ exclude_country_codes: [...countryDraft] })}
+          >
+            {saveImportCountryExclusion.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            Save selected countries
+          </Button>
+        </SectionCard>
+      </div>
+
+      <SectionCard title="Language Backfill & Retroactive Split" icon={<Wrench size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Maintenance for content imported before per-language matching existed. Movies/series that were
+          auto-merged across languages under the old rule stay mixed until split here. Run in order: 1) backfill
+          fills in any missing per-source language, 2) movie split, 3) series split (also re-splits mixed-language
+          episodes). Each is safe to re-run — once nothing is left to change, it becomes a no-op.
+        </p>
+
+        {[
+          {
+            key: 'backfill' as const,
+            label: 'Language backfill',
+            preview: languageBackfillPreview,
+            apply: languageBackfillApply,
+            previewCount: (d: any) => d ? Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0) : undefined,
+            previewLabel: (d: any) => `${Object.values(d).reduce((a: number, b: any) => a + (typeof b === 'number' ? b : 0), 0)} source rows missing a language`,
+            resultLabel: (r: any) => `${r.updated} rows backfilled.`,
+          },
+          {
+            key: 'recompute' as const,
+            label: 'Language recompute',
+            preview: languageRecomputePreview,
+            apply: languageRecomputeApply,
+            previewCount: (d: any) =>
+              d ? Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0) : undefined,
+            previewLabel: (d: any) => {
+              const total = Object.values(d).reduce((a: number, table: any) =>
+                a + Object.values(table).reduce((b: number, bucket: any) => b + bucket.count, 0), 0)
+              return `${total} source row${total === 1 ? '' : 's'} misclassified by an old bug`
+            },
+            resultLabel: (r: any) => `${r.updated} rows recomputed.`,
+          },
+          {
+            key: 'movies' as const,
+            label: 'Movie language split',
+            preview: movieLanguageSplitPreview,
+            apply: movieLanguageSplitApply,
+            previewCount: (d: any) => d?.movies?.length,
+            previewLabel: (d: any) => `${d.movies.length} mixed-language movie${d.movies.length === 1 ? '' : 's'} found`,
+            resultLabel: (r: any) => `${r.movies_split} movies split, ${r.new_rows_created} new rows created.`,
+          },
+          {
+            key: 'series' as const,
+            label: 'Series language split',
+            preview: seriesLanguageSplitPreview,
+            apply: seriesLanguageSplitApply,
+            previewCount: (d: any) => d?.series?.length,
+            previewLabel: (d: any) => `${d.series.length} mixed-language series found`,
+            resultLabel: (r: any) => `${r.series_split} series split, ${r.new_rows_created} new rows created.`,
+          },
+        ].map(({ key, label, preview, apply, previewCount, previewLabel, resultLabel }) => (
+          <div key={key} className="flex items-center gap-2 border border-border rounded p-2">
+            <span className="text-xs font-medium w-40">{label}</span>
+            <Button size="sm" variant="outline" disabled={preview.isFetching} onClick={() => preview.refetch()}>
+              {preview.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Preview
+            </Button>
+            <Button
+              size="sm"
+              disabled={apply.isPending || !preview.data || previewCount(preview.data) === 0}
+              onClick={() => apply.mutate()}
+            >
+              {apply.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+              Apply
+            </Button>
+            <span className="text-xs text-muted-foreground flex-1">
+              {apply.data
+                ? resultLabel(apply.data)
+                : apply.isError
+                ? `Failed: ${(apply.error as any)?.response?.data?.detail ?? (apply.error as any)?.message}`
+                : preview.data
+                ? previewLabel(preview.data)
+                : preview.isError
+                ? `Failed: ${(preview.error as any)?.response?.data?.detail ?? (preview.error as any)?.message}`
+                : ''}
+            </span>
+          </div>
+        ))}
       </SectionCard>
       </>
       )}
@@ -9799,110 +10387,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Language Backfill" icon={<Search size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Every source's language (used by Enabled Playback Languages, Import Language Exclusion, and Duplicate
-          Finder's language matching) is detected from its raw title and provider category. Rows written before that
-          detection existed on a given import path -- or classified by a since-fixed version of it -- sit with the
-          wrong value until backfilled. Safe to re-run any time; once nothing's missing or outdated it's a no-op.
-        </p>
-        <div className="flex items-center gap-1.5">
-          <Button size="sm" variant="outline" disabled={languageBackfillQuery.isFetching} onClick={() => languageBackfillQuery.refetch()}>
-            {languageBackfillQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
-            Scan
-          </Button>
-          {!!languageBackfillQuery.data && (() => {
-            const countAll = (buckets: Record<string, Record<string, LanguageBackfillBucket>>) =>
-              Object.values(buckets).reduce((sum, byCode) => sum + Object.values(byCode).reduce((s, b) => s + b.count, 0), 0)
-            const total = countAll(languageBackfillQuery.data.missing) + countAll(languageBackfillQuery.data.outdated)
-            return total === 0
-              ? <span className="text-xs text-muted-foreground">Clean — nothing to backfill.</span>
-              : (
-                <Button size="sm" variant="outline" disabled={applyLanguageBackfill.isPending} onClick={() => applyLanguageBackfill.mutate()}>
-                  {applyLanguageBackfill.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
-                  Backfill {total} row{total === 1 ? '' : 's'}
-                </Button>
-              )
-          })()}
-        </div>
-        {!!languageBackfillQuery.data && (
-          <div className="space-y-1.5">
-            {(['missing', 'outdated'] as const).flatMap((kind) =>
-              Object.entries(languageBackfillQuery.data![kind]).map(([table, byCode]) => {
-                const count = Object.values(byCode).reduce((s, b) => s + b.count, 0)
-                const codes = Object.entries(byCode).sort((a, b) => b[1].count - a[1].count)
-                const samples = codes.flatMap(([, b]) => b.sample_titles).slice(0, 5)
-                return (
-                  <div key={`${kind}-${table}`} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
-                    <StatusPill tone={count ? 'warning' : 'success'} label={`${table} ${kind}`} />
-                    <span className="flex-1 text-muted-foreground truncate">
-                      {count} -- {codes.slice(0, 6).map(([code, b]) => `${code}: ${b.count}`).join(', ')}
-                      {!!samples.length && ` · e.g. ${samples.join(', ')}`}
-                    </span>
-                  </div>
-                )
-              })
-            )}
-            {Object.keys(languageBackfillQuery.data.missing).length === 0 && Object.keys(languageBackfillQuery.data.outdated).length === 0 && (
-              <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
-                <StatusPill tone="success" label="Language" />
-                <span className="flex-1 text-muted-foreground">Clean — every source already has an up-to-date language.</span>
-              </div>
-            )}
-          </div>
-        )}
-      </SectionCard>
-
-      <SectionCard title="Language Split" icon={<Search size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          A movie/series with sources in two languages that share no common source got auto-merged together back
-          when auto-merging only checked for a shared TMDB id -- before the current auto-merge language gate existed.
-          This finds and undoes those: the largest-source language stays on the original entry, every other language
-          gets split off into its own new entry with its own sources (and, for series, its own episodes) and the same
-          category placements. Run after Language Backfill above -- it depends on accurate per-source language.
-          Safe to re-run; once nothing conflicts it's a no-op.
-        </p>
-        {([
-          { label: 'Movies', query: movieLanguageSplitQuery, apply: applyMovieLanguageSplit, idKey: 'movie_id' as const },
-          { label: 'Series', query: seriesLanguageSplitQuery, apply: applySeriesLanguageSplit, idKey: 'series_id' as const },
-        ]).map(({ label, query, apply, idKey }) => (
-          <div key={label} className="space-y-1.5">
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs font-medium">{label}</span>
-              <Button size="sm" variant="outline" disabled={query.isFetching} onClick={() => query.refetch()}>
-                {query.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
-                Scan
-              </Button>
-              {!!query.data && (
-                query.data.count === 0
-                  ? <span className="text-xs text-muted-foreground">Clean — nothing to split.</span>
-                  : (
-                    <Button size="sm" variant="outline" disabled={apply.isPending} onClick={() => apply.mutate()}>
-                      {apply.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
-                      Split {query.data.count} {label.toLowerCase()}
-                    </Button>
-                  )
-              )}
-            </div>
-            {!!query.data && query.data.count > 0 && (
-              <div className="space-y-1.5">
-                {query.data.sample.map((c) => (
-                  <div key={c[idKey]} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-sm">
-                    <StatusPill tone="warning" label={c.name} />
-                    <span className="flex-1 text-muted-foreground truncate">
-                      {c.groups.map((g) => `${g.languages.join('/')} (${g.source_count})`).join(' vs ')}
-                    </span>
-                  </div>
-                ))}
-                {query.data.count > query.data.sample.length && (
-                  <p className="text-xs text-muted-foreground">…and {query.data.count - query.data.sample.length} more.</p>
-                )}
-              </div>
-            )}
-          </div>
-        ))}
-      </SectionCard>
-
       <SectionCard title="Stream Priority" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           When a title has sources from more than one provider, which one plays: by provider priority (Providers
@@ -10271,6 +10755,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'movies' && (
       <>
+      <div className="flex items-center gap-1 border-b border-border/60">
+        <button className={`border-b-2 px-3 py-2 text-xs font-medium ${movieSubTab === 'library' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setMovieSubTab('library')}>Movies</button>
+        <button className={`border-b-2 px-3 py-2 text-xs font-medium ${movieSubTab === 'matches' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setMovieSubTab('matches')}>Possible matches</button>
+      </div>
+      {movieSubTab === 'matches' ? <PossibleMetadataMatches contentType="movie" /> : (
+      <>
       <SectionCard title="Movies" icon={<Film size={14} />}>
         <div className="flex items-center gap-1.5 flex-wrap">
           <input
@@ -10309,8 +10799,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('movie')}>Manage Categories</Button>
-          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('movie')}>
-            Needs Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
+          <Button size="sm" variant="outline" onClick={() => { setMetadataContentType('movie'); setActiveTab('metadata') }}>
+            Metadata Review{needsReviewQuery.data?.movies.length ? ` (${needsReviewQuery.data.movies.length})` : ''}
           </Button>
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('movie')}>
             Missing Artwork{missingArtworkCountsQuery.data?.movies ? ` (${missingArtworkCountsQuery.data.movies})` : ''}
@@ -10442,8 +10932,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </SectionCard>
       </>
       )}
+      </>
+      )}
 
       {activeTab === 'series' && (
+      <>
+      <div className="flex items-center gap-1 border-b border-border/60">
+        <button className={`border-b-2 px-3 py-2 text-xs font-medium ${seriesSubTab === 'library' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setSeriesSubTab('library')}>TV Shows</button>
+        <button className={`border-b-2 px-3 py-2 text-xs font-medium ${seriesSubTab === 'matches' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setSeriesSubTab('matches')}>Possible matches</button>
+      </div>
+      {seriesSubTab === 'matches' ? <PossibleMetadataMatches contentType="series" /> : (
       <>
       <SectionCard title="TV Shows" icon={<Tv size={14} />}>
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -10483,8 +10981,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <Button size="sm" variant="outline" onClick={() => setCategoriesModalOpen('series')}>Manage Categories</Button>
-          <Button size="sm" variant="outline" onClick={() => setNeedsReviewModalOpen('series')}>
-            Needs Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
+          <Button size="sm" variant="outline" onClick={() => { setMetadataContentType('series'); setActiveTab('metadata') }}>
+            Metadata Review{needsReviewQuery.data?.series.length ? ` (${needsReviewQuery.data.series.length})` : ''}
           </Button>
           <Button size="sm" variant="outline" onClick={() => setMissingArtworkModalOpen('series')}>
             Missing Artwork{missingArtworkCountsQuery.data?.series ? ` (${missingArtworkCountsQuery.data.series})` : ''}
@@ -10613,6 +11111,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
         </div>
       </SectionCard>
+      </>
+      )}
       </>
       )}
 

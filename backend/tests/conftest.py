@@ -33,3 +33,12 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "_raw_cache", None)
     vod_db.init_db()
     return vod_db
+
+
+@pytest.fixture(autouse=True)
+def _reset_enrich_done_ids():
+    """Module-level progress-dedup sets persist across tests; tests that call
+    _enrich_one directly would otherwise inherit earlier tests' keys."""
+    import vod_importer
+    vod_importer._reset_enrich_done_ids()
+    yield

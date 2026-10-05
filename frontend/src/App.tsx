@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CalendarDays, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Activity, CalendarDays, CheckCircle2, CircleAlert, ClipboardCheck, Film, Flame, Globe2, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
@@ -44,6 +44,24 @@ interface RuntimeStatus {
   enrichment: { running: boolean; movies_done: number; movies_total: number; series_done: number; series_total: number }
   tmdb: { running: boolean; done: number; total: number }
   bulk_ai: { running: boolean; done: number; total: number; jobs: number }
+  catalog_workflow: {
+    state: 'idle' | 'queued' | 'running' | 'ready' | 'failed'
+    phase: string | null
+    provider_name: string | null
+    import_started_at: number | null
+    import_finished_at: number | null
+    reconciliation_started_at: number | null
+    reconciliation_finished_at: number | null
+    enrichment_started_at: number | null
+    enrichment_finished_at: number | null
+    started_at: number | null
+    finished_at: number | null
+    error: string | null
+  }
+  review_summary: {
+    missing_identity: { movies: number; series: number }
+    invalid_tmdb: { movies: number; series: number }
+  }
   process_cpu_percent: number | null
 }
 const NAV_GROUPS: NavGroup[] = [
@@ -135,22 +153,39 @@ export default function App() {
     },
     retry: false,
   })
+  const externalIpQuery = useQuery<{ ip: string | null; available: boolean }>({
+    queryKey: ['external-ip'],
+    queryFn: () => api.get('/external-ip/').then((r) => r.data),
+    enabled: authState === 'ready',
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+  const workflow = runtimeStatusQuery.data?.catalog_workflow
+  const reviewSummary = runtimeStatusQuery.data?.review_summary
+  const workflowIsActive = workflow?.state === 'queued' || workflow?.state === 'running'
+  const workflowIsReady = workflow?.state === 'ready'
+  const workflowHasFailed = workflow?.state === 'failed'
+  const workflowDurationSeconds = workflow?.import_started_at && workflow?.import_finished_at
+    ? Math.max(0, Math.round(workflow.import_finished_at - workflow.import_started_at))
+    : null
+  const reconciliationDurationSeconds = workflow?.reconciliation_started_at && workflow?.reconciliation_finished_at
+    ? Math.max(0, Math.round(workflow.reconciliation_finished_at - workflow.reconciliation_started_at))
+    : null
+  const enrichmentDurationSeconds = workflow?.enrichment_started_at && workflow?.enrichment_finished_at
+    ? Math.max(0, Math.round(workflow.enrichment_finished_at - workflow.enrichment_started_at))
+    : null
+  const missingIdentitySummary = reviewSummary
+    ? `${reviewSummary.missing_identity.movies} movie${reviewSummary.missing_identity.movies === 1 ? '' : 's'} · ${reviewSummary.missing_identity.series} TV show${reviewSummary.missing_identity.series === 1 ? '' : 's'} need identity review`
+    : 'Loading review summary…'
+  const invalidTmdbTotal = reviewSummary
+    ? reviewSummary.invalid_tmdb.movies + reviewSummary.invalid_tmdb.series
+    : 0
+  const activeWorkflowDetail = runtimeStatusQuery.data?.tmdb.running
+    ? `TMDB identities ${runtimeStatusQuery.data.tmdb.done}/${runtimeStatusQuery.data.tmdb.total}`
+    : runtimeStatusQuery.data?.enrichment.running
+      ? `Details: ${runtimeStatusQuery.data.enrichment.movies_done}/${runtimeStatusQuery.data.enrichment.movies_total} movies · ${runtimeStatusQuery.data.enrichment.series_done}/${runtimeStatusQuery.data.enrichment.series_total} series`
+      : workflow?.phase ?? 'Working on catalog…'
   const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
-  const runtime = runtimeStatusQuery.data
-  const catalogBusy = !!(runtime?.import.running || runtime?.import.queued || runtime?.bulk_ai.running || runtime?.tmdb.running || runtime?.enrichment.running)
-  const catalogFailed = !catalogBusy && !!runtime?.import.error
-  const catalogDetail = runtime?.import.running
-    ? `Importing ${runtime.import.provider_name ?? 'provider'}…`
-    : runtime?.import.queued
-      ? `${runtime.import.provider_name ?? 'Provider'} import queued${runtime.import.queue_position && runtime.import.queue_position > 1 ? ` (${runtime.import.queue_position - 1} ahead)` : ''}…`
-      : runtime?.bulk_ai.running
-        ? `AI review: ${runtime.bulk_ai.done}/${runtime.bulk_ai.total}`
-        : runtime?.tmdb.running
-          ? `TMDB: ${runtime.tmdb.done}/${runtime.tmdb.total}`
-          : runtime?.enrichment.running
-            ? `Enriching: ${runtime.enrichment.movies_done}/${runtime.enrichment.movies_total} movies · ${runtime.enrichment.series_done}/${runtime.enrichment.series_total} series`
-            : catalogFailed ? 'Import needs attention. Check the provider and retry.' : 'Idle'
-
   useEffect(() => {
     if (isLoading) return
     if (!settings?.has_credentials) {
@@ -260,12 +295,56 @@ export default function App() {
           ))}
           <div className="rounded-md border border-border bg-background/60 px-2.5 py-2 text-[11px] text-muted-foreground">
             <div className="flex items-center gap-1.5 font-semibold text-foreground">
-              <Activity size={13} className={catalogBusy ? 'text-primary animate-pulse' : 'text-muted-foreground'} />
-              Status
+              <Activity size={13} className={workflowIsActive || runtimeStatusQuery.data?.bulk_ai.running ? 'text-primary animate-pulse' : workflowIsReady ? 'text-emerald-400' : workflowHasFailed ? 'text-destructive' : 'text-muted-foreground'} />
+              Catalog status
             </div>
-            <p className="mt-1">{catalogDetail}</p>
+            {runtimeStatusQuery.data?.import.queued ? (
+              <p className="mt-1">{runtimeStatusQuery.data.import.provider_name ?? 'Provider'} import queued{runtimeStatusQuery.data.import.queue_position && runtimeStatusQuery.data.import.queue_position > 1 ? ` (${runtimeStatusQuery.data.import.queue_position - 1} ahead)` : ''}…</p>
+            ) : runtimeStatusQuery.data?.import.running ? (
+              <p className="mt-1">Importing {runtimeStatusQuery.data.import.provider_name ?? 'provider'}…</p>
+            ) : runtimeStatusQuery.data?.bulk_ai.running ? (
+              <p className="mt-1">AI review: {runtimeStatusQuery.data.bulk_ai.done}/{runtimeStatusQuery.data.bulk_ai.total}</p>
+            ) : runtimeStatusQuery.data?.tmdb.running ? (
+              <p className="mt-1">TMDB: {runtimeStatusQuery.data.tmdb.done}/{runtimeStatusQuery.data.tmdb.total}</p>
+            ) : runtimeStatusQuery.data?.enrichment.running ? (
+              <p className="mt-1">Enriching: {runtimeStatusQuery.data.enrichment.movies_done}/{runtimeStatusQuery.data.enrichment.movies_total} movies · {runtimeStatusQuery.data.enrichment.series_done}/{runtimeStatusQuery.data.enrichment.series_total} series</p>
+            ) : runtimeStatusQuery.data?.import.error ? (
+              // KNM: 2026-10-04 -- imports run in the background now; without this a failed one just fell back to "Idle" (upstream PR #31 review).
+              <p className="mt-1 text-destructive">{runtimeStatusQuery.data.import.provider_name ?? 'Provider'} import failed: {runtimeStatusQuery.data.import.error}</p>
+            ) : (
+              <p className={workflowIsReady ? 'mt-1 text-emerald-400' : workflowHasFailed ? 'mt-1 text-destructive' : 'mt-1'}>
+                {workflowIsReady ? 'Catalog ready for review' : workflowHasFailed ? (workflow?.error ?? 'Automatic catalog work needs attention.') : 'Idle'}
+              </p>
+            )}
             <p className="mt-1 text-[10px] text-muted-foreground/80">App CPU: {runtimeStatusQuery.data?.process_cpu_percent == null ? 'sampling…' : `${runtimeStatusQuery.data.process_cpu_percent}%`}</p>
+            <p className="mt-1 flex items-center gap-1 text-[10px] text-muted-foreground/80" title="Public address seen by external services">
+              <Globe2 size={11} /> External IP: {externalIpQuery.isLoading ? 'checking…' : externalIpQuery.data?.ip ?? 'unavailable'}
+            </p>
           </div>
+          {workflowIsReady && (
+            <div className="rounded-md border border-emerald-500/25 bg-emerald-500/5 px-2.5 py-2 text-[11px]">
+              <div className="flex items-center gap-1.5 font-semibold text-foreground">
+                <ClipboardCheck size={13} className="text-emerald-400" />
+                Review in this order
+              </div>
+              <button onClick={() => setActiveTab('metadata')} className="mt-1.5 block w-full text-left text-muted-foreground hover:text-foreground">
+                <span className="font-semibold text-primary">1. Metadata Review</span><br />
+                <span>{missingIdentitySummary}</span>
+              </button>
+              <button onClick={() => setActiveTab('metadata')} className="mt-1.5 block w-full text-left text-muted-foreground hover:text-foreground">
+                <span className="font-semibold text-primary">2. Incorrect TMDB IDs</span><br />
+                <span>{invalidTmdbTotal} item{invalidTmdbTotal === 1 ? '' : 's'} need a corrected ID</span>
+              </button>
+              <button onClick={() => setActiveTab('curation')} className="mt-1.5 block w-full text-left text-muted-foreground hover:text-foreground">
+                <span className="font-semibold text-primary">3. Duplicate Finder</span><br />
+                <span>Review only remaining ambiguous matches</span>
+              </button>
+              <button onClick={() => setActiveTab('movies')} className="mt-1.5 block w-full text-left text-muted-foreground hover:text-foreground">
+                <span className="font-semibold text-primary">4. Missing artwork</span><br />
+                <span>Finish visual cleanup after identity work</span>
+              </button>
+            </div>
+          )}
         </nav>
       </aside>
 
@@ -275,22 +354,26 @@ export default function App() {
             <Search size={13} className="flex-shrink-0" />
             Search coming soon…
           </div>
-          {runtime ? (
-            <div
-              role="status"
-              aria-label="Catalog status"
-              aria-atomic="true"
-              className={`order-last min-w-0 basis-full flex-1 rounded-md border px-4 py-1.5 text-center 2xl:order-none 2xl:basis-auto ${
-                catalogFailed ? 'border-destructive/40 bg-destructive/10' : 'border-primary/35 bg-primary/10'
-              }`}
-            >
+          {workflow && workflow.state !== 'idle' && (
+            <div className={`order-last min-w-0 basis-full flex-1 rounded-md border px-4 py-1.5 text-center 2xl:order-none 2xl:basis-auto ${
+              workflowIsReady ? 'border-emerald-500/35 bg-emerald-500/10' : workflowHasFailed ? 'border-destructive/40 bg-destructive/10' : 'border-primary/35 bg-primary/10'
+            }`}>
               <div className="flex items-center justify-center gap-1.5 text-[12px] font-semibold text-foreground">
-                <Activity size={14} aria-hidden="true" className={catalogFailed ? 'text-destructive' : 'text-primary'} />
-                <span>Catalog status</span>
+                {workflowIsReady ? <CheckCircle2 size={14} className="text-emerald-400" /> : workflowHasFailed ? <CircleAlert size={14} className="text-destructive" /> : <Loader2 size={14} className="animate-spin text-primary" />}
+                <span>{workflowIsReady ? 'Import complete · Catalog ready for review' : workflowHasFailed ? 'Automatic catalog work needs attention' : activeWorkflowDetail}</span>
               </div>
-              <p className="mt-0.5 break-words text-[11px] text-foreground/80">{catalogDetail}</p>
+              {workflowIsReady && (
+                <div className="mt-0.5 break-words text-center text-[11px] text-foreground/75">
+                  {workflowDurationSeconds != null ? `Import ${workflowDurationSeconds}s` : 'Import duration pending'}
+                  {enrichmentDurationSeconds != null ? ` · Enrichment ${enrichmentDurationSeconds}s` : ''}
+                  {reconciliationDurationSeconds != null ? ` · Reconciliation ${reconciliationDurationSeconds}s` : ''} ·
+                  Review: {missingIdentitySummary}{invalidTmdbTotal ? ` · ${invalidTmdbTotal} incorrect TMDB ID${invalidTmdbTotal === 1 ? '' : 's'}` : ''}
+                </div>
+              )}
+              {workflowHasFailed && workflow.error && <div className="mt-0.5 text-center text-[10px] text-destructive">{workflow.error}</div>}
             </div>
-          ) : <div className="flex-1" />}
+          )}
+          <div className="flex-1" />
           <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
             {(THEMES as readonly Theme[]).map((t) => {
               const meta = THEME_META[t]

@@ -26,6 +26,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+import config
 from config import DATA_DIR
 from routes import require_auth
 import vod_db
@@ -151,6 +152,8 @@ async def restore_component(component_id: str, file: UploadFile):
     else:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         component.path.write_bytes(contents)
+        if component.id == "config":
+            config.invalidate_cache()
 
     logger.info("[backup] restored %s from uploaded file (%d bytes)", component.filename, len(contents))
     return {"ok": True}
@@ -162,5 +165,7 @@ async def reset_component(component_id: str):
     _stash_current(component)
     if component.reinit:
         component.reinit()
+    if component.id == "config":
+        config.invalidate_cache()
     logger.info("[backup] reset %s to fresh state", component.filename)
     return {"ok": True}

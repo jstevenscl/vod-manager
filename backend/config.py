@@ -33,21 +33,10 @@ LOG_FILE        = LOG_DIR / "vod_manager.log"
 LOG_BACKUP_COUNT = 5
 
 
-# In-memory cache of config.json -- every one of this file's ~40 getters
-# (including require_auth's has_credentials() check, run synchronously on
-# the event loop for nearly every API request via _GUARDS) used to call
-# _read_raw() straight through to a blocking disk read, every single call,
-# uncached. Invisible on a fast local disk, but the moment the underlying
-# volume is under heavy I/O pressure from something else on the same mount
-# (a large SQLite write -- e.g. a slow provider import, or a backfill/scan
-# touching the whole catalog), those blocking reads, being on the event
-# loop and not wrapped in asyncio.to_thread, stall every concurrent
-# request in the whole app, not just the slow one. Caching removes the
-# disk read from the hot path entirely for every call after the first.
-#
-# Reads staying cached (possibly stale) is fine -- config values rarely
-# need to be instantaneously fresh across processes. WRITES are a
-# different story: see _update_raw below.
+# Configuration is read from the synchronous request path by many getters,
+# including the authentication guard. Keep the parsed document in memory so
+# large SQLite/import operations cannot turn every request into a blocking
+# config.json disk read. Writes refresh the cache immediately.
 _raw_cache: dict | None = None
 
 
@@ -139,6 +128,16 @@ def _update_raw(mutate) -> dict:
             if fcntl:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
+
+
+def invalidate_cache() -> None:
+    """Force the next getter to reread config.json from disk.
+
+    Backup/restore can replace the file without going through _write_raw.
+    Tests also use this when switching CONFIG_FILE to an isolated path.
+    """
+    global _raw_cache
+    _raw_cache = None
 
 
 # ── Dispatcharr connection ───────────────────────────────────────────────────
@@ -356,6 +355,19 @@ def save_duplicate_finder_quality_prefix_matching(enabled: bool) -> None:
     _update_raw(lambda data: data.__setitem__("duplicate_finder_quality_prefix_matching", bool(enabled)))
 
 
+# ── Duplicate Finder: auto-merge on tmdb_id match ────────────────────────────
+# User request 2026-09-10: enrichment can confirm a tmdb_id on a movie row
+# that turns out to match an existing row's tmdb_id exactly -- a signal that
+# comes from TMDB itself, not from our own name-normalization heuristics, so
+# it's trusted enough to merge without a human click (see
+# vod_db.auto_merge_movie_by_tmdb). Default ON, unlike the quality-prefix
+# flag above -- that flag changes what gets SUGGESTED for manual review
+# (low stakes to leave on), this flag changes what gets MERGED automatically
+# (an irreversible delete, see _merge_movie_row), so the two defaults look
+# inconsistent but are deliberately opposite: this one is gated on an
+# independently-corroborated exact-id match, which is a strong enough signal
+# to default-enable even though the action itself is destructive.
+
 def get_duplicate_finder_auto_merge_tmdb() -> bool:
     return bool(_read_raw().get("duplicate_finder_auto_merge_tmdb", True))
 
@@ -451,8 +463,8 @@ def get_enabled_languages() -> list[str]:
 
 
 def save_enabled_languages(codes: list[str]) -> None:
-    _update_raw(lambda data: data.__setitem__(
-        "enabled_playback_languages", [c.strip().upper() for c in codes if c.strip()]))
+    cleaned = [c.strip().upper() for c in codes if c.strip()]
+    _update_raw(lambda data: data.__setitem__("enabled_playback_languages", cleaned))
 
 
 def get_default_categories_prompt_dismissed() -> bool:
@@ -544,6 +556,14 @@ _REFRESH_DEFAULTS = {
     "catalog_refresh_seconds_jellyfin": 6 * 3600,
     "enrichment_ttl_seconds":           24 * 3600,
     "tmdb_sync_interval_seconds":       None,
+    # KNM: 2026-10-03 -- paced episode trickle: at most this many pending
+    # series sources per provider per batch, one request at a time with a
+    # few seconds between them, so a big backlog never looks like a burst.
+    # KNM: 2026-10-04 -- pause 45 -> 15 min: ~300 shows/hr instead of ~100,
+    # same per-request pace (the part a provider actually feels).
+    "episode_trickle_batch":            100,
+    "episode_trickle_interval_seconds": 15 * 60,
+    "episode_trickle_spacing_seconds":  3,
 }
 
 
@@ -559,8 +579,21 @@ def save_refresh_settings(
     catalog_refresh_seconds_jellyfin: int,
     enrichment_ttl_seconds: int,
     tmdb_sync_interval_seconds: int | None,
+    episode_trickle_batch: int | None = None,
+    episode_trickle_interval_seconds: int | None = None,
+    episode_trickle_spacing_seconds: float | None = None,
 ) -> None:
+    # KNM: 2026-10-04 -- trickle pacing is tunable from Settings; the floors
+    # keep it gentle on providers (>=1 s between requests, >=5 min pause).
+    trickle = {}
+    if episode_trickle_batch is not None:
+        trickle["episode_trickle_batch"] = min(500, max(0, int(episode_trickle_batch)))
+    if episode_trickle_interval_seconds is not None:
+        trickle["episode_trickle_interval_seconds"] = min(86400, max(300, int(episode_trickle_interval_seconds)))
+    if episode_trickle_spacing_seconds is not None:
+        trickle["episode_trickle_spacing_seconds"] = min(60, max(1, float(episode_trickle_spacing_seconds)))
     _update_raw(lambda data: data.update({
+        **trickle,
         "catalog_refresh_seconds_xc":       max(60, int(catalog_refresh_seconds_xc)),
         "catalog_refresh_seconds_plex":     max(60, int(catalog_refresh_seconds_plex)),
         "catalog_refresh_seconds_emby":     max(60, int(catalog_refresh_seconds_emby)),

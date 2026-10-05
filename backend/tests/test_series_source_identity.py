@@ -1,6 +1,4 @@
-"""Series source IDs must remain attached to their established title -- a
-second provider re-importing a series it's seen before must resolve back
-through series_sources, not create a duplicate source-less shadow row."""
+"""Series source IDs must be stable across provider refreshes."""
 
 
 def _series(provider_series_id: str, name: str, year: int | None) -> dict:
@@ -19,6 +17,11 @@ def test_secondary_series_source_does_not_create_a_sourceless_shadow(db):
 
     db.bulk_import_series(provider_a, [_series("a-1", "Example Show", 2020)])
     db.bulk_import_series(provider_b, [_series("b-1", "Example Show", 2020)])
+
+    # Provider B is a secondary source, so its ID is not in the legacy
+    # import_provider_* columns. A later no-year spelling must still find
+    # the series through series_sources, rather than reassigning b-1 to a
+    # newly-created row and stranding the original.
     db.bulk_import_series(provider_b, [_series("b-1", "Example Show (US)", None)])
 
     conn = db._connect()
@@ -30,7 +33,7 @@ def test_secondary_series_source_does_not_create_a_sourceless_shadow(db):
     assert {source["provider_series_id"] for source in db.list_series_sources(rows[0]["id"])} == {"a-1", "b-1"}
 
 
-def test_orphan_cleanup_uses_actual_sources_not_legacy_provider_pointer(db):
+def test_orphan_cleanup_deletes_series_with_no_actual_source_even_with_legacy_pointer(db):
     provider_id = db.upsert_provider("Provider", "http://a.invalid", "u", "p", provider_type="xc")
     conn = db._connect()
     try:
@@ -44,3 +47,4 @@ def test_orphan_cleanup_uses_actual_sources_not_legacy_provider_pointer(db):
 
     assert db.find_orphans()["orphaned_series"]["count"] == 1
     assert db.purge_orphans()["series_deleted"] == 1
+    assert db.find_orphans()["orphaned_series"]["count"] == 0

@@ -214,6 +214,15 @@ async def _call_ai(system: str, user_message: str, tool_name: str, tool_descript
     model = get_ai_model()
     try:
         return await caller(model, system, user_message, tool_name, tool_description, schema, max_tokens)
+    except ValueError as exc:
+        # Reasoning models can spend the entire small completion budget before
+        # emitting the required tool call. Retry once with a larger budget so
+        # the UI records a useful decision instead of a generic structured-
+        # response failure. Other ValueErrors still propagate unchanged.
+        if "structured response" not in str(exc).lower() or max_tokens >= 2048:
+            raise
+        logger.warning("[ai_assist] %s returned no structured tool call; retrying with more output budget", provider)
+        return await caller(model, system, user_message, tool_name, tool_description, schema, min(max_tokens * 2, 2048))
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:300]
         raise ValueError(f"{provider} request failed ({exc.response.status_code}): {detail}") from exc
@@ -307,30 +316,64 @@ async def evaluate_candidates_for_category(description: str, content_type: str, 
     return matched_ids
 
 
-async def suggest_year_review_match(item_name: str, provider_category_name: str | None, content_type: str, candidates: list[dict]) -> dict:
+async def suggest_year_review_match(
+    item_name: str,
+    provider_category_name: str | None,
+    content_type: str,
+    candidates: list[dict],
+    *,
+    imported_details: dict | None = None,
+    existing_matches: list[dict] | None = None,
+) -> dict:
     """candidates: the same suggestion dicts already built by
     tmdb_sync.search_title (name, year, overview, cast, season_count,
     episode_count, vote_average). Returns a recommended pick for the
     reviewer to consider -- never applied automatically."""
     system = (
-        "You help disambiguate an item in a VOD catalog against TMDB search results, when its "
-        "own metadata doesn't include a year. Pick the candidate that's most likely the correct "
-        "match, or say none are confident matches."
+        "You help disambiguate one imported movie or TV show in a VOD catalog. "
+        "Use the imported record, provider/source evidence, and existing catalog matches "
+        "before considering the TMDB candidates. A same-name existing record is not enough "
+        "when multiple years or conflicting TMDB identities are present. Prefer a candidate "
+        "only when the evidence is consistent; otherwise return null with low confidence. "
+        "Never invent a year, TMDB ID, provider detail, or match reason."
     )
     listing = "\n".join(
         f"{i}: {c.get('name')} ({c.get('year') or '?'}) -- {(c.get('overview') or '')[:200]}"
         + (f" -- cast: {', '.join(c.get('cast') or [])}" if c.get("cast") else "")
         for i, c in enumerate(candidates)
     )
+    imported = imported_details or {}
+    existing_listing = "\n".join(
+        f"- catalog id={m.get('id')}: {m.get('name')} ({m.get('year') or '?'})"
+        f", tmdb_id={m.get('tmdb_id') or 'none'}, sources={m.get('source_count') or 0}"
+        f", reason={m.get('match_reason') or 'possible title match'}"
+        for m in (existing_matches or [])
+    ) or "- none"
+    source_listing = "\n".join(
+        f"- provider={s.get('provider_name') or s.get('provider_id')}, "
+        f"raw_name={s.get('raw_name') or 'none'}, language={s.get('language') or 'unknown'}, "
+        f"stream={s.get('provider_stream_id') or s.get('provider_series_id') or 'none'}"
+        for s in (imported.get('sources') or [])
+    ) or "- none"
     user_message = (
-        f"Item name in catalog: {item_name}\n"
-        + (f"Provider's own category for it: {provider_category_name}\n" if provider_category_name else "")
-        + f"Content type: {content_type}\n\nTMDB candidates:\n{listing}\n\nWhich is the correct match?"
+        f"Imported catalog record:\n"
+        f"- content_type={content_type}\n"
+        f"- id={imported.get('id') or 'unknown'}\n"
+        f"- name={imported.get('name') or item_name}\n"
+        f"- year={imported.get('year') if imported.get('year') is not None else 'missing'}\n"
+        f"- tmdb_id={imported.get('tmdb_id') or 'missing'}\n"
+        + (f"- provider_category={provider_category_name}\n" if provider_category_name else "")
+        + f"Provider/source details:\n{source_listing}\n\n"
+        f"Existing catalog candidates (these may be the same item already represented in the DB):\n"
+        f"{existing_listing}\n\n"
+        f"TMDB search candidates:\n{listing}\n\n"
+        "Choose the best TMDB candidate only if the imported details and existing-catalog evidence "
+        "support it. Explain the decisive evidence and identify any conflict."
     )
     return await _call_ai(
         system, user_message, "report_match",
         "Report the best matching candidate, or none.",
-        _YEAR_MATCH_SCHEMA, max_tokens=512,
+        _YEAR_MATCH_SCHEMA, max_tokens=1200,
     )
 
 

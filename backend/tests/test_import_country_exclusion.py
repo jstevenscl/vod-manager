@@ -33,10 +33,10 @@ def test_country_suffix_code_unknown_code_not_stripped(db):
 def test_should_auto_archive_respects_country_exclusion(db):
     country = ["NZ"]
     assert vod_importer._should_auto_archive(
-        "Married at First Sight (NZ)", lang={"exclude_prefixes": [], "exclude_non_latin": False}, country=country,
+        "Married at First Sight (NZ)", lang={"enabled_languages": ["EN", "ES"], "exclude_non_latin": False}, country=country,
     ) is True
     assert vod_importer._should_auto_archive(
-        "Married at First Sight (AU)", lang={"exclude_prefixes": [], "exclude_non_latin": False}, country=country,
+        "Married at First Sight (AU)", lang={"enabled_languages": ["EN", "ES"], "exclude_non_latin": False}, country=country,
     ) is False
 
 
@@ -44,13 +44,13 @@ def test_should_auto_archive_country_exclusion_defaults_to_config(db):
     config.save_import_country_exclusion(["NZ"])
     # No explicit country arg -- falls back to reading config, same as lang.
     assert vod_importer._should_auto_archive(
-        "Married at First Sight (NZ)", lang={"exclude_prefixes": [], "exclude_non_latin": False},
+        "Married at First Sight (NZ)", lang={"enabled_languages": ["EN", "ES"], "exclude_non_latin": False},
     ) is True
 
 
 def test_should_auto_archive_empty_country_exclusion_never_archives(db):
     assert vod_importer._should_auto_archive(
-        "Married at First Sight (NZ)", lang={"exclude_prefixes": [], "exclude_non_latin": False}, country=[],
+        "Married at First Sight (NZ)", lang={"enabled_languages": ["EN", "ES"], "exclude_non_latin": False}, country=[],
     ) is False
 
 

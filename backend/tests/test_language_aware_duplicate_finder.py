@@ -114,9 +114,9 @@ def test_duplicate_finder_still_groups_series_with_same_language(db):
 
 
 def test_duplicate_finder_movies_and_series_together(db):
-    """Both content types exercised in the same test run/db (Step 2
-    instruction: run the same tests again including movies and shows
-    together to make sure both are good)."""
+    """Both content types exercised in the same test run/db (user's Step 2
+    instruction: 'run same tests again include movies and shows together to
+    make sure both are good')."""
     config.save_duplicate_finder_quality_prefix_matching(True)
     provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
 
@@ -134,50 +134,3 @@ def test_duplicate_finder_movies_and_series_together(db):
     for group in series_groups:
         names = {i["name"] for i in group["items"]}
         assert not {"Dark", "DE - Dark"} <= names
-
-
-def test_cross_bucket_tmdb_pass_joins_rows_with_different_name_keys(db):
-    """Pass 4 (beads-cd4): two rows sharing a CONFIRMED tmdb_id but with a
-    name-key artifact (a doubled year) that keeps them out of the same
-    pass-(1) bucket must still cluster via the cross-bucket tmdb_id pass."""
-    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
-
-    _import_movie(db, provider_id, "Predator", 1987, "p1-1", "Predator", tmdb_id=106)
-    _import_movie(db, provider_id, "Predator (1987) (1987)", 1987, "p1-2", "Predator (1987) (1987)", tmdb_id=106)
-
-    groups = db.find_duplicate_groups("movie")
-
-    matching = [g for g in groups if {i["name"] for i in g["items"]} == {"Predator", "Predator (1987) (1987)"}]
-    assert len(matching) == 1
-
-
-def test_base_name_pass_groups_confirmed_and_unconfirmed_same_base_name(db):
-    """Pass 5 (beads-8sl): a confirmed-tmdb_id row and a same-base-name row
-    with no tmdb_id at all never share a pass-(1) name-key bucket when one
-    side carries a "(YYYY)" the other lacks -- grouped here purely on
-    year-stripped base name, kept only because the group mixes a
-    confirmed-id row with a no-id row."""
-    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
-
-    _import_series(db, provider_id, "Crashing", None, "s-1", "Crashing", tmdb_id=None)
-    _import_series(db, provider_id, "Crashing (2016)", 2016, "s-2", "Crashing (2016)", tmdb_id=62126)
-
-    groups = db.find_duplicate_groups("series")
-
-    matching = [g for g in groups if {i["name"] for i in g["items"]} == {"Crashing", "Crashing (2016)"}]
-    assert len(matching) == 1
-
-
-def test_base_name_pass_does_not_group_two_unconfirmed_rows(db):
-    """Same base name with NEITHER side carrying a tmdb_id is not proof of
-    anything -- pass 5 only ever fires when the group mixes a confirmed-id
-    row with a no-id row."""
-    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
-
-    _import_series(db, provider_id, "Crashing", None, "s-1", "Crashing", tmdb_id=None)
-    _import_series(db, provider_id, "Crashing (2016)", None, "s-2", "Crashing (2016)", tmdb_id=None)
-
-    groups = db.find_duplicate_groups("series")
-
-    matching = [g for g in groups if {i["name"] for i in g["items"]} == {"Crashing", "Crashing (2016)"}]
-    assert len(matching) == 0

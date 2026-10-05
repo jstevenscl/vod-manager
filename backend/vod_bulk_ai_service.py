@@ -86,18 +86,45 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
     item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
     if not item:
         return {"id": item_id, "status": "error", "detail": "not found"}
-    if not item.get("needs_year_review"):
-        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs review"}
+    # KNM: added 2026-09-14 -- Metadata Review also contains provider rows with no usable identity at
+    # all (both TMDB ID and year absent). They never passed through the older
+    # ambiguous-year detector, but a user-selected bulk AI run should be able
+    # to resolve them with the exact same high-confidence-only safeguards.
+    if not item.get("needs_year_review") and not (item.get("tmdb_id") is None and item.get("year") is None):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs identity review"}
 
     try:
-        candidates = await tmdb_sync.search_title(item["name"], content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"]), content_type)
     except Exception as exc:
         return {"id": item_id, "name": item["name"], "status": "error", "detail": f"TMDB search failed: {exc}"}
     if not candidates:
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no TMDB results"}
 
+    source_rows = (
+        vod_db.list_movie_sources(item_id)
+        if content_type == "movie"
+        else vod_db.list_series_sources(item_id)
+    )
+    existing_matches = vod_db.find_existing_metadata_matches(content_type, item_id)
+    for source in source_rows:
+        provider = vod_db.get_provider(source.get("provider_id")) if source.get("provider_id") else None
+        source["provider_name"] = provider.get("name") if provider else None
+    imported_details = {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "year": item.get("year"),
+        "tmdb_id": item.get("tmdb_id"),
+        "provider_category_name": item.get("provider_category_name"),
+        "raw_name": item.get("raw_name"),
+        "sources": source_rows,
+    }
+
     try:
-        suggestion = await ai_assist.suggest_year_review_match(item["name"], item.get("provider_category_name"), content_type, candidates)
+        suggestion = await ai_assist.suggest_year_review_match(
+            item["name"], item.get("provider_category_name"), content_type, candidates,
+            imported_details=imported_details,
+            existing_matches=existing_matches,
+        )
     except Exception as exc:
         return {"id": item_id, "name": item["name"], "status": "error", "detail": f"AI suggestion failed: {exc}"}
 
@@ -109,6 +136,8 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
         }
 
     pick = candidates[idx]
+    if pick.get("year") is None or not pick.get("tmdb_id"):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "confident TMDB result has no usable ID/year"}
     try:
         result = vod_db.resolve_year_review(content_type, item_id, pick.get("year"), pick.get("tmdb_id"))
     except ValueError as exc:
@@ -152,7 +181,7 @@ async def _resolve_one_tmdb_lookup_failure(content_type: str, item_id: int) -> d
     if item.get("is_adult"):
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "adult title"}
     try:
-        candidates = await tmdb_sync.search_title(item["name"], content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"]), content_type)
     except Exception as exc:
         return {"id": item_id, "name": item["name"], "status": "error", "detail": f"TMDB search failed: {exc}"}
     if not candidates:
@@ -209,7 +238,7 @@ async def _resolve_one_missing_artwork(content_type: str, item_id: int) -> dict:
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "already has a poster"}
 
     try:
-        candidates = await tmdb_sync.search_title(item["name"], content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"]), content_type)
     except Exception as exc:
         return {"id": item_id, "name": item["name"], "status": "error", "detail": f"TMDB search failed: {exc}"}
     if not candidates:

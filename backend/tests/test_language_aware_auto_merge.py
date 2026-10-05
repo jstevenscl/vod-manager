@@ -15,6 +15,17 @@ auto_merge_* as two separate rows at all."""
 import config
 
 
+def _insert_missing_card(db, table, name, year):
+    conn = db._connect()
+    cur = conn.execute(
+        f"INSERT INTO {table} (name, year, created_at) VALUES (?, ?, ?)",
+        (name, year, db._now()),
+    )
+    db._commit_with_retry(conn)
+    conn.close()
+    return int(cur.lastrowid)
+
+
 def _import_movie(db, provider_id, name, year, stream_id, raw_name, tmdb_id):
     db.bulk_import_movies(provider_id, [
         {
@@ -194,6 +205,68 @@ def test_auto_merge_series_merges_same_tmdb_id_same_language(db):
     assert len(remaining) == 1
 
 
+def test_auto_merge_movie_skips_same_tmdb_id_when_year_differs(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    first = _import_movie(db, provider_id, "Example Movie", 2020, "one", "Example Movie", tmdb_id=777)
+    second = _import_movie(db, provider_id, "Example Movie", 2021, "two", "Example Movie", tmdb_id=777)
+
+    db.auto_merge_movie_by_tmdb(first["id"])
+
+    assert db.get_movie(first["id"]) is not None
+    assert db.get_movie(second["id"]) is not None
+
+
+def test_auto_merge_series_skips_same_tmdb_id_when_year_differs(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    db.bulk_import_series(provider_id, [
+        {"name": "Example Show", "year": 2020, "provider_series_id": "one",
+         "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
+        {"name": "Example Show", "year": 2021, "provider_series_id": "two",
+         "raw_name": "Example Show", "tmdb_id": 778, "_has_detail": True},
+    ])
+    rows = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "778"]
+
+    db.auto_merge_series_by_tmdb(rows[0]["id"])
+
+    assert all(db.get_series(row["id"]) is not None for row in rows)
+
+
+def test_auto_merge_movie_missing_tmdb_same_name_year_into_known_card(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    known_id = db.upsert_movie("The Cage", 2024, tmdb_id="287230")
+    missing_id = _insert_missing_card(db, "movies", "The Cage", 2024)
+
+    events = db.auto_merge_movie_tmdb_collisions([missing_id])
+
+    assert db.get_movie(known_id) is not None
+    assert db.get_movie(missing_id) is None
+    assert events[0]["detail"]["match_type"] == "name_year_missing_tmdb"
+
+
+def test_auto_merge_movie_missing_tmdb_does_not_cross_years(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    known_id = db.upsert_movie("The Cage", 2026, tmdb_id="287230")
+    missing_id = _insert_missing_card(db, "movies", "The Cage", 2024)
+
+    assert db.auto_merge_movie_tmdb_collisions([missing_id]) == []
+    assert db.get_movie(known_id) is not None
+    assert db.get_movie(missing_id) is not None
+
+
+def test_auto_merge_series_missing_tmdb_same_name_year_into_known_card(db):
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    known_id = db.upsert_series("Pose", 2018, tmdb_id="79084")
+    missing_id = _insert_missing_card(db, "series", "Pose", 2018)
+
+    events = db.auto_merge_series_tmdb_collisions([missing_id])
+
+    assert db.get_series(known_id) is not None
+    assert db.get_series(missing_id) is None
+    assert events[0]["detail"]["match_type"] == "name_year_missing_tmdb"
+
+
 def test_auto_merge_movies_by_tmdb_batch_merges_each_id_sequentially(db):
     """2026-09-14 CPU-spike fix: bulk enrich's end-of-run sweep used to fan
     out one asyncio.to_thread(auto_merge_movie_by_tmdb, id) task per affected
@@ -238,4 +311,40 @@ def test_auto_merge_series_by_tmdb_batch_merges_each_id_sequentially(db):
     db.auto_merge_series_by_tmdb_batch([rows[0]["id"]])
 
     remaining = [s for s in db.list_series(limit=1000) if s["name"] in ("Show A", "Show A Dup")]
+    assert len(remaining) == 1
+
+
+def test_collision_sweep_merges_exact_tmdb_series_omitted_from_work_list(db):
+    """A final DB-derived sweep catches siblings missed by a coalesced run."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    db.bulk_import_series(provider_id, [
+        {"name": "Canonical Show", "year": 2020, "provider_series_id": "canonical",
+         "raw_name": "Canonical Show", "tmdb_id": 602, "_has_detail": True,
+         "provider_category_name": None, "genre": None, "description": None, "cast_list": None,
+         "director": None, "poster_url": None, "rating": None, "release_date": None,
+         "provider_last_modified": None},
+        {"name": "Provider Alias", "year": 2020, "provider_series_id": "alias",
+         "raw_name": "Provider Alias", "tmdb_id": 602, "_has_detail": True,
+         "provider_category_name": None, "genre": None, "description": None, "cast_list": None,
+         "director": None, "poster_url": None, "rating": None, "release_date": None,
+         "provider_last_modified": None},
+    ])
+
+    db.auto_merge_series_tmdb_collisions()
+
+    remaining = [s for s in db.list_series(limit=1000) if s["tmdb_id"] == "602"]
+    assert len(remaining) == 1
+
+
+def test_collision_sweep_merges_exact_tmdb_movies_omitted_from_work_list(db):
+    """Known-ID movies may skip detail enrichment but must still reconcile."""
+    config.save_duplicate_finder_auto_merge_tmdb(True)
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    first = _import_movie(db, provider_id, "Canonical Movie", 2020, "canonical", "Canonical Movie", tmdb_id=701)
+    second = _import_movie(db, provider_id, "Provider Movie Alias", 2020, "alias", "Provider Movie Alias", tmdb_id=701)
+
+    db.auto_merge_movie_tmdb_collisions()
+
+    remaining = [movie_id for movie_id in (first["id"], second["id"]) if db.get_movie(movie_id)]
     assert len(remaining) == 1
