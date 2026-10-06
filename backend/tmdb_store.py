@@ -482,21 +482,47 @@ def set_meta(key: str, value) -> None:
         )
 
 
-def _today_key() -> str:
-    return "requests:" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _today_key(prefix: str = "requests") -> str:
+    return f"{prefix}:" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def requests_today() -> int:
     return int(get_meta(_today_key(), "0") or 0)
 
 
-def add_requests(count: int) -> None:
+def _add_counter(key: str, count: int) -> None:
     with _conn() as conn:
         conn.execute(
             """INSERT INTO meta (key, value) VALUES (?, ?)
                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)""",
-            (_today_key(), str(count)),
+            (key, str(count)),
         )
+
+
+def add_requests(count: int) -> None:
+    _add_counter(_today_key(), count)
+
+
+# Local-vs-TMDB hit rate for the TMDB Library page -- every
+# app lookup (not the background fill) counts as answered locally or by TMDB.
+def count_lookup(local: bool) -> None:
+    _add_counter(_today_key("lookups_local" if local else "lookups_tmdb"), 1)
+
+
+def lookups_today() -> dict:
+    return {"local": int(get_meta(_today_key("lookups_local"), "0") or 0),
+            "tmdb": int(get_meta(_today_key("lookups_tmdb"), "0") or 0)}
+
+
+def export_name_count(media_type: str, name: str) -> int:
+    """How many TMDB titles the ID export lists under this exact (original)
+    name -- 0 when the export isn't loaded."""
+    key = name_key(normalize(name))
+    if key is None:
+        return 0
+    with _conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM export_ids WHERE media_type=? AND name_key=?",
+                            (media_type, key)).fetchone()[0]
 
 
 def stats() -> list[dict]:

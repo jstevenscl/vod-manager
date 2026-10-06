@@ -641,6 +641,7 @@ _TMDB_STORE_DEFAULTS = {
     "prefill_top": 100000,
     "daily_budget": 20000,
     "concurrency": 4,
+    "auto_match_batch": 2000,  # no-ID titles auto-matched per burst; 0 = off
 }
 
 

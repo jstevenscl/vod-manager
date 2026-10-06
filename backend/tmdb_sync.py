@@ -101,6 +101,17 @@ def store_enabled() -> bool:
     return bool(get_tmdb_store_settings()["enabled"])
 
 
+# Local-vs-TMDB hit-rate counter (TMDB Library page). Never
+# lets a counter write break the lookup itself.
+async def note_lookup(local: bool) -> None:
+    if not store_enabled():
+        return
+    try:
+        await asyncio.to_thread(tmdb_store.count_lookup, local)
+    except Exception as exc:
+        logger.debug("[tmdb_sync] lookup counter write failed: %s", exc)
+
+
 async def fetch_title_payload(media_type: str, tmdb_id, *, use_store: bool = True) -> dict | None:
     """Full /movie/{id} or /tv/{id} payload: local store first, then TMDB
     (stored on success). Raises TmdbNotFoundError on a TMDB 404; returns
@@ -114,10 +125,13 @@ async def fetch_title_payload(media_type: str, tmdb_id, *, use_store: bool = Tru
             logger.warning("[tmdb_sync] local store read failed for %s %s: %s", media_type, key, exc)
             cached = None
         if cached is not None:
+            await note_lookup(True)
             return cached
     api_key = get_tmdb_api_key()
     if not api_key:
         return None
+    if use_store:
+        await note_lookup(False)
     try:
         async with _tmdb_semaphore:
             r = await _tmdb_get(
@@ -273,6 +287,7 @@ async def search_title(query: str, content_type: str) -> list[dict]:
 
     endpoint = "movie" if content_type == "movie" else "tv"
     local = await search_local(endpoint, query)
+    await note_lookup(bool(local))
     if local:
         data = {"results": [as_search_item(endpoint, row) for row in local]}
     else:
@@ -358,7 +373,9 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
                 logger.warning("[tmdb_sync] local season read failed for tmdb_id=%s: %s", tmdb_id, exc)
                 cached = None
             if cached is not None:
+                await note_lookup(True)
                 return cached
+        await note_lookup(False)
         try:
             async with _tmdb_semaphore:
                 sr = await _tmdb_get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})

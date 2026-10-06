@@ -22,6 +22,7 @@ class StoreSettings(BaseModel):
     prefill_top: int | None = None
     daily_budget: int | None = None
     concurrency: int | None = None
+    auto_match_batch: int | None = None
 
 
 @router.get("/status", dependencies=_GUARDS)
@@ -36,6 +37,7 @@ async def get_status():
         "settings": settings,
         "stats": stats,
         "requests_today": await asyncio.to_thread(tmdb_store.requests_today),
+        "lookups_today": await asyncio.to_thread(tmdb_store.lookups_today),
         "next_burst_at": float(next_burst) if next_burst else None,
         "db_size_bytes": await asyncio.to_thread(tmdb_store.db_size_bytes),
         "job": tmdb_fill.status,
@@ -59,8 +61,8 @@ async def put_settings(body: StoreSettings):
 
 @router.post("/run/{job}", dependencies=_GUARDS)
 async def run(job: str):
-    if job not in ("export", "changes", "burst"):
-        raise HTTPException(400, detail="job must be export, changes or burst")
+    if job not in ("export", "changes", "burst", "match"):
+        raise HTTPException(400, detail="job must be export, changes, burst or match")
     if not get_tmdb_api_key():
         raise HTTPException(400, detail="Save a TMDB API key first")
     if not get_tmdb_store_settings()["enabled"]:
