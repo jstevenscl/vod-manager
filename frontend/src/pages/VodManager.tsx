@@ -4912,6 +4912,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   }
   const applyExclusionsJobQuery = useQuery<{
     status: string; total: number; completed: number; current_provider: string | null
+    phase?: string
     results: ApplyExclusionsProviderResult[]; error: string | null
   }>({
     queryKey: ['vod-apply-exclusions-job', applyExclusionsJobId],
@@ -6547,7 +6548,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       <>
       <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
         <p className="text-xs text-muted-foreground">
-          TMDB API key — used to sync categories from public TMDB Lists (see Categories below).
+          TMDB API key (v3) — used for all TMDB lookups: bulk metadata enrichment, ID matching, trailers, and syncing categories from public TMDB Lists.
         </p>
         <div className="flex items-center gap-1.5">
           <input
@@ -8641,8 +8642,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </Button>
           {applyExclusionsJobQuery.data?.status === 'running' && (
             <span className="text-xs text-muted-foreground">
-              Provider {applyExclusionsJobQuery.data.completed + 1} of {applyExclusionsJobQuery.data.total}
-              {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+              {applyExclusionsJobQuery.data.phase === 'finalizing'
+                ? `All ${applyExclusionsJobQuery.data.total} provider(s) synced — finalizing…`
+                : <>
+                    Provider {Math.min(applyExclusionsJobQuery.data.completed + 1, applyExclusionsJobQuery.data.total)} of {applyExclusionsJobQuery.data.total}
+                    {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
+                  </>}
             </span>
           )}
           {applyExclusionsJobQuery.data?.status === 'error' && (

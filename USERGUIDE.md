@@ -234,10 +234,13 @@ Jellyfin kept for legacy Emby-client compatibility. Not every Jellyfin
 install has those aliases available, though; if adding a Jellyfin provider
 fails on the library-detection step, VOD & DVR Manager now automatically
 retries against Jellyfin's native (unprefixed) paths and remembers that
-choice for the rest of the request. It also sends the API key as both a
-query parameter and the `X-Emby-Token` header, since some Jellyfin
-deployments (typically ones behind a reverse proxy or with a hardened auth
-config) only accept one or the other. If a Jellyfin provider still can't
+choice for the rest of the request. It also sends the API key as a query
+parameter, the `X-Emby-Token` header, and Jellyfin's native
+`Authorization: MediaBrowser Token="…"` header, since different servers
+accept different ones — Jellyfin 12.1, for example, rejects the first two
+and only accepts the native header. The library listing needs an
+administrator-level API key; if the server answers 401/403 the log now says
+the key was rejected or lacks admin rights. If a Jellyfin provider still can't
 import after this, it's worth checking whether anything sits in front of
 your Jellyfin server (a reverse proxy, an auth gateway) that might be
 altering the request before it reaches Jellyfin itself.
@@ -395,7 +398,11 @@ first time gets auto-archived the moment it's discovered, same as
 Dispatcharr's own "auto-archive new VOD categories" behavior. Off by
 default, and turning it on never retroactively archives categories the
 provider was already reporting before you enabled it — only ones that show
-up for the first time on a later import.
+up for the first time on a later import (a provider's very first import
+archives nothing, since every category would count as new). Content in an
+auto-archived category **stays archived on every later import** until you
+turn the setting off, which un-archives it on the next import; you can also
+un-archive individual items by hand.
 
 Turning either of these on only affects **future** imports by default. If
 you already have a large catalog and want the new rules applied
@@ -1596,8 +1603,10 @@ re-run any time (each becomes a no-op once nothing's left to fix):
 ## 12. TMDB integration
 
 A free [TMDB API key](https://www.themoviedb.org/settings/api) (v3 auth)
-under Configuration → API Keys unlocks real TMDB search for the Needs
-Review and Missing Artwork flows above, plus two ways to auto-populate
+under Configuration → API Keys is used for **all** TMDB lookups — bulk
+metadata enrichment, ID matching, trailers and library-source matching, not
+just the features below. It unlocks real TMDB search for the Needs Review
+and Missing Artwork flows above, plus two ways to auto-populate
 categories from a public list — both only ever place items already present
 in your pool; neither pulls in anything new.
 

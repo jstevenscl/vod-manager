@@ -424,7 +424,8 @@ built by hand with the same name — it only ever fills in what's missing.
 auto-archives any category a provider reports for the first time, catching
 it before it lands in your library instead of after — off by default, and
 never retroactively archives a category the provider was already reporting
-before you turned it on.
+before you turned it on. Archived content stays archived on later imports
+until you turn the setting off.
 
 **Stream priority** (Curation & Maintenance → *Stream Priority*) controls
 which of a pool item's multiple real sources gets used first when more than

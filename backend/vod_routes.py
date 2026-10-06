@@ -996,7 +996,8 @@ async def get_apply_import_exclusions_status(job_id: str):
         raise HTTPException(404, detail="job not found")
     return {
         "status": job["status"], "total": job["total"], "completed": job["completed"],
-        "current_provider": job["current_provider"], "results": job["results"], "error": job["error"],
+        "current_provider": job["current_provider"], "phase": job.get("phase"),
+        "results": job["results"], "error": job["error"],
     }
 
 
@@ -3049,7 +3050,7 @@ async def year_review_suggestions(content_type: str, item_id: int, q: Optional[s
         # different region (e.g. international vs. North American title),
         # and the default search (item's own stored name) won't find a match
         # TMDB's index doesn't already associate with that exact string.
-        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        return await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3068,7 +3069,7 @@ async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[st
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3224,7 +3225,7 @@ async def missing_artwork_suggestions(content_type: str, item_id: int, q: Option
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        return await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        return await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3243,7 +3244,7 @@ async def missing_artwork_ai_suggest(content_type: str, item_id: int, q: Optiona
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        candidates = await tmdb_sync.search_title((q or item["name"]).strip(), content_type)
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:

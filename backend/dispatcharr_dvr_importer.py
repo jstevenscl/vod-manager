@@ -317,7 +317,7 @@ async def _import_dvr_recordings_locked(provider_id: int) -> dict:
 
     recordings = await dispatcharr_dvr_client.list_completed_recordings(connection)
     remote_root = provider.get("dvr_remote_recordings_root") or _DEFAULT_REMOTE_RECORDINGS_ROOT
-    vod_db.cleanup_stale_recording_claims()
+    await asyncio.to_thread(vod_db.cleanup_stale_recording_claims)
     # Opt-in, default off -- see vod_db.enable_dvr_for_connection's docstring
     # for why. own_storage_dir is Phase 1b's existing DATA_DIR/dvr_recordings
     # convention, reused here as the destination for Phase 1a's copy too, so

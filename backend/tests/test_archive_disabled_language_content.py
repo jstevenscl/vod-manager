@@ -150,3 +150,22 @@ def test_does_not_touch_manually_archived_series(db):
     updated = db.get_series(series["id"])
     assert updated["review_excluded"] == 1
     assert updated["review_excluded_manual"] == 1
+
+
+def test_does_not_unarchive_row_archived_by_import(db):
+    # Import-time auto-archive (excluded category, archive_new_categories) is
+    # not this sweep's to undo, even when the row has an enabled language.
+    config.save_enabled_languages(["EN"])
+    provider_id = db.upsert_provider("prov1", "http://example.com", "user", "pass")
+    db.bulk_import_movies(provider_id, [{
+        "name": "EN - Archived By Import", "year": 2001, "provider_stream_id": "en-1",
+        "container_extension": "mp4", "raw_name": "EN - Archived By Import",
+        "auto_archive": True, "_has_detail": True,
+    }])
+    movie = db.get_movie_by_name_year("EN - Archived By Import", 2001)
+    assert movie["review_excluded"] == 1
+
+    result = vod_db.archive_disabled_language_content()
+
+    assert result["movies_unarchived"] == 0
+    assert db.get_movie(movie["id"])["review_excluded"] == 1

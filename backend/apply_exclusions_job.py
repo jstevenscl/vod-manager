@@ -18,9 +18,11 @@ import uuid
 
 import dispatcharr_dvr_importer
 import emby_vod_importer
+import library_importer
 import plex_importer
 import vod_db
 import vod_importer
+from xc_server import _redact_upstream_url
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ async def _run_job(job_id: str) -> None:
                     result = await plex_importer.import_plex_library(p["id"])
                 elif p.get("provider_type") in ("emby", "jellyfin"):
                     result = await emby_vod_importer.import_emby_library(p["id"])
+                elif p.get("provider_type") == "library":
+                    result = await library_importer.import_library(p["id"])
                 elif p.get("provider_type") == "dispatcharr_dvr":
                     # DVR recordings have no language/category exclusion rules
                     # to retroactively apply yet -- this just re-runs the same
@@ -49,11 +53,20 @@ async def _run_job(job_id: str) -> None:
                     result = await dispatcharr_dvr_importer.import_dvr_recordings(p["id"])
                 else:
                     result = await vod_importer.import_provider_catalog(p["id"])
+                # This was a full re-import; without the stamp the periodic
+                # refresher still sees the provider as due and imports it again.
+                await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, p["id"])
                 job["results"].append({"provider": p["name"], **result})
             except Exception as exc:
-                logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], exc)
-                job["results"].append({"provider": p["name"], "error": str(exc)})
+                # httpx errors embed the request URL, including the provider
+                # login; this text is shown in the UI, so redact it.
+                detail = _redact_upstream_url(str(exc)) or type(exc).__name__
+                logger.error("[apply_exclusions_job] provider=%s failed: %s", p["name"], detail)
+                job["results"].append({"provider": p["name"], "error": detail})
             job["completed"] += 1
+        # Every provider is done; the re-sweep below can still take a while.
+        job["current_provider"] = None
+        job["phase"] = "finalizing"
         # Real gap found live 2026-07-29: without this, an item newly
         # un-excluded by re-running import exclusions doesn't reappear in
         # All Movies/All TV Shows (and therefore stays invisible to

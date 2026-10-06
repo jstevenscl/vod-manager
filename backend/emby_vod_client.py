@@ -106,8 +106,18 @@ class EmbyVodClient:
         Playing session-identification ones _SESSION_HEADERS originally
         covered, since VirtualFolders (an admin-level library-management
         endpoint, unlike ordinary content browsing) is exactly the kind of
-        call more likely to enforce stricter auth."""
-        return {**_SESSION_HEADERS, "X-Emby-Token": self.api_key}
+        call more likely to enforce stricter auth.
+
+        GH#38: Jellyfin 12.1 rejects BOTH the `api_key` query param and the
+        `X-Emby-Token` header (401 on an otherwise valid admin key) and only
+        accepts its native `Authorization: MediaBrowser Token="..."` header,
+        so that is sent as well. The older credentials stay for Emby and
+        pre-12 Jellyfin servers that still rely on them."""
+        return {
+            **_SESSION_HEADERS,
+            "X-Emby-Token": self.api_key,
+            "Authorization": f'MediaBrowser Token="{self.api_key}"',
+        }
 
     async def _get(self, path: str, params: dict | None = None, timeout: float = _REQUEST_TIMEOUT) -> dict:
         query = {"api_key": self.api_key}
@@ -160,6 +170,12 @@ class EmbyVodClient:
                         path, native_path, r2.status_code,
                     )
                     r = r2
+            if r.status_code in (401, 403):
+                logger.error(
+                    "[emby_vod_client] %s returned HTTP %s -- the API key was rejected or lacks "
+                    "administrator rights (library listing needs an admin key)",
+                    effective_path, r.status_code,
+                )
             r.raise_for_status()
             return r.json() if r.content else {}
         except Exception:

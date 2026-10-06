@@ -131,3 +131,22 @@ def test_requests_send_x_emby_token_auth_header():
 
     assert seen_headers["token"] == "secret-key"
     assert seen_headers["client"] == "VOD & DVR Manager"
+
+
+def test_sends_jellyfin_native_authorization_header():
+    """GH#38: Jellyfin 12.1 401s on api_key= and X-Emby-Token alone; only its
+    native `Authorization: MediaBrowser Token="..."` header is accepted. The
+    older credentials must still go out for Emby / older Jellyfin."""
+    provider = {"base_url": "http://jellyfin.example", "password": "key"}
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("Authorization")
+        seen["token"] = request.headers.get("X-Emby-Token")
+        seen["query_key"] = request.url.params.get("api_key")
+        return httpx.Response(200, json=[])
+
+    client = _client_with_transport(provider, handler)
+    asyncio.run(client._get("/emby/Library/VirtualFolders"))
+
+    assert seen == {"auth": 'MediaBrowser Token="key"', "token": "key", "query_key": "key"}
