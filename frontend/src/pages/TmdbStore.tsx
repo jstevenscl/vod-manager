@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Database, Loader2, Play, Power, RefreshCw, Search, Settings as SettingsIcon, Trash2 } from 'lucide-react'
+import { Database, Loader2, Play, Power, RefreshCw, Search, Settings as SettingsIcon, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { inputCls, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -15,6 +15,7 @@ interface StoreSettings {
   bursts_per_day: number
   daily_budget: number
   concurrency: number
+  auto_match_batch: number
 }
 interface TypeStats {
   media_type: MediaType
@@ -35,6 +36,7 @@ interface StoreStatus {
   settings: StoreSettings
   stats: TypeStats[]
   requests_today: number
+  lookups_today: { local: number; tmdb: number }
   next_burst_at: number | null
   db_size_bytes: number
   retention_policy: { maximum_days: number; refresh_after_days: number; last_run_at: number | null }
@@ -75,6 +77,7 @@ const SETTING_FIELDS: { key: Exclude<keyof StoreSettings, 'enabled'>; label: str
   { key: 'bursts_per_day', label: 'Bursts per day', hint: 'How many fill bursts run each day.' },
   { key: 'daily_budget', label: 'Daily request budget', hint: 'Fill bursts stop once this many TMDB requests were made today.' },
   { key: 'concurrency', label: 'Parallel requests', hint: 'Concurrent requests during a burst — keep low to stay light on bandwidth.' },
+  { key: 'auto_match_batch', label: 'Titles to match per burst', hint: 'Catalog titles without a TMDB ID matched by name and year after each burst. 0 turns it off.' },
 ]
 
 export default function TmdbStore() {
@@ -118,7 +121,7 @@ export default function TmdbStore() {
     onSettled: () => qc.invalidateQueries({ queryKey: ['tmdb-store-status'] }),
   })
   const runJob = useMutation({
-    mutationFn: (job: 'burst' | 'changes' | 'export') => api.post(`/tmdb-store/run/${job}`).then((r) => r.data),
+    mutationFn: (job: 'burst' | 'changes' | 'export' | 'match') => api.post(`/tmdb-store/run/${job}`).then((r) => r.data),
     onSettled: () => qc.invalidateQueries({ queryKey: ['tmdb-store-status'] }),
   })
   const retention = useMutation({
@@ -209,6 +212,11 @@ export default function TmdbStore() {
               <span className="text-muted-foreground">
                 Requests today: <b>{fmtNum(status.requests_today)}</b> / {fmtNum(status.settings.daily_budget)}
               </span>
+              <span className="text-muted-foreground">
+                Answered locally today:{' '}
+                <b>{pct(status.lookups_today.local, status.lookups_today.local + status.lookups_today.tmdb)}</b> of{' '}
+                {fmtNum(status.lookups_today.local + status.lookups_today.tmdb)} lookups
+              </span>
               <span className="text-muted-foreground">Size: <b>{fmtBytes(status.db_size_bytes)}</b></span>
               <span className="text-muted-foreground">Next burst: <b>{fmtTime(status.next_burst_at)}</b></span>
               <span className="text-muted-foreground">Refresh: <b>{status.retention_policy.refresh_after_days} days</b>; maximum: <b>{status.retention_policy.maximum_days} days</b></span>
@@ -220,6 +228,14 @@ export default function TmdbStore() {
               </p>
             )}
             {status.job.last_error && <p className="text-xs text-destructive">{status.job.last_error}</p>}
+            {status.job.last_result?.job === 'match' && (
+              <p className="text-xs text-muted-foreground">
+                Last title match: {fmtNum(Number(status.job.last_result.checked ?? 0))} checked,{' '}
+                {fmtNum(Number(status.job.last_result.matched ?? 0))} matched,{' '}
+                {fmtNum(Number(status.job.last_result.ambiguous ?? 0))} sent to Metadata Review,{' '}
+                {fmtNum(Number(status.job.last_result.unmatched ?? 0))} not found on TMDB
+              </p>
+            )}
             {runError && <p className="text-xs text-destructive">{runError}</p>}
 
             <div className="overflow-x-auto">
@@ -269,6 +285,9 @@ export default function TmdbStore() {
               </Button>
               <Button size="sm" variant="outline" disabled={!canRun} onClick={() => runJob.mutate('export')}>
                 <Database size={12} className="mr-1" /> Refresh TMDB ID list
+              </Button>
+              <Button size="sm" variant="outline" disabled={!canRun} onClick={() => runJob.mutate('match')}>
+                <Wand2 size={12} className="mr-1" /> Match titles without a TMDB ID
               </Button>
               <Button size="sm" variant="outline" disabled={retention.isPending || status.job.running} onClick={() => retention.mutate(true)}>
                 {retention.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Trash2 size={12} className="mr-1" />} Preview cleanup

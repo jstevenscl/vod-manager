@@ -99,7 +99,9 @@ async def _search(query: str, content_type: str, year: int | None) -> list[Candi
     if hits and (year is None or any(
         h["exact"] and h["year"] is not None and abs(h["year"] - year) <= 1 for h in hits
     )):
+        await tmdb_sync.note_lookup(True)
         return _to_candidates([tmdb_sync.as_search_item(endpoint, h) for h in hits], content_type)
+    await tmdb_sync.note_lookup(False)
     params = {"api_key": api_key, "query": query}
     if year:
         params["year" if content_type == "movie" else "first_air_date_year"] = year
@@ -121,8 +123,10 @@ async def _lookup_by_imdb(imdb_id: str, content_type: str) -> Candidate | None:
             logger.warning("[library_matcher] local IMDb lookup failed for %s: %s", imdb_id, exc)
             row = None
         if row and (row["title"] or row["original_title"]):
+            await tmdb_sync.note_lookup(True)
             return Candidate(str(row["tmdb_id"]), row["title"] or row["original_title"], row["year"],
                              float(row["popularity"] or 0.0))
+    await tmdb_sync.note_lookup(False)
     async with tmdb_sync._tmdb_semaphore:
         r = await tmdb_sync._tmdb_get(
             f"{tmdb_sync._API_BASE}/find/{imdb_id}",
@@ -175,17 +179,28 @@ async def match(parsed: ParsedPath) -> MatchResult:
             found = await _lookup_by_imdb(parsed.imdb_id, content_type)
             if found:
                 return MatchResult("matched", found.tmdb_id, found.title, found.year, "explicit_id")
-        if not parsed.title:
-            return MatchResult("unmatched", reason="no title parsed from path")
-
-        candidates = await _search(parsed.title, content_type, parsed.year)
-        if not candidates and parsed.year:
-            # Year-filtered search can miss (TMDB dates differ by region/festival
-            # release); retry unfiltered and let decide() enforce the +/-1 year.
-            candidates = await _search(parsed.title, content_type, None)
-        return decide(parsed.title, parsed.year, candidates)
     except Exception as exc:
         logger.warning("[library_matcher] TMDB match failed for %r: %s", parsed.title, tmdb_sync._redact(exc))
+        return MatchResult("unmatched", reason="TMDB lookup failed", transient=True)
+    if not parsed.title:
+        return MatchResult("unmatched", reason="no title parsed from path")
+    return await match_title(parsed.title, content_type, parsed.year)
+
+
+# Split out of match() so catalog titles with no TMDB ID can
+# be auto-matched by name+year too (tmdb_automatch).
+async def match_title(title: str, content_type: str, year: int | None) -> MatchResult:
+    """Name(+year) -> TMDB under decide()'s never-guess rules; local library
+    first, TMDB /search on a local miss. content_type is 'movie' or 'series'."""
+    try:
+        candidates = await _search(title, content_type, year)
+        if not candidates and year:
+            # Year-filtered search can miss (TMDB dates differ by region/festival
+            # release); retry unfiltered and let decide() enforce the +/-1 year.
+            candidates = await _search(title, content_type, None)
+        return decide(title, year, candidates)
+    except Exception as exc:
+        logger.warning("[library_matcher] TMDB match failed for %r: %s", title, tmdb_sync._redact(exc))
         return MatchResult("unmatched", reason="TMDB lookup failed", transient=True)
 
 

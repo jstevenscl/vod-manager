@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import tmdb_automatch
 import tmdb_store
 import tmdb_sync
 import vod_db
@@ -170,7 +171,8 @@ async def _run(phase: str, coro) -> dict:
 
 
 async def run_job(job: str) -> dict:
-    jobs = {"export": import_exports, "changes": refresh_changes, "burst": run_burst}
+    jobs = {"export": import_exports, "changes": refresh_changes, "burst": run_burst,
+            "match": tmdb_automatch.run_auto_match}
     return await _run(job, jobs[job]())
 
 
@@ -192,6 +194,9 @@ async def run_due_jobs() -> bool:
         await asyncio.to_thread(tmdb_store.set_meta, "changes_run_at", now)
     if now >= await asyncio.to_thread(meta, "next_burst_at"):
         await _run("burst", run_burst())
+        # Then assign TMDB IDs to catalog titles that have none.
+        if settings["auto_match_batch"]:
+            await _run("match", tmdb_automatch.run_auto_match())
         interval = _DAY / max(1, settings["bursts_per_day"])
         await asyncio.to_thread(tmdb_store.set_meta, "next_burst_at", time.time() + interval)
     return True
