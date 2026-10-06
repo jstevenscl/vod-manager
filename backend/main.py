@@ -20,8 +20,10 @@ import emby_vod_importer
 import library_importer
 import rclone_client
 import plex_importer
+import tmdb_fill
 from portal_routes import router as portal_router
 from routes import router
+from tmdb_store_routes import router as tmdb_store_router
 import vod_db
 import vod_importer
 import vod_list_sync
@@ -437,6 +439,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
+        asyncio.create_task(tmdb_fill.fill_loop()),
         asyncio.create_task(_category_schedule_loop()),
         asyncio.create_task(_uncategorized_sweep_loop()),
         asyncio.create_task(_smart_category_scheduler()),
@@ -461,6 +464,7 @@ app.include_router(portal_router)
 app.include_router(xc_router)
 app.include_router(backup_router)
 app.include_router(diagnostics_router)
+app.include_router(tmdb_store_router)
 
 if os.environ.get("VODMANAGER_TEST_UPSTREAM"):
     from test_upstream import router as test_upstream_router
