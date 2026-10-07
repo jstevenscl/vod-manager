@@ -166,10 +166,11 @@ def test_library_search_local_when_year_agrees(store, tmdb):
 def test_library_search_tmdb_when_local_year_disagrees(store, tmdb):
     _seed_export("movie", [(1, "Angry Boys")])
     store.upsert_payload("movie", _movie(1, "Angry Boys"))
-    tmdb.routes = {"/search/movie": (200, {"results": [{"id": 8, "title": "Angry Boys", "release_date": "1990-01-01"}]})}
+    tmdb.routes = {"/search/movie": (200, {"results": [{"id": 8, "title": "Angry Boys", "release_date": "1990-01-01"}]}),
+                   "/movie/8": (200, _movie(8, "Angry Boys", "1990"))}
     found = asyncio.run(library_matcher._search("Angry Boys", "movie", 1990))
     assert [c.tmdb_id for c in found] == ["8"]
-    assert tmdb.calls == ["/search/movie"]
+    assert tmdb.calls == ["/search/movie", "/movie/8"]  # TMDB's answer is saved locally
 
 
 def test_imdb_lookup_answered_locally(store, tmdb):

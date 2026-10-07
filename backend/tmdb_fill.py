@@ -273,24 +273,11 @@ async def lookup(query: str, media_type: str, year: int | None = None, limit: in
     hits = await asyncio.to_thread(tmdb_store.search, media_type, query, year, limit)
     if hits:
         return {"source": "local", "results": [_present(h) for h in hits]}
-    api_key = get_tmdb_api_key()
-    if not api_key or not query:
+    if not get_tmdb_api_key() or not query:
         return {"source": "local", "results": []}
-    params = {"api_key": api_key, "query": query}
-    if year:
-        params["year" if media_type == "movie" else "first_air_date_year"] = year
-    async with tmdb_sync._tmdb_semaphore:
-        r = await tmdb_sync._tmdb_get(f"{tmdb_sync._API_BASE}/search/{media_type}", params=params)
-    r.raise_for_status()
-    await asyncio.to_thread(tmdb_store.add_requests, 1)
-    ids = [int(item["id"]) for item in r.json().get("results", [])[:5] if item.get("id") is not None]
-
-    async def store_one(tmdb_id: int) -> None:
-        try:
-            await tmdb_sync.fetch_title_payload(media_type, tmdb_id)
-        except Exception:
-            pass
-
-    await asyncio.gather(*[store_one(i) for i in ids])
+    # The search answer is kept too, and its top results saved.
+    data, kept = await tmdb_sync.tmdb_search(media_type, query, year)
+    ids = [int(item["id"]) for item in data.get("results", [])[:5] if item.get("id") is not None]
+    await tmdb_sync.store_titles(media_type, ids)  # no-op for titles already saved
     rows = [await asyncio.to_thread(tmdb_store.get_title, media_type, i) for i in ids]
-    return {"source": "tmdb", "results": [_present(r) for r in rows if r]}
+    return {"source": "local" if kept else "tmdb", "results": [_present(r) for r in rows if r]}

@@ -98,7 +98,20 @@ CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+CREATE TABLE IF NOT EXISTS searches (
+    kind        TEXT NOT NULL,
+    query       TEXT NOT NULL,
+    year        INTEGER NOT NULL,
+    response    BLOB NOT NULL,
+    empty       INTEGER NOT NULL,
+    fetched_at  REAL NOT NULL,
+    PRIMARY KEY (kind, query, year)
+) WITHOUT ROWID;
 """
+# Every /search and /find answer is kept so the same question
+# never goes to TMDB twice. "Nothing found" is re-asked after a week (TMDB gains
+# titles); a found answer stands, its titles' details are kept current by /changes.
+EMPTY_SEARCH_MAX_AGE = 7 * 86400
 # After _upgrade, so they also apply to a store created before these columns existed.
 _INDEXES = """
 CREATE INDEX IF NOT EXISTS titles_by_imdb ON titles(imdb_id) WHERE imdb_id IS NOT NULL;
@@ -355,6 +368,33 @@ def search_confident(media_type: str, query: str, year: int | None = None, limit
             (media_type, name_key(normalize(query))),
         ).fetchone()
     return hits if listed and not missing else None
+
+
+def _search_key(query: str) -> str:
+    return normalize(query) or (query or "").strip().lower()
+
+
+def get_search(kind: str, query: str, year: int | None = None) -> dict | None:
+    """A kept TMDB answer for (kind, query, year), or None when never asked or
+    when it found nothing and is over a week old. kind is e.g. 'search/movie'
+    or 'find'."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT response, empty, fetched_at FROM searches WHERE kind=? AND query=? AND year=?",
+            (kind, _search_key(query), int(year or 0)),
+        ).fetchone()
+    if row is None or (row["empty"] and time.time() - row["fetched_at"] > EMPTY_SEARCH_MAX_AGE):
+        return None
+    return json.loads(zlib.decompress(row["response"]))
+
+
+def put_search(kind: str, query: str, year: int | None, response: dict, empty: bool) -> None:
+    raw = zlib.compress(json.dumps(response, separators=(",", ":")).encode())
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO searches (kind, query, year, response, empty, fetched_at) VALUES (?,?,?,?,?,?)",
+            (kind, _search_key(query), int(year or 0), raw, int(empty), time.time()),
+        )
 
 
 def find_by_imdb(media_type: str, imdb_id: str) -> dict | None:

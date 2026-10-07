@@ -110,7 +110,7 @@ def test_lookup_local_first_then_live_search_stores(store, monkeypatch):
     fetched = []
     monkeypatch.setattr(tmdb_sync, "_tmdb_get", fake_get)
 
-    async def fake_fetch(media_type, tmdb_id, *, use_store=True):
+    async def fake_fetch(media_type, tmdb_id, *, use_store=True, **_):
         fetched.append(tmdb_id)
         store.upsert_payload(media_type, _tv(int(tmdb_id), "Supercar", "1961-01-28"))
         return {}
