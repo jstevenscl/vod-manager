@@ -173,3 +173,12 @@ def test_tv_details_fetch_stores_payload(store, monkeypatch):
     assert len(calls) == 1
     assert "alternative_titles" in calls[0][1]
     assert store.search("tv", "supercar")[0]["tmdb_id"] == 77
+
+
+def test_name_search_starts_from_the_text_index(store):
+    # With the text index as an inner loop, every stored name was scanned per
+    # search (tens of seconds once the library held ~200K names).
+    store.upsert_payload("movie", _movie(1, "Angry Boys"))
+    with store._conn() as conn:
+        plan = conn.execute("EXPLAIN QUERY PLAN " + store._NAME_SEARCH_SQL, ('"angry"', "movie")).fetchall()
+    assert plan[0][3].startswith("SCAN f")

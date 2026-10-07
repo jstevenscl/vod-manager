@@ -314,6 +314,19 @@ def _fts_query(norm: str) -> str:
     return " ".join(f'"{token}"' for token in norm.split())
 
 
+# CROSS JOIN pins the text index as the outer loop. With a
+# plain JOIN, SQLite scanned every stored name and ran the match per row
+# (~35 s per search at ~200K names, vs ~1 ms).
+_NAME_SEARCH_SQL = """SELECT t.media_type, t.tmdb_id, t.title, t.original_title, t.year, t.release_date,
+          t.poster_path, t.overview, t.vote_average, t.popularity, t.content_rating,
+          t.top_cast, t.genres, t.fetched_at, n.norm
+   FROM title_names_fts f
+   CROSS JOIN title_names n ON n.id = f.rowid
+   CROSS JOIN titles t ON t.media_type = n.media_type AND t.tmdb_id = n.tmdb_id
+   WHERE title_names_fts MATCH ? AND n.media_type = ?
+   LIMIT 500"""
+
+
 def search(media_type: str, query: str, year: int | None = None, limit: int = 10) -> list[dict]:
     """Name lookup over every stored name. Exact (normalized) name matches
     rank first, then a release-year match (+/-1), then TMDB popularity."""
@@ -321,17 +334,7 @@ def search(media_type: str, query: str, year: int | None = None, limit: int = 10
     if not norm:
         return []
     with _conn() as conn:
-        rows = conn.execute(
-            """SELECT t.media_type, t.tmdb_id, t.title, t.original_title, t.year, t.release_date,
-                      t.poster_path, t.overview, t.vote_average, t.popularity, t.content_rating,
-                      t.top_cast, t.genres, t.fetched_at, n.norm
-               FROM title_names_fts f
-               JOIN title_names n ON n.id = f.rowid
-               JOIN titles t ON t.media_type = n.media_type AND t.tmdb_id = n.tmdb_id
-               WHERE title_names_fts MATCH ? AND n.media_type = ?
-               LIMIT 500""",
-            (_fts_query(norm), media_type),
-        ).fetchall()
+        rows = conn.execute(_NAME_SEARCH_SQL, (_fts_query(norm), media_type)).fetchall()
     best: dict[int, tuple] = {}
     for row in rows:
         exact = row["norm"] == norm
