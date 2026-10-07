@@ -150,3 +150,49 @@ def test_sends_jellyfin_native_authorization_header():
     asyncio.run(client._get("/emby/Library/VirtualFolders"))
 
     assert seen == {"auth": 'MediaBrowser Token="key"', "token": "key", "query_key": "key"}
+
+
+def test_jellyfin_provider_uses_native_paths_without_an_emby_404_roundtrip():
+    """GH#50: Jellyfin 12.1 no longer serves /emby/*; a provider of type
+    jellyfin must go straight to the unprefixed API."""
+    provider = {"base_url": "http://jellyfin.example", "password": "key", "provider_type": "jellyfin"}
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json=[]) if not request.url.path.startswith("/emby/") else httpx.Response(404)
+
+    client = _client_with_transport(provider, handler)
+    asyncio.run(client._get("/emby/Library/VirtualFolders"))
+
+    assert calls == ["/Library/VirtualFolders"]
+
+
+def test_emby_provider_keeps_the_emby_prefix():
+    provider = {"base_url": "http://emby.example", "password": "key", "provider_type": "emby"}
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json=[])
+
+    client = _client_with_transport(provider, handler)
+    asyncio.run(client._get("/emby/Library/VirtualFolders"))
+
+    assert calls == ["/emby/Library/VirtualFolders"]
+
+
+def test_stream_and_poster_urls_follow_the_provider_type():
+    import xc_server
+
+    jf = {"base_url": "http://jf:8096", "password": "k", "provider_type": "jellyfin"}
+    em = {"base_url": "http://em:8096", "password": "k", "provider_type": "emby"}
+    source = {"provider_stream_id": "abc", "container_extension": "mp4"}
+
+    jf_url = asyncio.run(xc_server._build_upstream_url("movie", jf, source))
+    em_url = asyncio.run(xc_server._build_upstream_url("movie", em, source))
+
+    assert jf_url == "http://jf:8096/Videos/abc/stream.mp4?Static=true&api_key=k"
+    assert em_url == "http://em:8096/emby/Videos/abc/stream.mp4?Static=true&api_key=k"
+    assert emby_vod_client.build_poster_url(jf, "abc") == "http://jf:8096/Items/abc/Images/Primary?api_key=k"
+    assert emby_vod_client.build_poster_url(em, "abc") == "http://em:8096/emby/Items/abc/Images/Primary?api_key=k"

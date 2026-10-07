@@ -60,6 +60,14 @@ _SESSION_HEADERS = {
 }
 
 
+def api_prefix(provider: dict) -> str:
+    """Path prefix for this provider's server. Jellyfin's own API is unprefixed:
+    `/emby/*` on a Jellyfin server is only a legacy-compatibility alias that
+    12.1 no longer serves (GH#50: every stream and poster 404'd). Emby's API
+    lives under `/emby`."""
+    return "" if provider.get("provider_type") == "jellyfin" else "/emby"
+
+
 class EmbyVodClient:
     """Use as `async with EmbyVodClient(provider) as client:` for anything
     making more than one call (import flow) — reuses one pooled connection
@@ -82,7 +90,9 @@ class EmbyVodClient:
         # result for the rest of this client's lifetime, so a whole
         # multi-call import pass against a no-alias Jellyfin server pays the
         # extra round-trip only on its first request, not every single one.
-        self._emby_prefix_unsupported = False
+        # GH#50: a Jellyfin provider never needs the /emby alias, so go straight
+        # to native paths instead of paying (or failing) the 404 round-trip.
+        self._emby_prefix_unsupported = provider.get("provider_type") == "jellyfin"
 
     async def __aenter__(self) -> "EmbyVodClient":
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
@@ -366,4 +376,4 @@ def extract_common_fields(item: dict) -> dict:
 
 def build_poster_url(provider: dict, item_id: str) -> str:
     base_url = provider["base_url"].rstrip("/")
-    return f"{base_url}/emby/Items/{item_id}/Images/Primary?api_key={provider['password']}"
+    return f"{base_url}{api_prefix(provider)}/Items/{item_id}/Images/Primary?api_key={provider['password']}"

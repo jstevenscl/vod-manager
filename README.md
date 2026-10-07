@@ -437,3 +437,12 @@ category), or either one as primary with the other as tiebreaker.
 
 Full details and screenshots for each in
 [USERGUIDE.md](USERGUIDE.md#11-curation-tools).
+
+## Credits
+
+[![TMDB](frontend/public/tmdb-logo.svg)](https://www.themoviedb.org)
+
+This product uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.
+You supply your own TMDB API key and are responsible for following
+[TMDB's API terms of use](https://www.themoviedb.org/api-terms-of-use) -- notably that information obtained from
+TMDB may not be cached for longer than 6 months.

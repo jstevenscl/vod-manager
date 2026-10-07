@@ -941,7 +941,7 @@ async def _build_upstream_url(kind: str, provider: dict, source: dict, credentia
         # item's (typically singular) source instead.
         ext = source["container_extension"] or "mp4"
         item_id = source["provider_stream_id"]
-        return (f"{provider['base_url'].rstrip('/')}/emby/Videos/{item_id}/stream.{ext}"
+        return (f"{provider['base_url'].rstrip('/')}{emby_vod_client.api_prefix(provider)}/Videos/{item_id}/stream.{ext}"
                 f"?Static=true&api_key={provider['password']}")
     ext = source["container_extension"] or "mp4"
     # credentials, when given, is the specific sub-account _select_upstream_

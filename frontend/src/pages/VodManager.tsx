@@ -6565,6 +6565,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <span className="text-xs text-muted-foreground flex items-center gap-1"><CheckCircle2 size={12} /> configured</span>
           )}
         </div>
+        <div className="flex items-center gap-3 pt-2">
+          <a href="https://www.themoviedb.org" target="_blank" rel="noreferrer" className="shrink-0">
+            <img src="/tmdb-logo.svg" alt="TMDB" className="h-3.5" />
+          </a>
+          <p className="text-xs text-muted-foreground">
+            This product uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.
+            The TMDB key is yours; you are responsible for following{' '}
+            <a href="https://www.themoviedb.org/api-terms-of-use" target="_blank" rel="noreferrer" className="underline">TMDB&apos;s API terms</a>.
+          </p>
+        </div>
         <p className="text-xs text-muted-foreground pt-2">
           MDBList API key — a second public-list source for category sync, alongside TMDB Lists (see Categories below).
         </p>

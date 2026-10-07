@@ -240,7 +240,11 @@ parameter, the `X-Emby-Token` header, and Jellyfin's native
 accept different ones — Jellyfin 12.1, for example, rejects the first two
 and only accepts the native header. The library listing needs an
 administrator-level API key; if the server answers 401/403 the log now says
-the key was rejected or lacks admin rights. If a Jellyfin provider still can't
+the key was rejected or lacks admin rights.
+Providers of type **Jellyfin** use Jellyfin's own unprefixed API paths
+(`/Videos/…`, `/Items/…`) for streams, posters and playback reporting —
+the `/emby/*` aliases are gone on Jellyfin 12.1 — while **Emby** providers keep
+the `/emby` prefix. If a Jellyfin provider still can't
 import after this, it's worth checking whether anything sits in front of
 your Jellyfin server (a reverse proxy, an auth gateway) that might be
 altering the request before it reaches Jellyfin itself.
@@ -1605,7 +1609,11 @@ re-run any time (each becomes a no-op once nothing's left to fix):
 A free [TMDB API key](https://www.themoviedb.org/settings/api) (v3 auth)
 under Configuration → API Keys is used for **all** TMDB lookups — bulk
 metadata enrichment, ID matching, trailers and library-source matching, not
-just the features below. It unlocks real TMDB search for the Needs Review
+just the features below. TMDB's terms require attribution (shown on the
+Configuration page and in the README) and limit how long TMDB data may be
+cached (6 months); the key is yours, so following
+[TMDB's API terms](https://www.themoviedb.org/api-terms-of-use) is up to you.
+It unlocks real TMDB search for the Needs Review
 and Missing Artwork flows above, plus two ways to auto-populate
 categories from a public list — both only ever place items already present
 in your pool; neither pulls in anything new.
