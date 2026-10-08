@@ -944,6 +944,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     NOT EXISTS above only helps fresh databases."""
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
+        # Consecutive re-enrichments that found nothing new -- backs the movie
+        # re-check interval off (see _is_stale / ENRICHMENT_BACKOFF_MAX_STEPS).
+        ("movies", "enrich_stable_count", "INTEGER NOT NULL DEFAULT 0"),
         ("movies", "cast_list", "TEXT"),
         ("movies", "director", "TEXT"),
         ("movies", "country", "TEXT"),
@@ -1076,6 +1079,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # episodes_synced_last_modified below for the other half of that
         # comparison.
         ("series", "provider_last_modified", "TEXT"),
+        # Consecutive TTL-fallback re-fetches that found no new episodes --
+        # backs the re-check interval off for series whose provider sends no
+        # last_modified (see series_needs_enrichment / _is_stale).
+        ("series", "enrich_stable_count", "INTEGER NOT NULL DEFAULT 0"),
         # Snapshot of provider_last_modified as of the last time episodes
         # were actually (re)fetched via get_series_info. NULL until the first
         # successful episode fetch. series_needs_enrichment compares this
@@ -5821,15 +5828,49 @@ def set_provider_import_totals(provider_id: int, movie_total: int | None, series
         conn.close()
 
 
-def _is_stale(last_enriched_at) -> bool:
+# A movie whose re-enrichment keeps coming back identical is re-checked less and
+# less often: the interval doubles per unchanged check, up to 2**4 = 16x the
+# configured TTL (16 days at the default 24h). Measured on a real catalog,
+# ~91% of re-fetches of already-enriched XC movies returned nothing new, so a
+# blind every-TTL refetch was mostly wasted provider/TMDB traffic. Any change
+# resets the interval, and force-enrich always bypasses it.
+ENRICHMENT_BACKOFF_MAX_STEPS = 4
+
+# Fields a re-enrichment is compared on to decide "nothing new".
+_ENRICH_COMPARE_FIELDS = (
+    "name", "genre", "description", "cast_list", "director", "country", "poster_url",
+    "duration_secs", "rating", "release_date", "tmdb_id", "content_rating",
+)
+
+
+def _is_stale(last_enriched_at, stable_count: int = 0) -> bool:
     if not last_enriched_at:
         return True
-    return (time.time() - float(last_enriched_at)) > get_enrichment_ttl_seconds()
+    steps = min(max(int(stable_count or 0), 0), ENRICHMENT_BACKOFF_MAX_STEPS)
+    return (time.time() - float(last_enriched_at)) > get_enrichment_ttl_seconds() * (2 ** steps)
+
+
+def _norm_enrich_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _next_enrich_stable_count(row, fields: dict) -> int:
+    """0 when any incoming (non-empty) value differs from what's stored,
+    otherwise the stored count + 1. Values a provider didn't send (None/blank)
+    never count as a change -- they aren't written over stored data either way."""
+    for key in _ENRICH_COMPARE_FIELDS:
+        new = _norm_enrich_value(fields.get(key))
+        if new is not None and new != _norm_enrich_value(row[key]):
+            return 0
+    return int(row["enrich_stable_count"] or 0) + 1
 
 
 def movie_needs_enrichment(movie_id: int) -> bool:
     movie = get_movie(movie_id)
-    return bool(movie) and _is_stale(movie.get("last_enriched_at"))
+    return bool(movie) and _is_stale(movie.get("last_enriched_at"), movie.get("enrich_stable_count"))
 
 
 def set_movie_enrichment(movie_id: int, **fields) -> None:
@@ -5839,11 +5880,19 @@ def set_movie_enrichment(movie_id: int, **fields) -> None:
     for provider detail lookups."""
     with _WRITE_LOCK:
         conn = _connect()
-        fields["last_enriched_at"] = _now()
-        sets = ", ".join(f"{k}=?" for k in fields)
-        conn.execute(f"UPDATE movies SET {sets} WHERE id=?", (*fields.values(), movie_id))
-        _commit_with_retry(conn)
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+            fields["last_enriched_at"] = _now()
+            if row is not None:
+                fields["enrich_stable_count"] = _next_enrich_stable_count(row, fields)
+            sets = ", ".join(f"{k}=?" for k in fields)
+            conn.execute(f"UPDATE movies SET {sets} WHERE id=?", (*fields.values(), movie_id))
+            _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def apply_movie_enrichment_batch(items: list[dict]) -> None:
@@ -5876,7 +5925,10 @@ def apply_movie_enrichment_batch(items: list[dict]) -> None:
             try:
                 with _item_savepoint(conn):
                     fields = dict(item.get("fields") or {})
+                    row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
                     fields["last_enriched_at"] = _now()
+                    if row is not None:
+                        fields["enrich_stable_count"] = _next_enrich_stable_count(row, fields)
                     sets = ", ".join(f"{k}=?" for k in fields)
                     conn.execute(f"UPDATE movies SET {sets} WHERE id=?", (*fields.values(), movie_id))
                     source_id = item.get("source_id")
@@ -6599,11 +6651,65 @@ def series_needs_enrichment(series_id: int) -> bool:
     # changed since the last time they were.
     provider_lm = series.get("provider_last_modified")
     if provider_lm:
-        return series.get("episodes_synced_last_modified") != provider_lm
-    # Provider doesn't send last_modified at all -- fall back to the
-    # original TTL-based staleness check, same behavior as before this
-    # existed.
-    return _is_stale(series.get("last_enriched_at"))
+        if series.get("episodes_synced_last_modified") != provider_lm:
+            return True
+    # Provider doesn't send last_modified at all -- fall back to the TTL check,
+    # backed off while re-fetches keep finding no new episodes (an ended show
+    # settles to the longest interval quickly; any new episode resets it).
+    elif _is_stale(series.get("last_enriched_at"), series.get("enrich_stable_count")):
+        return True
+    # A source whose episodes were never fetched (e.g. a second provider that
+    # started carrying an already-synced series) is due regardless of the
+    # series-level verdict above.
+    return _series_has_unfetched_source(series_id)
+
+
+def _series_has_unfetched_source(series_id: int) -> bool:
+    """A source that failed within the last TTL isn't retried yet, so a dead
+    provider can't make its series permanently 'due'."""
+    retry_before = time.time() - get_enrichment_ttl_seconds()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM series_sources WHERE series_id=? AND episodes_last_enriched_at IS NULL "
+            "AND (last_failed_at IS NULL OR CAST(last_failed_at AS REAL) < ?) LIMIT 1",
+            (series_id, retry_before),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def set_series_enrich_stable(series_id: int, unchanged: bool) -> None:
+    """After a fetch: +1 when it found no new episodes, else reset to 0."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE series SET enrich_stable_count = CASE WHEN ? THEN enrich_stable_count + 1 ELSE 0 END WHERE id=?",
+                (1 if unchanged else 0, series_id),
+            )
+            _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def list_episode_keys(series_id: int, provider_id: int) -> set[tuple[int, int]]:
+    """(season, episode) pairs this provider already has a source for."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT e.season_number, e.episode_number FROM episodes e "
+            "JOIN episode_sources es ON es.episode_id=e.id "
+            "WHERE e.series_id=? AND es.provider_id=?",
+            (series_id, provider_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {(r["season_number"], r["episode_number"]) for r in rows}
 
 
 def set_series_enrichment(series_id: int, **fields) -> None:
@@ -6633,15 +6739,19 @@ def list_series_sources(series_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def series_source_needs_enrichment(source: dict) -> bool:
-    """Per-source episode-discovery gate.
+def series_source_needs_enrichment(source: dict, series_due: bool = False) -> bool:
+    """Per-source episode-discovery gate. series_due: the series-level gate
+    (series_needs_enrichment) already said this series is due -- a provider-
+    reported change or a TTL pass -- so every source is refetched. Without
+    this the per-source gate below blocked every refetch once a source's
+    episodes had been fetched once (vod_manager-v30).
 
     Deliberately reads episodes_last_enriched_at, NOT last_seen_at --
     last_seen_at is also stamped by bulk_import_series's cheap catalog-list
     refresh (no episode data), which runs far more often than a full bulk
     enrich and would otherwise make a never-actually-fetched source look
     fresh forever. See episodes_last_enriched_at's migration comment."""
-    return not source.get("episodes_last_enriched_at")
+    return series_due or not source.get("episodes_last_enriched_at")
 
 
 def has_pending_series_source_enrichment(provider_id: int) -> bool:

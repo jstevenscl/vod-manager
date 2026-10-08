@@ -1353,23 +1353,32 @@ async def enrich_series(series_id: int, *, force: bool = False, write_queue: "as
     # (see the Plex branch inside the loop), so this only ever fires for the
     # first successfully-fetched XC source.
     any_fetched = False
+    all_unchanged = True
     last_reason = "already up to date"
 
     for source in sources:
-        outcome = await _enrich_one_series_source(series_id, series, source, force=force, write_queue=write_queue)
+        # The series-level gate above already passed (or this is a forced run),
+        # so this series is due: every source is refetched, not only
+        # never-fetched ones.
+        outcome = await _enrich_one_series_source(
+            series_id, series, source, force=force, series_due=True, write_queue=write_queue,
+        )
         if outcome["fetched"]:
             any_fetched = True
+            all_unchanged = all_unchanged and outcome.get("unchanged", True)
         else:
             last_reason = outcome["reason"]
 
     if not any_fetched:
         return {"fetched": False, "reason": last_reason}
 
+    await asyncio.to_thread(vod_db.set_series_enrich_stable, series_id, all_unchanged)
     return {"fetched": True, "reason": None}
 
 
 async def _enrich_one_series_source(
-    series_id: int, series: dict, source: dict, *, force: bool = False, write_queue: "asyncio.Queue | None" = None,
+    series_id: int, series: dict, source: dict, *, force: bool = False, series_due: bool = False,
+    write_queue: "asyncio.Queue | None" = None,
 ) -> dict:
     """Fetches and persists exactly ONE series_sources row's episodes/detail.
     Extracted from enrich_series's loop body so each provider's source is
@@ -1379,7 +1388,7 @@ async def _enrich_one_series_source(
     applied to this source's whole episode batch (one queued write instead of
     one add_episode + add_episode_source + set_episode_source_bitrate call
     PER EPISODE, each independently lock-contending under bulk_enrich_all)."""
-    if not force and not await asyncio.to_thread(vod_db.series_source_needs_enrichment, source):
+    if not force and not await asyncio.to_thread(vod_db.series_source_needs_enrichment, source, series_due):
         return {"fetched": False, "reason": "already up to date"}
 
     provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
@@ -1495,6 +1504,14 @@ async def _enrich_one_series_source(
         await asyncio.to_thread(vod_db.set_series_enrichment, series_id, **series_fields)
         if series_tmdb_id:
             await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
+    else:
+        # Some panels send episodes without an info block. Still record that
+        # episodes were synced as of this last_modified (and stamp the TTL),
+        # otherwise the series-level gate would report it due on every pass.
+        await asyncio.to_thread(
+            vod_db.set_series_enrichment, series_id,
+            episodes_synced_last_modified=series.get("provider_last_modified"),
+        )
 
     # get_series_info's "episodes" field is documented as {season_key: [ep, ...]}
     # (standard XC shape), but at least one real provider returns a plain
@@ -1531,6 +1548,12 @@ async def _enrich_one_series_source(
                 "bitrate": _coerce_int((ep.get("info") or {}).get("bitrate")),
             })
 
+    # "Unchanged" for the TTL backoff: the provider lists exactly the episodes we
+    # already hold for it (an ended show with a complete -- or permanently
+    # incomplete -- list settles here and is rechecked less and less often).
+    existing_keys = await asyncio.to_thread(vod_db.list_episode_keys, series_id, provider["id"])
+    unchanged = {(e["season_number"], e["episode_number"]) for e in episode_items} == existing_keys
+
     if episode_items:
         # See _write_movie_enrichment's docstring -- same batching reasoning,
         # collapsing what used to be up to 3 separately-locked calls PER
@@ -1549,7 +1572,7 @@ async def _enrich_one_series_source(
     await asyncio.to_thread(
         vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
     )
-    return {"fetched": True, "reason": None}
+    return {"fetched": True, "reason": None, "unchanged": unchanged}
 
 
 # ── Bulk enrichment ──────────────────────────────────────────────────────────

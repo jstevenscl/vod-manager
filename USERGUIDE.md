@@ -1303,9 +1303,11 @@ actually comes from depends on what's already known:
   includes it (most do). What's left for enrichment is discovering
   episodes, which still needs one call per series to that series' own
   provider — but only when the provider reports something's actually
-  changed, or episodes have never been fetched at all, not on a blind
-  schedule. A series with nothing new since its last check is skipped even
-  past the Enrichment TTL.
+  changed (`last_modified`), a provider that never had its episodes fetched
+  appears, or — for providers that don't report changes at all — the
+  Enrichment TTL comes due, backed off the longer nothing new shows up (see
+  Bulk Enrich All below). A series the provider reports no change for is
+  skipped, even past the TTL.
 - **Movies** — once a movie has a known TMDB id (captured at catalog-refresh
   time if the provider includes it, or from a prior enrichment pass),
   enrichment fetches its detail straight from TMDB instead of the provider
@@ -1320,7 +1322,19 @@ all.
 
 - **Bulk Enrich All** — enriches everything that hasn't been enriched yet,
   or has aged past the **Enrichment TTL** (Configuration → Refresh
-  Schedule), skipping anything still fresh.
+  Schedule), skipping anything still fresh. A movie whose last refetch found
+  nothing new is rechecked on a growing interval — the wait doubles with each
+  unchanged check, up to 16× the TTL (16 days at the default 24 hours) — and
+  any change in what the provider/TMDB returns resets it to the plain TTL.
+  Providers rarely change a movie's details, so this avoids re-requesting the
+  whole catalog every day; **Force Re-Enrich All** below still refreshes
+  everything on demand.
+  **Series** without a provider change signal follow the same growing interval:
+  an ended show whose episode list keeps coming back the same (complete or not)
+  is rechecked less and less often, and a newly listed episode resets it.
+  The background pass itself starts about one TTL after the previous pass
+  *started* (not finished), with at least a 15-minute rest between passes, so
+  items enriched early in a pass are still fresh when the next pass reaches them.
 - **Force Re-Enrich All** — re-fetches every movie/series regardless of
   freshness, ignoring the TTL entirely. Use this once after an update adds
   a new field it captures (e.g. rating, release date, bitrate), so existing

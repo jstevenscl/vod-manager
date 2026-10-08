@@ -264,6 +264,18 @@ async def _watch_session_poller() -> None:
         await asyncio.sleep(_WATCH_SESSION_POLL_SECONDS)
 
 
+_ENRICHMENT_MIN_REST_SECONDS = 15 * 60
+
+
+def _enrichment_sleep_seconds(ttl: float, elapsed: float) -> float:
+    """Wait before the next pass so starts are ~ttl apart. When a pass runs
+    as long as (or longer than) the TTL there's nothing left to wait for, but
+    never go back-to-back: keep a rest (capped at the TTL itself) so a
+    catalog whose pass overruns a short TTL doesn't hit the providers
+    non-stop."""
+    return max(ttl - elapsed, min(ttl, _ENRICHMENT_MIN_REST_SECONDS))
+
+
 async def _vod_enrichment_scheduler() -> None:
     """Background task: periodically runs bulk_enrich_all so newly-imported or
     stale (past ENRICHMENT_TTL_SECONDS) items get enriched without a manual
@@ -283,12 +295,27 @@ async def _vod_enrichment_scheduler() -> None:
     else:
         await asyncio.sleep(45)
     while True:
+        # Anchor to the run's START, not its finish. Stamping the finish time
+        # and then sleeping a flat TTL spaced consecutive run starts
+        # (run duration + TTL) apart: a pass that takes 9h against a 24h TTL
+        # started every 33h, so every item enriched during the previous pass
+        # (even one enriched at its very start) was already past the TTL by
+        # the time the next pass reached it. enrich_movie/enrich_series's
+        # per-item TTL check never got to skip anything, and the whole catalog
+        # was re-fetched from the providers on every run. Starting runs ~TTL
+        # apart lets items enriched earlier in a pass still be fresh (and skip
+        # almost instantly) when the next one reaches them.
+        run_started_at = time.time()
         try:
             await vod_importer.bulk_enrich_all()
-            save_last_enrichment_run(time.time())
         except Exception as exc:
             logger.warning("[vod_enrichment_scheduler] run failed: %s", exc)
-        await asyncio.sleep(vod_db.get_enrichment_ttl_seconds())
+        # Outside the try: a failed attempt still took that long and still
+        # counts for the boot-time catch-up above, which already reads this
+        # value as "when the last run started".
+        save_last_enrichment_run(run_started_at)
+        elapsed = time.time() - run_started_at
+        await asyncio.sleep(_enrichment_sleep_seconds(vod_db.get_enrichment_ttl_seconds(), elapsed))
 
 
 _CATEGORY_SCHEDULE_POLL_SECONDS = 3600  # hourly is plenty -- apply_category_schedules

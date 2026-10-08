@@ -336,7 +336,11 @@ Configuration → Refresh Schedule controls how often background work runs:
   every type.
 - **Enrichment TTL** — how long detail-level metadata (posters, cast, genre)
   is cached before a movie/series is eligible to be refetched. Defaults to
-  24 hours.
+  24 hours. A movie whose refetch keeps coming back unchanged is rechecked less
+  and less often (the wait doubles each time, up to 16x the TTL); any change
+  resets it. Series are re-fetched when their provider reports a change, and
+  providers that don't report changes follow the same backoff; background
+  passes start about one TTL apart, with at least a 15-minute rest.
 - **List Sync** — how often categories with a linked public list source
   (TMDB List or MDBList) auto-resync. Off (manual "Sync now" only) by
   default — enabling it adds new recurring API traffic to whichever
