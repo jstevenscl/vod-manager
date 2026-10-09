@@ -1189,9 +1189,15 @@ const COUNTRY_CODE_NAMES: Record<string, string> = {
   NL: 'Netherlands', IE: 'Ireland', NZ: 'New Zealand', FI: 'Finland',
   TH: 'Thailand', IS: 'Iceland', PT: 'Portugal',
 }
+// The server's own explanation of a failed AI request (bad model, quota, rejected
+// key...), so the reviewer isn't left guessing from a generic message.
+function aiFailureDetail(error: unknown): string {
+  const detail = (error as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail
+  return typeof detail === 'string' ? detail.replace(/\s+/g, ' ').trim().slice(0, 240) : ''
+}
 type AiProvider = 'anthropic' | 'openai' | 'gemini'
 const AI_PROVIDER_DEFAULT_MODELS: Record<AiProvider, string> = {
-  anthropic: 'claude-haiku-4-5-20251001', openai: 'gpt-5-mini', gemini: 'gemini-2.5-flash',
+  anthropic: 'claude-haiku-4-5-20251001', openai: 'gpt-5-mini', gemini: 'gemini-flash-latest',
 }
 const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string }[]> = {
   anthropic: [
@@ -1204,8 +1210,10 @@ const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string 
     { id: 'gpt-5', label: 'GPT-5 — most capable, priciest' },
   ],
   gemini: [
-    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash — cheapest, fastest (default)' },
-    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable, priciest' },
+    { id: 'gemini-flash-latest', label: 'Gemini Flash (latest) — cheapest, fastest (default)' },
+    { id: 'gemini-pro-latest', label: 'Gemini Pro (latest) — most capable, priciest' },
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash — older accounts only' },
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — older accounts only' },
   ],
 }
 const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult', 'provider_category', 'content_rating'] as const
@@ -1572,7 +1580,7 @@ function NeedsReviewRow({ contentType, item, qc, xcCredentials, extraInvalidateK
             </Button>
           </div>
           {aiSuggest.isError && (
-            <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
+            <p className="text-destructive">AI suggestion failed{aiFailureDetail(aiSuggest.error) ? `: ${aiFailureDetail(aiSuggest.error)}` : ''} — check the AI provider/model/API key in API Keys settings.</p>
           )}
           {aiSuggest.data && (
             <p className="text-muted-foreground border border-border rounded px-2 py-1">
@@ -1715,7 +1723,7 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
             </Button>
           </div>
           {aiSuggest.isError && (
-            <p className="text-destructive">AI suggestion failed — check the AI provider/API key in API Keys settings.</p>
+            <p className="text-destructive">AI suggestion failed{aiFailureDetail(aiSuggest.error) ? `: ${aiFailureDetail(aiSuggest.error)}` : ''} — check the AI provider/model/API key in API Keys settings.</p>
           )}
           {aiSuggest.data && (
             <p className="text-muted-foreground border border-border rounded px-2 py-1">

@@ -1280,6 +1280,20 @@ rather than needing flagship-level reasoning per call. Switching provider
 resets the model choice to that provider's own default rather than carrying
 over a model id that belongs to a different provider.
 
+**Google Gemini models:** the default is `gemini-flash-latest` (and
+`gemini-pro-latest` for the most capable tier) — aliases Google keeps pointed
+at a current model. Google retires specific versions quickly: Gemini 2.5
+Flash/Pro now answer "no longer available to new users" on newer accounts, so
+they stay in the list only for accounts that still have them. If you pick a
+model your account can't use you'll see Google's own message.
+
+**When an AI request fails**, the message under the item (Needs Review,
+Missing Artwork) now includes the provider's own explanation — a retired
+model, exceeded quota, a rejected key — instead of a generic "check your API
+key". **AI Evaluate** on a category likewise reports the error when every
+batch failed, instead of showing zero matches; if only some batches fail you
+still get the matches from the rest.
+
 ---
 
 ## 11. Curation tools

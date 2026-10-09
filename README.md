@@ -166,7 +166,10 @@ any on-disk segments.
 An API key from **any** of Anthropic, OpenAI, or Google Gemini (Configuration
 → API Keys — configure as many as you have access to, then pick which one
 is active) unlocks three assists, none of which ever apply anything
-automatically — every one is a suggestion you still review and confirm:
+automatically — every one is a suggestion you still review and confirm. If a
+request fails, the message shows the provider's own reason (retired model,
+quota, rejected key). Gemini defaults to the `gemini-flash-latest` alias, since
+Google retires specific model versions quickly:
 
 - **Suggest a category with AI** (Categories) — describe a category in
   plain English and the AI proposes a structured filter rule using the

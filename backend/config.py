@@ -22,7 +22,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.23"
+APP_VERSION = "0.2.24"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -374,7 +374,10 @@ AI_PROVIDERS = ("anthropic", "openai", "gemini")
 _AI_DEFAULT_MODELS = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-5-mini",
-    "gemini": "gemini-2.5-flash",
+    # "-latest" alias: Google retires specific models quickly (2.5 Flash/Pro now
+    # answer 404 "no longer available to new users" on newer accounts), the alias
+    # always points at a current one.
+    "gemini": "gemini-flash-latest",
 }
 
 

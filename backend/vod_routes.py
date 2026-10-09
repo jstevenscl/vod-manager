@@ -1067,7 +1067,9 @@ async def ai_evaluate_category(category_id: int, body: AiEvaluateCategoryRequest
         raise HTTPException(400, detail=str(exc))
 
     try:
-        matched_ids = await ai_assist.evaluate_candidates_for_category(body.description, category["content_type"], candidates)
+        matched_ids = await ai_assist.evaluate_candidates_for_category(
+            body.description, category["content_type"], candidates, raise_if_all_failed=True,
+        )
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:

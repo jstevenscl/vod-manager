@@ -29,6 +29,7 @@ call on whichever provider is active so the response is always the declared
 JSON schema, never freeform prose to parse.
 """
 
+import asyncio
 import json
 import logging
 
@@ -163,42 +164,97 @@ async def _call_openai(model: str, system: str, user_message: str, tool_name: st
         raise ValueError("OpenAI did not return a structured response") from exc
 
 
+_GEMINI_TRANSIENT_RETRY_DELAYS = (2.0, 5.0)
+
+
+def _gemini_schema(schema):
+    """A copy of `schema` in the OpenAPI subset Gemini's function declarations
+    accept. Gemini rejects a list for `type` ("Schema type must not be a
+    list", GH#51) and wants `nullable: true` instead, and does not take
+    `additionalProperties`. Our shared schemas use standard JSON Schema
+    (e.g. ["integer", "null"]), which Anthropic/OpenAI accept as-is."""
+    if isinstance(schema, list):
+        return [_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "additionalProperties":
+            continue
+        if key == "type" and isinstance(value, list):
+            kinds = [kind for kind in value if kind != "null"]
+            if "null" in value:
+                out["nullable"] = True
+            out["type"] = kinds[0] if kinds else "string"
+        elif key in ("properties", "items"):
+            out[key] = ({name: _gemini_schema(sub) for name, sub in value.items()}
+                        if key == "properties" else _gemini_schema(value))
+        else:
+            out[key] = value
+    return out
+
+
+def _gemini_generation_config(model: str, max_tokens: int, attempt: int = 0) -> dict:
+    """On Gemini 2.5 models the model's internal "thinking" tokens are deducted
+    from maxOutputTokens, so the old fixed 512 could be used up before the
+    function-call arguments were finished, ending in finishReason
+    MALFORMED_FUNCTION_CALL (GH#51). Cap thinking and leave real headroom.
+    2.5 Flash can turn thinking off (budget 0); 2.5 Pro cannot (minimum 128).
+    Other models get no thinkingConfig -- some reject it -- and a larger cap."""
+    config = {"maxOutputTokens": max(max_tokens, 2048) * (4 if attempt else 1)}
+    if model.startswith("gemini-2.5"):
+        config["thinkingConfig"] = {"thinkingBudget": 128 if "pro" in model else 0}
+    else:
+        config["maxOutputTokens"] = max(config["maxOutputTokens"], 4096)
+    return config
+
+
 async def _call_gemini(model: str, system: str, user_message: str, tool_name: str, tool_description: str, schema: dict, max_tokens: int) -> dict:
     api_key = get_gemini_api_key()
     if not api_key:
         raise ValueError("Gemini API key not configured")
 
-    # Gemini's function-call schema is JSON Schema minus "additionalProperties"
-    # and it's fussier about unknown keys than OpenAI/Anthropic -- strip
-    # nothing here since our schemas are already plain enough, but keep this
-    # call isolated so a future incompatibility only needs a fix in one place.
-    body = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
-        "tools": [{"function_declarations": [
-            {"name": tool_name, "description": tool_description, "parameters": schema},
-        ]}],
-        "tool_config": {"function_calling_config": {"mode": "ANY", "allowed_function_names": [tool_name]}},
-        "generationConfig": {"maxOutputTokens": max_tokens},
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(
-            f"{_GEMINI_API_BASE}/{model}:generateContent",
-            params={"key": api_key},
-            json=body,
-        )
-        r.raise_for_status()
-        data = r.json()
+    last_reason = None
+    for attempt in range(2):
+        body = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+            "tools": [{"function_declarations": [
+                {"name": tool_name, "description": tool_description, "parameters": _gemini_schema(schema)},
+            ]}],
+            "tool_config": {"function_calling_config": {"mode": "ANY", "allowed_function_names": [tool_name]}},
+            "generationConfig": _gemini_generation_config(model, max_tokens, attempt),
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Gemini answers 503 "high demand" in short bursts (seen live,
+            # GH#51 testing): a couple of spaced retries rides those out
+            # instead of failing the reviewer's click. 429 is a quota error and
+            # is not retried.
+            for delay in (*_GEMINI_TRANSIENT_RETRY_DELAYS, None):
+                r = await client.post(
+                    f"{_GEMINI_API_BASE}/{model}:generateContent",
+                    params={"key": api_key},
+                    json=body,
+                )
+                if r.status_code in (500, 502, 503, 504) and delay is not None:
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            r.raise_for_status()
+            data = r.json()
 
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        for part in parts:
+        candidate = (data.get("candidates") or [{}])[0]
+        for part in (candidate.get("content") or {}).get("parts") or []:
             call = part.get("functionCall")
             if call and call.get("name") == tool_name:
-                return call["args"]
-    except (KeyError, IndexError):
-        pass
-    raise ValueError("Gemini did not return a structured response")
+                return call.get("args") or {}
+        last_reason = candidate.get("finishReason") or (data.get("promptFeedback") or {}).get("blockReason")
+        if last_reason not in ("MAX_TOKENS", "MALFORMED_FUNCTION_CALL"):
+            break  # a refusal/safety stop won't improve with more tokens; retry only truncation
+    raise ValueError(
+        "Gemini did not return a structured response"
+        + (f" (finishReason: {last_reason})" if last_reason else "")
+    )
 
 
 _PROVIDER_CALLERS = {
@@ -275,13 +331,23 @@ def _candidate_summary(row: dict) -> str:
     return " ".join(parts)
 
 
-async def evaluate_candidates_for_category(description: str, content_type: str, candidates: list[dict]) -> list[int]:
+async def evaluate_candidates_for_category(
+    description: str, content_type: str, candidates: list[dict], raise_if_all_failed: bool = False,
+) -> list[int]:
     """candidates: pool rows (movies or series), each with at least id/name/
     year/genre/description. Returns the subset of ids Claude judged as
     fitting the description. Batches _AI_EVAL_BATCH_SIZE at a time -- keeps
     each prompt small and each call's failure blast radius small (one bad
-    batch doesn't lose judgments on the rest of the candidate set)."""
+    batch doesn't lose judgments on the rest of the candidate set).
+
+    raise_if_all_failed: a failed batch is skipped, so when EVERY batch fails
+    (bad/unsupported model, bad key, quota) the old result -- an empty list --
+    was indistinguishable from "nothing fit". The interactive route asks for
+    that case to raise so the reviewer sees the real error; the scheduler
+    leaves it off so a persistent failure isn't retried every poll tick."""
     matched_ids: list[int] = []
+    batches = failures = 0
+    first_error: Exception | None = None
     system = (
         f"You judge whether {'movies' if content_type == 'movie' else 'TV shows'} fit a described "
         "category, based only on the title/year/genre/synopsis given -- you have no other "
@@ -289,6 +355,7 @@ async def evaluate_candidates_for_category(description: str, content_type: str, 
         "clear, confident fit; when genuinely unsure, leave it out."
     )
     for i in range(0, len(candidates), _AI_EVAL_BATCH_SIZE):
+        batches += 1
         batch = candidates[i:i + _AI_EVAL_BATCH_SIZE]
         listing = "\n".join(f"{j}: {_candidate_summary(c)}" for j, c in enumerate(batch))
         user_message = f"Category description: {description}\n\nTitles:\n{listing}\n\nWhich numbered titles fit?"
@@ -300,10 +367,14 @@ async def evaluate_candidates_for_category(description: str, content_type: str, 
             )
         except Exception as exc:
             logger.warning("[ai_assist] batch %d-%d failed, skipping: %s", i, i + len(batch), exc)
+            failures += 1
+            first_error = first_error or exc
             continue
         for idx in result.get("matches", []):
             if isinstance(idx, int) and 0 <= idx < len(batch):
                 matched_ids.append(batch[idx]["id"])
+    if raise_if_all_failed and batches and failures == batches and first_error is not None:
+        raise ValueError(str(first_error))
     return matched_ids
 
 
