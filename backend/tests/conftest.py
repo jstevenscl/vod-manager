@@ -33,3 +33,11 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "_raw_cache", None)
     vod_db.init_db()
     return vod_db
+
+
+@pytest.fixture(autouse=True)
+def _isolated_tmdb_store(tmp_path, monkeypatch):
+    """Every test gets its own tmdb.sqlite so stored payloads never leak
+    between tests (tmdb_sync reads through the store)."""
+    import tmdb_store
+    monkeypatch.setattr(tmdb_store, "DB_PATH", tmp_path / "tmdb.sqlite")
