@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CalendarDays, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Activity, CalendarDays, Database, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
 import Login from '@/pages/Login'
 import Settings from '@/pages/Settings'
+import TmdbStore from '@/pages/TmdbStore'
 import api from '@/lib/api'
 
 export const THEMES = ['dark', 'mid', 'light', 'mono', 'warm'] as const
@@ -28,11 +29,12 @@ function initTheme(): Theme {
 }
 
 type AuthState = 'checking' | 'login' | 'ready'
+type AppTab = VodManagerTab | 'tmdb'
 
 interface NavItem {
   label: string
   icon: React.ReactNode
-  tab: VodManagerTab
+  tab: AppTab
   dvrSubTab?: DvrSubTab
 }
 interface NavGroup {
@@ -63,6 +65,7 @@ const NAV_GROUPS: NavGroup[] = [
     { label: 'Metadata Review', icon: <Search size={15} />, tab: 'metadata' },
     { label: 'Stream Recovery', icon: <Activity size={15} />, tab: 'recovery' },
     { label: 'Curation & Maintenance', icon: <Wrench size={15} />, tab: 'curation' },
+    { label: 'TMDB Library', icon: <Database size={15} />, tab: 'tmdb' },
   ] },
   { label: 'System', items: [
     { label: 'Configuration', icon: <SettingsIcon size={15} />, tab: 'config' },
@@ -75,11 +78,11 @@ export default function App() {
   const [theme, setThemeState]          = useState<Theme>(initTheme)
   const queryClient = useQueryClient()
 
-  const [activeTab, setActiveTabState] = useState<VodManagerTab>(() => {
+  const [activeTab, setActiveTabState] = useState<AppTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'dvr' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'dvr' || saved === 'tmdb' ? saved : 'movies'
   })
-  function setActiveTab(t: VodManagerTab) {
+  function setActiveTab(t: AppTab) {
     localStorage.setItem('vodmanager-tab', t)
     setActiveTabState(t)
   }
@@ -329,7 +332,11 @@ export default function App() {
           )}
         </header>
         <main className="flex-1 min-w-0 p-4">
-          <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
+          {activeTab === 'tmdb' ? (
+            <TmdbStore />
+          ) : (
+            <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
+          )}
         </main>
       </div>
     </div>
