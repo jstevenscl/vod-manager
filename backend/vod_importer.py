@@ -835,6 +835,10 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     client = XCProviderClient(provider)
 
     exclude_categories = provider.get("import_exclude_categories") or []
+    # Saved list only. exclude_categories gains newly discovered categories
+    # below (archive_new_categories); purging with that list would delete
+    # their just-archived content and re-import it active on the next run.
+    saved_exclude_categories = list(exclude_categories)
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
 
     # Stripped for the same reason vod_routes.get_provider_available_categories
@@ -929,6 +933,24 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
             reconcile_result["episode_sources_removed"],
         )
 
+    # Reconcile above keeps sources the provider still lists, including ones
+    # in categories excluded after they were imported. Remove those now (see
+    # vod_db.purge_excluded_category_sources).
+    category_purge = await asyncio.to_thread(
+        vod_db.purge_excluded_category_sources, provider_id, saved_exclude_categories, exclude_uncategorized,
+    )
+    category_purge.pop("affected_movie_ids", None)
+    category_purge.pop("affected_series_ids", None)
+    if category_purge["movie_sources_removed"] or category_purge["series_sources_removed"]:
+        logger.warning(
+            "[vod_importer] provider=%s removed %d movie/%d series source(s) in excluded categories; "
+            "deleted %d movie(s)/%d series (e.g. %s). Preview with POST /providers/%s/purge-excluded-content/",
+            provider["name"], category_purge["movie_sources_removed"], category_purge["series_sources_removed"],
+            category_purge["movies_deleted"], category_purge["series_deleted"],
+            ", ".join((category_purge["sample_movies"] + category_purge["sample_series"])[:5]) or "none deleted",
+            provider_id,
+        )
+
     # A successful catalog pass is a safe opportunity to remove any legacy
     # rows with neither a provider source nor a playable episode source
     # (ported from knmplace's fork) -- catches whatever slips through the
@@ -1007,6 +1029,7 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
         "series_categories": len(series_categories),
         **movie_result,
         **series_result,
+        "excluded_category_purge": category_purge,
     }
 
 
