@@ -664,7 +664,16 @@ def _catalog_sync_summary(result: dict | None) -> dict:
     return {field: result[field] for field in fields if field in result}
 
 
-def mark_import_running(provider_id: int, provider_name: str, provider_type: str = "unknown") -> int:
+def _write_catalog_report(operation, *args, **kwargs):
+    """Keep a report failure from replacing the import result or exception."""
+    try:
+        return operation(*args, **kwargs)
+    except Exception:
+        logger.exception("[vod_importer] Sync History report write failed")
+        return None
+
+
+def mark_import_running(provider_id: int, provider_name: str, provider_type: str = "unknown") -> int | None:
     """Expose a non-XC manual import while its provider adapter is running.
 
     XC imports update this state inside import_provider_catalog itself.
@@ -677,7 +686,7 @@ def mark_import_running(provider_id: int, provider_name: str, provider_type: str
         "provider_id": provider_id, "provider_name": provider_name,
         "started_at": time.time(), "finished_at": None, "error": None,
     })
-    return vod_db.create_catalog_sync_run(provider_id, provider_name, provider_type)
+    return _write_catalog_report(vod_db.create_catalog_sync_run, provider_id, provider_name, provider_type)
 
 
 def mark_import_finished(
@@ -692,7 +701,7 @@ def mark_import_finished(
             "finished_at": time.time(), "error": error,
         })
     if run_id is not None:
-        vod_db.finish_catalog_sync_run(run_id, summary=_catalog_sync_summary(result), error=error)
+        _write_catalog_report(vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result), error=error)
 
 
 async def run_tracked_import(provider_id: int, importer) -> dict:
@@ -700,14 +709,15 @@ async def run_tracked_import(provider_id: int, importer) -> dict:
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
     provider_name = provider.get("name") if provider else f"provider {provider_id}"
     provider_type = provider.get("provider_type", "unknown") if provider else "unknown"
-    run_id = mark_import_running(provider_id, provider_name, provider_type)
+    run_id = await asyncio.to_thread(mark_import_running, provider_id, provider_name, provider_type)
     try:
         result = await importer(provider_id)
     except Exception as exc:
-        mark_import_finished(provider_id, type(exc).__name__, run_id=run_id)
+        await asyncio.to_thread(mark_import_finished, provider_id, type(exc).__name__, run_id=run_id)
         raise
-    mark_import_finished(provider_id, run_id=run_id, result=result)
-    result["catalog_sync_run_id"] = run_id
+    await asyncio.to_thread(mark_import_finished, provider_id, run_id=run_id, result=result)
+    if run_id is not None:
+        result["catalog_sync_run_id"] = run_id
     return result
 
 
@@ -749,7 +759,7 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
     async with _XC_IMPORT_LOCK:
         run_id = await asyncio.to_thread(
-            vod_db.create_catalog_sync_run,
+            _write_catalog_report, vod_db.create_catalog_sync_run,
             provider_id,
             provider.get("name") if provider else f"provider {provider_id}",
             "xc",
@@ -764,11 +774,13 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
             result = await _import_provider_catalog_impl(provider_id)
         except Exception as exc:
             _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
-            await asyncio.to_thread(vod_db.finish_catalog_sync_run, run_id, error=type(exc).__name__)
+            if run_id is not None:
+                await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, error=type(exc).__name__)
             raise
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
-        await asyncio.to_thread(vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result))
-        result["catalog_sync_run_id"] = run_id
+        if run_id is not None:
+            await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result))
+            result["catalog_sync_run_id"] = run_id
     if schedule_enrichment:
         schedule_known_series_identity_reconciliation()
     return result

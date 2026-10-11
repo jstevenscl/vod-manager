@@ -1299,44 +1299,59 @@ def create_catalog_sync_run(provider_id: int | None, provider_name: str, provide
     now = _now()
     with _WRITE_LOCK:
         conn = _connect()
-        cur = conn.execute(
-            """INSERT INTO catalog_sync_runs
-               (provider_id, provider_name, provider_type, queued_at, started_at, status, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (provider_id, provider_name, provider_type, now, now, "running", now),
-        )
-        _commit_with_retry(conn)
-        run_id = int(cur.lastrowid)
-        conn.close()
-    return run_id
+        try:
+            cur = conn.execute(
+                """INSERT INTO catalog_sync_runs
+                   (provider_id, provider_name, provider_type, queued_at, started_at, status, created_at)
+                   VALUES (CASE WHEN EXISTS (SELECT 1 FROM providers WHERE id=?) THEN ? ELSE NULL END,
+                           ?,?,?,?,?,?)""",
+                (provider_id, provider_id, provider_name, provider_type, now, now, "running", now),
+            )
+            _commit_with_retry(conn)
+            return int(cur.lastrowid)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def finish_catalog_sync_run(run_id: int, *, summary: dict | None = None, error: str | None = None) -> None:
     """Close one import report exactly once with a compact, safe summary."""
     with _WRITE_LOCK:
         conn = _connect()
-        conn.execute(
-            """UPDATE catalog_sync_runs
-                  SET finished_at=?, status=?, summary_json=?, error=?
-                WHERE id=? AND status='running'""",
-            (_now(), "failed" if error else "ready", json.dumps(summary or {}, separators=(",", ":")), error, run_id),
-        )
-        _commit_with_retry(conn)
-        conn.close()
+        try:
+            conn.execute(
+                """UPDATE catalog_sync_runs
+                       SET finished_at=?, status=?, summary_json=?, error=?
+                     WHERE id=? AND status='running'""",
+                (_now(), "failed" if error else "ready", json.dumps(summary or {}, separators=(",", ":")), error, run_id),
+            )
+            _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def close_orphaned_catalog_sync_runs() -> int:
     """Mark reports interrupted by a process restart as final, never live."""
     with _WRITE_LOCK:
         conn = _connect()
-        count = conn.execute(
-            """UPDATE catalog_sync_runs
-                  SET finished_at=?, status='failed', error='interrupted by restart'
-                WHERE status='running'""",
-            (_now(),),
-        ).rowcount
-        _commit_with_retry(conn)
-        conn.close()
+        try:
+            count = conn.execute(
+                """UPDATE catalog_sync_runs
+                       SET finished_at=?, status='failed', error='interrupted by restart'
+                     WHERE status='running'""",
+                (_now(),),
+            ).rowcount
+            _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     return count
 
 

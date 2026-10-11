@@ -1696,7 +1696,8 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     track_lifecycle = provider.get("provider_type") != "xc"
     run_id = None
     if track_lifecycle:
-        run_id = vod_importer.mark_import_running(
+        run_id = await asyncio.to_thread(
+            vod_importer.mark_import_running,
             provider_id, provider["name"], provider.get("provider_type", "unknown"),
         )
     try:
@@ -1715,7 +1716,7 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
             result = await vod_importer.import_provider_catalog(provider_id, schedule_enrichment=False)
     except Exception as exc:
         if track_lifecycle:
-            vod_importer.mark_import_finished(provider_id, type(exc).__name__, run_id=run_id)
+            await asyncio.to_thread(vod_importer.mark_import_finished, provider_id, type(exc).__name__, run_id=run_id)
         # exc_info: some failures here raise with an empty str() (e.g. a bare
         # TimeoutError), which used to log as "failed: " with nothing else
         # to go on -- the full traceback is the only way to actually
@@ -1732,7 +1733,7 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
     await vod_importer.resweep_smart_categories()
     if track_lifecycle:
-        vod_importer.mark_import_finished(provider_id, run_id=run_id, result=result)
+        await asyncio.to_thread(vod_importer.mark_import_finished, provider_id, run_id=run_id, result=result)
     return result
 
 
