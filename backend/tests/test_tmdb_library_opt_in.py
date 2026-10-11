@@ -1,6 +1,7 @@
-"""The local TMDB library is opt-in and never pulls TMDB's full ID export on
-its own: an upgrade with only a TMDB key saved must make no downloads and no
-TMDB requests (upstream review of the catalog-first library)."""
+"""The local TMDB library is opt-in: an upgrade with only a TMDB key saved
+must make no downloads and no TMDB requests. Once turned on, it keeps its ID
+list current with TMDB's daily export (upstream review of the catalog-first
+library)."""
 
 import asyncio
 
@@ -40,11 +41,14 @@ def test_fresh_install_with_key_does_nothing(fresh):
     assert fresh == []
 
 
-def test_enabled_scheduler_never_downloads_the_export(fresh):
+def test_enabled_scheduler_downloads_the_export_once_a_day(fresh):
     config.save_tmdb_store_settings({"enabled": True})
     assert asyncio.run(tmdb_fill.run_due_jobs()) is True
+    assert "import_exports" in fresh and "run_burst" in fresh
+    tmdb_store.set_meta("exports_imported_at", tmdb_fill.time.time())
+    fresh.clear()
+    asyncio.run(tmdb_fill.run_due_jobs())
     assert "import_exports" not in fresh
-    assert "run_burst" in fresh
 
 
 def test_prefill_top_setting_removed(fresh):
