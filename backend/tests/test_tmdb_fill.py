@@ -19,6 +19,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(tmdb_sync, "get_tmdb_api_key", lambda: "k")
     monkeypatch.setattr(tmdb_fill, "get_tmdb_api_key", lambda: "k")
     tmdb_store.init_db()
+    config.save_tmdb_store_settings({"enabled": True})  # library is opt-in
     return tmdb_store
 
 

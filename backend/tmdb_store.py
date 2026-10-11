@@ -428,21 +428,6 @@ def list_stale_ids(media_type: str, limit: int) -> list[int]:
     return [r[0] for r in rows]
 
 
-def list_fill_candidates(media_type: str, limit: int, top_n: int) -> list[int]:
-    """Most popular export ids (within the top_n) not yet stored or known gone."""
-    with _conn() as conn:
-        rows = conn.execute(
-            """SELECT e.tmdb_id FROM (
-                   SELECT tmdb_id, popularity FROM export_ids WHERE media_type=?
-                   ORDER BY popularity DESC LIMIT ?
-               ) e
-               WHERE NOT EXISTS (SELECT 1 FROM titles t WHERE t.media_type=? AND t.tmdb_id=e.tmdb_id)
-                 AND NOT EXISTS (SELECT 1 FROM gone g WHERE g.media_type=? AND g.tmdb_id=e.tmdb_id)
-               ORDER BY e.popularity DESC LIMIT ?""",
-            (media_type, top_n, media_type, media_type, limit),
-        ).fetchall()
-    return [r[0] for r in rows]
-
 
 def _load_retention_refs(conn: sqlite3.Connection, referenced: dict[str, set[int]]) -> None:
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS retention_refs (media_type TEXT, tmdb_id INTEGER, PRIMARY KEY(media_type, tmdb_id)) WITHOUT ROWID")

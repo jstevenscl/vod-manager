@@ -13,7 +13,6 @@ interface StoreSettings {
   enabled: boolean
   burst_size: number
   bursts_per_day: number
-  prefill_top: number
   daily_budget: number
   concurrency: number
 }
@@ -145,7 +144,7 @@ export default function TmdbStore() {
   })
 
   const runError = (runJob.error as { response?: { data?: { detail?: string } } } | null)?.response?.data?.detail
-  const enabled = status?.settings.enabled ?? true
+  const enabled = status?.settings.enabled ?? false
   const canRun = !!status?.has_api_key && enabled && !status?.job.running
 
   return (

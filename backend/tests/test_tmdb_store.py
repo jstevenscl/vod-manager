@@ -18,6 +18,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(config, "_raw_cache", None)
     tmdb_store.init_db()
+    config.save_tmdb_store_settings({"enabled": True})  # library is opt-in
     return tmdb_store
 
 
@@ -100,7 +101,7 @@ def test_changed_title_is_not_served_until_refetched(store):
     assert store.get_payload("movie", 1) is not None
 
 
-def test_export_import_and_fill_candidates(store, tmp_path):
+def test_export_import_skips_adult(store, tmp_path):
     path = tmp_path / "movie_ids.json.gz"
     lines = [
         {"id": 1, "original_title": "A", "popularity": 9.0, "adult": False, "video": False},
@@ -111,10 +112,6 @@ def test_export_import_and_fill_candidates(store, tmp_path):
     with gzip.open(path, "wt", encoding="utf-8") as fh:
         fh.write("\n".join(json.dumps(line) for line in lines) + "\n")
     assert store.import_export_file("movie", path) == 3  # adult skipped
-    store.upsert_payload("movie", _movie(1))
-    store.mark_gone("movie", 3)
-    assert store.list_fill_candidates("movie", limit=10, top_n=100) == [4]
-    assert store.list_fill_candidates("movie", limit=10, top_n=2) == []
 
 
 def test_stats_counts(store):

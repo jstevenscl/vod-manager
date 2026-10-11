@@ -1,14 +1,16 @@
 """
 Keeps the local TMDB store (tmdb_store) filled and fresh in the background.
 
-Active only once a TMDB API key is saved (and the store isn't disabled in its
-settings). Each cycle, as due:
-  - import TMDB's daily ID export (keyless file download, once a day) -- the
-    work list, ranked by TMDB popularity;
+Opt-in: active only once a TMDB API key is saved and the library is turned
+on. Each cycle, as due:
+  - retention: drop data no longer referenced by the catalog;
   - refresh: mark stored titles TMDB reports as changed (/movie/changes,
     /tv/changes) so they're refetched;
-  - a small burst: refetch changed titles first, then fetch the most popular
-    not-yet-stored titles, a few times a day, under a daily request budget.
+  - a small burst: refetch changed titles first, then fetch catalog titles
+    not yet stored, a few times a day, under a daily request budget.
+
+TMDB's daily ID export is never downloaded automatically; it's a manual job
+("Refresh TMDB ID list") that only makes local name search answer more often.
 
 Also the store's lookup entry point: local name/ID search first, live TMDB
 search (results stored) only on a local miss.
@@ -180,8 +182,6 @@ async def run_due_jobs() -> bool:
         return False
     now = time.time()
     meta = lambda key: float(tmdb_store.get_meta(key, "0") or 0)  # noqa: E731
-    if now - await asyncio.to_thread(meta, "exports_imported_at") >= _DAY:
-        await _run("export", import_exports())
     if now - await asyncio.to_thread(meta, "retention_run_at") >= _DAY:
         result = await _run("retention", retention(dry_run=False))
         if "error" not in result:

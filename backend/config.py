@@ -635,13 +635,12 @@ def set_credentials(username: str, password: str) -> None:
         {"auth_username": username, "auth_salt": salt, "auth_hash": hashed, "auth_scheme": "pbkdf2"}))
 
 
-# Local TMDB library (tmdb_store/tmdb_fill) -- background fill only runs once
-# a TMDB API key is saved; these tune how much it does.
+# Local TMDB library (tmdb_store/tmdb_fill) -- opt-in: background fill only
+# runs once a TMDB API key is saved AND the library is turned on.
 _TMDB_STORE_DEFAULTS = {
-    "enabled": True,
+    "enabled": False,
     "burst_size": 2000,
     "bursts_per_day": 4,
-    "prefill_top": 100000,
     "daily_budget": 20000,
     "concurrency": 4,
 }

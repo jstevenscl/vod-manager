@@ -20,7 +20,6 @@ class StoreSettings(BaseModel):
     enabled: bool | None = None
     burst_size: int | None = None
     bursts_per_day: int | None = None
-    prefill_top: int | None = None
     daily_budget: int | None = None
     concurrency: int | None = None
 

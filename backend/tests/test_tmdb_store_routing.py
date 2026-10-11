@@ -27,6 +27,7 @@ def store(tmp_path, monkeypatch):
     for mod in (tmdb_sync, tmdb_fill, library_matcher):
         monkeypatch.setattr(mod, "get_tmdb_api_key", lambda: "k")
     tmdb_store.init_db()
+    config.save_tmdb_store_settings({"enabled": True})  # library is opt-in
     return tmdb_store
 
 
