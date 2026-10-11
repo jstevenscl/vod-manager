@@ -1602,8 +1602,12 @@ async def set_provider_import_exclude_categories(provider_id: int, body: Provide
 
 
 @router.post("/providers/{provider_id}/purge-excluded-content/", dependencies=_GUARDS)
-async def purge_excluded_content(provider_id: int, dry_run: bool = True):
-    """Preview by default; delete legacy sources only on explicit apply."""
+async def purge_excluded_content(
+    provider_id: int,
+    dry_run: bool = True,
+    body: Optional[ProviderImportExcludeCategoriesRequest] = None,
+):
+    """Preview proposed exclusions; delete only under already-saved rules."""
     provider = vod_db.get_provider(provider_id)
     if not provider:
         raise HTTPException(404, detail="provider not found")
@@ -1611,13 +1615,25 @@ async def purge_excluded_content(provider_id: int, dry_run: bool = True):
     # "exclude uncategorized" could otherwise match an entire media server.
     if (provider.get("provider_type") or "xc") != "xc":
         raise HTTPException(400, detail="purge-excluded-content supports XC providers only")
-    return await asyncio.to_thread(
+    if not dry_run and body is not None:
+        raise HTTPException(400, detail="Cleanup apply uses saved exclusions; save the previewed settings first")
+    category_names = body.category_names if body is not None else (provider.get("import_exclude_categories") or [])
+    exclude_uncategorized = body.exclude_uncategorized if body is not None else bool(provider.get("import_exclude_uncategorized"))
+    result = await asyncio.to_thread(
         vod_db.purge_excluded_category_sources,
         provider_id,
-        provider.get("import_exclude_categories") or [],
-        bool(provider.get("import_exclude_uncategorized")),
+        category_names,
+        exclude_uncategorized,
         dry_run=dry_run,
     )
+    result.pop("affected_movie_ids", None)
+    result.pop("affected_series_ids", None)
+    result["provider_id"] = provider_id
+    result["saved_category_names"] = sorted(set(provider.get("import_exclude_categories") or []))
+    result["saved_exclude_uncategorized"] = bool(provider.get("import_exclude_uncategorized"))
+    result["proposed_category_names"] = sorted(set(category_names))
+    result["proposed_exclude_uncategorized"] = bool(exclude_uncategorized)
+    return result
 
 
 @router.post("/providers/{provider_id}/deactivate/", dependencies=_GUARDS)

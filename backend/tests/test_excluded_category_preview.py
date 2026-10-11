@@ -109,6 +109,24 @@ def test_preview_then_apply_removes_legacy_content_once(db, monkeypatch):
     assert asyncio.run(vod_routes.purge_excluded_content(provider_id))["movie_sources_removed"] == 0
 
 
+def test_proposed_preview_does_not_save_or_allow_cleanup_before_save(db):
+    provider_id = db.upsert_provider("prov1", "http://example.invalid", "u", "p", provider_type="xc")
+    _import_movie(db, provider_id, "Talk Movie", "talk-1", "Talk")
+    proposal = vod_routes.ProviderImportExcludeCategoriesRequest(category_names=["Talk"], exclude_uncategorized=False)
+
+    preview = asyncio.run(vod_routes.purge_excluded_content(provider_id, body=proposal))
+
+    assert preview["provider_id"] == provider_id
+    assert preview["saved_category_names"] == []
+    assert preview["proposed_category_names"] == ["Talk"]
+    assert preview["movies_deleted"] == 1
+    assert db.get_provider(provider_id)["import_exclude_categories"] == []
+    assert db.get_movie_by_name_year("Talk Movie", 2001) is not None
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(vod_routes.purge_excluded_content(provider_id, dry_run=False, body=proposal))
+    assert exc.value.status_code == 400
+
+
 def test_archive_new_category_is_stored_archived_not_skipped(db, monkeypatch):
     provider_id = db.upsert_provider("prov1", "http://example.invalid", "u", "p", provider_type="xc")
     db.set_provider_archive_new_categories(provider_id, True)
