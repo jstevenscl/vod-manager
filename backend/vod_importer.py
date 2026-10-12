@@ -492,17 +492,24 @@ class XCProviderClient:
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict, country: list[str],
+    lang: dict, country: list[str], *, saved_exclude_categories: list[str] | None = None,
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     streams = await client.get_vod_streams()
     fetch_elapsed = time.time() - fetch_started
     movie_name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
     movie_items = []
+    skipped_excluded = 0
+    saved_excluded = {name.strip() for name in (saved_exclude_categories or []) if name and name.strip()}
     for s in streams:
+        category_name = category_names.get(str(s.get("category_id")))
+        if ((category_name or "").strip() in saved_excluded) or (
+            not (category_name or "").strip() and exclude_uncategorized
+        ):
+            skipped_excluded += 1
+            continue
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, movie_name_rules)
-        category_name = category_names.get(str(s.get("category_id")))
         movie_items.append({
             "name": name,
             "year": year,
@@ -543,6 +550,8 @@ async def _import_movies_for_provider(
         })
     db_started = time.time()
     movie_result = await asyncio.to_thread(vod_db.bulk_import_movies, provider_id, movie_items)
+    if isinstance(movie_result, dict):
+        movie_result["movies_skipped_excluded"] = skipped_excluded
     await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "movie", movie_items)
     db_elapsed = time.time() - db_started
     logger.info(
@@ -560,7 +569,7 @@ async def _import_movies_for_provider(
 async def _import_series_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     series_category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
-    lang: dict, country: list[str],
+    lang: dict, country: list[str], *, saved_exclude_categories: list[str] | None = None,
 ) -> tuple[dict, int, set[str]]:
     fetch_started = time.time()
     series_list = await client.get_series()
@@ -578,10 +587,17 @@ async def _import_series_for_provider(
         for field in ("genre", "description", "cast_list", "director")
     }
     series_items = []
+    skipped_excluded = 0
+    saved_excluded = {name.strip() for name in (saved_exclude_categories or []) if name and name.strip()}
     for s in series_list:
+        category_name = series_category_names.get(str(s.get("category_id")))
+        if ((category_name or "").strip() in saved_excluded) or (
+            not (category_name or "").strip() and exclude_uncategorized
+        ):
+            skipped_excluded += 1
+            continue
         name, year = parse_name_year(s.get("name") or "")
         name = vod_db.apply_rules_to_value(name, series_name_rules)
-        category_name = series_category_names.get(str(s.get("category_id")))
         series_items.append({
             "name": name,
             "year": year or _coerce_year(s.get("year")),
@@ -612,6 +628,8 @@ async def _import_series_for_provider(
         })
     db_started = time.time()
     series_result = await asyncio.to_thread(vod_db.bulk_import_series, provider_id, series_items)
+    if isinstance(series_result, dict):
+        series_result["series_skipped_excluded"] = skipped_excluded
     await asyncio.to_thread(vod_db.apply_provider_trailers, provider_id, "series", series_items)
     db_elapsed = time.time() - db_started
     logger.info(
@@ -653,7 +671,27 @@ def mark_import_queued(provider_id: int, provider_name: str, queue_position: int
     })
 
 
-def mark_import_running(provider_id: int, provider_name: str) -> None:
+def _catalog_sync_summary(result: dict | None) -> dict:
+    """Keep Sync History useful without retaining provider payloads or URLs."""
+    result = result or {}
+    fields = (
+        "catalog_changed", "movies_created", "movies_matched", "movies_archived",
+        "movies_unarchived", "series_created", "series_matched", "episodes_imported",
+        "total", "flagged_for_review", "errors",
+    )
+    return {field: result[field] for field in fields if field in result}
+
+
+def _write_catalog_report(operation, *args, **kwargs):
+    """Keep a report failure from replacing the import result or exception."""
+    try:
+        return operation(*args, **kwargs)
+    except Exception:
+        logger.exception("[vod_importer] Sync History report write failed")
+        return None
+
+
+def mark_import_running(provider_id: int, provider_name: str, provider_type: str = "unknown") -> int | None:
     """Expose a non-XC manual import while its provider adapter is running.
 
     XC imports update this state inside import_provider_catalog itself.
@@ -666,18 +704,39 @@ def mark_import_running(provider_id: int, provider_name: str) -> None:
         "provider_id": provider_id, "provider_name": provider_name,
         "started_at": time.time(), "finished_at": None, "error": None,
     })
+    return _write_catalog_report(vod_db.create_catalog_sync_run, provider_id, provider_name, provider_type)
 
 
-def mark_import_finished(provider_id: int, error: str | None = None) -> None:
+def mark_import_finished(
+    provider_id: int, error: str | None = None, *, run_id: int | None = None, result: dict | None = None,
+) -> None:
     """Finish a non-XC manual import without clobbering a newer job's state
     (e.g. the queue worker already moved on to the next provider by the
     time this one's cleanup runs)."""
-    if _IMPORT_PROGRESS.get("provider_id") != provider_id:
-        return
-    _IMPORT_PROGRESS.update({
-        "running": False, "queued": False, "queue_position": None,
-        "finished_at": time.time(), "error": error,
-    })
+    if _IMPORT_PROGRESS.get("provider_id") == provider_id:
+        _IMPORT_PROGRESS.update({
+            "running": False, "queued": False, "queue_position": None,
+            "finished_at": time.time(), "error": error,
+        })
+    if run_id is not None:
+        _write_catalog_report(vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result), error=error)
+
+
+async def run_tracked_import(provider_id: int, importer) -> dict:
+    """Run a non-XC adapter with the same durable report as XC imports."""
+    provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
+    provider_name = provider.get("name") if provider else f"provider {provider_id}"
+    provider_type = provider.get("provider_type", "unknown") if provider else "unknown"
+    run_id = await asyncio.to_thread(mark_import_running, provider_id, provider_name, provider_type)
+    try:
+        result = await importer(provider_id)
+    except Exception as exc:
+        await asyncio.to_thread(mark_import_finished, provider_id, type(exc).__name__, run_id=run_id)
+        raise
+    await asyncio.to_thread(mark_import_finished, provider_id, run_id=run_id, result=result)
+    if run_id is not None:
+        result["catalog_sync_run_id"] = run_id
+    return result
 
 
 def get_process_cpu_percent() -> float | None:
@@ -717,6 +776,12 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
     same writer."""
     provider = await asyncio.to_thread(vod_db.get_provider, provider_id)
     async with _XC_IMPORT_LOCK:
+        run_id = await asyncio.to_thread(
+            _write_catalog_report, vod_db.create_catalog_sync_run,
+            provider_id,
+            provider.get("name") if provider else f"provider {provider_id}",
+            "xc",
+        )
         _IMPORT_PROGRESS.update({
             "running": True, "queued": False, "queue_position": None,
             "provider_id": provider_id,
@@ -727,8 +792,13 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
             result = await _import_provider_catalog_impl(provider_id)
         except Exception as exc:
             _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time(), "error": type(exc).__name__})
+            if run_id is not None:
+                await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, error=type(exc).__name__)
             raise
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+        if run_id is not None:
+            await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result))
+            result["catalog_sync_run_id"] = run_id
     if schedule_enrichment:
         schedule_known_series_identity_reconciliation()
     return result
@@ -835,6 +905,10 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
     client = XCProviderClient(provider)
 
     exclude_categories = provider.get("import_exclude_categories") or []
+    # Only saved exclusions are omitted from import. archive_new_categories
+    # extends the run-time archive list below, but its items must remain stored
+    # (archived) until the user decides what to do with the new category.
+    saved_exclude_categories = list(exclude_categories)
     exclude_uncategorized = bool(provider.get("import_exclude_uncategorized"))
 
     # Stripped for the same reason vod_routes.get_provider_available_categories
@@ -899,9 +973,11 @@ async def _import_provider_catalog_impl(provider_id: int) -> dict:
 
     movie_result, streams_total, seen_movie_stream_ids = await _import_movies_for_provider(
         client, provider, provider_id, category_names, exclude_categories, exclude_uncategorized, lang, country,
+        saved_exclude_categories=saved_exclude_categories,
     )
     series_result, series_total, seen_series_ids = await _import_series_for_provider(
         client, provider, provider_id, series_category_names, exclude_categories, exclude_uncategorized, lang, country,
+        saved_exclude_categories=saved_exclude_categories,
     )
 
     await asyncio.to_thread(vod_db.set_provider_import_totals, provider_id, streams_total, series_total)

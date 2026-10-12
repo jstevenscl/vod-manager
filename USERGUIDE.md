@@ -185,6 +185,15 @@ click **Add**.
 
 ![Providers table](docs/screenshots/providers.png)
 
+The **Movies** and **Series** columns show *imported / the provider's own
+reported total* as of its last import (Xtream-Codes providers only). Series
+count as soon as they are imported; their episodes are fetched afterwards by
+enrichment, so the **Episodes** column can lag behind while a new provider
+is still being enriched. Every catalog import is also recorded with its start
+and finish time, outcome and summary; `GET /api/vod/sync-history/` lists the
+recent runs (a run still marked running when the app restarts is closed out as
+failed, "interrupted by restart").
+
 Each provider row also has:
 
 - **Priority** — lower numbers are preferred when the same title is
@@ -387,7 +396,24 @@ providers hit where an item is reported with no category at all — since
 that has no name to match against, it can't be caught by picking specific
 categories and needs its own switch.
 
-![Exclude Categories picker for a provider](docs/screenshots/exclude-categories-modal.png)
+![Exclude Categories picker for a provider, showing the change preview](docs/screenshots/exclude-categories-modal.png)
+
+Changes go through a **preview first**: tick or untick categories and click
+**Preview changes**. Nothing is saved or deleted at that point — the dialog
+lists the categories being newly excluded or allowed again and how many
+stored sources, episode sources and cards the change would affect. Then
+**Confirm & save exclusions** saves the list (a separate confirmation), and
+only after it is saved does **Apply cleanup** appear, which removes what the
+preview showed. Saving alone never deletes stored content.
+
+On Xtream-Codes providers, categories in the saved list are **skipped
+during import** — their movies and series are not created at all, so they
+don't come back after a cleanup. Cleanup removes that provider's sources in
+the excluded categories; a movie or show that another provider also carries
+stays, one left with no source is deleted, and anything you curated by hand is
+never touched. The preview and the cleanup always report the same counts.
+Cleanup is XC-only: for Plex/Emby/Jellyfin the exclusion still applies to future
+imports, but existing content is not removed.
 
 If a provider's own category list has drifted since you last set exclusions
 (a category renamed or removed on their end), the picker calls those out
@@ -1641,7 +1667,18 @@ just the features below. TMDB's terms require attribution (shown on the
 Configuration page and in the README) and limit how long TMDB data may be
 cached (6 months); the key is yours, so following
 [TMDB's API terms](https://www.themoviedb.org/api-terms-of-use) is up to you.
-It unlocks real TMDB search for the Needs Review
+The optional local TMDB library is off by default; turn it on from the TMDB Library page in the sidebar
+(it needs the TMDB key above). It is catalog-first: it fills known movie and show
+IDs only, refreshes retained records after 150 days, removes unreferenced data
+daily, and never serves data older than 170 days. The TMDB Library page
+has a cleanup preview, so you can review the affected records before
+applying removal. Once it is on, TMDB's daily ID export is downloaded at most
+once a day (no API key or request budget needed) so name search can be
+answered locally.
+
+![TMDB Library page](docs/screenshots/tmdb-library.png)
+
+The TMDB key unlocks real TMDB search for the Needs Review
 and Missing Artwork flows above, plus two ways to auto-populate
 categories from a public list — both only ever place items already present
 in your pool; neither pulls in anything new.

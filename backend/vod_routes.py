@@ -562,6 +562,20 @@ async def get_xc_credentials():
     return {"username": client["username"], "password": client["password"]}
 
 
+@router.get("/sync-history/", dependencies=_GUARDS)
+async def sync_history(limit: int = 100, offset: int = 0):
+    """Durable summaries for completed catalog imports, newest first."""
+    return await asyncio.to_thread(vod_db.list_catalog_sync_runs, limit, offset)
+
+
+@router.get("/sync-history/{run_id}/", dependencies=_GUARDS)
+async def sync_history_detail(run_id: int):
+    report = await asyncio.to_thread(vod_db.get_catalog_sync_run, run_id)
+    if not report:
+        raise HTTPException(404, detail="sync report not found")
+    return report
+
+
 # ── XC clients (per-instance credentials) ───────────────────────────────────
 
 def _client_out(c: dict) -> dict:
@@ -1601,6 +1615,41 @@ async def set_provider_import_exclude_categories(provider_id: int, body: Provide
     return {"ok": True}
 
 
+@router.post("/providers/{provider_id}/purge-excluded-content/", dependencies=_GUARDS)
+async def purge_excluded_content(
+    provider_id: int,
+    dry_run: bool = True,
+    body: Optional[ProviderImportExcludeCategoriesRequest] = None,
+):
+    """Preview proposed exclusions; delete only under already-saved rules."""
+    provider = vod_db.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(404, detail="provider not found")
+    # Non-XC sources may not carry provider_category_name. In particular,
+    # "exclude uncategorized" could otherwise match an entire media server.
+    if (provider.get("provider_type") or "xc") != "xc":
+        raise HTTPException(400, detail="purge-excluded-content supports XC providers only")
+    if not dry_run and body is not None:
+        raise HTTPException(400, detail="Cleanup apply uses saved exclusions; save the previewed settings first")
+    category_names = body.category_names if body is not None else (provider.get("import_exclude_categories") or [])
+    exclude_uncategorized = body.exclude_uncategorized if body is not None else bool(provider.get("import_exclude_uncategorized"))
+    result = await asyncio.to_thread(
+        vod_db.purge_excluded_category_sources,
+        provider_id,
+        category_names,
+        exclude_uncategorized,
+        dry_run=dry_run,
+    )
+    result.pop("affected_movie_ids", None)
+    result.pop("affected_series_ids", None)
+    result["provider_id"] = provider_id
+    result["saved_category_names"] = sorted(set(provider.get("import_exclude_categories") or []))
+    result["saved_exclude_uncategorized"] = bool(provider.get("import_exclude_uncategorized"))
+    result["proposed_category_names"] = sorted(set(category_names))
+    result["proposed_exclude_uncategorized"] = bool(exclude_uncategorized)
+    return result
+
+
 @router.post("/providers/{provider_id}/deactivate/", dependencies=_GUARDS)
 async def deactivate_provider(provider_id: int):
     if not vod_db.get_provider(provider_id):
@@ -1680,8 +1729,12 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     # so publish their queued -> running transition here instead of leaving
     # the sidebar stuck on "queued" for the whole import.
     track_lifecycle = provider.get("provider_type") != "xc"
+    run_id = None
     if track_lifecycle:
-        vod_importer.mark_import_running(provider_id, provider["name"])
+        run_id = await asyncio.to_thread(
+            vod_importer.mark_import_running,
+            provider_id, provider["name"], provider.get("provider_type", "unknown"),
+        )
     try:
         if provider.get("provider_type") == "plex":
             result = await plex_importer.import_plex_library(provider_id)
@@ -1698,7 +1751,7 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
             result = await vod_importer.import_provider_catalog(provider_id, schedule_enrichment=False)
     except Exception as exc:
         if track_lifecycle:
-            vod_importer.mark_import_finished(provider_id, type(exc).__name__)
+            await asyncio.to_thread(vod_importer.mark_import_finished, provider_id, type(exc).__name__, run_id=run_id)
         # exc_info: some failures here raise with an empty str() (e.g. a bare
         # TimeoutError), which used to log as "failed: " with nothing else
         # to go on -- the full traceback is the only way to actually
@@ -1715,7 +1768,7 @@ async def _run_provider_catalog_import(provider_id: int) -> dict:
     await asyncio.to_thread(vod_db.mark_provider_catalog_refreshed, provider_id)
     await vod_importer.resweep_smart_categories()
     if track_lifecycle:
-        vod_importer.mark_import_finished(provider_id)
+        await asyncio.to_thread(vod_importer.mark_import_finished, provider_id, run_id=run_id, result=result)
     return result
 
 

@@ -20,8 +20,10 @@ import emby_vod_importer
 import library_importer
 import rclone_client
 import plex_importer
+import tmdb_fill
 from portal_routes import router as portal_router
 from routes import router
+from tmdb_store_routes import router as tmdb_store_router
 import vod_db
 import vod_importer
 import vod_list_sync
@@ -140,11 +142,11 @@ async def _vod_catalog_refresher() -> None:
                 for p in due:
                     try:
                         if p.get("provider_type") == "plex":
-                            result = await plex_importer.import_plex_library(p["id"])
+                            result = await vod_importer.run_tracked_import(p["id"], plex_importer.import_plex_library)
                         elif p.get("provider_type") in ("emby", "jellyfin"):
-                            result = await emby_vod_importer.import_emby_library(p["id"])
+                            result = await vod_importer.run_tracked_import(p["id"], emby_vod_importer.import_emby_library)
                         elif p.get("provider_type") == "library":
-                            result = await library_importer.import_library(p["id"])
+                            result = await vod_importer.run_tracked_import(p["id"], library_importer.import_library)
                         else:
                             # Deferred (schedule_enrichment=False): firing
                             # identity reconciliation once per provider here
@@ -458,12 +460,16 @@ async def _tmdb_sync_scheduler() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("VOD Manager started")
+    closed = await asyncio.to_thread(vod_db.close_orphaned_catalog_sync_runs)
+    if closed:
+        logger.info("Closed %d Sync History run(s) interrupted by the previous process", closed)
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_tmdb_sync_scheduler()),
+        asyncio.create_task(tmdb_fill.fill_loop()),
         asyncio.create_task(_category_schedule_loop()),
         asyncio.create_task(_uncategorized_sweep_loop()),
         asyncio.create_task(_smart_category_scheduler()),
@@ -488,6 +494,7 @@ app.include_router(portal_router)
 app.include_router(xc_router)
 app.include_router(backup_router)
 app.include_router(diagnostics_router)
+app.include_router(tmdb_store_router)
 
 if os.environ.get("VODMANAGER_TEST_UPSTREAM"):
     from test_upstream import router as test_upstream_router

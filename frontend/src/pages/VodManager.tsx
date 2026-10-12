@@ -42,6 +42,22 @@ interface Provider {
   has_library_remote_secret: boolean
 }
 
+interface ExcludedCategoryPurgePreview {
+  dry_run: boolean
+  provider_id: number
+  saved_category_names: string[]
+  saved_exclude_uncategorized: boolean
+  movie_sources_removed: number
+  series_sources_removed: number
+  episode_sources_removed: number
+  movies_deleted: number
+  series_deleted: number
+  sample_movies: string[]
+  sample_series: string[]
+  proposed_category_names: string[]
+  proposed_exclude_uncategorized: boolean
+}
+
 interface RecordingProfile {
   id: number
   provider_id: number
@@ -5249,6 +5265,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [excludeCategoriesShowFilter, setExcludeCategoriesShowFilter] = useState<'all' | 'selected' | 'unselected'>('all')
   const [excludeCategoriesLastClickedIndex, setExcludeCategoriesLastClickedIndex] = useState<number | null>(null)
   const [excludeCategoriesError, setExcludeCategoriesError] = useState<string | null>(null)
+  const [excludeCategoriesPreview, setExcludeCategoriesPreview] = useState<ExcludedCategoryPurgePreview | null>(null)
+  const [excludeCategoriesPreviewSaved, setExcludeCategoriesPreviewSaved] = useState(false)
   const providerAvailableCategoriesQuery = useQuery<{ categories: string[] }>({
     queryKey: ['vod-provider-available-categories', excludeCategoriesProviderId],
     queryFn:  () => api.get(`/vod/providers/${excludeCategoriesProviderId}/available-categories/`).then((r) => r.data),
@@ -5279,9 +5297,35 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       // categories, which looked exactly like "my selection didn't stick".
       await qc.invalidateQueries({ queryKey: ['vod-providers'] })
       setExcludeCategoriesError(null)
-      setExcludeCategoriesProviderId(null)
+      setExcludeCategoriesPreviewSaved(true)
     },
     onError: (e: any) => setExcludeCategoriesError(e?.response?.data?.detail ?? e.message ?? 'Save failed.'),
+  })
+  const previewProviderCategoryExclusions = useMutation({
+    mutationFn: ({ id, category_names, exclude_uncategorized }: { id: number; category_names: string[]; exclude_uncategorized: boolean }) =>
+      api.post(
+        `/vod/providers/${id}/purge-excluded-content/`,
+        { category_names, exclude_uncategorized },
+        { params: { dry_run: true } },
+      ),
+    onSuccess: (response) => {
+      setExcludeCategoriesPreview(response.data)
+      setExcludeCategoriesPreviewSaved(false)
+      setExcludeCategoriesError(null)
+    },
+    onError: (e: any) => setExcludeCategoriesError(e?.response?.data?.detail ?? e.message ?? 'Preview failed.'),
+  })
+  const applyExcludedCategoryPurge = useMutation({
+    mutationFn: (id: number) =>
+      api.post(`/vod/providers/${id}/purge-excluded-content/`, null, { params: { dry_run: false } }),
+    onSuccess: async (response) => {
+      const result = response.data as ExcludedCategoryPurgePreview
+      notify(`Removed ${result.movie_sources_removed} movie and ${result.series_sources_removed} series source(s) from saved exclusions.`)
+      await qc.invalidateQueries({ queryKey: ['vod-providers'] })
+      setExcludeCategoriesPreview(null)
+      setExcludeCategoriesProviderId(null)
+    },
+    onError: (e: any) => setExcludeCategoriesError(e?.response?.data?.detail ?? e.message ?? 'Cleanup failed.'),
   })
   // ── DVR recording profiles (Phase 2) ──
   const [recordingProfilesProviderId, setRecordingProfilesProviderId] = useState<number | null>(null)
@@ -7909,7 +7953,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Name</th>
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Base URL</th>
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Imported (in the pool) / the provider's own reported total, as of its last import pass — a gap between them can mean items are stuck (Needs Review, blank names) or the provider's list changed since. XC providers only; Plex/Emby import differently and don't report this.">Movies (Imported / Provider)</th>
-              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Distinct series with at least one episode from this provider. Imported (in the pool) / the provider's own reported total, as of its last import pass — XC providers only.">Series (Imported / Provider)</th>
+              <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Distinct series this provider carries (episodes are fetched later by enrichment). Imported (in the pool) / the provider's own reported total, as of its last import pass — XC providers only.">Series (Imported / Provider)</th>
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Total episode files from this provider — a different number than Series by design (one series can have many episodes)">Episodes</th>
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide" title="Higher number wins when multiple providers carry the same title">Priority</th>
               <th className="py-2.5 px-2 font-bold text-[10.5px] uppercase tracking-wide">Max Streams</th>
@@ -8145,6 +8189,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       setExcludeCategoriesProviderId(p.id)
                       setExcludeCategoriesDraft(new Set(p.import_exclude_categories))
                       setExcludeUncategorizedDraft(!!p.import_exclude_uncategorized)
+                      setExcludeCategoriesPreview(null)
+                      setExcludeCategoriesPreviewSaved(false)
                       setExcludeCategoriesSearch('')
                       setExcludeCategoriesShowFilter('all')
                       setExcludeCategoriesLastClickedIndex(null)
@@ -8387,6 +8433,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       )}
 
       {excludeCategoriesProviderId != null && (() => {
+        const selectedProvider = providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)
+        const proposedNames = Array.from(excludeCategoriesDraft).sort()
+        const previewIsCurrent = !!excludeCategoriesPreview
+          && excludeCategoriesPreview.provider_id === excludeCategoriesProviderId
+          && excludeCategoriesPreview.proposed_exclude_uncategorized === excludeUncategorizedDraft
+          && JSON.stringify(excludeCategoriesPreview.proposed_category_names) === JSON.stringify(proposedNames)
+        const addedNames = previewIsCurrent
+          ? excludeCategoriesPreview.proposed_category_names.filter((n) => !excludeCategoriesPreview.saved_category_names.includes(n)) : []
+        const allowedNames = previewIsCurrent
+          ? excludeCategoriesPreview.saved_category_names.filter((n) => !excludeCategoriesPreview.proposed_category_names.includes(n)) : []
         const allNames = providerAvailableCategoriesQuery.data?.categories ?? []
         const allNamesSet = new Set(allNames)
         // Saved exclusions can outlive the provider's own category list (renamed,
@@ -8410,8 +8466,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
             </h2>
             <p className="text-sm text-muted-foreground">
-              Movies/series in a checked category get auto-archived on import, using this provider's own category
-              names. Archived, not deleted — still browsable if you change your mind.
+              Preview category changes before saving. Saving affects future imports; cleanup of existing XC content
+              requires a separate confirmation.
             </p>
             <label className="flex items-center gap-1.5 text-xs select-none border border-border rounded p-2">
               <input
@@ -8507,15 +8563,53 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               ))}
               {!!allNames.length && !visible.length && <p className="text-muted-foreground">No categories match.</p>}
             </div>
+            {previewIsCurrent && excludeCategoriesPreview && (() => {
+              const affectedSources = excludeCategoriesPreview.movie_sources_removed + excludeCategoriesPreview.series_sources_removed
+              const deletedCards = excludeCategoriesPreview.movies_deleted + excludeCategoriesPreview.series_deleted
+              const samples = [...excludeCategoriesPreview.sample_movies, ...excludeCategoriesPreview.sample_series]
+              return (
+                <div className="rounded border border-warning/50 bg-warning/10 p-3 space-y-1.5 text-xs">
+                  <p className="font-medium">Category change preview — nothing has been deleted</p>
+                  <p>{excludeCategoriesPreviewSaved ? 'Exclusions saved.' : 'Proposed exclusions have not been saved.'}</p>
+                  <p>Newly excluded: {addedNames.length ? addedNames.join(', ') : 'none'}{excludeUncategorizedDraft && !excludeCategoriesPreview.saved_exclude_uncategorized ? ', Uncategorized' : ''}</p>
+                  <p>Allowed again: {allowedNames.length ? allowedNames.join(', ') : 'none'}{!excludeUncategorizedDraft && excludeCategoriesPreview.saved_exclude_uncategorized ? ', Uncategorized' : ''}</p>
+                  {selectedProvider?.provider_type === 'xc' ? <p>
+                    {affectedSources} stored source{affectedSources === 1 ? '' : 's'} match the proposed exclusions.
+                    Cleanup would remove {excludeCategoriesPreview.episode_sources_removed} episode source(s) and
+                    delete {deletedCards} card{deletedCards === 1 ? '' : 's'} left with no other source.
+                  </p> : <p>Existing content is not cleaned up for this provider type.</p>}
+                  {!!samples.length && <p className="text-muted-foreground">Examples: {samples.join(', ')}</p>}
+                  <p className="text-muted-foreground">Saving does not delete stored content. XC cleanup is a separate action.</p>
+                </div>
+              )
+            })()}
             {excludeCategoriesError && <p className="text-xs text-destructive">{excludeCategoriesError}</p>}
             <div className="flex justify-end gap-2 pt-2">
-              <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Cancel</Button>
+              <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Close</Button>
+              {previewIsCurrent && excludeCategoriesPreviewSaved && selectedProvider?.provider_type === 'xc' && excludeCategoriesPreview && (excludeCategoriesPreview.movie_sources_removed + excludeCategoriesPreview.series_sources_removed > 0) && (
+                <Button
+                  size="sm"
+                  disabled={applyExcludedCategoryPurge.isPending}
+                  onClick={() => askConfirm('Remove the previewed sources from saved excluded categories? Cards with no remaining source will be deleted.', () => applyExcludedCategoryPurge.mutate(excludeCategoriesProviderId))}
+                >
+                  {applyExcludedCategoryPurge.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Apply cleanup'}
+                </Button>
+              )}
               <Button
                 size="sm"
-                disabled={setProviderImportExcludeCategories.isPending}
-                onClick={() => setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: Array.from(excludeCategoriesDraft), exclude_uncategorized: excludeUncategorizedDraft })}
+                disabled={!selectedProvider || previewProviderCategoryExclusions.isPending || setProviderImportExcludeCategories.isPending || (previewIsCurrent && excludeCategoriesPreviewSaved)}
+                onClick={() => {
+                  if (previewIsCurrent && excludeCategoriesPreview) {
+                    setProviderImportExcludeCategories.mutate({ id: excludeCategoriesProviderId, category_names: excludeCategoriesPreview.proposed_category_names, exclude_uncategorized: excludeCategoriesPreview.proposed_exclude_uncategorized })
+                  } else if (selectedProvider?.provider_type === 'xc') {
+                    previewProviderCategoryExclusions.mutate({ id: excludeCategoriesProviderId, category_names: proposedNames, exclude_uncategorized: excludeUncategorizedDraft })
+                  } else {
+                    setExcludeCategoriesPreview({ dry_run: true, provider_id: excludeCategoriesProviderId, saved_category_names: selectedProvider?.import_exclude_categories ?? [], saved_exclude_uncategorized: !!selectedProvider?.import_exclude_uncategorized, proposed_category_names: proposedNames, proposed_exclude_uncategorized: excludeUncategorizedDraft, movie_sources_removed: 0, series_sources_removed: 0, episode_sources_removed: 0, movies_deleted: 0, series_deleted: 0, sample_movies: [], sample_series: [] })
+                    setExcludeCategoriesPreviewSaved(false)
+                  }
+                }}
               >
-                {setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+                {previewProviderCategoryExclusions.isPending || setProviderImportExcludeCategories.isPending ? <Loader2 size={12} className="animate-spin" /> : previewIsCurrent ? excludeCategoriesPreviewSaved ? 'Saved' : 'Confirm & save exclusions' : 'Preview changes'}
               </Button>
             </div>
           </div>

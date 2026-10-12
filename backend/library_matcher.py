@@ -23,8 +23,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-import httpx
-
+import tmdb_store
 import tmdb_sync
 import vod_db
 from config import get_tmdb_api_key
@@ -95,28 +94,42 @@ async def _search(query: str, content_type: str, year: int | None) -> list[Candi
     if not api_key:
         raise ValueError("TMDB API key not configured")
     endpoint = "movie" if content_type == "movie" else "tv"
+    # Local library first; only trusted when an exact-name hit also agrees on year.
+    hits = await tmdb_sync.search_local(endpoint, query, year)
+    if hits and (year is None or any(
+        h["exact"] and h["year"] is not None and abs(h["year"] - year) <= 1 for h in hits
+    )):
+        return _to_candidates([tmdb_sync.as_search_item(endpoint, h) for h in hits], content_type)
     params = {"api_key": api_key, "query": query}
     if year:
         params["year" if content_type == "movie" else "first_air_date_year"] = year
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        async with tmdb_sync._tmdb_semaphore:
-            r = await client.get(f"{tmdb_sync._API_BASE}/search/{endpoint}", params=params)
-        r.raise_for_status()
-        return _to_candidates(r.json().get("results", []), content_type)
+    async with tmdb_sync._tmdb_semaphore:
+        r = await tmdb_sync._tmdb_get(f"{tmdb_sync._API_BASE}/search/{endpoint}", params)
+    r.raise_for_status()
+    return _to_candidates(r.json().get("results", []), content_type)
 
 
 async def _lookup_by_imdb(imdb_id: str, content_type: str) -> Candidate | None:
     api_key = get_tmdb_api_key()
     if not api_key:
         raise ValueError("TMDB API key not configured")
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        async with tmdb_sync._tmdb_semaphore:
-            r = await client.get(
-                f"{tmdb_sync._API_BASE}/find/{imdb_id}",
-                params={"api_key": api_key, "external_source": "imdb_id"},
-            )
-        r.raise_for_status()
-        data = r.json()
+    endpoint = "movie" if content_type == "movie" else "tv"
+    if tmdb_sync.store_enabled():
+        try:
+            row = await asyncio.to_thread(tmdb_store.find_by_imdb, endpoint, imdb_id)
+        except Exception as exc:
+            logger.warning("[library_matcher] local IMDb lookup failed for %s: %s", imdb_id, exc)
+            row = None
+        if row and (row["title"] or row["original_title"]):
+            return Candidate(str(row["tmdb_id"]), row["title"] or row["original_title"], row["year"],
+                             float(row["popularity"] or 0.0))
+    async with tmdb_sync._tmdb_semaphore:
+        r = await tmdb_sync._tmdb_get(
+            f"{tmdb_sync._API_BASE}/find/{imdb_id}",
+            {"api_key": api_key, "external_source": "imdb_id"},
+        )
+    r.raise_for_status()
+    data = r.json()
     key = "movie_results" if content_type == "movie" else "tv_results"
     found = _to_candidates(data.get(key, []), content_type)
     return found[0] if found else None

@@ -434,6 +434,13 @@ never retroactively archives a category the provider was already reporting
 before you turned it on. Archived content stays archived on later imports
 until you turn the setting off.
 
+**Exclude Categories** (per provider) previews any change before it is saved:
+you see which categories are being added or allowed again and how many stored
+sources and cards would be affected, then confirm saving, and finally confirm a
+separate cleanup. Saved categories are skipped at import so they don't come back.
+
+![Exclude Categories preview](docs/screenshots/exclude-categories-modal.png)
+
 **Stream priority** (Curation & Maintenance → *Stream Priority*) controls
 which of a pool item's multiple real sources gets used first when more than
 one provider has the same content: by provider priority (today's default),
@@ -453,3 +460,8 @@ This product uses TMDB and the TMDB APIs but is not endorsed, certified, or othe
 You supply your own TMDB API key and are responsible for following
 [TMDB's API terms of use](https://www.themoviedb.org/api-terms-of-use) -- notably that information obtained from
 TMDB may not be cached for longer than 6 months.
+
+The optional local TMDB library is off by default (turn it on from the TMDB Library page). When enabled, it keeps details only for current
+catalog titles, refreshes them after 150 days, and automatically removes
+unreferenced or 170-day-old records. Its cleanup screen always provides a preview
+before deleting anything.

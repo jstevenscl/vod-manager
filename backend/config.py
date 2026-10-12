@@ -22,7 +22,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.2.24"
+APP_VERSION = "0.2.25"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -633,3 +633,32 @@ def set_credentials(username: str, password: str) -> None:
     hashed = _hash_password(password, salt)
     _update_raw(lambda data: data.update(
         {"auth_username": username, "auth_salt": salt, "auth_hash": hashed, "auth_scheme": "pbkdf2"}))
+
+
+# Local TMDB library (tmdb_store/tmdb_fill) -- opt-in: background fill only
+# runs once a TMDB API key is saved AND the library is turned on.
+_TMDB_STORE_DEFAULTS = {
+    "enabled": False,
+    "burst_size": 2000,
+    "bursts_per_day": 4,
+    "daily_budget": 20000,
+    "concurrency": 4,
+}
+
+
+def get_tmdb_store_settings() -> dict:
+    stored = _read_raw().get("tmdb_store") or {}
+    return {k: stored.get(k, v) for k, v in _TMDB_STORE_DEFAULTS.items()}
+
+
+def save_tmdb_store_settings(updates: dict) -> dict:
+    def mutate(data: dict) -> None:
+        current = {k: v for k, v in (data.get("tmdb_store") or {}).items() if k in _TMDB_STORE_DEFAULTS}
+        for key, value in updates.items():
+            if key not in _TMDB_STORE_DEFAULTS or value is None:
+                continue
+            current[key] = bool(value) if key == "enabled" else max(0, int(value))
+        data["tmdb_store"] = current
+
+    _update_raw(mutate)
+    return get_tmdb_store_settings()
