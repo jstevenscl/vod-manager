@@ -16,6 +16,7 @@ a new sync loop -- e.g. a future "trakt_list:" kind just needs its own
 fetch-and-normalize function plugged in here.
 """
 
+import asyncio
 import json
 import logging
 
@@ -47,6 +48,9 @@ async def _fetch_normalized_items(source: str) -> list[dict]:
         raw = await tmdb_sync.fetch_list_items(ref)
         return tmdb_sync.normalize_list_items(raw)
 
+    if kind == "tmdb_chart":
+        return await tmdb_sync.fetch_chart_items(ref)
+
     if kind == "mdblist":
         api_key = config.get_mdblist_api_key()
         if not api_key:
@@ -54,6 +58,63 @@ async def _fetch_normalized_items(source: str) -> list[dict]:
         return await mdblist_sync.fetch_list_items(api_key, ref)
 
     raise ValueError(f"unknown list source kind {kind!r}")
+
+
+def _match_items(items, category, source, matched_movie_ids, matched_series_ids, title_index) -> int:
+    """Match one source's items against the pool; returns how many weren't
+    found. title_index caches one normalized-title index per content type for
+    the whole sync (see vod_db.build_title_year_index)."""
+    unmatched = 0
+    for item in items:
+        media_type = item.get("media_type")
+        tmdb_id = item.get("tmdb_id")
+        if tmdb_id is None:
+            unmatched += 1
+            continue
+
+        if media_type == "movie" and category["content_type"] == "movie":
+            movie = vod_db.get_movie_by_tmdb_id(tmdb_id)
+            if not movie:
+                # Most pool movies never get a tmdb_id at import time --
+                # fall back to a normalized title+year match, backfilling
+                # the id on a hit so future syncs take the fast path.
+                title, year = item.get("title"), item.get("year")
+                if title and "movie" not in title_index:
+                    title_index["movie"] = vod_db.build_title_year_index("movie")
+                found = title and vod_db.lookup_title_year_index(title_index["movie"], title, year)
+                if found:
+                    movie = found
+                    logger.info(
+                        "[vod_list_sync] fallback match: pool movie id=%s (%r, year=%s) <- source=%s title=%r year=%s tmdb_id=%s",
+                        found["id"], found["name"], found["year"], source, title, year, tmdb_id,
+                    )
+                    vod_db.backfill_tmdb_id_if_missing("movie", found["id"], str(tmdb_id))
+            if movie:
+                matched_movie_ids.add(movie["id"])
+            else:
+                unmatched += 1
+        elif media_type == "tv" and category["content_type"] == "series":
+            series = vod_db.get_series_by_tmdb_id(tmdb_id)
+            if not series:
+                title, year = item.get("title"), item.get("year")
+                if title and "series" not in title_index:
+                    title_index["series"] = vod_db.build_title_year_index("series")
+                found = title and vod_db.lookup_title_year_index(title_index["series"], title, year)
+                if found:
+                    series = found
+                    logger.info(
+                        "[vod_list_sync] fallback match: pool series id=%s (%r, year=%s) <- source=%s title=%r year=%s tmdb_id=%s",
+                        found["id"], found["name"], found["year"], source, title, year, tmdb_id,
+                    )
+                    vod_db.backfill_tmdb_id_if_missing("series", found["id"], str(tmdb_id))
+            if series:
+                matched_series_ids.add(series["id"])
+            else:
+                unmatched += 1
+        # media_type not matching this category's content_type is silently
+        # skipped -- a movie-content category ignores TV entries in the same
+        # list and vice versa, rather than erroring.
+    return unmatched
 
 
 async def sync_category(category_id: int) -> dict:
@@ -76,6 +137,7 @@ async def sync_category(category_id: int) -> dict:
     matched_series_ids: set[int] = set()
     unmatched = 0
     list_total = 0
+    title_index: dict = {}
     source_errors: dict[str, str] = {}
 
     for source in sources:
@@ -87,53 +149,12 @@ async def sync_category(category_id: int) -> dict:
             continue
 
         list_total += len(items)
-        for item in items:
-            media_type = item.get("media_type")
-            tmdb_id = item.get("tmdb_id")
-            if tmdb_id is None:
-                unmatched += 1
-                continue
-
-            if media_type == "movie" and category["content_type"] == "movie":
-                movie = vod_db.get_movie_by_tmdb_id(tmdb_id)
-                if not movie:
-                    # Most pool movies never get a tmdb_id at import time --
-                    # fall back to a normalized title+year match, backfilling
-                    # the id on a hit so future syncs take the fast path.
-                    title, year = item.get("title"), item.get("year")
-                    found = title and vod_db.find_movie_by_title_year(title, year)
-                    if found:
-                        movie = found
-                        if not found.get("tmdb_id"):
-                            logger.info(
-                                "[vod_list_sync] fallback match: pool movie id=%s (%r, year=%s) <- source=%s title=%r year=%s tmdb_id=%s",
-                                found["id"], found["name"], found["year"], source, title, year, tmdb_id,
-                            )
-                            vod_db.backfill_tmdb_id_if_missing("movie", found["id"], str(tmdb_id))
-                if movie:
-                    matched_movie_ids.add(movie["id"])
-                else:
-                    unmatched += 1
-            elif media_type == "tv" and category["content_type"] == "series":
-                series = vod_db.get_series_by_tmdb_id(tmdb_id)
-                if not series:
-                    title, year = item.get("title"), item.get("year")
-                    found = title and vod_db.find_series_by_title_year(title, year)
-                    if found:
-                        series = found
-                        if not found.get("tmdb_id"):
-                            logger.info(
-                                "[vod_list_sync] fallback match: pool series id=%s (%r, year=%s) <- source=%s title=%r year=%s tmdb_id=%s",
-                                found["id"], found["name"], found["year"], source, title, year, tmdb_id,
-                            )
-                            vod_db.backfill_tmdb_id_if_missing("series", found["id"], str(tmdb_id))
-                if series:
-                    matched_series_ids.add(series["id"])
-                else:
-                    unmatched += 1
-            # media_type not matching this category's content_type is
-            # silently skipped -- a movie-content category ignores TV
-            # entries in the same list and vice versa, rather than erroring.
+        # Matching is a lot of synchronous SQLite + string work (thousands of
+        # entries against a catalog of hundreds of thousands); run it off the
+        # event loop so a big list can't freeze the whole server.
+        unmatched += await asyncio.to_thread(
+            _match_items, items, category, source, matched_movie_ids, matched_series_ids, title_index,
+        )
 
     if category["content_type"] == "movie":
         newly_placed = vod_db.bulk_place_movies_in_category(list(matched_movie_ids), category_id)

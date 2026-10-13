@@ -638,6 +638,10 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
+        -- list sync / enrichment / auto-merge look items up by tmdb_id one at a time;
+        -- without these each lookup was a full table scan.
+        CREATE INDEX IF NOT EXISTS idx_movies_tmdb_id ON movies(tmdb_id);
+        CREATE INDEX IF NOT EXISTS idx_series_tmdb_id ON series(tmdb_id);
         CREATE INDEX IF NOT EXISTS idx_episodes_series_season_ep ON episodes(series_id, season_number, episode_number);
         -- SQLite never auto-indexes a foreign key column (only the referenced
         -- side's PRIMARY KEY gets one) -- movie_id/episode_id had no index of
@@ -5585,6 +5589,35 @@ def find_series_by_title_year(title: str, year: int | None) -> dict | None:
     rows = conn.execute("SELECT id, name, year FROM series WHERE tmdb_id IS NULL").fetchall()
     conn.close()
     candidates = [r for r in rows if _normalize_title_for_dedup(r["name"]) == normalized]
+    if not candidates:
+        return None
+    if year is not None:
+        in_range = [r for r in candidates if r["year"] is not None and abs(r["year"] - year) <= 1]
+        if in_range:
+            candidates = in_range
+    return dict(candidates[0])
+
+
+def build_title_year_index(kind: str) -> dict[str, list[dict]]:
+    """normalized title -> [{id, name, year}] for every pool item with no
+    tmdb_id yet. List sync matches hundreds or thousands of list entries per
+    run; building this once per sync replaces find_*_by_title_year's full-table
+    read + normalize per entry (O(entries x pool), minutes on a large pool)."""
+    table = "movies" if kind == "movie" else "series"
+    conn = _connect()
+    try:
+        rows = conn.execute(f"SELECT id, name, year FROM {table} WHERE tmdb_id IS NULL").fetchall()
+    finally:
+        conn.close()
+    index: dict[str, list[dict]] = {}
+    for r in rows:
+        index.setdefault(_normalize_title_for_dedup(r["name"]), []).append(dict(r))
+    return index
+
+
+def lookup_title_year_index(index: dict[str, list[dict]], title: str, year: int | None) -> dict | None:
+    """Same rule as find_movie_by_title_year, against a prebuilt index."""
+    candidates = index.get(_normalize_title_for_dedup(title)) or []
     if not candidates:
         return None
     if year is not None:

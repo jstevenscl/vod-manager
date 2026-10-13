@@ -1699,6 +1699,43 @@ in your pool; neither pulls in anything new.
   [MDBList API key](https://mdblist.com) (Configuration → API Keys) unlocks
   MDBList as a second source kind, alongside TMDB Lists.
 
+**Finding a list's ID.** A TMDB List ID is the number at the end of a list's
+own page, `themoviedb.org/list/<number>`. Only user-made lists have one. An
+MDBList ID is the list's numeric ID, shown in the list's API/Info section on
+mdblist.com. Lists of any length are fetched in full (MDBList lists are read
+page by page).
+
+**TMDB charts.** TMDB's built-in browse pages — **Top Rated**, **Popular**,
+**Now Playing**, **Upcoming** (movies) and **Top Rated**, **Popular**,
+**Airing Today**, **On The Air** (TV) — are not lists and have no ID, so they
+have their own source type: in **List Sync**, choose **TMDB Chart** and pick
+one from the dropdown. TMDB keeps these charts current, so the category
+follows them on the normal list-sync schedule (use *Mirror* mode to also drop
+titles that fall off the chart). A chart source covers TMDB's top 500 entries.
+A movie chart fills a movie category and a TV chart a series category.
+
+> **Charts do not update on their own until you turn on List Sync.** Adding a
+> chart source and clicking **Sync now** fills the category once; after that it
+> only changes when you click **Sync now** again. To keep it current
+> automatically, set **Configuration → Refresh Schedule → List Sync (hrs)** to
+> how often it should re-check (e.g. `24` for daily — charts move slowly, so
+> daily is plenty). That one setting applies to every category linked to a
+> TMDB List, MDBList list or TMDB chart; it is blank (off) by default.
+>
+> **Titles that drop off the chart are not removed unless the category is in
+> Mirror mode.** In the default **Add only** mode a sync only ever adds, so the
+> category slowly accumulates everything that has ever been on the chart. Set
+> the category's **On sync** mode to **Mirror (also removes)** (next to its
+> sources) to have it track the chart exactly: anything no longer on the chart
+> is removed on the next sync — including titles you placed by hand, so use
+> Mirror only for categories that exist to reflect their sources. A sync where
+> any source failed to load never removes anything.
+>
+> For a "stays up to date with Top Rated" category: add the chart, choose
+> **Mirror**, and set **List Sync (hrs)**.
+
+![TMDB Chart as a List Sync source](docs/screenshots/category-list-sync-tmdb-chart.png)
+
 ![Multi-source List Sync on a category, with the Add only / Mirror mode picker](docs/screenshots/category-list-sync-mirror-mode.jpg)
 
 Both matching engines work the same way: each list entry's own TMDB id is
@@ -1729,8 +1766,10 @@ page a provider's API returns.
   reconfirmed is gone."
 
 A manual **Sync now** on the category runs immediately; **Configuration →
-Refresh Schedule → List Sync** controls how often it happens automatically
-(off by default).
+Refresh Schedule → List Sync (hrs)** controls how often every list-sourced
+category (TMDB List, MDBList or TMDB chart) re-syncs automatically — **blank
+means off**, the default, in which case categories only update when you click
+**Sync now**.
 
 ---
 

@@ -886,7 +886,7 @@ async def _emby_heartbeat_loop(
 
 
 _UPSTREAM_XC_PATH_RE = re.compile(r"/(live|movie|series)/[^/\s\"]+/[^/\s\"]+/")
-_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_key|username|password)=[^&\s\"]*", re.IGNORECASE)
+_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_?key|username|password)=[^&\s\"]*", re.IGNORECASE)
 
 
 def _redact_upstream_url(url: str) -> str:

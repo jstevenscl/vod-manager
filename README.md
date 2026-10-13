@@ -35,7 +35,7 @@ concise technical reference for people already up and running.
   provider that rate-limits aggressively), the year-review/missing-artwork
   disambiguation flows, and category List Sync; not required for basic operation
 - Optional: a free [MDBList](https://mdblist.com) API key — a second public
-  list source for category List Sync, alongside TMDB Lists
+  list source for category List Sync, alongside TMDB Lists and charts
 - Optional: an API key from Anthropic, OpenAI, and/or Google (Gemini) for
   the AI-assisted features (any one is enough; more than one lets you
   switch providers without re-entering a key)
@@ -406,15 +406,22 @@ flag; fix the actual mismatch (rename, re-match TMDB, move/remove the wrong
 source) from the item itself first.
 
 **Category List Sync** (Manage Categories → the list icon on any category)
-auto-populates a category from one or more public lists — a TMDB List
-and/or an MDBList list, mixed freely on the same category — matching each
+auto-populates a category from one or more public lists — a TMDB List,
+an MDBList list, or one of TMDB's built-in charts (Top Rated, Popular, …),
+mixed freely on the same category — matching each
 list entry against your pool by TMDB id first, falling back to a forgiving
 title+year match. Two sync modes: **Add only** (default) never removes
 anything already placed, for a curated category you're still hand-tuning;
 **Mirror** also removes anything no longer on any linked list, keeping the
 category an exact reflection of its source(s) (e.g. a "Top 100" list that
 cycles over time) — skipped for that pass if any linked source's fetch
-fails, so a transient error never looks like "everything's gone."
+fails, so a transient error never looks like "everything's gone." Lists of
+any length are fetched in full. A category only re-syncs on its own once you set
+Configuration → Refresh Schedule → **List Sync (hrs)** (blank = off, the default;
+otherwise use **Sync now**), and titles that drop off a list or chart are only
+removed in **Mirror** mode.
+
+![TMDB Chart as a List Sync source](docs/screenshots/category-list-sync-tmdb-chart.png)
 
 **Auto-create categories** (per provider, Providers → *Auto-create
 categories*) creates a Smart Category for every distinct category name a

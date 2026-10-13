@@ -178,6 +178,51 @@ async def fetch_list_items(list_id: str) -> list[dict]:
     return items
 
 
+# TMDB's built-in browse charts ("Top Rated", "Popular", ...). They are not
+# user lists (no list id), but they are live: TMDB recomputes them continuously,
+# so a category linked to one stays current on the normal list-sync schedule.
+CHARTS = {
+    "movie/top_rated": "Top Rated Movies",
+    "movie/popular": "Popular Movies",
+    "movie/now_playing": "Now Playing Movies",
+    "movie/upcoming": "Upcoming Movies",
+    "tv/top_rated": "Top Rated TV Shows",
+    "tv/popular": "Popular TV Shows",
+    "tv/airing_today": "TV Airing Today",
+    "tv/on_the_air": "TV On The Air",
+}
+# 20 results per page; 25 pages = the top 500, plenty for a curated category
+# and a bounded number of requests per sync.
+_CHART_MAX_PAGES = 25
+
+
+async def fetch_chart_items(chart: str) -> list[dict]:
+    """GET /movie|tv/{top_rated,popular,...}, paginated, returned already in
+    the common normalized list-item shape."""
+    if chart not in CHARTS:
+        raise ValueError(f"unknown TMDB chart {chart!r}")
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        raise ValueError("TMDB API key not configured")
+    media_type = chart.split("/", 1)[0]
+    raw: list[dict] = []
+    page = 1
+    total_pages = 1
+    while page <= min(total_pages, _CHART_MAX_PAGES):
+        async with _tmdb_semaphore:
+            r = await _tmdb_get(f"{_API_BASE}/{chart}", params={"api_key": api_key, "page": page})
+        r.raise_for_status()
+        data = r.json()
+        total_pages = int(data.get("total_pages") or 1)
+        results = data.get("results") or []
+        if not results:
+            break
+        for item in results:
+            raw.append({**item, "media_type": media_type})
+        page += 1
+    return normalize_list_items(raw)
+
+
 def normalize_list_items(raw_items: list[dict]) -> list[dict]:
     """TMDB's own /list/{id} item shape (media_type, id, title/
     original_title, release_date, name/original_name, first_air_date) ->

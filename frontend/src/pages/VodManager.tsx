@@ -3426,7 +3426,16 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
   // sources directly to any existing category (custom or smart), with an
   // add_only/mirror mode toggle -- see vod_list_sync.py's module docstring.
   const [listSyncOpenId, setListSyncOpenId] = useState<number | null>(null)
-  const [newSourceKind, setNewSourceKind] = useState<'tmdb_list' | 'mdblist'>('tmdb_list')
+  const [newSourceKind, setNewSourceKind] = useState<'tmdb_list' | 'mdblist' | 'tmdb_chart'>('tmdb_list')
+  // TMDB's built-in browse charts -- live, so a category linked to one stays
+  // current on the normal list-sync schedule (see tmdb_sync.CHARTS).
+  const TMDB_CHARTS: Record<string, string> = {
+    'movie/top_rated': 'Top Rated Movies', 'movie/popular': 'Popular Movies',
+    'movie/now_playing': 'Now Playing Movies', 'movie/upcoming': 'Upcoming Movies',
+    'tv/top_rated': 'Top Rated TV Shows', 'tv/popular': 'Popular TV Shows',
+    'tv/airing_today': 'TV Airing Today', 'tv/on_the_air': 'TV On The Air',
+  }
+  const sourceLabel = (s: string) => (s.startsWith('tmdb_chart:') ? `TMDB chart: ${TMDB_CHARTS[s.slice(11)] ?? s.slice(11)}` : s)
   const [newSourceRef, setNewSourceRef] = useState('')
   const setSyncSources = useMutation({
     mutationFn: ({ id, sources }: { id: number; sources: string[] }) =>
@@ -3696,7 +3705,7 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
               <li className="rounded border border-border/50 bg-muted/20 p-2 space-y-1.5">
                 {parseCategorySources(c).map((s) => (
                   <span key={s} className="inline-flex items-center gap-1 mr-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground border border-border">
-                    {s}
+                    {sourceLabel(s)}
                     <button
                       title="Remove this source"
                       className="hover:text-destructive"
@@ -3708,16 +3717,30 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 ))}
                 {parseCategorySources(c).length === 0 && <p className="text-muted-foreground">No list sources linked yet.</p>}
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <select className={inputCls('w-24')} value={newSourceKind} onChange={(e) => setNewSourceKind(e.target.value as 'tmdb_list' | 'mdblist')}>
+                  <select className={inputCls('w-24')} value={newSourceKind} onChange={(e) => { setNewSourceKind(e.target.value as 'tmdb_list' | 'mdblist' | 'tmdb_chart'); setNewSourceRef('') }}>
                     <option value="tmdb_list">TMDB List</option>
+                    <option value="tmdb_chart">TMDB Chart</option>
                     <option value="mdblist">MDBList</option>
                   </select>
-                  <input
-                    className={inputCls('w-28')}
-                    placeholder={newSourceKind === 'tmdb_list' ? 'TMDB List ID' : 'MDBList List ID'}
-                    value={newSourceRef}
-                    onChange={(e) => setNewSourceRef(e.target.value)}
-                  />
+                  {newSourceKind === 'tmdb_chart' ? (
+                    <select className={inputCls('w-44')} value={newSourceRef} onChange={(e) => setNewSourceRef(e.target.value)}>
+                      <option value="">Choose a chart…</option>
+                      {Object.entries(TMDB_CHARTS).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+                    </select>
+                  ) : (
+                    <input
+                      className={inputCls('w-28')}
+                      placeholder={newSourceKind === 'tmdb_list' ? 'TMDB List ID' : 'MDBList List ID'}
+                      value={newSourceRef}
+                      onChange={(e) => setNewSourceRef(e.target.value)}
+                    />
+                  )}
+                  {newSourceKind === 'tmdb_chart' && (
+                    <p className="basis-full text-[10px] text-muted-foreground">
+                      A chart only updates when you click Sync now, unless you set <b>List Sync (hrs)</b> under Configuration → Refresh Schedule.
+                      Set the mode below to <b>Mirror</b> to also drop titles that fall off the chart.
+                    </p>
+                  )}
                   <Button
                     size="sm"
                     disabled={!newSourceRef.trim() || setSyncSources.isPending}
@@ -6879,8 +6902,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 onChange={(e) => setRefreshForm({ ...refreshValues, enrichment_ttl_hours: e.target.value })}
               />
             </label>
-            <label className="flex items-center gap-1.5 text-xs">
-              TMDB Lists sync (hrs)
+            <label
+              className="flex items-center gap-1.5 text-xs"
+              title="How often categories linked to a TMDB List, MDBList list or TMDB chart re-sync on their own. Blank = off: they only update when you click Sync now."
+            >
+              List Sync (hrs)
               <input
                 className={inputCls('w-16')}
                 type="number" min={0.02} step="1"
@@ -6902,7 +6928,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           {refreshForm && (
             <Button size="sm" variant="outline" onClick={() => setRefreshForm(null)}>Cancel</Button>
           )}
-          <span className="text-xs text-muted-foreground">Leave TMDB Lists sync blank to keep it manual-only.</span>
+          <span className="text-xs text-muted-foreground">Leave List Sync blank to keep it manual-only.</span>
         </div>
       </SectionCard>
 

@@ -20,6 +20,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.mdblist.com"
+_PAGE_SIZE = 500
+_MAX_PAGES = 100
 _API_KEY_RE = re.compile(r"(apikey=)[^&\s'\"]+")
 
 
@@ -37,26 +39,38 @@ async def fetch_list_items(api_key: str, list_id: str) -> list[dict]:
     which provider a source came from. Raises on a bad key/id/network
     failure rather than returning an empty list, so a broken source is an
     obvious sync error, not a silent zero-match no-op."""
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        try:
-            r = await client.get(
-                f"{_API_BASE}/lists/{list_id}/items",
-                params={"apikey": api_key, "limit": 500},
-            )
-            r.raise_for_status()
-        except Exception as exc:
-            raise ValueError(f"MDBList request failed: {_redact(exc)}") from exc
-        data = r.json()
-
     out: list[dict] = []
-    for media_type, bucket_key in (("movie", "movies"), ("tv", "shows")):
-        for item in data.get(bucket_key, []) or []:
-            ids = item.get("ids") or {}
-            tmdb_id = ids.get("tmdb")
-            out.append({
-                "media_type": media_type,
-                "tmdb_id": int(tmdb_id) if isinstance(tmdb_id, (int, float)) else None,
-                "title": item.get("title"),
-                "year": item.get("release_year"),
-            })
+    offset = 0
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        # One call returns at most `limit` items, so a list longer than that
+        # was silently truncated (GH report: a 535-item list imported 500).
+        # X-Has-More says whether another page exists; the page cap is only a
+        # runaway guard (50k items, MDBList's own largest per-list limit).
+        for _ in range(_MAX_PAGES):
+            try:
+                r = await client.get(
+                    f"{_API_BASE}/lists/{list_id}/items",
+                    params={"apikey": api_key, "limit": _PAGE_SIZE, "offset": offset},
+                )
+                r.raise_for_status()
+            except Exception as exc:
+                raise ValueError(f"MDBList request failed: {_redact(exc)}") from exc
+            data = r.json()
+
+            page_count = 0
+            for media_type, bucket_key in (("movie", "movies"), ("tv", "shows")):
+                for item in data.get(bucket_key, []) or []:
+                    page_count += 1
+                    ids = item.get("ids") or {}
+                    tmdb_id = ids.get("tmdb")
+                    out.append({
+                        "media_type": media_type,
+                        "tmdb_id": int(tmdb_id) if isinstance(tmdb_id, (int, float)) else None,
+                        "title": item.get("title"),
+                        "year": item.get("release_year"),
+                    })
+            has_more = str(r.headers.get("X-Has-More", "")).strip().lower() == "true"
+            if not has_more or page_count == 0:
+                break
+            offset += page_count
     return out
