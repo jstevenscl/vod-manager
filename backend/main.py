@@ -13,13 +13,14 @@ from fastapi.staticfiles import StaticFiles
 
 import ai_assist
 from backup import router as backup_router
-from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, save_last_enrichment_run
+from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, get_strm_export_settings, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
 import library_importer
 import rclone_client
 import plex_importer
+import strm_export
 import tmdb_fill
 from portal_routes import router as portal_router
 from routes import router
@@ -457,6 +458,24 @@ async def _tmdb_sync_scheduler() -> None:
         await asyncio.sleep(interval)
 
 
+async def _strm_export_scheduler() -> None:
+    """Re-runs the .strm export every `interval_hours` (Emby / Jellyfin export
+    settings; 0 = off, manual Export now only). Polls every few minutes so a
+    changed interval takes effect without a restart."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            settings = get_strm_export_settings()
+            hours = settings.get("interval_hours") or 0
+            last = strm_export.get_status().get("last_run_at") or 0
+            if hours and strm_export.validate_settings(settings) is None and time.time() - last >= hours * 3600:
+                result = await asyncio.to_thread(strm_export.run_tracked_export, settings, False)
+                logger.info("[strm_export] scheduled export: %s", result)
+        except Exception as exc:
+            logger.warning("[strm_export] scheduled export failed: %s", exc)
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("VOD Manager started")
@@ -465,6 +484,7 @@ async def lifespan(app: FastAPI):
         logger.info("Closed %d Sync History run(s) interrupted by the previous process", closed)
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
+        asyncio.create_task(_strm_export_scheduler()),
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),

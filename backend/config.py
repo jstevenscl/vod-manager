@@ -327,6 +327,27 @@ def save_stream_priority_mode(mode: str) -> None:
 # user adopt TMDB's own title into the pool) instead of requiring a second,
 # separate title-source toggle.
 
+# ── .strm export for Emby / Jellyfin (see strm_export.py) ────────────────────
+
+_STRM_EXPORT_DEFAULTS = {
+    "output_dir": "", "base_url": "", "xc_client_id": None,
+    "include_movies": True, "include_series": True, "include_unmatched": False,
+    "mirror": True, "interval_hours": 0,
+}
+
+
+def get_strm_export_settings() -> dict:
+    saved = _read_raw().get("strm_export") or {}
+    out = {**_STRM_EXPORT_DEFAULTS, **{k: saved[k] for k in _STRM_EXPORT_DEFAULTS if k in saved}}
+    out["interval_hours"] = max(0, int(out["interval_hours"] or 0))
+    return out
+
+
+def save_strm_export_settings(settings: dict) -> None:
+    clean = {k: settings[k] for k in _STRM_EXPORT_DEFAULTS if k in settings}
+    _update_raw(lambda data: data.__setitem__("strm_export", {**(data.get("strm_export") or {}), **clean}))
+
+
 def get_xc_title_include_year() -> bool:
     return bool(_read_raw().get("xc_title_include_year", False))
 

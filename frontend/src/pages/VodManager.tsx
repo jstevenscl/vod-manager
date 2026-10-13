@@ -4539,6 +4539,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
 
 
+  // ── Emby / Jellyfin .strm export (strm_export.py) ──
+  type StrmSettings = { output_dir: string; base_url: string; xc_client_id: number | null; include_movies: boolean; include_series: boolean; include_unmatched: boolean; mirror: boolean; interval_hours: number }
+  type StrmResult = { dry_run: boolean; total: number; movies: number; series: number; episodes: number; skipped_no_tmdb: number; written: number; updated: number; unchanged: number; removed: number }
+  type StrmStatus = { running: boolean; last_run_at: number | null; last_error: string | null; last_result: StrmResult | null }
+  const strmQuery = useQuery<{ settings: StrmSettings; status: StrmStatus }>({
+    queryKey: ['vod-strm-export'],
+    queryFn: () => api.get('/vod/strm-export/').then((r) => r.data),
+    enabled: activeTab === 'config',
+    refetchInterval: (query) => (query.state.data?.status.running ? 2000 : false),
+  })
+  const [strmDraft, setStrmDraft] = useState<StrmSettings | null>(null)
+  const [strmPreview, setStrmPreview] = useState<StrmResult | null>(null)
+  const [strmError, setStrmError] = useState<string | null>(null)
+  useEffect(() => { if (strmQuery.data && !strmDraft) setStrmDraft(strmQuery.data.settings) }, [strmQuery.data, strmDraft])
+  const strmErrorText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
+  const saveStrmSettings = useMutation({
+    mutationFn: (settings: StrmSettings) => api.post('/vod/strm-export/settings/', settings),
+    onSuccess: () => { setStrmError(null); qc.invalidateQueries({ queryKey: ['vod-strm-export'] }) },
+    onError: (e: any) => setStrmError(strmErrorText(e)),
+  })
+  const runStrmExport = useMutation({
+    mutationFn: async (v: { dryRun: boolean }) => {
+      if (strmDraft) await api.post('/vod/strm-export/settings/', strmDraft)
+      return api.post('/vod/strm-export/run/', null, { params: { dry_run: v.dryRun } }).then((r) => r.data as StrmResult)
+    },
+    onSuccess: (result, v) => {
+      setStrmError(null)
+      setStrmPreview(result)
+      if (!v.dryRun) qc.invalidateQueries({ queryKey: ['vod-strm-export'] })
+    },
+    onError: (e: any) => { setStrmPreview(null); setStrmError(strmErrorText(e)) },
+  })
+
   // ── Connected Instances (per-instance XC credentials) ──
   const xcClientsQuery = useQuery<XcClient[]>({
     queryKey: ['vod-xc-clients'],
@@ -7260,6 +7293,66 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {createXcClient.isPending ? <Loader2 size={12} className="animate-spin" /> : <><Plus size={12} className="mr-1" />Add</>}
           </Button>
         </div>
+      </SectionCard>
+
+      <SectionCard title="Emby / Jellyfin Library (.strm export)" icon={<HardDriveDownload size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Emby and Jellyfin can't use the Xtream (XC) API for movies and shows, but they can scan a folder. This writes your
+          curated library as small <code>.strm</code> files (one stream URL each, named the way Emby/Jellyfin expect, with the
+          TMDB id in the folder name) into a folder you mount into the media server. Playback still goes through VOD Manager,
+          so source failover keeps working. Only items placed in an active category are exported.
+        </p>
+        {strmDraft && (
+          <div className="space-y-2 text-xs">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input className={inputCls('w-72')} placeholder="Output folder inside this container, e.g. /strm" value={strmDraft.output_dir} onChange={(e) => setStrmDraft({ ...strmDraft, output_dir: e.target.value })} />
+              <input className={inputCls('w-72')} placeholder="URL Emby uses to reach VOD Manager, e.g. http://192.168.1.10:8282" value={strmDraft.base_url} onChange={(e) => setStrmDraft({ ...strmDraft, base_url: e.target.value })} />
+              <select className={inputCls()} value={strmDraft.xc_client_id ?? ''} onChange={(e) => setStrmDraft({ ...strmDraft, xc_client_id: e.target.value ? Number(e.target.value) : null })}>
+                <option value="">Choose the XC user for the URLs…</option>
+                {(xcClientsQuery.data ?? []).filter((c) => c.enabled).map((c) => <option key={c.id} value={c.id}>{c.label}{c.category_allowlist ? ' (limited categories)' : ''}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={strmDraft.include_movies} onChange={(e) => setStrmDraft({ ...strmDraft, include_movies: e.target.checked })} />Movies</label>
+              <label className="flex items-center gap-1"><input type="checkbox" checked={strmDraft.include_series} onChange={(e) => setStrmDraft({ ...strmDraft, include_series: e.target.checked })} />TV Shows</label>
+              <label className="flex items-center gap-1" title="Items without a confirmed TMDB id are skipped by default, because Emby matches them poorly. Turn this on to put them in an Unmatched folder instead."><input type="checkbox" checked={strmDraft.include_unmatched} onChange={(e) => setStrmDraft({ ...strmDraft, include_unmatched: e.target.checked })} />Include items with no TMDB id</label>
+              <label className="flex items-center gap-1" title="Delete .strm files for items that are no longer in the library (only .strm files this export manages are ever removed)."><input type="checkbox" checked={strmDraft.mirror} onChange={(e) => setStrmDraft({ ...strmDraft, mirror: e.target.checked })} />Remove files for items that left the library</label>
+              <label className="flex items-center gap-1">Auto-export every
+                <input className={inputCls('w-14')} type="number" min={0} value={strmDraft.interval_hours} onChange={(e) => setStrmDraft({ ...strmDraft, interval_hours: Math.max(0, Number(e.target.value) || 0) })} />
+                hrs (0 = manual only)
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button size="sm" variant="outline" disabled={saveStrmSettings.isPending} onClick={() => saveStrmSettings.mutate(strmDraft)}>
+                {saveStrmSettings.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save settings'}
+              </Button>
+              <Button size="sm" variant="outline" disabled={runStrmExport.isPending || !!strmQuery.data?.status.running} onClick={() => runStrmExport.mutate({ dryRun: true })}>
+                Preview
+              </Button>
+              <Button size="sm" disabled={runStrmExport.isPending || !!strmQuery.data?.status.running} onClick={() => runStrmExport.mutate({ dryRun: false })}>
+                {runStrmExport.isPending || strmQuery.data?.status.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <HardDriveDownload size={12} className="mr-1" />}Export now
+              </Button>
+            </div>
+            {strmError && <p className="text-destructive">{strmError}</p>}
+            {strmPreview && (
+              <p className="text-muted-foreground">
+                {strmPreview.dry_run ? 'Preview — nothing written: ' : 'Exported: '}
+                {strmPreview.movies} movie(s), {strmPreview.episodes} episode(s) across {strmPreview.series} show(s) —
+                {' '}{strmPreview.written} new, {strmPreview.updated} updated, {strmPreview.unchanged} unchanged, {strmPreview.removed} removed
+                {strmPreview.skipped_no_tmdb > 0 ? `; ${strmPreview.skipped_no_tmdb} skipped (no TMDB id)` : ''}.
+              </p>
+            )}
+            {strmQuery.data?.status.last_error && <p className="text-destructive">Last scheduled/manual export failed: {strmQuery.data.status.last_error}</p>}
+            {strmQuery.data?.status.last_run_at && !strmQuery.data.status.last_error && (
+              <p className="text-muted-foreground">Last export: {new Date(strmQuery.data.status.last_run_at * 1000).toLocaleString()}.</p>
+            )}
+            <p className="text-muted-foreground">
+              Use a dedicated XC user (Connected Instances above) — its username and password are written into every .strm file. If you give it an IP
+              allowlist, include the media server's address. Mount the output folder into both this container and Emby/Jellyfin, then add its
+              <code> Movies</code> and <code> Shows</code> folders as libraries.
+            </p>
+          </div>
+        )}
       </SectionCard>
 
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>

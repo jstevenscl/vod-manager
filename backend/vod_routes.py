@@ -8,6 +8,8 @@ from pydantic import BaseModel
 
 from auth import verify_session
 from config import (
+    get_strm_export_settings,
+    save_strm_export_settings as _save_strm_export_settings,
     get_ai_model,
     get_ai_provider,
     get_anthropic_api_key,
@@ -59,6 +61,7 @@ import rclone_client
 import plex_client
 import plex_importer
 import portal_auth
+import strm_export
 import tmdb_sync
 import vod_bulk_ai_service
 import vod_db
@@ -3804,6 +3807,45 @@ async def apply_tmdb_title_series(series_id: int):
     if "merged_into" in result:
         vod_db.backfill_tmdb_id_if_missing("series", result["merged_into"], series["tmdb_id"])
     return result
+
+
+class StrmExportSettingsRequest(BaseModel):
+    output_dir: str = ""
+    base_url: str = ""
+    xc_client_id: Optional[int] = None
+    include_movies: bool = True
+    include_series: bool = True
+    include_unmatched: bool = False
+    mirror: bool = True
+    interval_hours: int = 0
+
+
+@router.get("/strm-export/", dependencies=_GUARDS)
+async def get_strm_export():
+    return {"settings": get_strm_export_settings(), "status": strm_export.get_status()}
+
+
+@router.post("/strm-export/settings/", dependencies=_GUARDS)
+async def save_strm_export_settings(body: StrmExportSettingsRequest):
+    settings = body.model_dump()
+    settings["output_dir"] = settings["output_dir"].strip()
+    settings["base_url"] = settings["base_url"].strip().rstrip("/")
+    settings["interval_hours"] = max(0, settings["interval_hours"])
+    _save_strm_export_settings(settings)
+    return {"settings": get_strm_export_settings()}
+
+
+@router.post("/strm-export/run/", dependencies=_GUARDS)
+async def run_strm_export(dry_run: bool = False):
+    """dry_run=true reports what would be written/removed without touching disk."""
+    try:
+        return await asyncio.to_thread(strm_export.run_tracked_export, None, dry_run)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(500, detail=f"Couldn't write to the output folder: {exc}")
 
 
 @router.post("/series/{series_id}/tmdb-episode-titles/", dependencies=_GUARDS)
