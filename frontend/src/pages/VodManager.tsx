@@ -5269,6 +5269,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0',
     provider_type: 'xc' as 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library',
     library_backend: 'local' as LibraryBackend,
+    start_inactive: true,
   })
   const [libraryRemote, setLibraryRemote] = useState({
     host: '', port: '', share: '', domain: '', path: '',
@@ -5285,6 +5286,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       password: providerForm.password,
       max_streams: Number(providerForm.max_streams) || 0,
       priority: Number(providerForm.priority) || 0, provider_type: providerForm.provider_type,
+      is_active: !providerForm.start_inactive,
       library_backend: providerForm.provider_type === 'library' ? providerForm.library_backend : 'local',
       library_remote_config: isRemoteLibrary ? {
         host: libraryRemote.host || undefined, port: libraryRemote.port ? Number(libraryRemote.port) : undefined,
@@ -5296,7 +5298,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-providers'] })
-      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc', library_backend: 'local' })
+      setProviderForm({ name: '', base_url: '', username: '', password: '', max_streams: '0', priority: '0', provider_type: 'xc', library_backend: 'local', start_inactive: true })
       setLibraryRemote({ host: '', port: '', share: '', domain: '', path: '', bucket: '', region: '', endpoint: '', s3_provider: '', token: '', client_id: '' })
     },
   })
@@ -8530,6 +8532,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           )}
           <input className={inputCls('w-24')} type="number" placeholder="Max streams" value={providerForm.max_streams} onChange={(e) => setProviderForm({ ...providerForm, max_streams: e.target.value })} />
           <input className={inputCls('w-20')} type="number" placeholder="Priority" value={providerForm.priority} onChange={(e) => setProviderForm({ ...providerForm, priority: e.target.value })} />
+          <label
+            className="flex items-center gap-1 text-xs text-muted-foreground"
+            title="A provider that is Active is imported automatically on the scheduled refresh. Add it inactive, set up Exclude Categories, then activate it (or run Import yourself)."
+          >
+            <input type="checkbox" checked={providerForm.start_inactive} onChange={(e) => setProviderForm({ ...providerForm, start_inactive: e.target.checked })} />
+            Add as inactive
+          </label>
           <Button
             size="sm"
             disabled={
@@ -10518,14 +10527,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
-          {movieCategoryFilter != null && (
-            <span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-              Viewing: {movieCategories.find((c) => c.id === movieCategoryFilter)?.name ?? movieCategoryFilter}
-              <button title="Clear category filter" onClick={() => { setMovieCategoryFilter(null); setMovieOffset(0) }}>
-                <X size={12} />
-              </button>
-            </span>
-          )}
+          <select
+            className={inputCls()}
+            title="Show only the movies placed in a category"
+            value={movieCategoryFilter ?? ''}
+            onChange={(e) => { setMovieCategoryFilter(e.target.value ? Number(e.target.value) : null); setMovieSearch(''); setMovieOffset(0) }}
+          >
+            <option value="">All categories</option>
+            {movieCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
           {moviesQuery.data && <Pager total={moviesQuery.data.total} limit={MOVIE_LIMIT} offset={movieOffset} onOffset={setMovieOffset} />}
           <PageSizeSelect value={MOVIE_LIMIT} onChange={setMovieLimit} />
         </div>
@@ -10692,14 +10702,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
-          {seriesCategoryFilter != null && (
-            <span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-              Viewing: {seriesCategories.find((c) => c.id === seriesCategoryFilter)?.name ?? seriesCategoryFilter}
-              <button title="Clear category filter" onClick={() => { setSeriesCategoryFilter(null); setSeriesOffset(0) }}>
-                <X size={12} />
-              </button>
-            </span>
-          )}
+          <select
+            className={inputCls()}
+            title="Show only the TV shows placed in a category"
+            value={seriesCategoryFilter ?? ''}
+            onChange={(e) => { setSeriesCategoryFilter(e.target.value ? Number(e.target.value) : null); setSeriesSearch(''); setSeriesOffset(0) }}
+          >
+            <option value="">All categories</option>
+            {seriesCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
           {seriesQuery.data && <Pager total={seriesQuery.data.total} limit={SERIES_LIMIT} offset={seriesOffset} onOffset={setSeriesOffset} />}
           <PageSizeSelect value={SERIES_LIMIT} onChange={setSeriesLimit} />
         </div>

@@ -152,7 +152,7 @@ export default function App() {
           ? `TMDB: ${runtime.tmdb.done}/${runtime.tmdb.total}`
           : runtime?.enrichment.running
             ? `Enriching: ${runtime.enrichment.movies_done}/${runtime.enrichment.movies_total} movies · ${runtime.enrichment.series_done}/${runtime.enrichment.series_total} series`
-            : catalogFailed ? 'Import needs attention. Check the provider and retry.' : 'Idle'
+            : catalogFailed ? `Import failed for ${runtime?.import.provider_name ?? 'a provider'}${runtime?.import.error ? ` (${runtime.import.error})` : ''}. Check that provider in Providers and retry.` : 'Idle'
 
   useEffect(() => {
     if (isLoading) return

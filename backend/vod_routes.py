@@ -197,6 +197,10 @@ class ProviderRequest(BaseModel):
     max_streams: int = 0
     priority: int = 0
     provider_type: str = "xc"
+    # False = a NEW provider starts inactive, so the scheduled catalog refresh
+    # (which imports active providers) can't pull its whole catalog before the
+    # user has set up category exclusions. Ignored when updating an existing one.
+    is_active: bool = True
     library_backend: str = "local"
     # Backend-specific fields for a non-local library source (host, share,
     # port, bucket, region, endpoint, domain, ...) plus secret sub-fields
@@ -1270,10 +1274,13 @@ async def upsert_provider(body: ProviderRequest):
                 merged[key] = existing_secrets.get(key)
         remote_config = merged
 
+    is_new_provider = not any(p["name"] == body.name for p in vod_db.list_providers())
     provider_id = vod_db.upsert_provider(
         body.name, body.base_url, body.username, password, body.max_streams, body.priority, body.provider_type,
         library_backend=body.library_backend, library_remote_config=remote_config or None,
     )
+    if is_new_provider and not body.is_active:
+        vod_db.set_provider_active(provider_id, False)
 
     sync_error = None
     if body.provider_type == "library":
