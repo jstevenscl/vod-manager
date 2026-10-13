@@ -2775,6 +2775,19 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-series'] }),
   })
 
+  // Episode names from TMDB for just this one series. Always previews first
+  // (dry_run) so the user sees the counts before anything is written.
+  type EpisodeTitlesResult = { checked: number; renamed: number; no_change: number; skipped_existing: number; unmatched: number; examples: string[]; dry_run: boolean; mode: string }
+  const [episodeTitlesPanel, setEpisodeTitlesPanel] = useState<{ replace: boolean; result: EpisodeTitlesResult | null; applied: boolean } | null>(null)
+  const episodeTitlesRun = useMutation({
+    mutationFn: (v: { replace: boolean; dryRun: boolean }) =>
+      api.post(`/vod/series/${series.id}/tmdb-episode-titles/`, null, { params: { mode: v.replace ? 'replace' : 'fill', dry_run: v.dryRun } }).then((r) => r.data as EpisodeTitlesResult),
+    onSuccess: (result, v) => {
+      setEpisodeTitlesPanel({ replace: v.replace, result, applied: !v.dryRun })
+      if (!v.dryRun) qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+  })
+
   // See Movie's identical clearTmdbId -- same reasoning (GH issue #6).
   const clearTmdbId = useMutation({
     mutationFn: () => api.post(`/vod/series/${series.id}/tmdb-id/clear/`),
@@ -2928,6 +2941,14 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   {useTmdbTitle.isPending ? <Loader2 size={11} className="animate-spin inline" /> : 'Use TMDB title'}
                 </button>
                 <button
+                  className="text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+                  title="Preview, then set this series' episode names from TMDB (matched by season + episode number). Only this series is affected."
+                  disabled={episodeTitlesRun.isPending}
+                  onClick={() => { setEpisodeTitlesPanel({ replace: false, result: null, applied: false }); episodeTitlesRun.mutate({ replace: false, dryRun: true }) }}
+                >
+                  Use TMDB episode titles
+                </button>
+                <button
                   className="text-muted-foreground hover:text-destructive underline decoration-dotted disabled:opacity-50"
                   title="Clear this series' TMDB match if it's wrong -- leaves name/year/episodes/poster untouched"
                   disabled={clearTmdbId.isPending}
@@ -2965,6 +2986,48 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         )}
         {rename.isError && <p className="text-destructive">{(rename.error as any)?.response?.data?.detail ?? 'Rename failed'}</p>}
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
+        {episodeTitlesRun.isError && <p className="text-destructive">{(episodeTitlesRun.error as any)?.response?.data?.detail ?? 'TMDB episode titles failed'}</p>}
+        {episodeTitlesPanel && (
+          <div className="rounded border border-border/60 p-2 space-y-1.5">
+            <p className="font-medium">TMDB episode titles — this series only</p>
+            {episodeTitlesRun.isPending && !episodeTitlesPanel.result && <p className="text-muted-foreground"><Loader2 size={11} className="animate-spin inline mr-1" />Checking TMDB…</p>}
+            {episodeTitlesPanel.result && (
+              <>
+                <p>
+                  {episodeTitlesPanel.applied ? 'Renamed' : 'Would rename'} {episodeTitlesPanel.result.renamed} of {episodeTitlesPanel.result.checked} episode(s)
+                  {' '}— {episodeTitlesPanel.result.no_change} already match
+                  {episodeTitlesPanel.result.skipped_existing > 0 ? `, ${episodeTitlesPanel.result.skipped_existing} kept (already have a name)` : ''}
+                  {episodeTitlesPanel.result.unmatched > 0 ? `, ${episodeTitlesPanel.result.unmatched} not on TMDB (left alone)` : ''}.
+                </p>
+                {episodeTitlesPanel.result.examples.length > 0 && (
+                  <ul className="text-muted-foreground list-disc pl-4">
+                    {episodeTitlesPanel.result.examples.map((ex) => <li key={ex}>{ex}</li>)}
+                  </ul>
+                )}
+              </>
+            )}
+            {!episodeTitlesPanel.applied && (
+              <label className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={episodeTitlesPanel.replace}
+                  disabled={episodeTitlesRun.isPending}
+                  onChange={(e) => episodeTitlesRun.mutate({ replace: e.target.checked, dryRun: true })}
+                />
+                Replace existing names too (default fills only blank / "Episode N" names)
+              </label>
+            )}
+            <div className="flex items-center gap-1.5">
+              {!episodeTitlesPanel.applied && (
+                <Button size="sm" disabled={episodeTitlesRun.isPending || !episodeTitlesPanel.result || episodeTitlesPanel.result.renamed === 0}
+                  onClick={() => episodeTitlesRun.mutate({ replace: episodeTitlesPanel.replace, dryRun: false })}>
+                  {episodeTitlesRun.isPending && episodeTitlesPanel.result ? <Loader2 size={11} className="animate-spin" /> : 'Apply'}
+                </Button>
+              )}
+              <Button size="sm" variant="outline" onClick={() => setEpisodeTitlesPanel(null)}>{episodeTitlesPanel.applied ? 'Done' : 'Cancel'}</Button>
+            </div>
+          </div>
+        )}
         {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
         {setTmdbId.isError && <p className="text-destructive">{(setTmdbId.error as any)?.response?.data?.detail ?? 'Set TMDB id failed'}</p>}
         <div className="flex items-center gap-1.5 mt-1">
@@ -5878,17 +5941,21 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const buildTmdbPairName = (template: string, label: string) =>
     template.includes(TMDB_TOKEN) ? template.split(TMDB_TOKEN).join(label) : `${template} — ${label}`
   const [tmdbListForm, setTmdbListForm] = useState({ list_id: '', name_template: '', movie_label: 'Movies', tv_label: 'TV Shows' })
-  const addTmdbList = useMutation({
+  const emptyListForm = { list_id: '', name_template: '', movie_label: 'Movies', tv_label: 'TV Shows' }
+  const makeAddListMutation = (kind: 'tmdb_list' | 'mdblist', form: typeof emptyListForm, reset: () => void) => ({
     mutationFn: async () => {
-      const syncSource = `tmdb_list:${tmdbListForm.list_id.trim()}`
-      await api.post('/vod/categories/', { name: buildTmdbPairName(tmdbListForm.name_template, tmdbListForm.movie_label), content_type: 'movie', is_smart: false, sync_source: syncSource })
-      await api.post('/vod/categories/', { name: buildTmdbPairName(tmdbListForm.name_template, tmdbListForm.tv_label), content_type: 'series', is_smart: false, sync_source: syncSource })
+      const syncSource = `${kind}:${form.list_id.trim()}`
+      await api.post('/vod/categories/', { name: buildTmdbPairName(form.name_template, form.movie_label), content_type: 'movie', is_smart: false, sync_source: syncSource })
+      await api.post('/vod/categories/', { name: buildTmdbPairName(form.name_template, form.tv_label), content_type: 'series', is_smart: false, sync_source: syncSource })
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-categories'] })
-      setTmdbListForm({ list_id: '', name_template: '', movie_label: 'Movies', tv_label: 'TV Shows' })
+      reset()
     },
   })
+  const addTmdbList = useMutation(makeAddListMutation('tmdb_list', tmdbListForm, () => setTmdbListForm(emptyListForm)))
+  const [mdblistForm, setMdblistForm] = useState(emptyListForm)
+  const addMdblist = useMutation(makeAddListMutation('mdblist', mdblistForm, () => setMdblistForm(emptyListForm)))
   const deleteCategory = useMutation({
     mutationFn: (id: number) => api.delete(`/vod/categories/${id}/`),
     onSuccess:  () => qc.invalidateQueries({ queryKey: ['vod-categories'] }),
@@ -6463,13 +6530,114 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
   const movieCategories  = categoriesQuery.data?.filter((c) => c.content_type === 'movie')  ?? []
   const seriesCategories = categoriesQuery.data?.filter((c) => c.content_type === 'series') ?? []
-  const tmdbGroups = Object.values(
-    (categoriesQuery.data ?? []).filter((c) => !!c.sync_source).reduce((acc, c) => {
+  const listGroups = (include: (src: string) => boolean) => Object.values(
+    (categoriesQuery.data ?? []).filter((c) => !!c.sync_source && include(c.sync_source)).reduce((acc, c) => {
       const key = c.sync_source as string
       if (!acc[key]) acc[key] = { sync_source: key, categories: [] as Category[] }
       acc[key].categories.push(c)
       return acc
     }, {} as Record<string, { sync_source: string; categories: Category[] }>)
+  )
+  const tmdbGroups = listGroups((src) => !src.startsWith('mdblist:'))
+  const mdblistGroups = listGroups((src) => src.startsWith('mdblist:'))
+
+  const renderListSection = (cfg: { title: string; intro: string; emptyText: string; groups: { sync_source: string; categories: Category[] }[]; prefix: string; syncTitle: string; idPlaceholder: string; form: { list_id: string; name_template: string; movie_label: string; tv_label: string }; setForm: (f: { list_id: string; name_template: string; movie_label: string; tv_label: string }) => void; addMutation: { mutate: () => void; isPending: boolean } }) => (
+      <SectionCard title={cfg.title} icon={<RefreshCw size={14} />}>
+        <p className="text-xs text-muted-foreground">{cfg.intro}</p>
+        {cfg.groups.length === 0 && <p className="text-xs text-muted-foreground">{cfg.emptyText}</p>}
+        <div className="space-y-2">
+          {cfg.groups.map((g) => (
+            <div key={g.sync_source} className="rounded border border-border/50 p-2 text-xs space-y-1">
+              <p className="text-muted-foreground">List ID: {g.sync_source.replace(cfg.prefix, '')}</p>
+              {g.categories.map((c) => (
+                <div key={c.id} className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
+                  <span className="flex items-center gap-1 min-w-0">
+                    <input
+                      className={inputCls('w-40')}
+                      defaultValue={c.name}
+                      key={c.name}
+                      title="Rename category"
+                      onBlur={(e) => {
+                        const v = e.target.value.trim()
+                        if (v && v !== c.name) renameCategory.mutate({ id: c.id, name: v })
+                      }}
+                    />
+                    <span className="text-muted-foreground">({c.content_type === 'movie' ? 'Movies' : 'TV Shows'})</span>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <input
+                      className={inputCls('w-12')}
+                      type="number"
+                      title="Sort order (lower shows first in Dispatcharr)"
+                      defaultValue={c.sort_order}
+                      key={c.sort_order}
+                      onBlur={(e) => {
+                        const v = Number(e.target.value) || 0
+                        if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
+                      }}
+                    />
+                    <button title={cfg.syncTitle} className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
+                      <RefreshCw size={12} />
+                    </button>
+                    <button
+                      title={c.content_type === 'movie' ? 'View movies in this category' : 'View series in this category'}
+                      className={(c.content_type === 'movie' ? movieCategoryFilter : seriesCategoryFilter) === c.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                      onClick={() => {
+                        if (c.content_type === 'movie') { setMovieCategoryFilter(c.id); setMovieSearch(''); setMovieOffset(0) }
+                        else { setSeriesCategoryFilter(c.id); setSeriesSearch(''); setSeriesOffset(0) }
+                      }}
+                    >
+                      <Eye size={12} />
+                    </button>
+                    <button
+                      title={c.is_active ? 'Disable — stops exporting to Dispatcharr, keeps everything for later (e.g. a seasonal category)' : 'Enable — resumes exporting to Dispatcharr'}
+                      className={c.is_active ? 'text-muted-foreground hover:text-foreground' : 'text-amber-500 hover:text-foreground'}
+                      disabled={setCategoryActive2.isPending}
+                      onClick={() => setCategoryActive2.mutate({ id: c.id, is_active: !c.is_active })}
+                    >
+                      {c.is_active ? <Power size={12} /> : <PowerOff size={12} />}
+                    </button>
+                    <button
+                      title={c.schedule_start_mmdd ? `Annual schedule: enable ${c.schedule_start_mmdd} → disable ${c.schedule_end_mmdd}` : 'Set an annual enable/disable schedule (e.g. a seasonal category)'}
+                      className={c.schedule_start_mmdd ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                      disabled={setCategorySchedule2.isPending}
+                      onClick={() => promptSchedule2(c)}
+                    >
+                      <CalendarClock size={12} />
+                    </button>
+                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { askConfirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`, () => deleteCategory.mutate(c.id)) }}>
+                      <Trash2 size={12} />
+                    </button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+        {categoryScheduleError2 && <p className="text-xs text-destructive">{categoryScheduleError2}</p>}
+        {categoryActiveError2 && <p className="text-xs text-destructive">{categoryActiveError2}</p>}
+        {tmdbSyncResult && <p className="text-xs text-muted-foreground">{tmdbSyncResult}</p>}
+        <div className="flex flex-wrap items-center gap-1.5 pt-1">
+          <input className={inputCls('w-28')} placeholder={cfg.idPlaceholder} value={cfg.form.list_id} onChange={(e) => cfg.setForm({ ...cfg.form, list_id: e.target.value })} />
+          <input
+            className={inputCls()}
+            placeholder={`Name template, e.g. "My ${TMDB_TOKEN} Picks"`}
+            title={`Use ${TMDB_TOKEN} where the type name should be inserted. No ${TMDB_TOKEN}? We'll append " — <type>" to the end instead.`}
+            value={cfg.form.name_template}
+            onChange={(e) => cfg.setForm({ ...cfg.form, name_template: e.target.value })}
+          />
+          <input className={inputCls('w-24')} placeholder="Movie label" value={cfg.form.movie_label} onChange={(e) => cfg.setForm({ ...cfg.form, movie_label: e.target.value })} />
+          <input className={inputCls('w-24')} placeholder="TV label" value={cfg.form.tv_label} onChange={(e) => cfg.setForm({ ...cfg.form, tv_label: e.target.value })} />
+          <Button size="sm" disabled={!cfg.form.list_id || !cfg.form.name_template || cfg.addMutation.isPending} onClick={() => cfg.addMutation.mutate()}>
+            <Plus size={12} className="mr-1" /> Add
+          </Button>
+        </div>
+        {!!cfg.form.name_template && (
+          <p className="text-xs text-muted-foreground">
+            Will create "{buildTmdbPairName(cfg.form.name_template, cfg.form.movie_label || 'Movies')}" and "{buildTmdbPairName(cfg.form.name_template, cfg.form.tv_label || 'TV Shows')}".
+          </p>
+        )}
+      </SectionCard>
   )
 
   return (
@@ -8487,7 +8655,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         })
         return (
         <Modal onClose={() => setExcludeCategoriesProviderId(null)} maxWidth="max-w-lg">
-          <div className="p-5 space-y-3">
+          <div className="p-5 space-y-3 overflow-y-auto min-h-0">
             <h2 className="text-base font-semibold">
               Exclude categories — {providersQuery.data?.find((p) => p.id === excludeCategoriesProviderId)?.name}
             </h2>
@@ -8594,7 +8762,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               const deletedCards = excludeCategoriesPreview.movies_deleted + excludeCategoriesPreview.series_deleted
               const samples = [...excludeCategoriesPreview.sample_movies, ...excludeCategoriesPreview.sample_series]
               return (
-                <div className="rounded border border-warning/50 bg-warning/10 p-3 space-y-1.5 text-xs">
+                <div className="rounded border border-warning/50 bg-warning/10 p-3 space-y-1.5 text-xs max-h-60 overflow-y-auto">
                   <p className="font-medium">Category change preview — nothing has been deleted</p>
                   <p>{excludeCategoriesPreviewSaved ? 'Exclusions saved.' : 'Proposed exclusions have not been saved.'}</p>
                   <p>Newly excluded: {addedNames.length ? addedNames.join(', ') : 'none'}{excludeUncategorizedDraft && !excludeCategoriesPreview.saved_exclude_uncategorized ? ', Uncategorized' : ''}</p>
@@ -8610,7 +8778,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               )
             })()}
             {excludeCategoriesError && <p className="text-xs text-destructive">{excludeCategoriesError}</p>}
-            <div className="flex justify-end gap-2 pt-2">
+            <div className="flex justify-end gap-2 pt-2 sticky bottom-0 bg-card">
               <Button size="sm" variant="outline" onClick={() => setExcludeCategoriesProviderId(null)}>Close</Button>
               {previewIsCurrent && excludeCategoriesPreviewSaved && selectedProvider?.provider_type === 'xc' && excludeCategoriesPreview && (excludeCategoriesPreview.movie_sources_removed + excludeCategoriesPreview.series_sources_removed > 0) && (
                 <Button
@@ -10309,106 +10477,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="TMDB Lists" icon={<RefreshCw size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Auto-populate categories from a public TMDB List (movie + TV watchlists). A list can hold both movies and
-          shows, so each one gets a paired movie category and series category — kept separate because Dispatcharr's
-          movie and TV catalogs are different endpoints.
-        </p>
-        {tmdbGroups.length === 0 && <p className="text-xs text-muted-foreground">No TMDB lists linked yet.</p>}
-        <div className="space-y-2">
-          {tmdbGroups.map((g) => (
-            <div key={g.sync_source} className="rounded border border-border/50 p-2 text-xs space-y-1">
-              <p className="text-muted-foreground">List ID: {g.sync_source.replace('tmdb_list:', '')}</p>
-              {g.categories.map((c) => (
-                <div key={c.id} className={`flex items-center justify-between gap-2 ${!c.is_active ? 'opacity-50' : ''}`}>
-                  <span className="flex items-center gap-1 min-w-0">
-                    <input
-                      className={inputCls('w-40')}
-                      defaultValue={c.name}
-                      key={c.name}
-                      title="Rename category"
-                      onBlur={(e) => {
-                        const v = e.target.value.trim()
-                        if (v && v !== c.name) renameCategory.mutate({ id: c.id, name: v })
-                      }}
-                    />
-                    <span className="text-muted-foreground">({c.content_type === 'movie' ? 'Movies' : 'TV Shows'})</span>
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <input
-                      className={inputCls('w-12')}
-                      type="number"
-                      title="Sort order (lower shows first in Dispatcharr)"
-                      defaultValue={c.sort_order}
-                      key={c.sort_order}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value) || 0
-                        if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
-                      }}
-                    />
-                    <button title="Sync from TMDB now" className="text-muted-foreground hover:text-foreground" disabled={syncCategoryNow.isPending} onClick={() => syncCategoryNow.mutate(c.id)}>
-                      <RefreshCw size={12} />
-                    </button>
-                    <button
-                      title={c.content_type === 'movie' ? 'View movies in this category' : 'View series in this category'}
-                      className={(c.content_type === 'movie' ? movieCategoryFilter : seriesCategoryFilter) === c.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}
-                      onClick={() => {
-                        if (c.content_type === 'movie') { setMovieCategoryFilter(c.id); setMovieSearch(''); setMovieOffset(0) }
-                        else { setSeriesCategoryFilter(c.id); setSeriesSearch(''); setSeriesOffset(0) }
-                      }}
-                    >
-                      <Eye size={12} />
-                    </button>
-                    <button
-                      title={c.is_active ? 'Disable — stops exporting to Dispatcharr, keeps everything for later (e.g. a seasonal category)' : 'Enable — resumes exporting to Dispatcharr'}
-                      className={c.is_active ? 'text-muted-foreground hover:text-foreground' : 'text-amber-500 hover:text-foreground'}
-                      disabled={setCategoryActive2.isPending}
-                      onClick={() => setCategoryActive2.mutate({ id: c.id, is_active: !c.is_active })}
-                    >
-                      {c.is_active ? <Power size={12} /> : <PowerOff size={12} />}
-                    </button>
-                    <button
-                      title={c.schedule_start_mmdd ? `Annual schedule: enable ${c.schedule_start_mmdd} → disable ${c.schedule_end_mmdd}` : 'Set an annual enable/disable schedule (e.g. a seasonal category)'}
-                      className={c.schedule_start_mmdd ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
-                      disabled={setCategorySchedule2.isPending}
-                      onClick={() => promptSchedule2(c)}
-                    >
-                      <CalendarClock size={12} />
-                    </button>
-                    <button title="Delete category" className="text-muted-foreground hover:text-destructive" onClick={() => { askConfirm(`Delete category "${c.name}"? Items stay in the pool, just unplaced from this category.`, () => deleteCategory.mutate(c.id)) }}>
-                      <Trash2 size={12} />
-                    </button>
-                  </span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-        {categoryScheduleError2 && <p className="text-xs text-destructive">{categoryScheduleError2}</p>}
-        {categoryActiveError2 && <p className="text-xs text-destructive">{categoryActiveError2}</p>}
-        {tmdbSyncResult && <p className="text-xs text-muted-foreground">{tmdbSyncResult}</p>}
-        <div className="flex flex-wrap items-center gap-1.5 pt-1">
-          <input className={inputCls('w-28')} placeholder="TMDB List ID" value={tmdbListForm.list_id} onChange={(e) => setTmdbListForm({ ...tmdbListForm, list_id: e.target.value })} />
-          <input
-            className={inputCls()}
-            placeholder={`Name template, e.g. "My ${TMDB_TOKEN} Picks"`}
-            title={`Use ${TMDB_TOKEN} where the type name should be inserted. No ${TMDB_TOKEN}? We'll append " — <type>" to the end instead.`}
-            value={tmdbListForm.name_template}
-            onChange={(e) => setTmdbListForm({ ...tmdbListForm, name_template: e.target.value })}
-          />
-          <input className={inputCls('w-24')} placeholder="Movie label" value={tmdbListForm.movie_label} onChange={(e) => setTmdbListForm({ ...tmdbListForm, movie_label: e.target.value })} />
-          <input className={inputCls('w-24')} placeholder="TV label" value={tmdbListForm.tv_label} onChange={(e) => setTmdbListForm({ ...tmdbListForm, tv_label: e.target.value })} />
-          <Button size="sm" disabled={!tmdbListForm.list_id || !tmdbListForm.name_template || addTmdbList.isPending} onClick={() => addTmdbList.mutate()}>
-            <Plus size={12} className="mr-1" /> Add
-          </Button>
-        </div>
-        {!!tmdbListForm.name_template && (
-          <p className="text-xs text-muted-foreground">
-            Will create "{buildTmdbPairName(tmdbListForm.name_template, tmdbListForm.movie_label || 'Movies')}" and "{buildTmdbPairName(tmdbListForm.name_template, tmdbListForm.tv_label || 'TV Shows')}".
-          </p>
-        )}
-      </SectionCard>
+      {renderListSection({
+        title: 'TMDB Lists', intro: "Auto-populate categories from a public TMDB List (movie + TV watchlists). A list can hold both movies and shows, so each one gets a paired movie category and series category — kept separate because Dispatcharr's movie and TV catalogs are different endpoints.",
+        emptyText: 'No TMDB lists linked yet.', groups: tmdbGroups, prefix: 'tmdb_list:', syncTitle: 'Sync from TMDB now',
+        idPlaceholder: 'TMDB List ID', form: tmdbListForm, setForm: setTmdbListForm, addMutation: addTmdbList,
+      })}
+
+      {renderListSection({
+        title: 'MDBList Lists', intro: "Auto-populate categories from a public MDBList list (needs your MDBList API key, saved under Configuration). Like TMDB Lists, each list gets a paired movie category and series category. The list ID is the number in the list's MDBList URL.",
+        emptyText: 'No MDBList lists linked yet.', groups: mdblistGroups, prefix: 'mdblist:', syncTitle: 'Sync from MDBList now',
+        idPlaceholder: 'MDBList List ID', form: mdblistForm, setForm: setMdblistForm, addMutation: addMdblist,
+      })}
       </>
       )}
 

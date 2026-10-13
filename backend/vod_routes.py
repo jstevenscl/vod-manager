@@ -3799,6 +3799,32 @@ async def apply_tmdb_title_series(series_id: int):
     return result
 
 
+@router.post("/series/{series_id}/tmdb-episode-titles/", dependencies=_GUARDS)
+async def apply_tmdb_episode_titles(series_id: int, mode: str = "fill", dry_run: bool = False):
+    """Sets this one series' episode names from TMDB (matched on season +
+    episode number). mode=fill only replaces blank/placeholder names (default);
+    mode=replace overwrites every matched name. dry_run=true previews the counts.
+    Renamed episodes are locked so a provider re-sync does not revert them."""
+    series = vod_db.get_series(series_id)
+    if not series:
+        raise HTTPException(404, detail="series not found")
+    if not series.get("tmdb_id"):
+        raise HTTPException(400, detail="no confirmed TMDB id for this series")
+    try:
+        episodes = await tmdb_sync.get_series_episode_list_cached(str(series["tmdb_id"]))
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(502, detail=str(exc))
+    names = {(e["season_number"], e["episode_number"]): e["name"] for e in episodes if e.get("name")}
+    if not names:
+        raise HTTPException(502, detail="TMDB returned no episode names for this series")
+    try:
+        return await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, mode, dry_run)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
 @router.post("/series/tmdb-title/bulk-apply/", dependencies=_GUARDS)
 async def bulk_apply_tmdb_title_series(after_id: int = 0, limit: int = 100):
     """See bulk_apply_tmdb_title_movies' identical docstring -- same reasoning."""

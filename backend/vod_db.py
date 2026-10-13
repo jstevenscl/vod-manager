@@ -966,6 +966,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     NOT EXISTS above only helps fresh databases."""
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
+        # 1 = the name was set deliberately (manual edit or "Use TMDB episode
+        # titles"), so a provider re-sync must not revert it.
+        ("episodes", "name_locked", "INTEGER NOT NULL DEFAULT 0"),
         # Consecutive re-enrichments that found nothing new -- backs the movie
         # re-check interval off (see _is_stale / ENRICHMENT_BACKOFF_MAX_STEPS).
         ("movies", "enrich_stable_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -7140,12 +7143,13 @@ def _add_episode_row(conn: sqlite3.Connection, series_id: int, season_number: in
     of paying a fresh connection + WAL fsync per episode. add_episode wraps
     this with its own lock/connect/commit for one-off single-episode callers."""
     row = conn.execute(
-        "SELECT id FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
+        "SELECT id, name_locked FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
         (series_id, season_number, episode_number),
     ).fetchone()
     if row:
         episode_id = row["id"]
-        fields["name"] = name
+        if not row["name_locked"]:
+            fields["name"] = name
         sets = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE episodes SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), episode_id))
     else:
@@ -8934,7 +8938,7 @@ def bulk_import_plex_series(provider_id: int, items: list[dict]) -> dict:
                                         )
                                     else:
                                         conn.execute(
-                                            "UPDATE episodes SET name=?, description=?, duration_secs=?, updated_at=? WHERE id=?",
+                                            "UPDATE episodes SET name=CASE WHEN name_locked=1 THEN name ELSE ? END, description=?, duration_secs=?, updated_at=? WHERE id=?",
                                             (ep["name"], ep.get("description"), ep.get("duration_secs"), now, episode_id),
                                         )
                                 else:
@@ -11277,6 +11281,7 @@ def update_episode(episode_id: int, name: str | None = None, season_number: int 
                 raise ValueError("name cannot be blank")
             sets.append("name=?")
             vals.append(name)
+            sets.append("name_locked=1")  # a manual name survives provider re-syncs
         if season_number is not None:
             sets.append("season_number=?")
             vals.append(season_number)
@@ -11291,6 +11296,70 @@ def update_episode(episode_id: int, name: str | None = None, season_number: int 
             _commit_with_retry(conn)
         conn.close()
     return {"id": episode_id}
+
+
+_EMBEDDED_EPISODE_CODE = re.compile(r"(?<![a-z0-9])s\d{1,3}\s*e\d{1,3}(?![a-z0-9])", re.IGNORECASE)
+_PLACEHOLDER_EPISODE_NAME = re.compile(r"^\s*((episode|ep\.?)\s*\d+|s\d+\s*e\d+|\d+x\d+|\d+)\s*$", re.IGNORECASE)
+
+
+def _is_placeholder_episode_name(name: str | None, series_name: str | None) -> bool:
+    """A blank/auto-generated episode name ("Episode 5", "S01E05", "1x05", a
+    bare number, or the series' own name) -- the only names the fill-gaps mode
+    of apply_tmdb_episode_titles is willing to replace."""
+    n = (name or "").strip()
+    if not n:
+        return True
+    if series_name and n.lower() == series_name.strip().lower():
+        return True
+    # A provider-formatted name that embeds the SxxExx code ("Show (2008) -
+    # S01E01 - Pilot") is catalog noise, not a real title.
+    return bool(_PLACEHOLDER_EPISODE_NAME.match(n) or _EMBEDDED_EPISODE_CODE.search(n))
+
+
+def apply_tmdb_episode_titles(series_id: int, names: dict[tuple[int, int], str], mode: str = "fill", dry_run: bool = False) -> dict:
+    """Sets a series' episode names from TMDB's (season, episode) -> name map.
+
+    mode="fill": only blank/placeholder names are replaced, and a name locked by
+    a manual edit or an earlier apply is left alone. mode="replace": every
+    matched episode takes TMDB's name. Renamed episodes are locked so a provider
+    re-sync does not revert them. Episodes TMDB has no entry for are counted as
+    `unmatched` and never touched. dry_run reports the counts without writing."""
+    if mode not in ("fill", "replace"):
+        raise ValueError("mode must be 'fill' or 'replace'")
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            series = conn.execute("SELECT name FROM series WHERE id=?", (series_id,)).fetchone()
+            if not series:
+                raise ValueError(f"series {series_id} not found")
+            rows = conn.execute(
+                "SELECT id, season_number, episode_number, name, name_locked FROM episodes WHERE series_id=?", (series_id,)
+            ).fetchall()
+            checked = renamed = no_change = unmatched = skipped = 0
+            examples: list[str] = []
+            for r in rows:
+                checked += 1
+                new = (names.get((r["season_number"], r["episode_number"])) or "").strip()
+                if not new:
+                    unmatched += 1
+                    continue
+                if new == r["name"]:
+                    no_change += 1
+                    continue
+                if mode == "fill" and (r["name_locked"] or not _is_placeholder_episode_name(r["name"], series["name"])):
+                    skipped += 1
+                    continue
+                renamed += 1
+                if len(examples) < 5:
+                    examples.append(f"S{r['season_number']:02d}E{r['episode_number']:02d}: {r['name']} -> {new}")
+                if not dry_run:
+                    conn.execute("UPDATE episodes SET name=?, name_locked=1, updated_at=? WHERE id=?", (new, _now(), r["id"]))
+            if not dry_run and renamed:
+                _commit_with_retry(conn)
+            return {"checked": checked, "renamed": renamed, "no_change": no_change, "skipped_existing": skipped,
+                    "unmatched": unmatched, "examples": examples, "dry_run": dry_run, "mode": mode}
+        finally:
+            conn.close()
 
 
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
