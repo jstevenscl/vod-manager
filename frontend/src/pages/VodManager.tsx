@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -2269,7 +2269,7 @@ function MoveEpisodePicker({ initialSeason, initialEpisode, initialName, onPick,
   )
 }
 
-function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived }: {
+function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived, onRemoveFromCategory }: {
   movie: Movie
   movieCategories: Category[]
   providers: Provider[]
@@ -2279,6 +2279,8 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   onToggleSelect: (shiftKey: boolean) => void
   mode?: 'list' | 'grid'
   onToggleArchived: () => void
+  // set only while a category filter is on: takes this title out of that one category (stays in the pool)
+  onRemoveFromCategory?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [sourceForm, setSourceForm] = useState({ provider_id: '', provider_stream_id: '', container_extension: 'mp4' })
@@ -2624,6 +2626,15 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
         >
           {movie.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
         </button>
+        {onRemoveFromCategory && (
+          <button
+            title="Remove from the selected category (keeps it in the pool)"
+            className="absolute top-1.5 left-12 z-10 bg-background/85 rounded p-0.5 text-muted-foreground hover:text-foreground"
+            onClick={(e) => { e.stopPropagation(); onRemoveFromCategory() }}
+          >
+            <FolderMinus size={12} />
+          </button>
+        )}
         <button className="block w-full text-left relative" onClick={() => setOpen(true)}>
           <PosterThumb
             url={movie.poster_url}
@@ -2712,6 +2723,15 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           >
             18+
           </button>
+          {onRemoveFromCategory && (
+            <button
+              title="Remove from the selected category (keeps it in the pool)"
+              className="text-muted-foreground hover:text-foreground"
+              onClick={onRemoveFromCategory}
+            >
+              <FolderMinus size={12} />
+            </button>
+          )}
           <button
             title={movie.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
             className="text-muted-foreground hover:text-foreground"
@@ -2752,7 +2772,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
   )
 }
 
-function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived }: {
+function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived, onRemoveFromCategory }: {
   series: Series
   seriesCategories: Category[]
   qc: ReturnType<typeof useQueryClient>
@@ -2761,6 +2781,8 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
   onToggleSelect: (shiftKey: boolean) => void
   mode?: 'list' | 'grid'
   onToggleArchived: () => void
+  // set only while a category filter is on: takes this title out of that one category (stays in the pool)
+  onRemoveFromCategory?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [categoryPick, setCategoryPick] = useState('')
@@ -3240,6 +3262,15 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         >
           {series.review_excluded ? <ArchiveRestore size={12} /> : <Archive size={12} />}
         </button>
+        {onRemoveFromCategory && (
+          <button
+            title="Remove from the selected category (keeps it in the pool)"
+            className="absolute top-1.5 left-12 z-10 bg-background/85 rounded p-0.5 text-muted-foreground hover:text-foreground"
+            onClick={(e) => { e.stopPropagation(); onRemoveFromCategory() }}
+          >
+            <FolderMinus size={12} />
+          </button>
+        )}
         <button className="block w-full text-left relative" onClick={() => setOpen(true)}>
           <PosterThumb
             url={series.poster_url}
@@ -3302,6 +3333,15 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           >
             18+
           </button>
+          {onRemoveFromCategory && (
+            <button
+              title="Remove from the selected category (keeps it in the pool)"
+              className="text-muted-foreground hover:text-foreground"
+              onClick={onRemoveFromCategory}
+            >
+              <FolderMinus size={12} />
+            </button>
+          )}
           <button
             title={series.review_excluded ? 'Restore from archive' : 'Archive (removes from every category and hides from the pool)'}
             className="text-muted-foreground hover:text-foreground"
@@ -6562,6 +6602,34 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
     onError: (e: any) => setBulkMovieResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
+  // Take titles out of the category currently being filtered on (they stay in the pool).
+  const movieCategoryExclusionsQuery = useQuery<{ movie: number; series: number }>({
+    queryKey: ['vod-category-exclusions', movieCategoryFilter],
+    queryFn:  () => api.get(`/vod/categories/${movieCategoryFilter}/exclusions/`).then((r) => r.data),
+    enabled:  movieCategoryFilter != null,
+  })
+  const unplaceMovie = useMutation({
+    mutationFn: (body: { ids?: number[] }) => api.post('/vod/movies/bulk-unplace/', {
+      category_id: movieCategoryFilter, ids: body.ids,
+      search: body.ids ? undefined : (movieSearch || undefined),
+      source_provider_id: body.ids ? undefined : (movieProviderFilter ?? undefined),
+      no_tmdb: body.ids ? undefined : (movieNoTmdb || undefined),
+    }),
+    onSuccess: (r) => {
+      setBulkMovieResult(`Removed ${r.data.removed} from the category (they stay in the pool).`)
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-category-exclusions'] })
+      setSelectedMovieIds(new Set())
+    },
+    onError: (e: any) => setBulkMovieResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const allowRemovedMovie = useMutation({
+    mutationFn: () => api.post(`/vod/categories/${movieCategoryFilter}/exclusions/clear/`),
+    onSuccess: (r) => {
+      setBulkMovieResult(`${r.data.cleared} removed title(s) can be added by the category rule again.`)
+      qc.invalidateQueries({ queryKey: ['vod-category-exclusions'] })
+    },
+  })
   const bulkArchiveMovies = useMutation({
     mutationFn: (body: { ids: number[]; archived: boolean }) => api.post('/vod/bulk-archive/', { content_type: 'movie', ...body }),
     onSuccess: (r) => {
@@ -6633,6 +6701,34 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       setSelectedSeriesIds(new Set())
     },
     onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  // Take titles out of the category currently being filtered on (they stay in the pool).
+  const seriesCategoryExclusionsQuery = useQuery<{ movie: number; series: number }>({
+    queryKey: ['vod-category-exclusions', seriesCategoryFilter],
+    queryFn:  () => api.get(`/vod/categories/${seriesCategoryFilter}/exclusions/`).then((r) => r.data),
+    enabled:  seriesCategoryFilter != null,
+  })
+  const unplaceSeries = useMutation({
+    mutationFn: (body: { ids?: number[] }) => api.post('/vod/series/bulk-unplace/', {
+      category_id: seriesCategoryFilter, ids: body.ids,
+      search: body.ids ? undefined : (seriesSearch || undefined),
+      source_provider_id: body.ids ? undefined : (seriesProviderFilter ?? undefined),
+      no_tmdb: body.ids ? undefined : (seriesNoTmdb || undefined),
+    }),
+    onSuccess: (r) => {
+      setBulkSeriesResult(`Removed ${r.data.removed} from the category (they stay in the pool).`)
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+      qc.invalidateQueries({ queryKey: ['vod-category-exclusions'] })
+      setSelectedSeriesIds(new Set())
+    },
+    onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const allowRemovedSeries = useMutation({
+    mutationFn: () => api.post(`/vod/categories/${seriesCategoryFilter}/exclusions/clear/`),
+    onSuccess: (r) => {
+      setBulkSeriesResult(`${r.data.cleared} removed title(s) can be added by the category rule again.`)
+      qc.invalidateQueries({ queryKey: ['vod-category-exclusions'] })
+    },
   })
   const bulkArchiveSeries = useMutation({
     mutationFn: (body: { ids: number[]; archived: boolean }) => api.post('/vod/bulk-archive/', { content_type: 'series', ...body }),
@@ -10969,6 +11065,34 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             Place all filtered ({moviesQuery.data?.total ?? 0})
           </Button>
+          {movieCategoryFilter != null && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={selectedMovieIds.size === 0 || unplaceMovie.isPending}
+                title="Takes the selected titles out of the category you are filtering on. They stay in the pool; a smart rule will not put them back."
+                onClick={() => askConfirm(`Remove ${selectedMovieIds.size} selected from this category? They stay in the pool.`, () => unplaceMovie.mutate({ ids: Array.from(selectedMovieIds) }))}
+              >
+                <FolderMinus size={12} className="mr-1" />Remove selected from category ({selectedMovieIds.size})
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!moviesQuery.data?.total || unplaceMovie.isPending}
+                title="Takes every title matching the current filters out of this category, across all pages"
+                onClick={() => askConfirm(`Remove all ${moviesQuery.data?.total ?? 0} filtered titles from this category? They stay in the pool.`, () => unplaceMovie.mutate({}))}
+              >
+                Remove all filtered from category ({moviesQuery.data?.total ?? 0})
+              </Button>
+              {((movieCategoryExclusionsQuery.data?.movie ?? 0) > 0) && (
+                <span className="text-xs text-muted-foreground">
+                  {movieCategoryExclusionsQuery.data?.movie} removed title(s) are kept out of this category.{' '}
+                  <button className="underline decoration-dotted hover:text-foreground" onClick={() => allowRemovedMovie.mutate()}>Allow them again</button>
+                </span>
+              )}
+            </>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -10993,6 +11117,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               onToggleSelect={(shiftKey) => toggleMovieSelected(m.id, i, shiftKey)}
               mode={movieViewMode}
               onToggleArchived={() => toggleMovieArchived.mutate({ id: m.id, archived: !m.review_excluded })}
+              onRemoveFromCategory={movieCategoryFilter != null ? () => unplaceMovie.mutate({ ids: [m.id] }) : undefined}
             />
           ))}
         </div>
@@ -11161,6 +11286,34 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             Place all filtered ({seriesQuery.data?.total ?? 0})
           </Button>
+          {seriesCategoryFilter != null && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={selectedSeriesIds.size === 0 || unplaceSeries.isPending}
+                title="Takes the selected titles out of the category you are filtering on. They stay in the pool; a smart rule will not put them back."
+                onClick={() => askConfirm(`Remove ${selectedSeriesIds.size} selected from this category? They stay in the pool.`, () => unplaceSeries.mutate({ ids: Array.from(selectedSeriesIds) }))}
+              >
+                <FolderMinus size={12} className="mr-1" />Remove selected from category ({selectedSeriesIds.size})
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!seriesQuery.data?.total || unplaceSeries.isPending}
+                title="Takes every title matching the current filters out of this category, across all pages"
+                onClick={() => askConfirm(`Remove all ${seriesQuery.data?.total ?? 0} filtered titles from this category? They stay in the pool.`, () => unplaceSeries.mutate({}))}
+              >
+                Remove all filtered from category ({seriesQuery.data?.total ?? 0})
+              </Button>
+              {((seriesCategoryExclusionsQuery.data?.series ?? 0) > 0) && (
+                <span className="text-xs text-muted-foreground">
+                  {seriesCategoryExclusionsQuery.data?.series} removed title(s) are kept out of this category.{' '}
+                  <button className="underline decoration-dotted hover:text-foreground" onClick={() => allowRemovedSeries.mutate()}>Allow them again</button>
+                </span>
+              )}
+            </>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -11214,6 +11367,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               onToggleSelect={(shiftKey) => toggleSeriesSelected(s.id, i, shiftKey)}
               mode={seriesViewMode}
               onToggleArchived={() => toggleSeriesArchived.mutate({ id: s.id, archived: !s.review_excluded })}
+              onRemoveFromCategory={seriesCategoryFilter != null ? () => unplaceSeries.mutate({ ids: [s.id] }) : undefined}
             />
           ))}
         </div>

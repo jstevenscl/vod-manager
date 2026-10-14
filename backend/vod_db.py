@@ -1026,6 +1026,15 @@ def _migrate_encrypt_plaintext_credentials(conn: sqlite3.Connection) -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns to pre-existing tables that predate them. CREATE TABLE IF
     NOT EXISTS above only helps fresh databases."""
+    # An item the user removed from a category stays out of it even when a smart
+    # rule / list sync would place it again; placing it by hand clears the entry.
+    conn.execute("""CREATE TABLE IF NOT EXISTS category_exclusions (
+        category_id  INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+        content_type TEXT NOT NULL,
+        item_id      INTEGER NOT NULL,
+        created_at   TEXT,
+        PRIMARY KEY (category_id, content_type, item_id)
+    )""")
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
         # 1 = the name was set deliberately (manual edit or "Use TMDB episode
@@ -7036,17 +7045,79 @@ def list_movie_placements_for_category(category_id: int) -> list[dict]:
 
 
 def remove_movie_from_category(movie_id: int, category_id: int) -> None:
+    remove_items_from_category("movie", [movie_id], category_id)
+
+
+def _excluded_ids(conn, content_type: str, category_id: int, ids: list[int]) -> set[int]:
+    out: set[int] = set()
+    for chunk in _chunked(ids):
+        placeholders = ",".join("?" for _ in chunk)
+        out.update(r["item_id"] for r in conn.execute(
+            f"SELECT item_id FROM category_exclusions WHERE category_id=? AND content_type=? AND item_id IN ({placeholders})",
+            (category_id, content_type, *chunk),
+        ).fetchall())
+    return out
+
+
+def remove_items_from_category(content_type: str, item_ids: list[int], category_id: int) -> int:
+    """Takes movies/series out of one category (they stay in the pool) and records
+    that they were removed on purpose, so a smart rule or list sync won't put them
+    straight back. Placing one by hand again lifts the exclusion. Returns how many
+    were actually placed there."""
+    if content_type not in ("movie", "series"):
+        raise ValueError("content_type must be 'movie' or 'series'")
+    table, col = ("movie_category_placements", "movie_id") if content_type == "movie" else ("series_category_placements", "series_id")
+    removed = 0
     with _WRITE_LOCK:
         conn = _connect()
         try:
-            conn.execute(
-                "DELETE FROM movie_category_placements WHERE movie_id=? AND category_id=?",
-                (movie_id, category_id),
-            )
+            for chunk in _chunked(list(item_ids)):
+                placeholders = ",".join("?" for _ in chunk)
+                removed += conn.execute(
+                    f"DELETE FROM {table} WHERE category_id=? AND {col} IN ({placeholders})", (category_id, *chunk)).rowcount
+                conn.executemany(
+                    "INSERT OR IGNORE INTO category_exclusions (category_id, content_type, item_id, created_at) VALUES (?,?,?,?)",
+                    [(category_id, content_type, i, _now()) for i in chunk],
+                )
             _commit_with_retry(conn)
-            conn.close()
+            return removed
         finally:
             conn.close()
+
+
+def clear_category_exclusions(category_id: int, content_type: str | None = None, item_ids: list[int] | None = None) -> int:
+    """Lets removed items be placed by rules again (all of a category's, or just these ids)."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            if item_ids is None:
+                sql, params = "DELETE FROM category_exclusions WHERE category_id=?", [category_id]
+                if content_type:
+                    sql += " AND content_type=?"
+                    params.append(content_type)
+                n = conn.execute(sql, params).rowcount
+            else:
+                n = 0
+                for chunk in _chunked(list(item_ids)):
+                    placeholders = ",".join("?" for _ in chunk)
+                    n += conn.execute(
+                        f"DELETE FROM category_exclusions WHERE category_id=? AND content_type=? AND item_id IN ({placeholders})",
+                        (category_id, content_type, *chunk),
+                    ).rowcount
+            _commit_with_retry(conn)
+            return n
+        finally:
+            conn.close()
+
+
+def count_category_exclusions(category_id: int) -> dict:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT content_type, COUNT(*) c FROM category_exclusions WHERE category_id=? GROUP BY content_type", (category_id,)).fetchall()
+        return {r["content_type"]: r["c"] for r in rows}
+    finally:
+        conn.close()
 
 
 def remove_movie_from_all_categories(movie_id: int) -> None:
@@ -7067,6 +7138,11 @@ def remove_movie_from_all_categories(movie_id: int) -> None:
 
 
 def place_movie_in_category(movie_id: int, category_id: int) -> int:
+    clear_category_exclusions(category_id, "movie", [movie_id])
+    return _place_movie_in_category(movie_id, category_id)
+
+
+def _place_movie_in_category(movie_id: int, category_id: int) -> int:
     """Assign a movie to a category, returning the export_stream_id to use in the XC feed.
 
     The first placement for a given movie uses the clean name; subsequent
@@ -7149,7 +7225,7 @@ def _chunked(ids: list[int], size: int = 900) -> list[list[int]]:
     return [ids[i:i + size] for i in range(0, len(ids), size)]
 
 
-def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int:
+def bulk_place_movies_in_category(movie_ids: list[int], category_id: int, respect_exclusions: bool = False) -> int:
     """Batch equivalent of place_movie_in_category — one connection/transaction
     for the whole list instead of one round-trip per movie. Needed because
     smart-category evaluation (e.g. a catch-all rule matching the entire
@@ -7194,6 +7270,8 @@ def bulk_place_movies_in_category(movie_ids: list[int], category_id: int) -> int
                 ).fetchall())
             if flagged:
                 logger.info("[vod_db] skipping %d movie(s) still needing year review for category=%s", len(flagged), category_id)
+            if respect_exclusions:
+                already |= _excluded_ids(conn, "movie", category_id, movie_ids)
             to_place = [mid for mid in movie_ids if mid not in already and mid not in flagged]
             # A row can be merged away/deleted between the caller's evaluation and this
             # call (merges also hold _WRITE_LOCK, so none can slip in from here on); an
@@ -8222,17 +8300,7 @@ def list_series_placements_for_category(category_id: int) -> list[dict]:
 
 
 def remove_series_from_category(series_id: int, category_id: int) -> None:
-    with _WRITE_LOCK:
-        conn = _connect()
-        try:
-            conn.execute(
-                "DELETE FROM series_category_placements WHERE series_id=? AND category_id=?",
-                (series_id, category_id),
-            )
-            _commit_with_retry(conn)
-            conn.close()
-        finally:
-            conn.close()
+    remove_items_from_category("series", [series_id], category_id)
 
 
 def remove_series_from_all_categories(series_id: int) -> None:
@@ -8248,6 +8316,11 @@ def remove_series_from_all_categories(series_id: int) -> None:
 
 
 def place_series_in_category(series_id: int, category_id: int) -> int:
+    clear_category_exclusions(category_id, "series", [series_id])
+    return _place_series_in_category(series_id, category_id)
+
+
+def _place_series_in_category(series_id: int, category_id: int) -> int:
     """Same virtual-file mechanism as place_movie_in_category, scoped to series."""
     with _WRITE_LOCK:
         conn = _connect()
@@ -8298,7 +8371,7 @@ def place_series_in_category(series_id: int, category_id: int) -> int:
             conn.close()
 
 
-def bulk_place_series_in_category(series_ids: list[int], category_id: int) -> int:
+def bulk_place_series_in_category(series_ids: list[int], category_id: int, respect_exclusions: bool = False) -> int:
     """Batch equivalent of place_series_in_category — see bulk_place_movies_in_category
     (including the _chunked rationale and why this holds _WRITE_LOCK for the
     whole call)."""
@@ -8322,6 +8395,8 @@ def bulk_place_series_in_category(series_ids: list[int], category_id: int) -> in
                 ).fetchall())
             if flagged:
                 logger.info("[vod_db] skipping %d series still needing year review for category=%s", len(flagged), category_id)
+            if respect_exclusions:
+                already |= _excluded_ids(conn, "series", category_id, series_ids)
             to_place = [sid for sid in series_ids if sid not in already and sid not in flagged]
             # A row can be merged away/deleted between the caller's evaluation and this
             # call (merges also hold _WRITE_LOCK, so none can slip in from here on); an
@@ -12904,9 +12979,9 @@ def evaluate_smart_category(category_id: int, ids: set[int] | None = None) -> di
 
     matched_ids = [row["id"] for row in rows if _rule_matches(row, rule)]
     if category["content_type"] == "movie":
-        newly_placed = bulk_place_movies_in_category(matched_ids, category_id)
+        newly_placed = bulk_place_movies_in_category(matched_ids, category_id, respect_exclusions=True)
     else:
-        newly_placed = bulk_place_series_in_category(matched_ids, category_id)
+        newly_placed = bulk_place_series_in_category(matched_ids, category_id, respect_exclusions=True)
     mark_category_evaluated(category_id)
 
     return {"evaluated": len(rows), "matched": len(matched_ids), "newly_placed": newly_placed}

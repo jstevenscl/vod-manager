@@ -1107,9 +1107,9 @@ async def ai_evaluate_category(category_id: int, body: AiEvaluateCategoryRequest
         raise HTTPException(502, detail=f"AI request failed: {exc}")
 
     if category["content_type"] == "movie":
-        newly_placed = vod_db.bulk_place_movies_in_category(matched_ids, category_id)
+        newly_placed = vod_db.bulk_place_movies_in_category(matched_ids, category_id, respect_exclusions=True)
     else:
-        newly_placed = vod_db.bulk_place_series_in_category(matched_ids, category_id)
+        newly_placed = vod_db.bulk_place_series_in_category(matched_ids, category_id, respect_exclusions=True)
     vod_db.set_category_ai_description(category_id, body.description)
     vod_db.mark_category_evaluated(category_id)
 
@@ -3433,11 +3433,62 @@ async def set_movie_archived(movie_id: int, archived: bool):
     return {"ok": True}
 
 
+class BulkUnplaceRequest(BaseModel):
+    category_id: int                      # the category to take items OUT of
+    ids: Optional[list[int]] = None       # explicit ids, or every item in the category matching the filters below
+    search: Optional[str] = None
+    source_provider_id: Optional[int] = None
+    no_tmdb: bool = False
+
+
+@router.post("/movies/bulk-unplace/", dependencies=_GUARDS)
+async def bulk_unplace_movies(body: BulkUnplaceRequest):
+    """Removes movies from one category without archiving them. Recorded as an
+    exclusion so a smart rule or list sync does not put them straight back."""
+    if not vod_db.get_category(body.category_id):
+        raise HTTPException(404, detail="category not found")
+    ids = body.ids if body.ids is not None else await asyncio.to_thread(
+        vod_db.list_all_movie_ids, search=body.search, category_id=body.category_id,
+        provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
+    removed = await asyncio.to_thread(vod_db.remove_items_from_category, "movie", ids, body.category_id)
+    return {"matched": len(ids), "removed": removed}
+
+
+@router.post("/series/bulk-unplace/", dependencies=_GUARDS)
+async def bulk_unplace_series(body: BulkUnplaceRequest):
+    """See bulk_unplace_movies."""
+    if not vod_db.get_category(body.category_id):
+        raise HTTPException(404, detail="category not found")
+    ids = body.ids if body.ids is not None else await asyncio.to_thread(
+        vod_db.list_all_series_ids, search=body.search, category_id=body.category_id,
+        provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
+    removed = await asyncio.to_thread(vod_db.remove_items_from_category, "series", ids, body.category_id)
+    return {"matched": len(ids), "removed": removed}
+
+
+@router.get("/categories/{category_id}/exclusions/", dependencies=_GUARDS)
+async def get_category_exclusions(category_id: int):
+    """How many titles were removed from this category by hand and are kept out of it."""
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    counts = await asyncio.to_thread(vod_db.count_category_exclusions, category_id)
+    return {"movie": counts.get("movie", 0), "series": counts.get("series", 0)}
+
+
+@router.post("/categories/{category_id}/exclusions/clear/", dependencies=_GUARDS)
+async def clear_category_exclusions(category_id: int):
+    """Lets the category's rule or list place the removed titles again (on its next evaluation)."""
+    if not vod_db.get_category(category_id):
+        raise HTTPException(404, detail="category not found")
+    return {"cleared": await asyncio.to_thread(vod_db.clear_category_exclusions, category_id)}
+
+
 @router.post("/movies/bulk-place/", dependencies=_GUARDS)
 async def bulk_place_movies(body: BulkPlaceRequest):
     if not vod_db.get_category(body.category_id):
         raise HTTPException(404, detail="category not found")
     ids = body.ids if body.ids is not None else vod_db.list_all_movie_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
+    await asyncio.to_thread(vod_db.clear_category_exclusions, body.category_id, "movie", ids)
     newly_placed = vod_db.bulk_place_movies_in_category(ids, body.category_id)
     return {"matched": len(ids), "newly_placed": newly_placed}
 
@@ -3740,6 +3791,7 @@ async def bulk_place_series(body: BulkPlaceRequest):
     if not vod_db.get_category(body.category_id):
         raise HTTPException(404, detail="category not found")
     ids = body.ids if body.ids is not None else vod_db.list_all_series_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
+    await asyncio.to_thread(vod_db.clear_category_exclusions, body.category_id, "series", ids)
     newly_placed = vod_db.bulk_place_series_in_category(ids, body.category_id)
     return {"matched": len(ids), "newly_placed": newly_placed}
 

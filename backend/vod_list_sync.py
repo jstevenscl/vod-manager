@@ -157,10 +157,10 @@ async def sync_category(category_id: int) -> dict:
         )
 
     if category["content_type"] == "movie":
-        newly_placed = vod_db.bulk_place_movies_in_category(list(matched_movie_ids), category_id)
+        newly_placed = vod_db.bulk_place_movies_in_category(list(matched_movie_ids), category_id, respect_exclusions=True)
         found_in_pool = len(matched_movie_ids)
     else:
-        newly_placed = vod_db.bulk_place_series_in_category(list(matched_series_ids), category_id)
+        newly_placed = vod_db.bulk_place_series_in_category(list(matched_series_ids), category_id, respect_exclusions=True)
         found_in_pool = len(matched_series_ids)
 
     removed = 0

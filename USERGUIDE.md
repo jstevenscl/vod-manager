@@ -1206,6 +1206,20 @@ each with a **list** or **grid** (poster wall) mode.
   page, without paging through results manually); **Archive selected**
   (**Un-archive selected** when viewing the Archived toggle) applies the same
   archive action described below to the whole selection at once.
+- **Removing titles from a category** (without archiving them) — choose the
+  category in the *All categories* dropdown and every row gets a **Remove from
+  category** button (the folder icon), and the selection bar gets **Remove
+  selected from category** and **Remove all filtered from category** (the latter
+  covers everything matching the search/provider/No TMDB ID filters, across all
+  pages). A single title can also be removed with the **X** next to the category
+  in its expanded detail. The title stays in the pool; only that one placement is
+  removed. This is different from **Archive**, which also hides the title and
+  strips it from every category. Removal **sticks**: a Smart category's rule, a
+  list-synced category or an AI evaluation will not put the title back, and the
+  bar shows "N removed title(s) are kept out of this category" with **Allow them
+  again** to undo it. Placing a title in the category by hand also lifts it.
+  Episodes are not placed in categories on their own — a show is placed as a
+  whole, so remove the show.
 - **Rename / fix year** — every item's detail view (click a row, or a tile
   in grid mode) has this. Providers occasionally send a blank, garbled, or
   otherwise wrong title/year with no other way to correct it — this fixes
