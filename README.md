@@ -152,7 +152,10 @@ pool, matching every existing credential's behavior today. Restricting it
 is enforced everywhere that credential is used — catalog listing, info
 lookups, and the actual stream — not just hidden from the browse UI, so a
 restricted client can't reach disallowed content even with a direct/copied
-stream URL.
+stream URL. The picker has **Select all** / **Select none**, so hiding just a few
+categories is "select all, untick those".
+
+![The category access picker with Select all and Select none](docs/screenshots/category-access-select-all.png)
 
 ## In-app test player
 
@@ -420,6 +423,38 @@ toolbar) does this in bulk for every already-confirmed TMDB match at once,
 instead of one item at a time. **Client Title Format** (Curation &
 Maintenance) is a separate, ongoing setting to have VOD clients see a
 "(Year)" suffix on every title, independent of the pool's own stored data.
+
+**Finding and bulk-fixing titles.** The **No TMDB ID** button on the Movies and
+TV Shows pages lists every title that still has no TMDB match, including
+year-bearing ones the Metadata Review queue doesn't show. **Select all
+filtered** selects everything matching the current filters across all pages, so
+**TMDB episode titles** (preview first, then Apply) can run over a whole library
+or a filtered slice, and the result names the series that had no TMDB match.
+
+![No TMDB ID filter, Select all filtered and Remove from category](docs/screenshots/no-tmdb-filter-and-remove.png)
+
+![Bulk TMDB episode titles preview naming the series with no TMDB match](docs/screenshots/bulk-episode-titles.png)
+
+**Automatic TMDB Episode Titles** (Curation & Maintenance) keeps episode names
+filled in as a provider adds episodes: hourly, it replaces blank or placeholder
+names from TMDB for the series you've already applied titles to (or every
+series with a TMDB id, or off). A real provider name, or one you set or locked,
+is never changed.
+
+![Automatic TMDB Episode Titles settings](docs/screenshots/auto-episode-titles.png)
+
+**Genre Categories** (Curation & Maintenance) replaces provider categories like
+"EN - ACTION & WAR" with plain genres in one click: pick genres from your
+library and it creates a smart category for each (rule: *genre contains …*, so a
+title in several genres appears in each).
+
+![Genre Categories picker](docs/screenshots/genre-categories.png)
+
+**Removing titles from a category** without archiving them: with a category
+chosen in the dropdown, use the per-row **Remove from category** button, **Remove
+selected from category**, or **Remove all filtered from category**. The title
+stays in the pool, and the removal sticks — a smart rule, list sync or AI
+evaluation won't put it back (use **Allow them again** to undo).
 
 **Flag as wrong content** (the flag icon on any movie, series, episode, or
 individual source) reports "this isn't actually what its label says" —

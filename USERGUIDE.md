@@ -698,6 +698,8 @@ that credential is used (catalog listing, detail lookups, and the actual
 stream), not just hidden from a browse UI — a restricted client can't reach
 disallowed content even with a raw copied stream URL.
 
+![The category access picker with Select all and Select none](docs/screenshots/category-access-select-all.png)
+
 ### Discovering providers automatically
 
 Once a **Dispatcharr Connection** exists (above), you don't have to type in
@@ -1370,19 +1372,23 @@ names, so a real name your provider sent and any name you set or locked is never
 changed, and a series is only sent to TMDB when it actually has a placeholder
 name to fix. **Run now** does one pass immediately.
 
+![Automatic TMDB Episode Titles settings](docs/screenshots/auto-episode-titles.png)
+
 **Finding items with no TMDB ID.** The **No TMDB ID** button next to *Archived*
 on the Movies and TV Shows pages lists only the titles that still have no TMDB
 match. This is wider than **Metadata Review**, which only lists titles with no
 year or an ambiguous auto-match; a title with a year that simply never matched
-shows up only here. Open one to use *Search TMDB*, or run the TMDB auto-match
-over them.
+shows up only here. Open one to use *Search TMDB*, or run **Match titles without
+a TMDB ID** on the TMDB Library page to have them matched by name and year.
+
+![The No TMDB ID filter with Select all filtered and Remove from category](docs/screenshots/no-tmdb-filter-and-remove.png)
 
 **For several series at once**, tick them on the TV Shows page (or click
 **Select all filtered** to take the whole library, or the whole filtered set, in
 one go) and click
 **TMDB episode titles (N)** in the selection bar. It previews the total ("Would
 rename 412 episode(s) across 7 of 9 series"), lists how many series have no
-confirmed TMDB match (skipped) or failed, and only writes when you click
+confirmed TMDB match (skipped, with a few names so you can find them) or failed, and only writes when you click
 **Apply**. The same **Replace existing names too** option applies.
 
 ![Selecting a series and previewing TMDB episode titles](docs/screenshots/bulk-episode-titles.png)
@@ -1895,6 +1901,8 @@ in your pool; neither pulls in anything new.
   and the new categories fill in over the next minute. To show only them in
   Dispatcharr, open the VOD Manager M3U source there and turn off the other
   groups (and "auto sync new categories") before refreshing.
+
+  ![Genre Categories picker](docs/screenshots/genre-categories.png)
 - **MDBList Lists** (Curation & Maintenance) — the same quick path for an
   [MDBList](https://mdblist.com) list: enter its list ID and a name template
   and it creates a paired movie and series category linked to it (needs your

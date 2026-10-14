@@ -10638,7 +10638,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           sent, or one you set or locked, is never changed.
         </p>
         <select
-          className={inputCls('w-80')}
+          className={inputCls()}
+          style={{ width: '27rem', maxWidth: '100%' }}
           value={autoEpisodeTitlesQuery.data?.mode ?? 'applied'}
           disabled={autoEpisodeTitlesQuery.isLoading || setAutoEpisodeTitles.isPending}
           onChange={(e) => setAutoEpisodeTitles.mutate(e.target.value)}

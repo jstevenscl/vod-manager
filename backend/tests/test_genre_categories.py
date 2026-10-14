@@ -67,3 +67,18 @@ def test_slash_separated_genres_and_min_items(db):
         conn.close()
     assert {g["genre"]: g["count"] for g in db.list_genre_counts()["movie"]} == {"Comedia": 1, "Drama": 2, "Thriller": 1}
     assert [g["genre"] for g in db.list_genre_counts(min_items=2)["movie"]] == ["Drama"]
+
+
+def test_html_escaped_genres_merge_and_match(db):
+    plain = db.upsert_movie("Plain", 2001)
+    escaped = db.upsert_movie("Escaped", 2002)
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE movies SET genre='Action & Adventure' WHERE id=?", (plain,))
+        conn.execute("UPDATE movies SET genre='Action &amp; Adventure' WHERE id=?", (escaped,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert {g["genre"]: g["count"] for g in db.list_genre_counts()["movie"]} == {"Action & Adventure": 2}
+    created = db.create_genre_categories(["Action & Adventure"], ["movie"])["created"][0]
+    assert db.evaluate_smart_category(created["id"])["matched"] == 2

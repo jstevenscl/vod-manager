@@ -12487,6 +12487,7 @@ def list_genre_counts(min_items: int = 1) -> dict[str, list[dict]]:
     series carry each. Providers write several genres into one string, separated by
     commas, slashes or pipes ("Action, Comedy", "Comedia / Drama"). Genres on fewer
     than `min_items` titles are left out."""
+    import html
     import re
     conn = _connect()
     try:
@@ -12495,7 +12496,7 @@ def list_genre_counts(min_items: int = 1) -> dict[str, list[dict]]:
             counts: dict[str, int] = {}
             display: dict[str, str] = {}
             for r in conn.execute(f"SELECT genre FROM {table} WHERE review_excluded=0 AND genre IS NOT NULL AND genre != ''"):
-                for g in {x.strip() for x in re.split(r"[,/|]", r["genre"]) if x.strip()}:
+                for g in {x.strip() for x in re.split(r"[,/|]", html.unescape(r["genre"])) if x.strip()}:
                     low = g.lower()
                     counts[low] = counts.get(low, 0) + 1
                     display.setdefault(low, g)
@@ -12785,6 +12786,9 @@ def _condition_matches(row: dict, cond: dict) -> bool:
     if field not in _SMART_CATEGORY_FIELDS:
         return False
     actual = row.get(_FIELD_ALIASES.get(field, field))
+    if field == "genre" and isinstance(actual, str) and "&" in actual:
+        import html
+        actual = html.unescape(actual)  # some providers store "Action &amp; Adventure"
 
     if op == "contains":
         return str(value or "").strip().lower() in str(actual or "").lower()
