@@ -1227,6 +1227,7 @@ const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string 
   ],
   gemini: [
     { id: 'gemini-flash-latest', label: 'Gemini Flash (latest) — cheapest, fastest (default)' },
+    { id: 'gemini-flash-lite-latest', label: 'Gemini Flash-Lite (latest) — lightest; best for free-tier keys' },
     { id: 'gemini-pro-latest', label: 'Gemini Pro (latest) — most capable, priciest' },
     { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash — older accounts only' },
     { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — older accounts only' },

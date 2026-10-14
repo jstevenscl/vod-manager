@@ -1443,7 +1443,10 @@ responses come from Google rather than the app: **503 "high demand"** (the app
 retries a few times, then tells you to try again) and **429 "exceeded your
 current quota"**, which means this key has run out of requests for that model —
 common on free-tier keys, which have little or no quota for the Pro models.
-Check your plan and usage on Google's side.
+Check your plan and usage on Google's side. A **free-tier** key allows only about
+20 requests per day per model (and none for Pro), so a busy review session can
+use a day's allowance; **Gemini Flash-Lite (latest)** is counted separately, so it
+keeps working when Flash has run out, or you can enable billing on the key's project.
 
 **When an AI request fails**, the message under the item (Needs Review,
 Missing Artwork) now includes the provider's own explanation — a retired
