@@ -150,3 +150,32 @@ def test_bulk_route_limits_batch_size(db):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(vod_routes.BulkEpisodeTitlesRequest(ids=list(range(51)))))
     assert exc.value.status_code == 400
+
+
+def test_bulk_route_survives_a_stale_tmdb_id(db, monkeypatch):
+    """One series whose TMDB id TMDB no longer knows (404) must be counted as
+    failed, not abort the whole batch with a 500."""
+    import asyncio
+
+    import tmdb_sync
+    import vod_routes
+
+    provider = db.upsert_provider("Provider One", "http://one.invalid", "u", "p")
+    stale = db.upsert_series("Stale Show", 2020)
+    db.backfill_tmdb_id_if_missing("series", stale, "297997")
+    good = db.upsert_series("Good Show", 2021)
+    db.backfill_tmdb_id_if_missing("series", good, "111")
+    ep = db.add_episode(good, 1, 1, "Episode 1")
+    db.add_episode_source(ep, provider, "g1", "mp4", raw_name="x")
+
+    async def fake_list(tmdb_id):
+        if tmdb_id == "297997":
+            raise tmdb_sync.TmdbNotFoundError(tmdb_id)
+        return [{"season_number": 1, "episode_number": 1, "name": "Pilot"}]
+
+    monkeypatch.setattr(tmdb_sync, "get_series_episode_list_cached", fake_list)
+    result = asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(
+        vod_routes.BulkEpisodeTitlesRequest(ids=[stale, good], dry_run=True)))
+
+    assert result["series_failed"] == 1 and result["series_changed"] == 1
+    assert "Stale Show" in result["failures"][0]

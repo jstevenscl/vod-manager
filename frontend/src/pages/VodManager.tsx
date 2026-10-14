@@ -6448,6 +6448,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [movieCategoryFilter, setMovieCategoryFilter] = useState<number | null>(null)
   const [movieProviderFilter, setMovieProviderFilter] = useState<number | null>(null)
   const [movieShowArchived, setMovieShowArchived] = useState(false)
+  const [movieNoTmdb, setMovieNoTmdb] = useState(false)
   const [MOVIE_LIMIT, setMovieLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-movies-limit')) || 25
   )
@@ -6457,8 +6458,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setMovieOffset(0)
   }
   const moviesQuery = useQuery<Page<Movie>>({
-    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, movieShowArchived, MOVIE_LIMIT],
-    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined, archived: movieShowArchived } }).then((r) => r.data),
+    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, movieShowArchived, movieNoTmdb, MOVIE_LIMIT],
+    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined, archived: movieShowArchived, no_tmdb: movieNoTmdb || undefined } }).then((r) => r.data),
   })
   const toggleMovieArchived = useMutation({
     mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/movies/${id}/archive/`, null, { params: { archived } }),
@@ -6494,7 +6495,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [bulkMovieTargetCategory, setBulkMovieTargetCategory] = useState('')
   const [bulkMovieResult, setBulkMovieResult] = useState<string | null>(null)
   const bulkPlaceMovies = useMutation({
-    mutationFn: (body: { category_id: number; ids?: number[]; search?: string; source_category_id?: number; source_provider_id?: number }) =>
+    mutationFn: (body: { category_id: number; ids?: number[]; search?: string; source_category_id?: number; source_provider_id?: number; no_tmdb?: boolean }) =>
       api.post('/vod/movies/bulk-place/', body),
     onSuccess: (r) => {
       setBulkMovieResult(`Matched ${r.data.matched} · newly placed ${r.data.newly_placed}.`)
@@ -6519,6 +6520,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [seriesCategoryFilter, setSeriesCategoryFilter] = useState<number | null>(null)
   const [seriesProviderFilter, setSeriesProviderFilter] = useState<number | null>(null)
   const [seriesShowArchived, setSeriesShowArchived] = useState(false)
+  const [seriesNoTmdb, setSeriesNoTmdb] = useState(false)
   const [SERIES_LIMIT, setSeriesLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-series-limit')) || 25
   )
@@ -6528,8 +6530,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setSeriesOffset(0)
   }
   const seriesQuery = useQuery<Page<Series>>({
-    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, seriesShowArchived, SERIES_LIMIT],
-    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined, archived: seriesShowArchived } }).then((r) => r.data),
+    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, seriesShowArchived, seriesNoTmdb, SERIES_LIMIT],
+    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined, archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined } }).then((r) => r.data),
   })
   const toggleSeriesArchived = useMutation({
     mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/series/${id}/archive/`, null, { params: { archived } }),
@@ -6565,7 +6567,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [bulkSeriesTargetCategory, setBulkSeriesTargetCategory] = useState('')
   const [bulkSeriesResult, setBulkSeriesResult] = useState<string | null>(null)
   const bulkPlaceSeries = useMutation({
-    mutationFn: (body: { category_id: number; ids?: number[]; search?: string; source_category_id?: number; source_provider_id?: number }) =>
+    mutationFn: (body: { category_id: number; ids?: number[]; search?: string; source_category_id?: number; source_provider_id?: number; no_tmdb?: boolean }) =>
       api.post('/vod/series/bulk-place/', body),
     onSuccess: (r) => {
       setBulkSeriesResult(`Matched ${r.data.matched} · newly placed ${r.data.newly_placed}.`)
@@ -6589,6 +6591,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   type EpisodeTitlesBulk = { series_checked: number; series_changed: number; episodes_renamed: number; series_without_tmdb: number; series_failed: number; failures: string[]; dry_run: boolean }
   const [bulkEpisodeTitles, setBulkEpisodeTitles] = useState<EpisodeTitlesBulk | null>(null)
   const [bulkEpisodeTitlesReplace, setBulkEpisodeTitlesReplace] = useState(false)
+  const selectAllFilteredSeries = useMutation({
+    mutationFn: async () => (await api.get('/vod/series/ids/', { params: {
+      search: seriesSearch || undefined, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined,
+      archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined,
+    } })).data as { ids: number[]; total: number },
+    onSuccess: (r) => { setSelectedSeriesIds(new Set(r.ids)); setBulkEpisodeTitles(null) },
+    onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
   const runBulkEpisodeTitles = useMutation({
     mutationFn: async (dry_run: boolean) => {
       const ids = Array.from(selectedSeriesIds)
@@ -7229,6 +7239,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 <td className="py-1 pr-2 text-muted-foreground align-top">
                   {expandedCategoryAccessClientId === c.id ? (
                     <div className="p-1.5 border border-border rounded space-y-1.5 w-56">
+                      <div className="flex items-center gap-2 text-[10px]">
+                        <button
+                          className="text-primary hover:underline"
+                          onClick={() => setCategoryAccessForm(new Set([...movieCategories, ...seriesCategories].map((cat) => cat.id)))}
+                        >
+                          Select all
+                        </button>
+                        <button className="text-primary hover:underline" onClick={() => setCategoryAccessForm(new Set())}>
+                          Select none
+                        </button>
+                        <span className="text-muted-foreground ml-auto">{categoryAccessForm?.size ?? 0} selected</span>
+                      </div>
                       <div className="max-h-40 overflow-y-auto space-y-0.5">
                         <p className="text-[10px] uppercase text-muted-foreground">Movies</p>
                         {movieCategories.map((cat) => (
@@ -10674,6 +10696,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
+          <Button
+            size="sm"
+            variant={movieNoTmdb ? 'default' : 'outline'}
+            onClick={() => { setMovieNoTmdb((v) => !v); setMovieOffset(0) }}
+            title={movieNoTmdb ? 'Showing only movies with no TMDB ID — click to show everything' : 'Show only movies that have no TMDB ID yet (including ones Metadata Review does not list)'}
+          >
+            No TMDB ID
+          </Button>
           <select
             className={inputCls()}
             title="Show only the movies placed in a category"
@@ -10773,6 +10803,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               search: movieSearch || undefined,
               source_category_id: movieCategoryFilter ?? undefined,
               source_provider_id: movieProviderFilter ?? undefined,
+              no_tmdb: movieNoTmdb || undefined,
             })}
             title="Places every movie matching the current search/category filter, not just this page"
           >
@@ -10849,6 +10880,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
+          <Button
+            size="sm"
+            variant={seriesNoTmdb ? 'default' : 'outline'}
+            onClick={() => { setSeriesNoTmdb((v) => !v); setSeriesOffset(0) }}
+            title={seriesNoTmdb ? 'Showing only series with no TMDB ID — click to show everything' : 'Show only series that have no TMDB ID yet (including ones Metadata Review does not list)'}
+          >
+            No TMDB ID
+          </Button>
           <select
             className={inputCls()}
             title="Show only the TV shows placed in a category"
@@ -10922,6 +10961,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             Select all visible ({seriesQuery.data?.items.length ?? 0})
           </button>
           <button
+            className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted disabled:opacity-50"
+            disabled={!seriesQuery.data?.total || selectAllFilteredSeries.isPending}
+            title="Selects every series matching the current search, provider, category and No TMDB ID filters, across all pages"
+            onClick={() => selectAllFilteredSeries.mutate()}
+          >
+            {selectAllFilteredSeries.isPending ? 'Selecting…' : `Select all filtered (${seriesQuery.data?.total ?? 0})`}
+          </button>
+          <button
             className="text-xs text-muted-foreground hover:text-foreground underline decoration-dotted"
             onClick={() => setSelectedSeriesIds(new Set())}
           >
@@ -10948,6 +10995,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               search: seriesSearch || undefined,
               source_category_id: seriesCategoryFilter ?? undefined,
               source_provider_id: seriesProviderFilter ?? undefined,
+              no_tmdb: seriesNoTmdb || undefined,
             })}
             title="Places every series matching the current search/category filter, not just this page"
           >

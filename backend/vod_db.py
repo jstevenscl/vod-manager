@@ -6486,7 +6486,7 @@ def upsert_movie(name: str, year: int | None = None, **fields) -> int:
 
 
 def _movie_filter_clause(
-    search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False,
+    search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> tuple[str, list]:
     where = ["m.review_excluded = ?"]
     params: list = [1 if archived else 0]
@@ -6507,17 +6507,19 @@ def _movie_filter_clause(
     if provider_id is not None:
         where.append("m.id IN (SELECT movie_id FROM movie_sources WHERE provider_id=?)")
         params.append(provider_id)
+    if no_tmdb:
+        where.append("m.tmdb_id IS NULL")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return clause, params
 
 
 def list_movies(
     limit: int = 50, offset: int = 0, search: str | None = None, category_id: int | None = None,
-    provider_id: int | None = None, archived: bool = False,
+    provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> list[dict]:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         rows = conn.execute(
             f"SELECT m.* FROM movies m {clause} ORDER BY m.name LIMIT ? OFFSET ?",
             (*params, limit, offset),
@@ -6529,11 +6531,11 @@ def list_movies(
 
 
 def count_movies(
-    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False,
+    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> int:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         n = conn.execute(f"SELECT COUNT(*) c FROM movies m {clause}", params).fetchone()["c"]
         conn.close()
         return n
@@ -6542,11 +6544,11 @@ def count_movies(
 
 
 def list_all_movie_ids(
-    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False,
+    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> list[int]:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         rows = conn.execute(f"SELECT m.id FROM movies m {clause}", params).fetchall()
         conn.close()
         return [r["id"] for r in rows]
@@ -7404,7 +7406,7 @@ def upsert_series(name: str, year: int | None = None, **fields) -> int:
 
 
 def _series_filter_clause(
-    search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False,
+    search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> tuple[str, list]:
     where = ["s.review_excluded = ?"]
     params: list = [1 if archived else 0]
@@ -7428,17 +7430,19 @@ def _series_filter_clause(
             WHERE es.provider_id=?
         )""")
         params.append(provider_id)
+    if no_tmdb:
+        where.append("s.tmdb_id IS NULL")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return clause, params
 
 
 def list_series(
     limit: int = 50, offset: int = 0, search: str | None = None, category_id: int | None = None,
-    provider_id: int | None = None, archived: bool = False,
+    provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> list[dict]:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         rows = conn.execute(
             f"""SELECT s.*, p.name AS import_provider_name FROM series s
             LEFT JOIN providers p ON p.id = s.import_provider_id
@@ -7452,11 +7456,11 @@ def list_series(
 
 
 def count_series(
-    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False,
+    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> int:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         n = conn.execute(f"SELECT COUNT(*) c FROM series s {clause}", params).fetchone()["c"]
         conn.close()
         return n
@@ -7465,11 +7469,11 @@ def count_series(
 
 
 def list_all_series_ids(
-    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False,
+    search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
 ) -> list[int]:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
         rows = conn.execute(f"SELECT s.id FROM series s {clause}", params).fetchall()
         conn.close()
         return [r["id"] for r in rows]

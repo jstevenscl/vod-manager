@@ -691,7 +691,9 @@ that instance's M3U account can see. To give one instance (or one end-user
 IPTV app pointed straight at VOD & DVR Manager, bypassing Dispatcharr entirely) a
 *restricted* catalog — a kids-only view, for example — set that instance's
 *Category access* under *Connected Instances* to a specific set of
-categories instead of leaving it at "— all —". This is enforced everywhere
+categories instead of leaving it at "— all —". (The picker has **Select all**
+and **Select none**, so to hide just a few categories, click Select all and
+untick those.) This is enforced everywhere
 that credential is used (catalog listing, detail lookups, and the actual
 stream), not just hidden from a browse UI — a restricted client can't reach
 disallowed content even with a raw copied stream URL.
@@ -1196,7 +1198,9 @@ each with a **list** or **grid** (poster wall) mode.
   Filter** — open the curation tool modals covered in §11, scoped to
   whichever tab (movies vs. series) you opened them from.
 - **Bulk actions** — check items individually, shift-click to select a range,
-  or **Select all visible** to grab everything on the current page. **Place
+  **Select all visible** to grab everything on the current page, or (TV Shows)
+  **Select all filtered** to grab every series matching the current search,
+  provider, category and No TMDB ID filters across all pages. **Place
   selected**/**Place all filtered** place into a category ("all filtered"
   covers everything matching the current search/filter, not just the current
   page, without paging through results manually); **Archive selected**
@@ -1342,7 +1346,16 @@ Episode names you set this way — or by hand with the inline edit — are
 **locked**: a later provider re-sync no longer reverts them. (Apply TMDB Titles
 in the toolbar renames series and movies only, not episodes.)
 
-**For several series at once**, tick them on the TV Shows page and click
+**Finding items with no TMDB ID.** The **No TMDB ID** button next to *Archived*
+on the Movies and TV Shows pages lists only the titles that still have no TMDB
+match. This is wider than **Metadata Review**, which only lists titles with no
+year or an ambiguous auto-match; a title with a year that simply never matched
+shows up only here. Open one to use *Search TMDB*, or run the TMDB auto-match
+over them.
+
+**For several series at once**, tick them on the TV Shows page (or click
+**Select all filtered** to take the whole library, or the whole filtered set, in
+one go) and click
 **TMDB episode titles (N)** in the selection bar. It previews the total ("Would
 rename 412 episode(s) across 7 of 9 series"), lists how many series have no
 confirmed TMDB match (skipped) or failed, and only writes when you click
@@ -1981,6 +1994,12 @@ export reported files written, that the media server mounts the same folder
 again. Playback returning 401 means the XC user's IP allowlist doesn't include
 the media server, or the base URL points at the wrong address (§6, Emby and
 Jellyfin: the .strm export).
+
+If the export says it wrote files but the folder you mounted is empty, check the
+mount's **container path**: the *Output folder* in the export card is a path
+inside the VOD & DVR Manager container, so it must be the path on the right-hand
+side of your volume mapping (`strm_library:/strm` means Output folder `/strm`, not
+`/app/strm`).
 
 **Locked out of your own login.** Set `VODMANAGER_ADMIN_USER` and
 `VODMANAGER_ADMIN_PASSWORD` as environment variables on the container and

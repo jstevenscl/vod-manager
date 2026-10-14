@@ -529,6 +529,7 @@ class BulkPlaceRequest(BaseModel):
     search: Optional[str] = None
     source_category_id: Optional[int] = None
     source_provider_id: Optional[int] = None
+    no_tmdb: bool = False
 
 
 class BulkArchiveRequest(BaseModel):
@@ -3366,9 +3367,9 @@ async def bulk_resolve_missing_artwork_progress(job_id: str):
 @router.get("/movies/", dependencies=_GUARDS)
 async def list_movies(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
-    provider_id: Optional[int] = None, archived: bool = False,
+    provider_id: Optional[int] = None, archived: bool = False, no_tmdb: bool = False,
 ):
-    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived)
+    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb)
     ids = [m["id"] for m in movies]
     sources_by_id    = vod_db.list_movie_sources_for_ids(ids)
     placements_by_id = vod_db.list_movie_placements_for_ids(ids)
@@ -3377,7 +3378,7 @@ async def list_movies(
         m["placements"] = placements_by_id.get(m["id"], [])
     return {
         "items": movies,
-        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id, archived=archived),
+        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb),
         "limit": limit,
         "offset": offset,
     }
@@ -3395,7 +3396,7 @@ async def set_movie_archived(movie_id: int, archived: bool):
 async def bulk_place_movies(body: BulkPlaceRequest):
     if not vod_db.get_category(body.category_id):
         raise HTTPException(404, detail="category not found")
-    ids = body.ids if body.ids is not None else vod_db.list_all_movie_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id)
+    ids = body.ids if body.ids is not None else vod_db.list_all_movie_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
     newly_placed = vod_db.bulk_place_movies_in_category(ids, body.category_id)
     return {"matched": len(ids), "newly_placed": newly_placed}
 
@@ -3623,9 +3624,9 @@ async def enrich_movie(movie_id: int, force: bool = False):
 @router.get("/series/", dependencies=_GUARDS)
 async def list_series(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
-    provider_id: Optional[int] = None, archived: bool = False,
+    provider_id: Optional[int] = None, archived: bool = False, no_tmdb: bool = False,
 ):
-    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived)
+    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb)
     ids = [s["id"] for s in series]
     episodes_by_id   = vod_db.list_episodes_for_series_ids(ids)
     placements_by_id = vod_db.list_series_placements_for_ids(ids)
@@ -3638,10 +3639,24 @@ async def list_series(
         s["placements"] = placements_by_id.get(s["id"], [])
     return {
         "items": series,
-        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id, archived=archived),
+        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb),
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/series/ids/", dependencies=_GUARDS)
+async def list_series_ids(
+    search: Optional[str] = None, category_id: Optional[int] = None, provider_id: Optional[int] = None,
+    archived: bool = False, no_tmdb: bool = False,
+):
+    """Every series id matching the Series page's current filters (not just the
+    visible page), so a bulk action can be applied to the whole filtered set."""
+    ids = await asyncio.to_thread(
+        vod_db.list_all_series_ids, search=search, category_id=category_id, provider_id=provider_id,
+        archived=archived, no_tmdb=no_tmdb,
+    )
+    return {"ids": ids, "total": len(ids)}
 
 
 @router.post("/series/{series_id}/archive/", dependencies=_GUARDS)
@@ -3656,7 +3671,7 @@ async def set_series_archived(series_id: int, archived: bool):
 async def bulk_place_series(body: BulkPlaceRequest):
     if not vod_db.get_category(body.category_id):
         raise HTTPException(404, detail="category not found")
-    ids = body.ids if body.ids is not None else vod_db.list_all_series_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id)
+    ids = body.ids if body.ids is not None else vod_db.list_all_series_ids(search=body.search, category_id=body.source_category_id, provider_id=body.source_provider_id, no_tmdb=body.no_tmdb)
     newly_placed = vod_db.bulk_place_series_in_category(ids, body.category_id)
     return {"matched": len(ids), "newly_placed": newly_placed}
 
@@ -3869,6 +3884,8 @@ async def apply_tmdb_episode_titles(series_id: int, mode: str = "fill", dry_run:
         episodes = await tmdb_sync.get_series_episode_list_cached(str(series["tmdb_id"]))
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
+    except tmdb_sync.TmdbNotFoundError:
+        raise HTTPException(404, detail="TMDB has no entry for this series' TMDB id (it may have been removed or merged)")
     except RuntimeError as exc:
         raise HTTPException(502, detail=str(exc))
     names = {(e["season_number"], e["episode_number"]): e["name"] for e in episodes if e.get("name")}
@@ -3913,6 +3930,12 @@ async def bulk_apply_tmdb_episode_titles(body: BulkEpisodeTitlesRequest):
             if not names:
                 raise RuntimeError("TMDB returned no episode names")
             result = await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, body.mode, body.dry_run)
+        except tmdb_sync.TmdbNotFoundError:
+            # a stale/removed TMDB id on one series must not abort the batch
+            totals["series_failed"] += 1
+            if len(totals["failures"]) < 5:
+                totals["failures"].append(f"{series.get('name')}: TMDB has no entry for id {series['tmdb_id']}")
+            continue
         except (ValueError, RuntimeError) as exc:
             totals["series_failed"] += 1
             if len(totals["failures"]) < 5:
