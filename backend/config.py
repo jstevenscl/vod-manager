@@ -348,6 +348,20 @@ def save_strm_export_settings(settings: dict) -> None:
     _update_raw(lambda data: data.__setitem__("strm_export", {**(data.get("strm_export") or {}), **clean}))
 
 
+_AUTO_EPISODE_TITLE_MODES = ("off", "applied", "all")
+
+
+def get_auto_episode_titles_mode() -> str:
+    mode = _read_raw().get("auto_episode_titles")
+    return mode if mode in _AUTO_EPISODE_TITLE_MODES else "applied"
+
+
+def save_auto_episode_titles_mode(mode: str) -> None:
+    if mode not in _AUTO_EPISODE_TITLE_MODES:
+        raise ValueError("mode must be one of: " + ", ".join(_AUTO_EPISODE_TITLE_MODES))
+    _update_raw(lambda data: data.__setitem__("auto_episode_titles", mode))
+
+
 def get_xc_title_include_year() -> bool:
     return bool(_read_raw().get("xc_title_include_year", False))
 

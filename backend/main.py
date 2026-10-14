@@ -20,6 +20,7 @@ import emby_vod_importer
 import library_importer
 import rclone_client
 import plex_importer
+import auto_episode_titles
 import strm_export
 import tmdb_fill
 from portal_routes import router as portal_router
@@ -476,6 +477,20 @@ async def _strm_export_scheduler() -> None:
         await asyncio.sleep(300)
 
 
+async def _auto_episode_titles_scheduler() -> None:
+    """Hourly pass that fills placeholder episode names from TMDB for the series
+    the user opted in (see auto_episode_titles.py; mode 'off' = never)."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            result = await auto_episode_titles.run_once()
+            if result["series_checked"]:
+                logger.info("[auto_episode_titles] %s", result)
+        except Exception as exc:
+            logger.warning("[auto_episode_titles] run failed: %s", exc)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("VOD Manager started")
@@ -485,6 +500,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_strm_export_scheduler()),
+        asyncio.create_task(_auto_episode_titles_scheduler()),
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),

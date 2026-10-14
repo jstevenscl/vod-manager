@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -6087,6 +6087,49 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: (mode: string) => api.post('/vod/stream-priority-mode/', { mode }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-stream-priority-mode'] }),
   })
+  // ── Genre categories (one smart category per TMDB genre) ──
+  type GenreCounts = { movie: { genre: string; count: number }[]; series: { genre: string; count: number }[] }
+  const [genreCounts, setGenreCounts] = useState<GenreCounts | null>(null)
+  const [genrePicked, setGenrePicked] = useState<Set<string>>(new Set())
+  const [genreTypes, setGenreTypes] = useState<{ movie: boolean; series: boolean }>({ movie: true, series: true })
+  const [genreResult, setGenreResult] = useState<string | null>(null)
+  const [genreMinItems, setGenreMinItems] = useState(25)
+  const loadGenres = useMutation({
+    mutationFn: () => api.get('/vod/categories/genres/', { params: { min_items: genreMinItems } }).then((r) => r.data as GenreCounts),
+    onSuccess: (r) => { setGenreCounts(r); setGenrePicked(new Set()); setGenreResult(null) },
+    onError: (e: any) => setGenreResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  const createGenreCategories = useMutation({
+    mutationFn: () => api.post('/vod/categories/from-genres/', {
+      genres: Array.from(genrePicked),
+      content_types: [genreTypes.movie ? 'movie' : null, genreTypes.series ? 'series' : null].filter(Boolean),
+    }).then((r) => r.data as { created: { name: string }[]; skipped: { name: string; content_type: string; reason: string }[] }),
+    onSuccess: (r) => {
+      setGenreResult(`Created ${r.created.length} categor${r.created.length === 1 ? 'y' : 'ies'}${r.skipped.length ? ` · skipped ${r.skipped.length} (${r.skipped.slice(0, 3).map((x) => `${x.name}: ${x.reason}`).join('; ')}${r.skipped.length > 3 ? '; …' : ''})` : ''}. They fill in over the next minute.`)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+    },
+    onError: (e: any) => setGenreResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+  // ── Automatic TMDB episode titles ──
+  type AutoEpisodeTitles = { mode: string; status: { running: boolean; last_run_at: number | null; last_result: { series_checked: number; series_changed: number; episodes_renamed: number; failed: number } | null } }
+  const autoEpisodeTitlesQuery = useQuery<AutoEpisodeTitles>({
+    queryKey: ['vod-auto-episode-titles'],
+    queryFn:  () => api.get('/vod/auto-episode-titles/').then((r) => r.data),
+  })
+  const setAutoEpisodeTitles = useMutation({
+    mutationFn: (mode: string) => api.post('/vod/auto-episode-titles/', { mode }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-auto-episode-titles'] }),
+  })
+  const [autoEpisodeTitlesRunMsg, setAutoEpisodeTitlesRunMsg] = useState<string | null>(null)
+  const runAutoEpisodeTitles = useMutation({
+    mutationFn: () => api.post('/vod/auto-episode-titles/run/').then((r) => r.data as { series_checked: number; series_changed: number; episodes_renamed: number; failed: number }),
+    onSuccess: (r) => {
+      setAutoEpisodeTitlesRunMsg(`Checked ${r.series_checked} series · renamed ${r.episodes_renamed} episode(s) in ${r.series_changed}${r.failed ? ` · ${r.failed} failed` : ''}`)
+      qc.invalidateQueries({ queryKey: ['vod-auto-episode-titles'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setAutoEpisodeTitlesRunMsg(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
   // ── XC title display format (GH issue #1) ──
   const xcTitleIncludeYearQuery = useQuery<{ enabled: boolean }>({
     queryKey: ['vod-xc-title-include-year'],
@@ -10425,6 +10468,107 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <option value="quality_then_provider">Quality first, provider priority as tiebreak</option>
           <option value="provider_then_quality">Provider priority first, quality as tiebreak</option>
         </select>
+      </SectionCard>
+
+      <SectionCard title="Genre Categories" icon={<Tag size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          Replace provider categories like "EN - ACTION &amp; WAR" with plain genres. Pick genres from your library and
+          this creates one smart category for each (named after the genre, rule "genre contains …", so a title in
+          several genres appears in each). Names you already have are left alone. TMDB supplies the genres, so run
+          enrichment first. To show only these in Dispatcharr, turn off the other groups for the VOD Manager source
+          there.
+        </p>
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button size="sm" variant="outline" disabled={loadGenres.isPending} onClick={() => loadGenres.mutate()}>
+            {loadGenres.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            {genreCounts ? 'Reload genres' : 'Load genres'}
+          </Button>
+          <label className="flex items-center gap-1 text-xs text-muted-foreground" title="Providers write many odd genre spellings; hiding the rare ones keeps the list usable">
+            only genres with at least
+            <input className={inputCls('w-16')} type="number" min={1} value={genreMinItems} onChange={(e) => setGenreMinItems(Math.max(1, Number(e.target.value) || 1))} />
+            titles
+          </label>
+          {genreCounts && (
+            <>
+              <label className="flex items-center gap-1 text-xs"><input type="checkbox" checked={genreTypes.movie} onChange={(e) => setGenreTypes({ ...genreTypes, movie: e.target.checked })} /> Movies</label>
+              <label className="flex items-center gap-1 text-xs"><input type="checkbox" checked={genreTypes.series} onChange={(e) => setGenreTypes({ ...genreTypes, series: e.target.checked })} /> TV Shows</label>
+            </>
+          )}
+        </div>
+        {genreCounts && (() => {
+          const names = Array.from(new Set([...genreCounts.movie, ...genreCounts.series].map((g) => g.genre))).sort((a, b) => a.localeCompare(b))
+          const countOf = (list: { genre: string; count: number }[], g: string) => list.find((x) => x.genre === g)?.count ?? 0
+          return names.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No genres found yet — run TMDB enrichment first.</p>
+          ) : (
+            <>
+              <div className="flex items-center gap-3 text-xs">
+                <button className="text-primary hover:underline" onClick={() => setGenrePicked(new Set(names))}>Select all</button>
+                <button className="text-primary hover:underline" onClick={() => setGenrePicked(new Set())}>Select none</button>
+                <span className="text-muted-foreground">{genrePicked.size} of {names.length} selected</span>
+              </div>
+              <div className="max-h-56 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-0.5 text-xs">
+                {names.map((g) => (
+                  <label key={g} className="flex items-center gap-1.5">
+                    <input
+                      type="checkbox"
+                      checked={genrePicked.has(g)}
+                      onChange={(e) => { const next = new Set(genrePicked); if (e.target.checked) next.add(g); else next.delete(g); setGenrePicked(next) }}
+                    />
+                    <span className="truncate">{g}</span>
+                    <span className="text-muted-foreground ml-auto">{countOf(genreCounts.movie, g)} movies · {countOf(genreCounts.series, g)} shows</span>
+                  </label>
+                ))}
+              </div>
+              <Button
+                size="sm"
+                disabled={genrePicked.size === 0 || (!genreTypes.movie && !genreTypes.series) || createGenreCategories.isPending}
+                onClick={() => { setGenreResult(null); createGenreCategories.mutate() }}
+              >
+                {createGenreCategories.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+                Create {genrePicked.size} genre categor{genrePicked.size === 1 ? 'y' : 'ies'}
+              </Button>
+            </>
+          )
+        })()}
+        {genreResult && <p className="text-xs text-muted-foreground">{genreResult}</p>}
+      </SectionCard>
+
+      <SectionCard title="Automatic TMDB Episode Titles" icon={<Sparkles size={14} />}>
+        <p className="text-xs text-muted-foreground">
+          When a provider adds episodes later, their names often arrive as "Episode 5" or with the season/episode code
+          in them. This fills those in from TMDB on its own (hourly, up to 100 series per pass) instead of you
+          re-running "Use TMDB episode titles". It only replaces blank or placeholder names — a name your provider
+          sent, or one you set or locked, is never changed.
+        </p>
+        <select
+          className={inputCls('w-80')}
+          value={autoEpisodeTitlesQuery.data?.mode ?? 'applied'}
+          disabled={autoEpisodeTitlesQuery.isLoading || setAutoEpisodeTitles.isPending}
+          onChange={(e) => setAutoEpisodeTitles.mutate(e.target.value)}
+        >
+          <option value="applied">Series I have applied TMDB episode titles to (default)</option>
+          <option value="all">Every series with a confirmed TMDB ID</option>
+          <option value="off">Off</option>
+        </select>
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            size="sm" variant="outline"
+            disabled={autoEpisodeTitlesQuery.data?.mode === 'off' || runAutoEpisodeTitles.isPending}
+            title="Runs one pass now with the mode above"
+            onClick={() => { setAutoEpisodeTitlesRunMsg(null); runAutoEpisodeTitles.mutate() }}
+          >
+            {runAutoEpisodeTitles.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            Run now
+          </Button>
+          {autoEpisodeTitlesRunMsg && <span className="text-xs text-muted-foreground">{autoEpisodeTitlesRunMsg}</span>}
+          {!autoEpisodeTitlesRunMsg && autoEpisodeTitlesQuery.data?.status.last_result && (
+            <span className="text-xs text-muted-foreground">
+              Last pass {autoEpisodeTitlesQuery.data.status.last_run_at ? new Date(autoEpisodeTitlesQuery.data.status.last_run_at * 1000).toLocaleString() : ''}:
+              checked {autoEpisodeTitlesQuery.data.status.last_result.series_checked}, renamed {autoEpisodeTitlesQuery.data.status.last_result.episodes_renamed} episode(s)
+            </span>
+          )}
+        </div>
       </SectionCard>
 
       <SectionCard title="Client Title Format" icon={<Type size={14} />}>

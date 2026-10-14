@@ -1031,6 +1031,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 1 = the name was set deliberately (manual edit or "Use TMDB episode
         # titles"), so a provider re-sync must not revert it.
         ("episodes", "name_locked", "INTEGER NOT NULL DEFAULT 0"),
+        # auto_episode_titles: the user applied TMDB episode titles to this
+        # series, so new placeholder-named episodes are filled in automatically.
+        # episode_titles_checked_at: last automatic pass (epoch seconds).
+        ("series", "auto_episode_titles", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "episode_titles_checked_at", "REAL"),
         # Consecutive re-enrichments that found nothing new -- backs the movie
         # re-check interval off (see _is_stale / ENRICHMENT_BACKOFF_MAX_STEPS).
         ("movies", "enrich_stable_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -12400,6 +12405,108 @@ def apply_tmdb_episode_titles(series_id: int, names: dict[tuple[int, int], str],
                     "unmatched": unmatched, "examples": examples, "dry_run": dry_run, "mode": mode}
         finally:
             conn.close()
+
+
+def list_genre_counts(min_items: int = 1) -> dict[str, list[dict]]:
+    """Distinct genres across the active (non-archived) pool with how many movies /
+    series carry each. Providers write several genres into one string, separated by
+    commas, slashes or pipes ("Action, Comedy", "Comedia / Drama"). Genres on fewer
+    than `min_items` titles are left out."""
+    import re
+    conn = _connect()
+    try:
+        out: dict[str, list[dict]] = {}
+        for key, table in (("movie", "movies"), ("series", "series")):
+            counts: dict[str, int] = {}
+            display: dict[str, str] = {}
+            for r in conn.execute(f"SELECT genre FROM {table} WHERE review_excluded=0 AND genre IS NOT NULL AND genre != ''"):
+                for g in {x.strip() for x in re.split(r"[,/|]", r["genre"]) if x.strip()}:
+                    low = g.lower()
+                    counts[low] = counts.get(low, 0) + 1
+                    display.setdefault(low, g)
+            out[key] = sorted(({"genre": display[k], "count": n} for k, n in counts.items() if n >= min_items), key=lambda x: (-x["count"], x["genre"]))
+        return out
+    finally:
+        conn.close()
+
+
+def create_genre_categories(genres: list[str], content_types: list[str], min_items: int = 1) -> dict:
+    """One smart category per (content type, genre), named after the genre, with a
+    'genre contains <genre>' rule. A category that already has that name is left
+    alone and reported as skipped; genres with fewer than `min_items` titles are
+    not created. Returns {"created": [{id, name, content_type}], "skipped": [...]}."""
+    import json
+    counts = list_genre_counts()
+    created: list[dict] = []
+    skipped: list[dict] = []
+    for ctype in content_types:
+        have = {g["genre"].lower(): g["count"] for g in counts.get(ctype, [])}
+        existing = {c["name"].lower() for c in list_categories(ctype)}
+        for genre in genres:
+            name = genre.strip()
+            if not name or have.get(name.lower(), 0) < min_items:
+                skipped.append({"name": name, "content_type": ctype, "reason": "no titles with this genre"})
+            elif name.lower() in existing:
+                skipped.append({"name": name, "content_type": ctype, "reason": "a category with this name already exists"})
+            else:
+                rule = json.dumps({"match": "all", "conditions": [{"field": "genre", "op": "contains", "value": name}]})
+                cid = upsert_category(name, ctype, True, 0, rule)
+                existing.add(name.lower())
+                created.append({"id": cid, "name": name, "content_type": ctype})
+    return {"created": created, "skipped": skipped}
+
+
+def mark_series_auto_episode_titles(series_ids: list[int]) -> None:
+    """Opt these series in to automatic TMDB episode titles (the user applied them)."""
+    if not series_ids:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.executemany(
+                "UPDATE series SET auto_episode_titles=1, episode_titles_checked_at=NULL WHERE id=?", [(i,) for i in series_ids])
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def mark_series_episode_titles_checked(series_id: int, when: float) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("UPDATE series SET episode_titles_checked_at=? WHERE id=?", (when, series_id))
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def list_series_due_for_auto_episode_titles(applied_only: bool, checked_before: float, limit: int) -> list[dict]:
+    """Series with a TMDB id that have at least one unlocked placeholder-named
+    episode and were not checked since `checked_before`. Placeholder detection is
+    the same rule the manual fill uses, so a series is only sent to TMDB when a
+    fill could actually change something."""
+    conn = _connect()
+    try:
+        flag = "AND s.auto_episode_titles=1" if applied_only else ""
+        rows = conn.execute(
+            f"""SELECT s.id, s.name, s.tmdb_id, e.name AS ep_name FROM series s
+                JOIN episodes e ON e.series_id = s.id AND e.name_locked = 0
+                WHERE s.tmdb_id IS NOT NULL AND s.review_excluded = 0 {flag}
+                  AND (s.episode_titles_checked_at IS NULL OR s.episode_titles_checked_at < ?)
+                ORDER BY COALESCE(s.episode_titles_checked_at, 0), s.id""",
+            (checked_before,),
+        ).fetchall()
+        out: dict[int, dict] = {}
+        for r in rows:
+            if r["id"] in out:
+                continue
+            if _is_placeholder_episode_name(r["ep_name"], r["name"]):
+                out[r["id"]] = {"id": r["id"], "name": r["name"], "tmdb_id": r["tmdb_id"]}
+                if len(out) >= limit:
+                    break
+        return list(out.values())
+    finally:
+        conn.close()
 
 
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:

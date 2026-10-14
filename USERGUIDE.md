@@ -1346,6 +1346,16 @@ Episode names you set this way — or by hand with the inline edit — are
 **locked**: a later provider re-sync no longer reverts them. (Apply TMDB Titles
 in the toolbar renames series and movies only, not episodes.)
 
+**Automatic TMDB episode titles.** When a provider adds episodes later, they
+usually arrive as "Episode 5" or with the season/episode code in the name.
+**Curation & Maintenance → Automatic TMDB Episode Titles** fills those in for
+you, once an hour (up to 100 series per pass). Choose which series it covers:
+the ones you have already applied TMDB episode titles to (the default), every
+series with a confirmed TMDB ID, or off. It only replaces blank or placeholder
+names, so a real name your provider sent and any name you set or locked is never
+changed, and a series is only sent to TMDB when it actually has a placeholder
+name to fix. **Run now** does one pass immediately.
+
 **Finding items with no TMDB ID.** The **No TMDB ID** button next to *Archived*
 on the Movies and TV Shows pages lists only the titles that still have no TMDB
 match. This is wider than **Metadata Review**, which only lists titles with no
@@ -1861,6 +1871,16 @@ in your pool; neither pulls in anything new.
   series category — kept separate since Dispatcharr's movie and TV catalogs
   are different endpoints. This is the quick path for "I don't have a
   category for this list yet."
+- **Genre Categories** (Curation & Maintenance) — one click to replace provider
+  categories like "EN - ACTION & WAR" with plain genres. **Load genres** lists
+  the genres in your library (TMDB supplies them, so run enrichment first;
+  providers also write odd spellings, so rare ones are hidden below the "at
+  least N titles" threshold). Tick the ones you want and **Create** makes a smart
+  category for each, named after the genre with the rule *genre contains …* (a
+  title in several genres appears in each). Existing category names are skipped,
+  and the new categories fill in over the next minute. To show only them in
+  Dispatcharr, open the VOD Manager M3U source there and turn off the other
+  groups (and "auto sync new categories") before refreshing.
 - **MDBList Lists** (Curation & Maintenance) — the same quick path for an
   [MDBList](https://mdblist.com) list: enter its list ID and a name template
   and it creates a paired movie and series category linked to it (needs your

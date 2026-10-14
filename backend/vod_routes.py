@@ -10,6 +10,8 @@ from auth import verify_session
 from config import (
     get_strm_export_settings,
     save_strm_export_settings as _save_strm_export_settings,
+    get_auto_episode_titles_mode,
+    save_auto_episode_titles_mode,
     get_ai_model,
     get_ai_provider,
     get_anthropic_api_key,
@@ -51,6 +53,7 @@ from routes import require_auth
 from secrets_util import hash_password, looks_like_fernet_token
 import ai_assist
 import apply_exclusions_job
+import auto_episode_titles
 import dispatcharr_dvr_client
 import dispatcharr_dvr_importer
 import duplicate_confirm
@@ -2722,6 +2725,44 @@ async def upsert_category(body: CategoryRequest):
     return {"id": category_id}
 
 
+@router.get("/categories/genres/", dependencies=_GUARDS)
+async def list_category_genres(min_items: int = 1):
+    """Genres present in the library with title counts, for the one-click genre categories."""
+    return await asyncio.to_thread(vod_db.list_genre_counts, max(1, min_items))
+
+
+class GenreCategoriesRequest(BaseModel):
+    genres: list[str]
+    content_types: list[str] = ["movie", "series"]
+    min_items: int = 1
+
+
+@router.post("/categories/from-genres/", dependencies=_GUARDS)
+async def create_genre_categories(body: GenreCategoriesRequest):
+    """Creates a smart category named after each chosen genre ('genre contains X'),
+    evaluates it, and skips names that already exist."""
+    if not body.genres:
+        raise HTTPException(400, detail="pick at least one genre")
+    if len(body.genres) > 100:
+        raise HTTPException(400, detail="at most 100 genres per request")
+    if not body.content_types or any(c not in ("movie", "series") for c in body.content_types):
+        raise HTTPException(400, detail="content_types must be 'movie' and/or 'series'")
+    result = await asyncio.to_thread(vod_db.create_genre_categories, body.genres, body.content_types, max(1, body.min_items))
+    if result["created"]:
+        asyncio.create_task(_evaluate_categories_in_background([c["id"] for c in result["created"]]))
+    return result
+
+
+async def _evaluate_categories_in_background(category_ids: list[int]) -> None:
+    """Each evaluation scans the whole pool, so a batch of new categories fills in
+    one after another instead of holding the request open for minutes."""
+    for category_id in category_ids:
+        try:
+            await asyncio.to_thread(vod_db.evaluate_smart_category, category_id)
+        except Exception as exc:
+            logger.warning("[vod_routes] genre category=%s evaluation failed: %s", category_id, exc)
+
+
 @router.delete("/categories/{category_id}/", dependencies=_GUARDS)
 async def delete_category(category_id: int):
     if not vod_db.get_category(category_id):
@@ -3645,6 +3686,33 @@ async def list_series(
     }
 
 
+class AutoEpisodeTitlesRequest(BaseModel):
+    mode: str
+
+
+@router.get("/auto-episode-titles/", dependencies=_GUARDS)
+async def get_auto_episode_titles():
+    return {"mode": get_auto_episode_titles_mode(), "status": auto_episode_titles.get_status()}
+
+
+@router.post("/auto-episode-titles/", dependencies=_GUARDS)
+async def set_auto_episode_titles(body: AutoEpisodeTitlesRequest):
+    try:
+        save_auto_episode_titles_mode(body.mode)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"mode": get_auto_episode_titles_mode()}
+
+
+@router.post("/auto-episode-titles/run/", dependencies=_GUARDS)
+async def run_auto_episode_titles():
+    """One pass now, using the saved mode (a manual run with mode 'off' does nothing)."""
+    try:
+        return await auto_episode_titles.run_once()
+    except RuntimeError as exc:
+        raise HTTPException(409, detail=str(exc))
+
+
 @router.get("/series/ids/", dependencies=_GUARDS)
 async def list_series_ids(
     search: Optional[str] = None, category_id: Optional[int] = None, provider_id: Optional[int] = None,
@@ -3892,9 +3960,12 @@ async def apply_tmdb_episode_titles(series_id: int, mode: str = "fill", dry_run:
     if not names:
         raise HTTPException(502, detail="TMDB returned no episode names for this series")
     try:
-        return await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, mode, dry_run)
+        result = await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, mode, dry_run)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
+    if not dry_run:
+        await asyncio.to_thread(vod_db.mark_series_auto_episode_titles, [series_id])
+    return result
 
 
 class BulkEpisodeTitlesRequest(BaseModel):
@@ -3932,6 +4003,8 @@ async def bulk_apply_tmdb_episode_titles(body: BulkEpisodeTitlesRequest):
             if not names:
                 raise RuntimeError("TMDB returned no episode names")
             result = await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, body.mode, body.dry_run)
+            if not body.dry_run:
+                await asyncio.to_thread(vod_db.mark_series_auto_episode_titles, [series_id])
         except tmdb_sync.TmdbNotFoundError:
             # a stale/removed TMDB id on one series must not abort the batch
             totals["series_failed"] += 1
