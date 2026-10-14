@@ -49,6 +49,7 @@ interface RetentionResult {
   expired_referenced_titles: number
   titles_removed: number
   seasons_removed: number
+  searches_removed: number
   gone_removed: number
 }
 interface LookupResult {
@@ -128,7 +129,7 @@ export default function TmdbStore() {
     mutationFn: (dryRun: boolean) => api.post('/tmdb-store/retention', null, { params: { dry_run: dryRun } }).then((r) => r.data as RetentionResult),
     onSuccess: (result) => {
       if (!result.dry_run) {
-        toast.success(`Removed ${fmtNum(result.titles_removed)} titles, ${fmtNum(result.seasons_removed)} seasons, and ${fmtNum(result.gone_removed)} expired records`)
+        toast.success(`Removed ${fmtNum(result.titles_removed)} titles, ${fmtNum(result.seasons_removed)} seasons, ${fmtNum(result.searches_removed)} search answers, and ${fmtNum(result.gone_removed)} expired records`)
         qc.invalidateQueries({ queryKey: ['tmdb-store-status'] })
       }
     },
@@ -296,7 +297,7 @@ export default function TmdbStore() {
             {retention.data?.dry_run && (
               <div className="rounded-md border border-border p-2 text-xs space-y-1">
                 <p><b>Cleanup preview:</b> {fmtNum(retention.data.referenced)} catalog references. {fmtNum(retention.data.unreferenced_titles)} unreferenced and {fmtNum(retention.data.expired_referenced_titles)} expired referenced titles would be removed.</p>
-                <p className="text-muted-foreground">Also removes {fmtNum(retention.data.seasons_removed)} season and {fmtNum(retention.data.gone_removed)} unavailable-title records.</p>
+                <p className="text-muted-foreground">Also removes {fmtNum(retention.data.seasons_removed)} season, {fmtNum(retention.data.searches_removed)} search answer and {fmtNum(retention.data.gone_removed)} unavailable-title records.</p>
                 <Button size="sm" disabled={retention.isPending} onClick={() => askConfirm('Remove the TMDB records shown in this preview? Current catalog items will be refreshed as needed.', () => retention.mutate(false))}>Apply cleanup</Button>
               </div>
             )}
