@@ -32,6 +32,7 @@ JSON schema, never freeform prose to parse.
 import asyncio
 import json
 import logging
+import re
 
 import httpx
 
@@ -264,6 +265,22 @@ _PROVIDER_CALLERS = {
 }
 
 
+def _provider_error_detail(response: httpx.Response, limit: int = 600) -> str:
+    """The provider's own error message, whitespace-collapsed -- a blind
+    300-char slice of the raw JSON cut off the part that says *why* (which
+    quota, free tier vs paid, which model)."""
+    text = response.text
+    try:
+        error = response.json().get("error")
+        if isinstance(error, dict):
+            text = " ".join(filter(None, [error.get("status"), error.get("message")]))
+        elif isinstance(error, str):
+            text = error
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
 async def _call_ai(system: str, user_message: str, tool_name: str, tool_description: str, schema: dict, max_tokens: int = 1024) -> dict:
     provider = get_ai_provider()
     caller = _PROVIDER_CALLERS[provider]
@@ -271,8 +288,13 @@ async def _call_ai(system: str, user_message: str, tool_name: str, tool_descript
     try:
         return await caller(model, system, user_message, tool_name, tool_description, schema, max_tokens)
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:300]
+        detail = _provider_error_detail(exc.response)
         raise ValueError(f"{provider} request failed ({exc.response.status_code}): {detail}") from exc
+    except httpx.TimeoutException as exc:
+        # str(exc) is empty for a timeout -- say what happened instead of a blank message.
+        raise ValueError(f"{provider} did not answer within 60 seconds (model {model}); it may be overloaded -- try again, or pick another model in Configuration") from exc
+    except httpx.RequestError as exc:
+        raise ValueError(f"{provider} request failed: {type(exc).__name__} (could not reach the API)") from exc
 
 
 async def suggest_category_rule(description: str, content_type: str) -> dict:

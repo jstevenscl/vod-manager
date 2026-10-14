@@ -196,3 +196,27 @@ def test_stream_and_poster_urls_follow_the_provider_type():
     assert em_url == "http://em:8096/emby/Videos/abc/stream.mp4?Static=true&api_key=k"
     assert emby_vod_client.build_poster_url(jf, "abc") == "http://jf:8096/Items/abc/Images/Primary?api_key=k"
     assert emby_vod_client.build_poster_url(em, "abc") == "http://em:8096/emby/Items/abc/Images/Primary?api_key=k"
+
+
+def test_api_prefix_honors_a_remembered_native_paths_flag():
+    assert emby_vod_client.api_prefix({"provider_type": "emby"}) == "/emby"
+    assert emby_vod_client.api_prefix({"provider_type": "emby", "native_api_paths": 1}) == ""
+    assert emby_vod_client.api_prefix({"provider_type": "jellyfin"}) == ""
+
+
+def test_discovering_a_no_alias_server_is_persisted_on_the_provider(db):
+    provider_id = db.upsert_provider("jf-as-emby", "http://jellyfin.example", "u", "key", provider_type="emby")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/emby/"):
+            return httpx.Response(404)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client_with_transport(db.get_provider(provider_id), handler)
+    asyncio.run(client._get("/emby/System/Info"))
+
+    stored = db.get_provider(provider_id)
+    assert stored["native_api_paths"] == 1
+    assert emby_vod_client.api_prefix(stored) == ""
+    # A fresh client for the same provider skips the failing /emby round-trip from the start.
+    assert emby_vod_client.EmbyVodClient(stored)._emby_prefix_unsupported is True

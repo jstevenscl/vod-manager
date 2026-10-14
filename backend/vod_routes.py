@@ -366,12 +366,17 @@ class DiscoveredProfileKey(BaseModel):
 
 class ImportDiscoveredProfilesRequest(BaseModel):
     profiles: list[DiscoveredProfileKey]
+    # Same reasoning as ProviderRequest.is_active: an active provider is imported
+    # straight away, before Exclude Categories can be set up. Applies only to
+    # providers this call creates, never to ones already imported.
+    start_inactive: bool = True
 
 
 class ImportDiscoveredProfilesAsSubAccountsRequest(BaseModel):
     profiles: list[DiscoveredProfileKey]
     provider_id: Optional[int] = None
     new_provider_name: Optional[str] = None
+    start_inactive: bool = True  # only used when new_provider_name creates a provider
 
 
 class CategoryRequest(BaseModel):
@@ -1493,7 +1498,7 @@ async def import_discovered_dispatcharr_accounts(connection_id: int, body: Impor
         if not profile:
             continue
         try:
-            imported.append(vod_sync.import_discovered_profile(connection_id, profile))
+            imported.append(vod_sync.import_discovered_profile(connection_id, profile, start_inactive=body.start_inactive))
         except ValueError as exc:
             skipped.append({"name": profile["name"], "reason": str(exc)})
     return {"imported": imported, "skipped": skipped}
@@ -1519,6 +1524,7 @@ async def import_discovered_dispatcharr_accounts_as_subaccounts(
     try:
         return vod_sync.import_discovered_profiles_as_subaccounts(
             connection_id, profiles, provider_id=body.provider_id, new_provider_name=body.new_provider_name,
+            start_inactive=body.start_inactive,
         )
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
@@ -3874,6 +3880,50 @@ async def apply_tmdb_episode_titles(series_id: int, mode: str = "fill", dry_run:
         raise HTTPException(400, detail=str(exc))
 
 
+class BulkEpisodeTitlesRequest(BaseModel):
+    ids: list[int]
+    mode: str = "fill"
+    dry_run: bool = True
+
+
+@router.post("/series/tmdb-episode-titles/bulk/", dependencies=_GUARDS)
+async def bulk_apply_tmdb_episode_titles(body: BulkEpisodeTitlesRequest):
+    """The per-series TMDB episode-title fill for a hand-picked set of series
+    (at most 50 per call -- the UI chunks bigger selections). Same fill/replace
+    modes and dry-run preview as the single-series route; a series that has no
+    confirmed TMDB id, or that TMDB can't answer for, is counted and skipped
+    rather than failing the whole batch."""
+    if body.mode not in ("fill", "replace"):
+        raise HTTPException(400, detail="mode must be 'fill' or 'replace'")
+    if len(body.ids) > 50:
+        raise HTTPException(400, detail="at most 50 series per request")
+    totals = {"series_checked": 0, "series_changed": 0, "episodes_renamed": 0, "series_without_tmdb": 0,
+              "series_failed": 0, "failures": [], "dry_run": body.dry_run}
+    for series_id in body.ids:
+        series = await asyncio.to_thread(vod_db.get_series, series_id)
+        if not series:
+            continue
+        totals["series_checked"] += 1
+        if not series.get("tmdb_id"):
+            totals["series_without_tmdb"] += 1
+            continue
+        try:
+            episodes = await tmdb_sync.get_series_episode_list_cached(str(series["tmdb_id"]))
+            names = {(e["season_number"], e["episode_number"]): e["name"] for e in episodes if e.get("name")}
+            if not names:
+                raise RuntimeError("TMDB returned no episode names")
+            result = await asyncio.to_thread(vod_db.apply_tmdb_episode_titles, series_id, names, body.mode, body.dry_run)
+        except (ValueError, RuntimeError) as exc:
+            totals["series_failed"] += 1
+            if len(totals["failures"]) < 5:
+                totals["failures"].append(f"{series.get('name')}: {tmdb_sync._redact(exc)}")
+            continue
+        if result.get("renamed"):
+            totals["series_changed"] += 1
+            totals["episodes_renamed"] += result["renamed"]
+    return totals
+
+
 @router.post("/series/tmdb-title/bulk-apply/", dependencies=_GUARDS)
 async def bulk_apply_tmdb_title_series(after_id: int = 0, limit: int = 100):
     """See bulk_apply_tmdb_title_movies' identical docstring -- same reasoning."""
@@ -3981,6 +4031,7 @@ async def runtime_status():
         "tmdb": {"running": False, "done": 0, "total": 0},
         "bulk_ai": vod_bulk_ai_service.get_active_bulk_ai_status(),
         "process_cpu_percent": vod_importer.get_process_cpu_percent(),
+        "failed_imports": await asyncio.to_thread(vod_db.list_failed_provider_imports),
     }
 
 

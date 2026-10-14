@@ -255,7 +255,7 @@ def _find_provider_linked_to_profile(connection_id: int, account_id: int, profil
     return None
 
 
-def import_discovered_profile(connection_id: int, profile: dict) -> dict:
+def import_discovered_profile(connection_id: int, profile: dict, start_inactive: bool = False) -> dict:
     """Creates (or refreshes, if this Dispatcharr profile was already
     imported before) one VOD Manager provider row from a discovered
     Dispatcharr profile. upsert_provider matches by name, so re-running
@@ -266,16 +266,20 @@ def import_discovered_profile(connection_id: int, profile: dict) -> dict:
     shouldn't get silently clobbered by a re-import. Refuses to import a
     profile whose credentials couldn't be parsed (see
     _extract_profile_credentials) rather than creating a provider with no
-    real login."""
+    real login. start_inactive applies only to a provider this call creates
+    (an already-imported one keeps whatever active state it has)."""
     if profile.get("credentials_unparseable") or not profile.get("username"):
         raise ValueError(f"couldn't determine real credentials for profile {profile['name']!r} -- not imported")
     existing = _find_provider_linked_to_profile(connection_id, profile["dispatcharr_account_id"], profile["dispatcharr_profile_id"])
     priority = existing["priority"] if existing else 0
+    is_new_provider = not any(p["name"] == profile["name"] for p in vod_db.list_providers())
     provider_id = vod_db.upsert_provider(
         name=profile["name"], base_url=profile["server_url"],
         username=profile["username"], password=profile["password"],
         max_streams=profile["max_streams"], priority=priority, provider_type="xc",
     )
+    if is_new_provider and start_inactive:
+        vod_db.set_provider_active(provider_id, False)
     if profile["max_streams"]:
         vod_db.set_provider_shared_limit(provider_id, profile["max_streams"])
     vod_db.set_provider_live_account(provider_id, connection_id, profile["dispatcharr_account_id"], profile["dispatcharr_profile_id"])
@@ -284,6 +288,7 @@ def import_discovered_profile(connection_id: int, profile: dict) -> dict:
 
 def import_discovered_profiles_as_subaccounts(
     connection_id: int, profiles: list[dict], provider_id: int | None = None, new_provider_name: str | None = None,
+    start_inactive: bool = False,
 ) -> dict:
     """vod_manager-gd5: group N discovered Dispatcharr profiles into one
     provider's sub-accounts, instead of import_discovered_profile's one-row-
@@ -321,6 +326,7 @@ def import_discovered_profiles_as_subaccounts(
             raise ValueError(f"provider {provider_id} not found")
     else:
         first = usable[0]
+        is_new_provider = not any(p["name"] == new_provider_name for p in vod_db.list_providers())
         pid = vod_db.upsert_provider(
             name=new_provider_name, base_url=first["server_url"],
             username=first["username"], password=first["password"],
@@ -328,6 +334,8 @@ def import_discovered_profiles_as_subaccounts(
         )
         if first["max_streams"]:
             vod_db.set_provider_shared_limit(pid, first["max_streams"])
+        if is_new_provider and start_inactive:
+            vod_db.set_provider_active(pid, False)
         vod_db.set_provider_live_account(pid, connection_id, first["dispatcharr_account_id"], first["dispatcharr_profile_id"])
         provider = vod_db.get_provider(pid)
         sub_account_profiles = usable[1:]

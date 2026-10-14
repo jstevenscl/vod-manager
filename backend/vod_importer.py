@@ -1215,7 +1215,9 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
     sources = await asyncio.to_thread(vod_db.list_movie_sources, movie_id)
     if not sources:
         return False
-    source = sources[0]
+    source = sources[0]  # active providers sort first
+    if not source.get("provider_is_active", 1):
+        return False  # only deactivated providers carry it: don't call their API (7rc)
     provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
     if not provider:
         return False
@@ -1420,6 +1422,9 @@ async def enrich_series(series_id: int, *, force: bool = False, write_queue: "as
     sources = await asyncio.to_thread(vod_db.list_series_sources, series_id)
     if not sources:
         return {"fetched": False, "reason": "no source provider recorded for this series"}
+    sources = [s for s in sources if s.get("provider_is_active", 1)]
+    if not sources:
+        return {"fetched": False, "reason": "every provider carrying this series is inactive"}
 
     # Detail metadata (genre/description/tmdb_id/etc) is only ever written
     # from the FIRST source below that's actually XC and actually fetched --

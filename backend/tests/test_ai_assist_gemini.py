@@ -202,3 +202,37 @@ def test_gemini_quota_429_is_not_retried(monkeypatch):
 def test_default_gemini_model_is_the_latest_alias():
     import config
     assert config._AI_DEFAULT_MODELS["gemini"] == "gemini-flash-latest"
+
+
+def test_provider_error_detail_keeps_the_reason_not_just_the_first_300_chars():
+    import httpx
+
+    import ai_assist
+
+    long_reason = "You exceeded your current quota. " + "padding " * 60 + "Quota exceeded for metric: free_tier_requests, limit: 0"
+    response = httpx.Response(429, json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": long_reason}})
+
+    detail = ai_assist._provider_error_detail(response)
+
+    assert detail.startswith("RESOURCE_EXHAUSTED You exceeded your current quota.")
+    assert "free_tier_requests" in detail and "\n" not in detail
+    assert ai_assist._provider_error_detail(httpx.Response(502, text="bad gateway")) == "bad gateway"
+
+
+def test_a_provider_timeout_gets_a_real_message_not_a_blank_one(monkeypatch):
+    import asyncio
+
+    import httpx
+    import pytest
+
+    import ai_assist
+
+    async def slow(*args, **kwargs):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setitem(ai_assist._PROVIDER_CALLERS, "gemini", slow)
+    monkeypatch.setattr(ai_assist, "get_ai_provider", lambda: "gemini")
+    monkeypatch.setattr(ai_assist, "get_ai_model", lambda: "gemini-flash-latest")
+
+    with pytest.raises(ValueError, match="did not answer within 60 seconds"):
+        asyncio.run(ai_assist._call_ai("s", "u", "tool", "d", {"type": "object"}))

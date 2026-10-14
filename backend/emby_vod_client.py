@@ -64,8 +64,11 @@ def api_prefix(provider: dict) -> str:
     """Path prefix for this provider's server. Jellyfin's own API is unprefixed:
     `/emby/*` on a Jellyfin server is only a legacy-compatibility alias that
     12.1 no longer serves (GH#50: every stream and poster 404'd). Emby's API
-    lives under `/emby`."""
-    return "" if provider.get("provider_type") == "jellyfin" else "/emby"
+    lives under `/emby`. An Emby-type provider that turned out to be a Jellyfin
+    12.1 server is remembered in `native_api_paths` (GH#50 follow-up)."""
+    if provider.get("provider_type") == "jellyfin" or provider.get("native_api_paths"):
+        return ""
+    return "/emby"
 
 
 class EmbyVodClient:
@@ -92,7 +95,9 @@ class EmbyVodClient:
         # extra round-trip only on its first request, not every single one.
         # GH#50: a Jellyfin provider never needs the /emby alias, so go straight
         # to native paths instead of paying (or failing) the 404 round-trip.
-        self._emby_prefix_unsupported = provider.get("provider_type") == "jellyfin"
+        self._provider_id = provider.get("id")
+        self._emby_prefix_unsupported = (provider.get("provider_type") == "jellyfin"
+                                         or bool(provider.get("native_api_paths")))
 
     async def __aenter__(self) -> "EmbyVodClient":
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
@@ -166,6 +171,7 @@ class EmbyVodClient:
                 )
                 if r2.is_success:
                     self._emby_prefix_unsupported = True
+                    await self._remember_native_paths()
                     logger.info(
                         "[emby_vod_client] %s 404'd, %s worked -- this server doesn't alias /emby/*, "
                         "using native Jellyfin paths for the rest of this session",
@@ -194,6 +200,18 @@ class EmbyVodClient:
         finally:
             if owns_client:
                 await client.aclose()
+
+    async def _remember_native_paths(self) -> None:
+        """Persist the discovery so xc_server builds stream/poster URLs without
+        /emby too (the client's own fallback only covers its API calls)."""
+        if not self._provider_id:
+            return
+        try:
+            import vod_db  # local import: the client is also used standalone in tests
+            await asyncio.to_thread(vod_db.set_provider_native_api_paths, self._provider_id, True)
+        except Exception as exc:
+            logger.warning("[emby_vod_client] couldn't remember native API paths for provider %s: %s",
+                           self._provider_id, exc)
 
     async def _post_session(self, path: str, body: dict) -> None:
         """Best-effort: a failed session report shouldn't interrupt the

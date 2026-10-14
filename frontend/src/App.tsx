@@ -47,6 +47,7 @@ interface RuntimeStatus {
   tmdb: { running: boolean; done: number; total: number }
   bulk_ai: { running: boolean; done: number; total: number; jobs: number }
   process_cpu_percent: number | null
+  failed_imports?: { provider_id: number; provider_name: string; error: string | null }[]
 }
 const NAV_GROUPS: NavGroup[] = [
   { label: 'VOD Library', items: [
@@ -141,7 +142,13 @@ export default function App() {
   const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
   const runtime = runtimeStatusQuery.data
   const catalogBusy = !!(runtime?.import.running || runtime?.import.queued || runtime?.bulk_ai.running || runtime?.tmdb.running || runtime?.enrichment.running)
-  const catalogFailed = !catalogBusy && !!runtime?.import.error
+  const failedImports = runtime?.failed_imports ?? []
+  // failed_imports (latest run per active provider) supersedes the in-memory last-import error, which
+  // lingers after a provider is deleted or fixed; only fall back to it for an older backend.
+  const catalogFailed = !catalogBusy && (runtime?.failed_imports !== undefined ? failedImports.length > 0 : !!runtime?.import.error)
+  const failedSummary = failedImports.length
+    ? failedImports.slice(0, 3).map((f) => `${f.provider_name}${f.error ? ` (${f.error})` : ''}`).join('; ') + (failedImports.length > 3 ? ` and ${failedImports.length - 3} more` : '')
+    : `${runtime?.import.provider_name ?? 'a provider'}${runtime?.import.error ? ` (${runtime.import.error})` : ''}`
   const catalogDetail = runtime?.import.running
     ? `Importing ${runtime.import.provider_name ?? 'provider'}…`
     : runtime?.import.queued
@@ -152,7 +159,7 @@ export default function App() {
           ? `TMDB: ${runtime.tmdb.done}/${runtime.tmdb.total}`
           : runtime?.enrichment.running
             ? `Enriching: ${runtime.enrichment.movies_done}/${runtime.enrichment.movies_total} movies · ${runtime.enrichment.series_done}/${runtime.enrichment.series_total} series`
-            : catalogFailed ? `Import failed for ${runtime?.import.provider_name ?? 'a provider'}${runtime?.import.error ? ` (${runtime.import.error})` : ''}. Check that provider in Providers and retry.` : 'Idle'
+            : catalogFailed ? `Import failed for ${failedSummary}. Check ${failedImports.length > 1 ? 'those providers' : 'that provider'} in Providers and retry.` : 'Idle'
 
   useEffect(() => {
     if (isLoading) return

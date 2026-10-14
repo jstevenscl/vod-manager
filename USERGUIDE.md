@@ -201,7 +201,10 @@ you've had a chance to set up **Exclude Categories**, and a full unfiltered
 import of a large provider can bog the app down. Add it inactive, set up its
 exclusions (the **Exclude Categories** picker still works on an inactive
 provider), then click the power icon to activate it or run **Import** yourself.
-Untick the box if you want the old behaviour.
+Untick the box if you want the old behaviour. The Dispatcharr **Discover
+Providers** dialog has the same **Add new providers as inactive** option (also
+on by default); it only affects providers that import creates, never ones you
+have already imported.
 
 Each provider row also has:
 
@@ -476,7 +479,11 @@ language from playback and the exported Dispatcharr catalog — nothing is
 deleted, and re-checking it brings that content back instantly. A
 movie/series with at least one source in a still-enabled language stays
 fully visible either way, even if it also has sources in languages you've
-unchecked.
+unchecked. Content a provider tags **[MULTI-LANG]** (category) or **[MULTI-SUB]**
+(title) is multi-track, so it is classed as its own **MULTI** language and is
+never hidden by this filter, whatever languages you leave enabled. Existing
+catalogs pick this up from [Language Backfill](#language-backfill-and-language-split)
+(Curation & Maintenance), which re-tags already-imported sources.
 
 Use Import Language Exclusion when you never want a language cluttering
 your pool at all; use Enabled Playback Languages when you just want to
@@ -1150,9 +1157,11 @@ Above the catalog itself, the dashboard always shows two live cards:
 ![Failed Streams, showing a mid-stream crash and an every-source-exhausted failure](docs/screenshots/failed-streams.png)
 
 If a catalog import fails, the **Catalog status** card at the top turns red and
-names the provider and the error (for example "Import failed for *My Provider*
-(ConnectError)"). Only the most recent failed import is shown; **Sync History**
-keeps the per-provider record. Fix the provider (credentials, URL, User-Agent)
+names each provider whose latest import failed, with the error (for example
+"Import failed for *My Provider* (ConnectError)"; up to three are listed, then
+"and N more"). A provider drops off the list as soon as its next import
+succeeds, or when you deactivate or delete it; **Sync History** keeps the
+per-provider record. Fix the provider (credentials, URL, User-Agent)
 and run **Import** again.
 
 On the **Movies** and **TV Shows** pages, the **All categories** dropdown next to
@@ -1333,6 +1342,12 @@ Episode names you set this way — or by hand with the inline edit — are
 **locked**: a later provider re-sync no longer reverts them. (Apply TMDB Titles
 in the toolbar renames series and movies only, not episodes.)
 
+**For several series at once**, tick them on the TV Shows page and click
+**TMDB episode titles (N)** in the selection bar. It previews the total ("Would
+rename 412 episode(s) across 7 of 9 series"), lists how many series have no
+confirmed TMDB match (skipped) or failed, and only writes when you click
+**Apply**. The same **Replace existing names too** option applies.
+
 ### Flagging wrong content
 
 Every movie, series, episode, and individual source has a **flag** icon —
@@ -1423,7 +1438,12 @@ over a model id that belongs to a different provider.
 at a current model. Google retires specific versions quickly: Gemini 2.5
 Flash/Pro now answer "no longer available to new users" on newer accounts, so
 they stay in the list only for accounts that still have them. If you pick a
-model your account can't use you'll see Google's own message.
+model your account can't use you'll see Google's own message. Two other
+responses come from Google rather than the app: **503 "high demand"** (the app
+retries a few times, then tells you to try again) and **429 "exceeded your
+current quota"**, which means this key has run out of requests for that model —
+common on free-tier keys, which have little or no quota for the Pro models.
+Check your plan and usage on Google's side.
 
 **When an AI request fails**, the message under the item (Needs Review,
 Missing Artwork) now includes the provider's own explanation — a retired
@@ -1910,7 +1930,10 @@ A manual **Sync now** on the category runs immediately; **Configuration →
 Refresh Schedule → List Sync (hrs)** controls how often every list-sourced
 category (TMDB List, MDBList or TMDB chart) re-syncs automatically — **blank
 means off**, the default, in which case categories only update when you click
-**Sync now**.
+**Sync now**. A list-sourced category also has its own schedule dropdown in
+Manage Categories (global / hourly / every 6h / daily / weekly) that overrides
+the global interval for just that category, so a chart can refresh daily while
+the others stay manual.
 
 ---
 

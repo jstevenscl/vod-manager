@@ -886,7 +886,9 @@ async def _emby_heartbeat_loop(
 
 
 _UPSTREAM_XC_PATH_RE = re.compile(r"/(live|movie|series)/[^/\s\"]+/[^/\s\"]+/")
-_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_?key|username|password)=[^&\s\"]*", re.IGNORECASE)
+# Gemini authenticates with a bare `?key=` query param, hence the lookbehind alternative
+# (a plain "key" alternative would also hit words like "monkey=").
+_UPSTREAM_TOKEN_QS_RE = re.compile(r"(X-Plex-Token|api_?key|username|password|(?<=[?&])key)=[^&\s\"]*", re.IGNORECASE)
 
 
 def _redact_upstream_url(url: str) -> str:

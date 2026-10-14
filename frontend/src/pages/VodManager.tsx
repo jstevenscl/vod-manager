@@ -3690,6 +3690,23 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                     if (v !== c.sort_order) setCategorySortOrder.mutate({ id: c.id, sort_order: v })
                   }}
                 />
+                {!c.is_smart && !!(c.sync_source || c.sync_sources) && (
+                  <select
+                    className={inputCls('w-20 text-[10px]')}
+                    title="How often this category re-syncs from its list. Without its own schedule it follows the global List Sync (hrs) setting, which is off by default."
+                    value={c.schedule_interval_seconds ? String(c.schedule_interval_seconds) : ''}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setCategoryEvalSchedule.mutate({ id: c.id, schedule_interval_seconds: v ? Number(v) : null, use_ai_evaluation: false })
+                    }}
+                  >
+                    <option value="">global / manual</option>
+                    <option value="3600">hourly</option>
+                    <option value="21600">every 6h</option>
+                    <option value="86400">daily</option>
+                    <option value="604800">weekly</option>
+                  </select>
+                )}
                 {!!c.is_smart && (
                   <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
                     <Zap size={12} />
@@ -4694,6 +4711,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // per-provider connection totals exactly).
   const [discoverModalConnectionId, setDiscoverModalConnectionId] = useState<number | null>(null)
   const [discoverSelectedIds, setDiscoverSelectedIds] = useState<Set<string>>(new Set())
+  const [discoverStartInactive, setDiscoverStartInactive] = useState(true)
   const discoverKey = (a: { dispatcharr_account_id: number; dispatcharr_profile_id: number }) =>
     `${a.dispatcharr_account_id}:${a.dispatcharr_profile_id}`
   const discoverAccountsQuery = useQuery<DiscoveredAccount[]>({
@@ -4707,6 +4725,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         const [dispatcharr_account_id, dispatcharr_profile_id] = key.split(':').map(Number)
         return { dispatcharr_account_id, dispatcharr_profile_id }
       }),
+      start_inactive: discoverStartInactive,
     }).then((r) => r.data),
     onSuccess: (data: { imported: unknown[]; skipped: { name: string; reason: string }[] }) => {
       qc.invalidateQueries({ queryKey: ['vod-dispatcharr-discover-accounts', discoverModalConnectionId] })
@@ -4732,6 +4751,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       }),
       provider_id: groupTargetProviderId === '' ? null : groupTargetProviderId,
       new_provider_name: groupTargetProviderId === '' ? groupNewProviderName : null,
+      start_inactive: discoverStartInactive,
     }).then((r) => r.data),
     onSuccess: (data: { provider: { name: string } | null; sub_accounts_created: number; skipped: { name: string; reason: string }[] }) => {
       const createdNewProvider = groupTargetProviderId === ''
@@ -6563,6 +6583,30 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
   })
 
+  // Fill (or replace) the episode names of every selected series from TMDB.
+  // Always previews first; chunks the selection to the API's 50-per-call limit.
+  type EpisodeTitlesBulk = { series_checked: number; series_changed: number; episodes_renamed: number; series_without_tmdb: number; series_failed: number; failures: string[]; dry_run: boolean }
+  const [bulkEpisodeTitles, setBulkEpisodeTitles] = useState<EpisodeTitlesBulk | null>(null)
+  const [bulkEpisodeTitlesReplace, setBulkEpisodeTitlesReplace] = useState(false)
+  const runBulkEpisodeTitles = useMutation({
+    mutationFn: async (dry_run: boolean) => {
+      const ids = Array.from(selectedSeriesIds)
+      const total: EpisodeTitlesBulk = { series_checked: 0, series_changed: 0, episodes_renamed: 0, series_without_tmdb: 0, series_failed: 0, failures: [], dry_run }
+      for (let i = 0; i < ids.length; i += 50) {
+        const r = (await api.post('/vod/series/tmdb-episode-titles/bulk/', { ids: ids.slice(i, i + 50), mode: bulkEpisodeTitlesReplace ? 'replace' : 'fill', dry_run })).data as EpisodeTitlesBulk
+        total.series_checked += r.series_checked; total.series_changed += r.series_changed; total.episodes_renamed += r.episodes_renamed
+        total.series_without_tmdb += r.series_without_tmdb; total.series_failed += r.series_failed
+        total.failures = [...total.failures, ...r.failures].slice(0, 5)
+      }
+      return total
+    },
+    onSuccess: (r) => {
+      setBulkEpisodeTitles(r)
+      if (!r.dry_run) { qc.invalidateQueries({ queryKey: ['vod-series'] }) }
+    },
+    onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
+  })
+
   const movieCategories  = categoriesQuery.data?.filter((c) => c.content_type === 'movie')  ?? []
   const seriesCategories = categoriesQuery.data?.filter((c) => c.content_type === 'series') ?? []
   const listGroups = (include: (src: string) => boolean) => Object.values(
@@ -7676,6 +7720,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               </div>
             )}
             {recheckResult && <p className="text-sm text-muted-foreground">{recheckResult}</p>}
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title="New providers are imported automatically once active, before you can set up Exclude Categories. Add them inactive, set up the exclusions, then activate each one. Providers you have already imported keep their current state."
+            >
+              <input type="checkbox" checked={discoverStartInactive} onChange={(e) => setDiscoverStartInactive(e.target.checked)} />
+              Add new providers as inactive
+            </label>
             <div className="flex items-center gap-1.5">
               <Button
                 size="sm" variant="outline"
@@ -9052,6 +9103,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <span className="text-xs text-muted-foreground">
               {applyExclusionsJobQuery.data.phase === 'finalizing'
                 ? `All ${applyExclusionsJobQuery.data.total} provider(s) synced — finalizing…`
+                : applyExclusionsJobQuery.data.total === 0
+                ? 'Starting…'
                 : <>
                     Provider {Math.min(applyExclusionsJobQuery.data.completed + 1, applyExclusionsJobQuery.data.total)} of {applyExclusionsJobQuery.data.total}
                     {applyExclusionsJobQuery.data.current_provider ? ` — syncing ${applyExclusionsJobQuery.data.current_provider}…` : '…'}
@@ -10907,7 +10960,37 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             {seriesShowArchived ? 'Un-archive' : 'Archive'} selected ({selectedSeriesIds.size})
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={selectedSeriesIds.size === 0 || runBulkEpisodeTitles.isPending}
+            onClick={() => runBulkEpisodeTitles.mutate(true)}
+            title="Preview filling the selected series' episode names from TMDB (needs a confirmed TMDB match on each)"
+          >
+            {runBulkEpisodeTitles.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            TMDB episode titles ({selectedSeriesIds.size})
+          </Button>
           {bulkSeriesResult && <span className="text-xs text-muted-foreground">{bulkSeriesResult}</span>}
+          {bulkEpisodeTitles && (
+            <div className="w-full flex items-center gap-2 flex-wrap rounded border border-border px-2 py-1.5 text-xs">
+              <span>
+                {bulkEpisodeTitles.dry_run ? 'Would rename' : 'Renamed'} {bulkEpisodeTitles.episodes_renamed} episode(s) across {bulkEpisodeTitles.series_changed} of {bulkEpisodeTitles.series_checked} series
+                {bulkEpisodeTitles.series_without_tmdb ? ` · ${bulkEpisodeTitles.series_without_tmdb} without a TMDB match` : ''}
+                {bulkEpisodeTitles.series_failed ? ` · ${bulkEpisodeTitles.series_failed} failed` : ''}
+                {bulkEpisodeTitles.failures.length ? ` (${bulkEpisodeTitles.failures.join('; ')})` : ''}
+              </span>
+              {bulkEpisodeTitles.dry_run && (
+                <>
+                  <label className="flex items-center gap-1 text-muted-foreground">
+                    <input type="checkbox" checked={bulkEpisodeTitlesReplace} onChange={(e) => { setBulkEpisodeTitlesReplace(e.target.checked); setBulkEpisodeTitles(null) }} />
+                    Replace existing names too
+                  </label>
+                  <Button size="sm" disabled={!bulkEpisodeTitles.episodes_renamed || runBulkEpisodeTitles.isPending} onClick={() => runBulkEpisodeTitles.mutate(false)}>Apply</Button>
+                </>
+              )}
+              <button className="text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={() => setBulkEpisodeTitles(null)}>Dismiss</button>
+            </div>
+          )}
         </div>
         <div className={seriesViewMode === 'grid' ? 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2' : 'space-y-2'}>
           {seriesQuery.isFetching && <p className="text-xs text-muted-foreground">Loading…</p>}

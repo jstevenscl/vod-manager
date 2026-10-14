@@ -103,3 +103,50 @@ def test_bad_mode_rejected(db):
     except ValueError:
         return
     raise AssertionError("expected ValueError")
+
+
+def test_bulk_route_renames_selected_series_and_counts_the_rest(db, monkeypatch):
+    import asyncio
+
+    import tmdb_sync
+    import vod_routes
+
+    provider = db.upsert_provider("prov", "http://example.com", "u", "p")
+    with_tmdb = db.upsert_series("Show A", 2020)
+    db.backfill_tmdb_id_if_missing("series", with_tmdb, "111")
+    ep = db.add_episode(with_tmdb, 1, 1, "Episode 1")
+    db.add_episode_source(ep, provider, "a1", "mp4", raw_name="x")
+    without_tmdb = db.upsert_series("Show B", 2021)
+
+    async def fake_list(tmdb_id):
+        return [{"season_number": 1, "episode_number": 1, "name": "Pilot"}]
+
+    monkeypatch.setattr(tmdb_sync, "get_series_episode_list_cached", fake_list)
+    body = vod_routes.BulkEpisodeTitlesRequest(ids=[with_tmdb, without_tmdb, 999999], dry_run=True)
+
+    preview = asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(body))
+
+    assert preview["series_checked"] == 2 and preview["series_changed"] == 1
+    assert preview["episodes_renamed"] == 1 and preview["series_without_tmdb"] == 1
+    assert db.get_series(with_tmdb)  # dry run changed nothing
+    body.dry_run = False
+    applied = asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(body))
+    assert applied["episodes_renamed"] == 1
+    conn = db._connect()
+    try:
+        assert conn.execute("SELECT name FROM episodes WHERE id=?", (ep,)).fetchone()["name"] == "Pilot"
+    finally:
+        conn.close()
+
+
+def test_bulk_route_limits_batch_size(db):
+    import asyncio
+
+    import pytest
+    from fastapi import HTTPException
+
+    import vod_routes
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(vod_routes.BulkEpisodeTitlesRequest(ids=list(range(51)))))
+    assert exc.value.status_code == 400
