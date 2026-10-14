@@ -83,6 +83,23 @@ mechanism as Drive/Dropbox but is less thoroughly tested. Full setup for
 each backend in
 [USERGUIDE.md](USERGUIDE.md#library-sources--local-folders-smb-sftp-and-cloud-storage).
 
+## Emby and Jellyfin: .strm export
+
+Emby and Jellyfin can't use the Xtream (XC) API for movies and shows, but they
+can scan a folder. **Configuration → Emby / Jellyfin Library (.strm export)**
+writes your curated library as small `.strm` files (one stream URL each, in
+`Movies/Title (Year) [tmdbid-N]/` and `Shows/Show (Year) [tmdbid-N]/Season NN/`
+folders) into a folder you mount into the media server. Playback still goes
+through VOD & DVR Manager, so source failover keeps working. It follows the same
+visibility rules as the XC catalog, can be limited to a dedicated XC user's
+categories, skips titles without a confirmed TMDB id by default, and can re-run
+on a schedule. Preview first, export when ready.
+
+![The Emby / Jellyfin Library (.strm export) card](docs/screenshots/strm-export.png)
+
+See the [User Guide](USERGUIDE.md#emby-and-jellyfin-the-strm-export) for the
+shared-folder compose setup.
+
 ## Connecting Dispatcharr instances
 
 VOD & DVR Manager distinguishes two separate relationships with Dispatcharr:
@@ -392,7 +409,8 @@ Every movie/series can also be manually renamed or have its year corrected
 from its own detail view, for whatever a provider's own catalog data got
 wrong with no other way to fix it — including setting its TMDB id directly
 when you already know the correct match, and (for a series) editing an
-individual episode's name/number. **Apply TMDB Titles** (Movies/TV Shows
+individual episode's name/number, or filling one series' episode names from TMDB
+(**Use TMDB episode titles**, with a preview first). **Apply TMDB Titles** (Movies/TV Shows
 toolbar) does this in bulk for every already-confirmed TMDB match at once,
 instead of one item at a time. **Client Title Format** (Curation &
 Maintenance) is a separate, ongoing setting to have VOD clients see a

@@ -194,6 +194,15 @@ and finish time, outcome and summary; `GET /api/vod/sync-history/` lists the
 recent runs (a run still marked running when the app restarts is closed out as
 failed, "interrupted by restart").
 
+**Add as inactive.** The add-provider form has an **Add as inactive** checkbox,
+on by default. An *active* provider is imported automatically on the scheduled
+catalog refresh, which for a brand-new provider means straight away — before
+you've had a chance to set up **Exclude Categories**, and a full unfiltered
+import of a large provider can bog the app down. Add it inactive, set up its
+exclusions (the **Exclude Categories** picker still works on an inactive
+provider), then click the power icon to activate it or run **Import** yourself.
+Untick the box if you want the old behaviour.
+
 Each provider row also has:
 
 - **Priority** — lower numbers are preferred when the same title is
@@ -706,6 +715,85 @@ side, without touching anything else you've set on that provider (priority,
 category exclusions, shared limit, etc.). Already-imported profiles show as
 "already imported" rather than being offered again.
 
+### Emby and Jellyfin: the .strm export
+
+Emby and Jellyfin can't use the Xtream (XC) API for movies and shows — that
+is what Dispatcharr, TiviMate and similar players speak. They build libraries
+from **folders**, and the standard way to put streamed content in a folder is a
+`.strm` file: a one-line text file holding a stream URL. **Configuration →
+Emby / Jellyfin Library (.strm export)** writes your curated library as a tree
+of those files into a folder you mount into the media server. Each file points
+back at VOD & DVR Manager's own `/movie/…` and `/series/…` stream URLs, so
+playback still goes through VOD & DVR Manager and keeps its source failover.
+
+![The Emby / Jellyfin Library (.strm export) card](docs/screenshots/strm-export.png)
+
+**Setting it up**
+
+1. **Share a folder between the two containers.** Mount the same volume into
+   VOD & DVR Manager (read-write) and into Emby/Jellyfin (read-only is enough).
+   For example, in your compose file:
+
+   ```yaml
+   services:
+     vod-manager:
+       volumes:
+         - vod_manager_data:/app/data
+         - strm_library:/strm          # export writes here
+     jellyfin:                          # or emby
+       volumes:
+         - strm_library:/strm-library:ro   # the media server reads here
+   volumes:
+     strm_library:
+   ```
+2. **Create a dedicated XC user** under *Connected Instances* (e.g. "Jellyfin").
+   Its username and password are written into every `.strm` file, so don't use
+   one you hand out elsewhere. Give it a **Category access** list to export only
+   some categories. If you set an **IP allowlist** on it, include the media
+   server's address or playback is refused.
+3. In the export card set the **Output folder** (the path *inside the VOD & DVR
+   Manager container*, e.g. `/strm`), the **base URL** the media server uses to
+   reach VOD & DVR Manager (e.g. `http://vod-manager:8282` on a shared Docker
+   network, or `http://192.168.1.10:8282`; not `localhost` unless they share a
+   host network), and pick the XC user. Click **Save settings**.
+4. Click **Preview** to see the counts without writing anything, then
+   **Export now**.
+5. In Emby/Jellyfin add two libraries: **Movies** pointing at `<mount>/Movies`
+   and **TV Shows** pointing at `<mount>/Shows`. If a library looks empty right
+   after you create it, run **Scan Library** once more — the first scan can run
+   before the files have finished appearing.
+
+**What gets exported.** The same items an XC client would see: placed in an
+active category, with a playable source in one of your enabled languages, not
+blocked by Stream Recovery, and inside the chosen XC user's category access.
+A movie in several categories is written once.
+
+```
+Movies/Title (Year) [tmdbid-123]/Title (Year).strm
+Shows/Show (Year) [tmdbid-456]/Season 01/Show - S01E01.strm
+```
+
+The TMDB id in the folder name lets Emby/Jellyfin match the right title without
+guessing from the name. Items **without a confirmed TMDB id are skipped** by
+default because media servers match them poorly; turn on **Include items with no
+TMDB id** to put them under `Movies/Unmatched` and `Shows/Unmatched` instead.
+(Titles and episode names Emby/Jellyfin shows are its own — it downloads them
+from TMDB itself, so a new item can show its file name until that download runs.)
+
+**Keeping it current.** Set **Auto-export every N hrs** to re-run it on a
+schedule (0 = only when you click Export now). A re-run only writes files that
+changed, so media-server rescans stay cheap. With **Remove files for items that
+left the library** on, `.strm` files for items you've since removed or archived
+are deleted, along with folders left empty. Only `.strm` files under `Movies`
+and `Shows` that this export manages are ever removed — anything else in the
+folder is left alone.
+
+**Safety.** The exporter refuses an output folder that already contains other
+files and wasn't created by it (it leaves a small `.vod-manager-strm-export`
+marker file), so pointing it at the wrong folder can't touch your other media.
+Only one export runs at a time. Tested against Jellyfin 12.1.0; Emby uses the
+same folder naming convention.
+
 ---
 
 ## 7. DVR recordings
@@ -1061,6 +1149,16 @@ Above the catalog itself, the dashboard always shows two live cards:
 
 ![Failed Streams, showing a mid-stream crash and an every-source-exhausted failure](docs/screenshots/failed-streams.png)
 
+If a catalog import fails, the **Catalog status** card at the top turns red and
+names the provider and the error (for example "Import failed for *My Provider*
+(ConnectError)"). Only the most recent failed import is shown; **Sync History**
+keeps the per-provider record. Fix the provider (credentials, URL, User-Agent)
+and run **Import** again.
+
+On the **Movies** and **TV Shows** pages, the **All categories** dropdown next to
+the provider filter shows only the items placed in one of your categories —
+the same view as the eye icon in Manage Categories, without opening it.
+
 ### Stream Recovery
 
 A separate, dedicated page (its own sidebar entry under Operations) for the
@@ -1220,6 +1318,20 @@ A provider occasionally sends a wrong or blank episode name, or gets the
 season/episode number wrong — every episode's own detail view has an inline
 edit for both, same idea as the movie/series-level *Rename / fix year*
 above but scoped to just that one episode.
+
+**Use TMDB episode titles.** A series that has a confirmed TMDB match also has a
+**Use TMDB episode titles** link next to *Use TMDB title*. It sets *that one
+series'* episode names from TMDB, matching on season and episode number. It
+always shows a preview first ("Would rename 62 of 62 episode(s)…") and writes
+nothing until you click **Apply**. By default it only replaces blank names,
+placeholders like "Episode 5", and provider-formatted names that embed the
+season/episode code (e.g. "Show (2008) - S01E01 - Pilot"); a real name your
+provider sent is kept. Tick **Replace existing names too** to overwrite every
+matched episode. Episodes TMDB has no entry for are left alone and counted.
+
+Episode names you set this way — or by hand with the inline edit — are
+**locked**: a later provider re-sync no longer reverts them. (Apply TMDB Titles
+in the toolbar renames series and movies only, not episodes.)
 
 ### Flagging wrong content
 
@@ -1690,6 +1802,14 @@ in your pool; neither pulls in anything new.
   series category — kept separate since Dispatcharr's movie and TV catalogs
   are different endpoints. This is the quick path for "I don't have a
   category for this list yet."
+- **MDBList Lists** (Curation & Maintenance) — the same quick path for an
+  [MDBList](https://mdblist.com) list: enter its list ID and a name template
+  and it creates a paired movie and series category linked to it (needs your
+  MDBList API key under Configuration → API Keys). Lists linked this way appear
+  in their own section, separate from TMDB Lists.
+
+  ![TMDB Lists and MDBList Lists sections in Curation & Maintenance](docs/screenshots/mdblist-lists.png)
+
 - **List Sync** (Manage Categories → the list icon on any category) is the
   more general version — attach one or more list sources, of either kind,
   to **any existing category**, movie or series. Mix sources freely on the
@@ -1798,6 +1918,18 @@ build rather than a tagged release.
 override (§5) — some providers reject requests that don't look
 browser-like. Also confirm the base URL and credentials work with a
 regular XC client first, to rule out a provider-side issue.
+
+**Catalog status says "Import failed for …".** The card names the provider
+whose most recent import failed and the error type. Check that provider's URL,
+credentials and User-Agent (§5), then run **Import** again. If several providers
+fail, only the latest shows — Sync History lists each run.
+
+**Emby/Jellyfin shows an empty library after the .strm export.** Confirm the
+export reported files written, that the media server mounts the same folder
+(read-only is fine) at the path you gave the library, and run **Scan Library**
+again. Playback returning 401 means the XC user's IP allowlist doesn't include
+the media server, or the base URL points at the wrong address (§6, Emby and
+Jellyfin: the .strm export).
 
 **Locked out of your own login.** Set `VODMANAGER_ADMIN_USER` and
 `VODMANAGER_ADMIN_PASSWORD` as environment variables on the container and
