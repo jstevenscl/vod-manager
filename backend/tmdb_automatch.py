@@ -14,6 +14,7 @@ through library_matcher's never-guess rules -- local TMDB library first, TMDB
 
 import asyncio
 import logging
+import re
 
 import library_matcher
 import tmdb_store
@@ -21,6 +22,14 @@ import vod_db
 from config import get_tmdb_store_settings
 
 logger = logging.getLogger(__name__)
+
+_TRAILING_YEAR = re.compile(r"\s*\((?:19|20)\d{2}\)\s*$")
+
+
+def _search_name(name: str) -> str:
+    """Providers often send series as "Show (2022)"; TMDB finds nothing for
+    that, so query with the bare title (the year is passed separately)."""
+    return _TRAILING_YEAR.sub("", name).strip() or name
 
 
 async def _unique_on_tmdb(content_type: str, name: str) -> bool:
@@ -46,12 +55,13 @@ async def run_auto_match(limit: int | None = None) -> dict:
         work = await asyncio.to_thread(vod_db.list_auto_match_work, content_type, remaining)
         for item in work:
             counts["checked"] += 1
-            result = await library_matcher.match_title(item["name"], content_type, item["year"])
+            name = _search_name(item["name"])
+            result = await library_matcher.match_title(name, content_type, item["year"])
             if result.transient:
                 counts["failed"] += 1
                 continue
             if result.status == "matched" and result.confidence == "title_only" \
-                    and not await _unique_on_tmdb(content_type, item["name"]):
+                    and not await _unique_on_tmdb(content_type, name):
                 result = library_matcher.MatchResult(
                     "ambiguous", reason="no year, and TMDB has other titles with this name",
                     candidates=[library_matcher.Candidate(result.tmdb_id, result.title, result.year, 0.0)])

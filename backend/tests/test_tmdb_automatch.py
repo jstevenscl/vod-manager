@@ -270,3 +270,14 @@ def test_lookup_counters_skip_fill_and_store_off(env):
     asyncio.run(tmdb_sync.fetch_title_payload("movie", 3))
 
     assert tmdb_store.lookups_today() == {"local": 0, "tmdb": 0}
+
+
+def test_provider_name_with_year_suffix_is_searched_by_bare_title(env):
+    db, fake = env
+    fake.routes = {"/search/tv": (200, {"results": [{"id": 95396, "name": "Severance", "first_air_date": "2022-02-17"}]})}
+    item = _add(db, "series", "Severance (2022)", 2022)
+
+    asyncio.run(tmdb_automatch.run_auto_match())
+
+    assert _tmdb_id(db, "series", item) == "95396"
+    assert all("(2022)" not in str(call) for call in fake.calls)
