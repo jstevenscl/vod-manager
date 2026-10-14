@@ -636,6 +636,20 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- Automatic name+year TMDB matching for items with no
+        -- tmdb_id (tmdb_automatch). Only undecided outcomes are kept: 'ambiguous'
+        -- shows in Metadata Review, 'unmatched' is retried after a while,
+        -- 'reviewed' means a person settled it without an ID.
+        CREATE TABLE IF NOT EXISTS tmdb_auto_match (
+            content_type TEXT NOT NULL CHECK(content_type IN ('movie','series')),
+            item_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            candidates_json TEXT,
+            attempted_at TEXT NOT NULL,
+            PRIMARY KEY(content_type, item_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_movies_name_year ON movies(name, year);
         CREATE INDEX IF NOT EXISTS idx_series_name_year ON series(name, year);
         -- list sync / enrichment / auto-merge look items up by tmdb_id one at a time;
@@ -677,6 +691,7 @@ def init_db() -> None:
     """)
     _commit_with_retry(conn)
     _migrate(conn)
+    _install_review_queue_cleanup(conn)
     _migrate_category_name_uniqueness(conn)
     _backfill_source_owners(conn)
     backfill_series_sources()
@@ -722,6 +737,50 @@ def init_db() -> None:
     _migrate_legacy_catchall_categories(conn)
     _seed_default_categories(conn)
     conn.close()
+
+
+def _install_review_queue_cleanup(conn: sqlite3.Connection) -> None:
+    """Keep persisted auto-match decisions scoped to active unresolved rows.
+
+    ``tmdb_auto_match`` deliberately has a polymorphic key rather than a
+    foreign key, so database triggers own its lifecycle for every write path,
+    including import-time archives and merges that do not call the review API.
+    The one-time DELETE also repairs stale rows created before these triggers
+    existed.
+    """
+    conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS cleanup_movie_auto_match_after_update
+        AFTER UPDATE OF review_excluded, tmdb_id ON movies
+        WHEN NEW.review_excluded=1 OR NEW.tmdb_id IS NOT NULL
+        BEGIN
+            DELETE FROM tmdb_auto_match WHERE content_type='movie' AND item_id=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS cleanup_series_auto_match_after_update
+        AFTER UPDATE OF review_excluded, tmdb_id ON series
+        WHEN NEW.review_excluded=1 OR NEW.tmdb_id IS NOT NULL
+        BEGIN
+            DELETE FROM tmdb_auto_match WHERE content_type='series' AND item_id=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS cleanup_movie_auto_match_after_delete
+        AFTER DELETE ON movies
+        BEGIN
+            DELETE FROM tmdb_auto_match WHERE content_type='movie' AND item_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS cleanup_series_auto_match_after_delete
+        AFTER DELETE ON series
+        BEGIN
+            DELETE FROM tmdb_auto_match WHERE content_type='series' AND item_id=OLD.id;
+        END;
+    """)
+    conn.execute("""
+        DELETE FROM tmdb_auto_match
+        WHERE (content_type='movie' AND NOT EXISTS (
+                   SELECT 1 FROM movies m WHERE m.id=tmdb_auto_match.item_id
+                     AND m.review_excluded=0 AND m.tmdb_id IS NULL))
+           OR (content_type='series' AND NOT EXISTS (
+                   SELECT 1 FROM series s WHERE s.id=tmdb_auto_match.item_id
+                     AND s.review_excluded=0 AND s.tmdb_id IS NULL))
+    """)
 
 
 def _migrate_category_name_uniqueness(conn: sqlite3.Connection) -> None:
@@ -9281,6 +9340,10 @@ def _merge_movie_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> No
                 (into_id, from_id, p["category_id"]),
             )
 
+    conn.execute(
+        "DELETE FROM tmdb_auto_match WHERE content_type='movie' AND item_id IN (?,?)",
+        (from_id, into_id),
+    )
     conn.execute("DELETE FROM movies WHERE id=?", (from_id,))
 
 
@@ -9374,6 +9437,10 @@ def _merge_series_row(conn: sqlite3.Connection, from_id: int, into_id: int) -> N
     # re-creates them. UNIQUE is (provider_id, provider_series_id), so this
     # can't conflict.
     conn.execute("UPDATE series_sources SET series_id=? WHERE series_id=?", (into_id, from_id))
+    conn.execute(
+        "DELETE FROM tmdb_auto_match WHERE content_type='series' AND item_id IN (?,?)",
+        (from_id, into_id),
+    )
     conn.execute("DELETE FROM series WHERE id=?", (from_id,))
 
 
@@ -10292,12 +10359,69 @@ def list_metadata_review(content_type: str | None = None) -> dict:
                     SELECT * FROM {table} WHERE review_excluded=0 AND needs_year_review=1
                     UNION
                     SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+                    UNION
+                    SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL
+                      AND id IN ({_ambiguous_auto_match_ids(table)})
                 )
                 ORDER BY needs_year_review DESC, name"""
         ).fetchall()]
         out[key] = rows
     conn.close()
     return out
+
+
+# Auto-match results TMDB couldn't settle go to Metadata
+# Review -- deliberately not via needs_year_review, which blocks placement.
+def _ambiguous_auto_match_ids(table: str) -> str:
+    content_type = "movie" if table == "movies" else "series"
+    return f"SELECT item_id FROM tmdb_auto_match WHERE content_type='{content_type}' AND status='ambiguous'"
+
+
+def list_auto_match_work(content_type: str, limit: int, retry_days: int = 7) -> list[dict]:
+    """No-ID active items not yet auto-matched, plus 'unmatched' ones whose
+    last attempt is older than retry_days (TMDB gains titles over time)."""
+    table = "movies" if content_type == "movie" else "series"
+    cutoff = time.time() - retry_days * 86400
+    conn = _connect()
+    rows = conn.execute(
+        f"""SELECT t.id, t.name, t.year FROM {table} t
+            LEFT JOIN tmdb_auto_match a ON a.content_type=? AND a.item_id=t.id
+            WHERE t.tmdb_id IS NULL AND t.review_excluded=0
+              AND (a.item_id IS NULL OR (a.status='unmatched' AND CAST(a.attempted_at AS REAL) < ?))
+            ORDER BY t.id LIMIT ?""",
+        (content_type, cutoff, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_auto_match(content_type: str, item_id: int, status: str, reason: str | None = None,
+                      candidates: list[dict] | None = None) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        conn.execute(
+            """INSERT INTO tmdb_auto_match (content_type,item_id,status,reason,candidates_json,attempted_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(content_type,item_id) DO UPDATE SET status=excluded.status,
+                 reason=excluded.reason, candidates_json=excluded.candidates_json,
+                 attempted_at=excluded.attempted_at""",
+            (content_type, item_id, status, reason, json.dumps(candidates) if candidates else None, _now()),
+        )
+        _commit_with_retry(conn)
+        conn.close()
+
+
+def _settle_auto_match(content_type: str, item_id: int, *, reviewed: bool = False) -> None:
+    """A person (or auto-match) settled this item: drop its auto-match row, or
+    keep it as 'reviewed' so a no-ID decision isn't re-attempted."""
+    conn = _connect()
+    if reviewed:
+        conn.execute("UPDATE tmdb_auto_match SET status='reviewed' WHERE content_type=? AND item_id=?",
+                     (content_type, item_id))
+    else:
+        conn.execute("DELETE FROM tmdb_auto_match WHERE content_type=? AND item_id=?", (content_type, item_id))
+    _commit_with_retry(conn)
+    conn.close()
 
 
 def record_tmdb_lookup_failure(content_type: str, item_id: int, tmdb_id: str, error: str = "TMDB returned 404 Not Found") -> None:
@@ -10415,6 +10539,7 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
             if tmdb_id:
                 clear_tmdb_lookup_failure(content_type, item_id)
                 record_manual_library_match(content_type, existing["id"], tmdb_id=tmdb_id, name=row["name"], year=year)
+            _settle_auto_match(content_type, item_id)
             return {"merged_into": existing["id"]}
 
         conn = _connect()
@@ -10432,6 +10557,7 @@ def resolve_year_review(content_type: str, item_id: int, year: int, tmdb_id: str
             else:
                 auto_merge_series_by_tmdb(item_id)
             record_manual_library_match(content_type, item_id, tmdb_id=tmdb_id, name=row["name"], year=year)
+        _settle_auto_match(content_type, item_id, reviewed=not tmdb_id)
         return {"resolved_id": item_id}
 
 
@@ -11221,14 +11347,15 @@ def clear_tmdb_id(content_type: str, item_id: int) -> dict:
     return {"cleared_id": item_id}
 
 
-def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
+def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int, *, manual: bool = True) -> dict:
     """Manual counterpart to clear_tmdb_id -- lets a reviewer directly
     correct a wrong (or missing) tmdb_id when they already know the right
     one, right from the item's own detail view, instead of only being able
     to clear it and hope a later enrichment/List Sync pass happens to find
     the right match on its own. Same merge-on-collision safety as
     rename_item: if another item already carries this exact tmdb_id, merge
-    into it rather than leaving two rows claiming the same real title."""
+    into it rather than leaving two rows claiming the same real title.
+    manual=False (auto-match) skips the manual Library-match record."""
     with _WRITE_LOCK:
         table = "movies" if content_type == "movie" else "series"
         conn = _connect()
@@ -11247,7 +11374,9 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
             else:
                 merge_series(item_id, existing["id"])
             clear_tmdb_lookup_failure(content_type, item_id)
-            record_manual_library_match(content_type, existing["id"], tmdb_id=str(tmdb_id))
+            _settle_auto_match(content_type, item_id)
+            if manual:
+                record_manual_library_match(content_type, existing["id"], tmdb_id=str(tmdb_id))
             return {"merged_into": existing["id"]}
 
         conn = _connect()
@@ -11255,7 +11384,9 @@ def set_tmdb_id(content_type: str, item_id: int, tmdb_id: int) -> dict:
         _commit_with_retry(conn)
         conn.close()
     clear_tmdb_lookup_failure(content_type, item_id)
-    record_manual_library_match(content_type, item_id, tmdb_id=str(tmdb_id))
+    _settle_auto_match(content_type, item_id)
+    if manual:
+        record_manual_library_match(content_type, item_id, tmdb_id=str(tmdb_id))
     logger.info("[set_tmdb_id] %s id=%s (%r) tmdb_id %s -> %s", content_type, item_id, row["name"], row["tmdb_id"], tmdb_id)
     return {"resolved_id": item_id}
 
