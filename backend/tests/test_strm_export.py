@@ -49,6 +49,20 @@ def test_safe_name_strips_illegal_characters_and_trailing_dots():
     assert len(strm_export.safe_name("x" * 500)) <= 120
 
 
+def test_a_year_already_in_the_name_is_not_repeated(db, tmp_path):
+    client, _ = _library(db)
+    series = db.upsert_series("Dark (2017)", 2017)
+    db.backfill_tmdb_id_if_missing("series", series, "70523")
+    provider = db.upsert_provider("prov2", "http://example.org", "u", "p")
+    ep = db.add_episode(series, 1, 1, "Secrets")
+    db.add_episode_source(ep, provider, "d1", "mp4", raw_name="Secrets")
+    db.place_series_in_category(series, db.upsert_category("Drama", "series"))
+
+    strm_export.run_export(_settings(tmp_path, client))
+
+    assert (tmp_path / "strm" / "Shows" / "Dark (2017) [tmdbid-70523]" / "Season 01" / "Dark - S01E01.strm").exists()
+
+
 def test_export_writes_emby_layout_and_urls(db, tmp_path):
     client, _ = _library(db)
 

@@ -60,8 +60,17 @@ def safe_name(name: str) -> str:
     return cleaned or "Untitled"
 
 
+_TRAILING_YEAR = re.compile(r"\s*\((?:18|19|20)\d{2}\)\s*$")
+
+
+def _base_title(name: str) -> str:
+    """The title without a trailing "(YYYY)": many provider names already carry
+    the year, and appending it again would give "Show (2008) (2008)"."""
+    return safe_name(_TRAILING_YEAR.sub("", name or "")) 
+
+
 def _title_year(name: str, year: int | None) -> str:
-    base = safe_name(name)
+    base = _base_title(name)
     return f"{base} ({year})" if year else base
 
 
@@ -157,7 +166,7 @@ def build_plan(settings: dict) -> dict:
             else:
                 counts["skipped_no_tmdb"] += 1
                 continue
-            show_name = safe_name(row["name"])
+            show_name = _base_title(row["name"])
             wrote_any = False
             for ep in vod_db.get_episode_export_rows_for_series(row["series_id"]):
                 if ep.get("provider_id") is None:
