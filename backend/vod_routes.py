@@ -3915,7 +3915,7 @@ async def bulk_apply_tmdb_episode_titles(body: BulkEpisodeTitlesRequest):
     if len(body.ids) > 50:
         raise HTTPException(400, detail="at most 50 series per request")
     totals = {"series_checked": 0, "series_changed": 0, "episodes_renamed": 0, "series_without_tmdb": 0,
-              "series_failed": 0, "failures": [], "dry_run": body.dry_run}
+              "series_failed": 0, "failures": [], "without_tmdb_examples": [], "dry_run": body.dry_run}
     for series_id in body.ids:
         series = await asyncio.to_thread(vod_db.get_series, series_id)
         if not series:
@@ -3923,6 +3923,8 @@ async def bulk_apply_tmdb_episode_titles(body: BulkEpisodeTitlesRequest):
         totals["series_checked"] += 1
         if not series.get("tmdb_id"):
             totals["series_without_tmdb"] += 1
+            if len(totals["without_tmdb_examples"]) < 5:
+                totals["without_tmdb_examples"].append(series.get("name"))
             continue
         try:
             episodes = await tmdb_sync.get_series_episode_list_cached(str(series["tmdb_id"]))

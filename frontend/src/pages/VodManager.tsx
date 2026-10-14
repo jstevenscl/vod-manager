@@ -1286,6 +1286,15 @@ function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
 // detail list, shared by all three bulk-AI panels below.
 function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (r: BulkAiJobResult) => string }) {
   const [expanded, setExpanded] = useState(false)
+  // Why items were skipped, most common first -- otherwise "N skipped" gives no hint
+  // that e.g. the AI wasn't confident enough (only high-confidence picks are applied).
+  const skipReasons = Object.entries(
+    job.results.filter((r) => r.status === 'skipped').reduce((acc, r) => {
+      const key = (r.detail || 'no reason given').slice(0, 90)
+      acc[key] = (acc[key] ?? 0) + 1
+      return acc
+    }, {} as Record<string, number>)
+  ).sort((x, y) => y[1] - x[1])
   return (
     <div className="text-xs px-2 py-1.5 rounded border border-primary/30 bg-primary/5 space-y-1">
       <div className="flex items-center gap-2">
@@ -1303,6 +1312,12 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
           </button>
         )}
       </div>
+      {!job.running && skipReasons.length > 0 && (
+        <p className="text-muted-foreground">
+          Skipped because: {skipReasons.slice(0, 3).map(([why, n]) => `${why} (${n})`).join(' · ')}
+          {skipReasons.length > 3 ? ' · …' : ''}. Only high-confidence AI matches are applied automatically.
+        </p>
+      )}
       {job.error && <p className="text-destructive">{job.error}</p>}
       {expanded && (
         <div className="max-h-48 overflow-y-auto space-y-0.5 pt-1 border-t border-border/50">
@@ -6588,7 +6603,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
   // Fill (or replace) the episode names of every selected series from TMDB.
   // Always previews first; chunks the selection to the API's 50-per-call limit.
-  type EpisodeTitlesBulk = { series_checked: number; series_changed: number; episodes_renamed: number; series_without_tmdb: number; series_failed: number; failures: string[]; dry_run: boolean }
+  type EpisodeTitlesBulk = { series_checked: number; series_changed: number; episodes_renamed: number; series_without_tmdb: number; series_failed: number; failures: string[]; without_tmdb_examples?: string[]; dry_run: boolean }
   const [bulkEpisodeTitles, setBulkEpisodeTitles] = useState<EpisodeTitlesBulk | null>(null)
   const [bulkEpisodeTitlesReplace, setBulkEpisodeTitlesReplace] = useState(false)
   const selectAllFilteredSeries = useMutation({
@@ -6602,12 +6617,13 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const runBulkEpisodeTitles = useMutation({
     mutationFn: async (dry_run: boolean) => {
       const ids = Array.from(selectedSeriesIds)
-      const total: EpisodeTitlesBulk = { series_checked: 0, series_changed: 0, episodes_renamed: 0, series_without_tmdb: 0, series_failed: 0, failures: [], dry_run }
+      const total: EpisodeTitlesBulk = { series_checked: 0, series_changed: 0, episodes_renamed: 0, series_without_tmdb: 0, series_failed: 0, failures: [], without_tmdb_examples: [], dry_run }
       for (let i = 0; i < ids.length; i += 50) {
         const r = (await api.post('/vod/series/tmdb-episode-titles/bulk/', { ids: ids.slice(i, i + 50), mode: bulkEpisodeTitlesReplace ? 'replace' : 'fill', dry_run })).data as EpisodeTitlesBulk
         total.series_checked += r.series_checked; total.series_changed += r.series_changed; total.episodes_renamed += r.episodes_renamed
         total.series_without_tmdb += r.series_without_tmdb; total.series_failed += r.series_failed
         total.failures = [...total.failures, ...r.failures].slice(0, 5)
+        total.without_tmdb_examples = [...(total.without_tmdb_examples ?? []), ...(r.without_tmdb_examples ?? [])].slice(0, 5)
       }
       return total
     },
@@ -11024,7 +11040,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             <div className="w-full flex items-center gap-2 flex-wrap rounded border border-border px-2 py-1.5 text-xs">
               <span>
                 {bulkEpisodeTitles.dry_run ? 'Would rename' : 'Renamed'} {bulkEpisodeTitles.episodes_renamed} episode(s) across {bulkEpisodeTitles.series_changed} of {bulkEpisodeTitles.series_checked} series
-                {bulkEpisodeTitles.series_without_tmdb ? ` · ${bulkEpisodeTitles.series_without_tmdb} without a TMDB match` : ''}
+                {bulkEpisodeTitles.series_without_tmdb ? ` · ${bulkEpisodeTitles.series_without_tmdb} without a TMDB match${bulkEpisodeTitles.without_tmdb_examples?.length ? ` (e.g. ${bulkEpisodeTitles.without_tmdb_examples.join(', ')} — use the No TMDB ID filter to find them)` : ''}` : ''}
                 {bulkEpisodeTitles.series_failed ? ` · ${bulkEpisodeTitles.series_failed} failed` : ''}
                 {bulkEpisodeTitles.failures.length ? ` (${bulkEpisodeTitles.failures.join('; ')})` : ''}
               </span>

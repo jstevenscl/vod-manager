@@ -128,6 +128,7 @@ def test_bulk_route_renames_selected_series_and_counts_the_rest(db, monkeypatch)
 
     assert preview["series_checked"] == 2 and preview["series_changed"] == 1
     assert preview["episodes_renamed"] == 1 and preview["series_without_tmdb"] == 1
+    assert preview["without_tmdb_examples"] == ["Show B"]
     assert db.get_series(with_tmdb)  # dry run changed nothing
     body.dry_run = False
     applied = asyncio.run(vod_routes.bulk_apply_tmdb_episode_titles(body))
