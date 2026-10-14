@@ -427,6 +427,11 @@ never touched. The preview and the cleanup always report the same counts.
 Cleanup is XC-only: for Plex/Emby/Jellyfin the exclusion still applies to future
 imports, but existing content is not removed.
 
+The Language and Country rules above work the same way on Xtream-Codes
+providers: a matching title is **skipped during import** and counted with the
+excluded titles, instead of being created archived and removed again on every
+import. On Plex/Emby/Jellyfin, matching titles are still auto-archived.
+
 If a provider's own category list has drifted since you last set exclusions
 (a category renamed or removed on their end), the picker calls those out
 separately — "N saved exclusions no longer reported by this provider" — with
