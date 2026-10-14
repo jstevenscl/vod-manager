@@ -231,3 +231,38 @@ def test_apply_series_language_split_is_idempotent(db):
 
     assert first == {"series_split": 1, "rows_created": 1}
     assert second == {"series_split": 0, "rows_created": 0}
+
+
+def test_series_split_keeps_original_language_episodes_from_a_provider_with_both(db):
+    """One provider carrying an EN and a DE copy of the same episode: only the
+    DE stream moves to the new series (GH#52)."""
+    provider = db.upsert_provider("both-prov", "http://example.com/both", "user", "pass")
+    conn = db._connect()
+    series_id = conn.execute("INSERT INTO series (name, year, tmdb_id, created_at) VALUES (?,?,?,?)",
+                             ("Dark", 2017, "77177", db._now())).lastrowid
+    conn.commit()
+    conn.close()
+    _series_source(provider, series_id, "en-series", "EN")
+    _series_source(provider, series_id, "de-series", "DE")
+    ep = _episode(series_id, 1, 1)
+    conn = vod_db._connect()
+    for stream_id, lang in (("en-e1", "EN"), ("de-e1", "DE")):
+        conn.execute(
+            "INSERT INTO episode_sources (episode_id, provider_id, provider_stream_id, container_extension, language, added_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?)", (ep, provider, stream_id, "mp4", lang, vod_db._now(), vod_db._now()))
+    conn.commit()
+    conn.close()
+
+    db.apply_series_language_split()
+
+    conn = db._connect()
+    kept = {r["provider_stream_id"] for r in conn.execute(
+        "SELECT es.provider_stream_id FROM episode_sources es JOIN episodes e ON e.id=es.episode_id WHERE e.series_id=?",
+        (series_id,))}
+    new_id = conn.execute("SELECT id FROM series WHERE id!=? AND tmdb_id='77177'", (series_id,)).fetchone()["id"]
+    moved = {r["provider_stream_id"] for r in conn.execute(
+        "SELECT es.provider_stream_id FROM episode_sources es JOIN episodes e ON e.id=es.episode_id WHERE e.series_id=?",
+        (new_id,))}
+    conn.close()
+    assert kept == {"en-e1"}
+    assert moved == {"de-e1"}

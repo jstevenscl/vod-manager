@@ -489,4 +489,6 @@ TMDB may not be cached for longer than 6 months.
 The optional local TMDB library is off by default (turn it on from the TMDB Library page). When enabled, it keeps details only for current
 catalog titles, refreshes them after 150 days, and automatically removes
 unreferenced or 170-day-old records. Its cleanup screen always provides a preview
-before deleting anything.
+before deleting anything. With it on, titles a provider sent without a TMDB ID are
+matched by name and year in the background (never guessing: uncertain ones go to
+Metadata Review), so the same title from different providers merges into one card.

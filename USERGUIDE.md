@@ -1788,6 +1788,27 @@ applying removal. Once it is on, TMDB's daily ID export is downloaded at most
 once a day (no API key or request budget needed) so name search can be
 answered locally.
 
+**Match titles without a TMDB ID.** Providers send plenty of titles with a clean
+name and year but no TMDB ID. Without one they can't merge with the same title
+from another provider (you see duplicate cards), and they are never enriched. With
+the local TMDB library on, the app matches them for you: after each fill burst it
+takes up to **Titles to match per burst** of them (default 2000; **0 turns it
+off**) and looks each up by name and year, in the local library first and TMDB
+search on a miss. The same never-guess rule as the rest of the app applies:
+
+- a confident match sets the TMDB ID, and merges the title with any existing one
+  that already has that ID, as if you had fixed it by hand;
+- anything uncertain (TMDB's year differs, several titles share the name) sets
+  nothing and is listed in **Metadata Review** with the candidates, so you pick;
+- titles TMDB doesn't know are retried after a week;
+- a network error or rate limit is simply retried on the next run.
+
+Names like "Show (2022)" are searched by the bare title. Click **Match titles
+without a TMDB ID** to run a pass now; the page shows the last pass's counts and
+an "Answered locally today" hit-rate, so you can see how many lookups cost no TMDB
+request. Search answers it saves are kept only within the six-month limit above
+and are removed by the daily cleanup after that.
+
 ![TMDB Library page](docs/screenshots/tmdb-library.png)
 
 The TMDB key unlocks real TMDB search for the Needs Review

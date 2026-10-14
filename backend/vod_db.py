@@ -9681,8 +9681,8 @@ def apply_series_language_split() -> dict:
     other group gets a new series row with series_sources reassigned and
     category placements copied), plus episode handling series_sources alone
     doesn't need: for every episode of the original series, whichever of
-    its episode_sources belong to a provider in the group being split off
-    move with it -- into a matching (season, episode) row on the new
+    its episode_sources belong to the group being split off (by their own
+    language when they have one, else by provider) move with it -- into a matching (season, episode) row on the new
     series, created if it doesn't have one yet, same reassign-or-merge
     pattern _merge_series_row uses in the opposite direction. An episode
     left with zero remaining episode_sources on the original series (all of
@@ -9709,6 +9709,7 @@ def apply_series_language_split() -> dict:
                 placements = [r["category_id"] for r in conn.execute(
                     "SELECT category_id FROM series_category_placements WHERE series_id=?", (series_id,)
                 ).fetchall()]
+                all_langs = set().union(*(g["langs"] for g in groups))
                 for group in groups[1:]:
                     now = _now()
                     placeholders = ", ".join("?" * len(copy_cols))
@@ -9742,17 +9743,23 @@ def apply_series_language_split() -> dict:
                             logger.warning("[apply_series_language_split] series_id=%s: couldn't place split-off row %s in category %s: %s",
                                             series_id, new_series_id, category_id, exc)
 
-                    provider_placeholders = ",".join("?" * len(moved_provider_ids))
                     episodes = conn.execute(
                         "SELECT id, season_number, episode_number FROM episodes WHERE series_id=?", (series_id,)
                     ).fetchall()
                     for ep in episodes:
+                        # A source with a known language follows its language, so a
+                        # provider carrying both languages doesn't drag its original-
+                        # language episodes along; only sources with no language (or
+                        # one the series' own sources never mention) follow their
+                        # provider.
                         moved_source_ids = [
                             r["id"] for r in conn.execute(
-                                f"SELECT id FROM episode_sources WHERE episode_id=? AND provider_id IN ({provider_placeholders})",
-                                (ep["id"], *moved_provider_ids),
+                                "SELECT id, provider_id, language FROM episode_sources WHERE episode_id=?",
+                                (ep["id"],),
                             ).fetchall()
-                        ] if moved_provider_ids else []
+                            if (r["language"] in group["langs"]) or
+                               (r["language"] not in all_langs and r["provider_id"] in moved_provider_ids)
+                        ]
                         if not moved_source_ids:
                             continue
                         target_ep = conn.execute(
