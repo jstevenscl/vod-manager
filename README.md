@@ -186,7 +186,9 @@ is active) unlocks three assists, none of which ever apply anything
 automatically — every one is a suggestion you still review and confirm. If a
 request fails, the message shows the provider's own reason (retired model,
 quota, rejected key). Gemini defaults to the `gemini-flash-latest` alias, since
-Google retires specific model versions quickly:
+Google retires specific model versions quickly. A free-tier Gemini key allows only
+about 20 requests a day per model, so pick **Flash-Lite** (counted separately) or
+enable billing if you use it heavily:
 
 - **Suggest a category with AI** (Categories) — describe a category in
   plain English and the AI proposes a structured filter rule using the
@@ -333,7 +335,8 @@ empty.
 - **Streaming credentials are never written to logs.** The XC protocol
   embeds them in the URL itself (its own convention, not ours) — both the
   app's own logging and the container's access log redact them before
-  anything is written to stdout.
+  anything is written to stdout. API keys that travel in a request URL
+  (TMDB, MDBList, Gemini, Emby/Jellyfin) are redacted from the logs the same way.
 - **Every connected instance gets its own credential**, not a shared one —
   Configuration → Connected Instances. Revoke or regenerate one without
   affecting the others if a specific instance's credential is ever
@@ -362,9 +365,10 @@ Configuration → Refresh Schedule controls how often background work runs:
   providers that don't report changes follow the same backoff; background
   passes start about one TTL apart, with at least a 15-minute rest.
 - **List Sync** — how often categories with a linked public list source
-  (TMDB List or MDBList) auto-resync. Off (manual "Sync now" only) by
+  (TMDB List, MDBList or a TMDB chart) auto-resync. Off (manual "Sync now" only) by
   default — enabling it adds new recurring API traffic to whichever
-  source(s) each category uses.
+  source(s) each category uses. Any one category can also have its own
+  schedule (hourly to weekly) in Manage Categories.
 
 ## Backup and restore
 
@@ -388,7 +392,8 @@ language-aware filter and sibling-safe bulk archiving), **Language Filter**
 poster-missing items), **Enabled Playback Languages** (a live,
 instantly-reversible playback/export filter by source language — separate
 from the import-time Language Exclusion above; nothing archived or deleted,
-just hidden from playback while unchecked), **Duplicate Finder** (matches on
+just hidden from playback while unchecked; content a provider tags
+[MULTI-LANG]/[MULTI-SUB] is its own always-visible "MULTI" language), **Duplicate Finder** (matches on
 punctuation variants, adjacent-year mislabeling, and TMDB id, with one-click
 bulk merges for both fully-corroborated TMDB-confirmed matches and a second,
 separate tier where only one candidate carries a self-consistent TMDB id; an

@@ -1348,6 +1348,8 @@ rename 412 episode(s) across 7 of 9 series"), lists how many series have no
 confirmed TMDB match (skipped) or failed, and only writes when you click
 **Apply**. The same **Replace existing names too** option applies.
 
+![Selecting a series and previewing TMDB episode titles](docs/screenshots/bulk-episode-titles.png)
+
 ### Flagging wrong content
 
 Every movie, series, episode, and individual source has a **flag** icon —
@@ -1937,6 +1939,8 @@ means off**, the default, in which case categories only update when you click
 Manage Categories (global / hourly / every 6h / daily / weekly) that overrides
 the global interval for just that category, so a chart can refresh daily while
 the others stay manual.
+
+![Manage Categories: a list-sourced category with its own schedule dropdown](docs/screenshots/list-category-schedule.png)
 
 ---
 
