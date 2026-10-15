@@ -1324,6 +1324,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_missing ON movies(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_flag ON series(id) WHERE review_excluded=0 AND needs_year_review=1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_missing ON series(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
+    # Heal movies enriched before _release_year_fields existed: held and
+    # yearless although TMDB already gave a release date. Archived rows are
+    # included so they show their year and a restored card comes back fixed.
+    # A no-op once caught up.
+    conn.execute("""UPDATE movies SET year=CAST(substr(release_date, 1, 4) AS INTEGER), needs_year_review=0
+                    WHERE needs_year_review=1 AND year IS NULL
+                      AND tmdb_id IS NOT NULL AND release_date GLOB '[0-9][0-9][0-9][0-9]*'""")
 
     _commit_with_retry(conn)
 
@@ -6729,6 +6736,18 @@ def movie_needs_enrichment(movie_id: int) -> bool:
     return bool(movie) and _is_stale(movie.get("last_enriched_at"), movie.get("enrich_stable_count"))
 
 
+def _release_year_fields(row, fields: dict) -> None:
+    """A held (needs_year_review=1) yearless movie takes its year from the TMDB
+    release date, as series do from first_air_date; otherwise it stays held
+    out of every category."""
+    release_date = str(fields.get("release_date") or "")
+    if row is None or not row["needs_year_review"] or row["year"] is not None:
+        return
+    if len(release_date) >= 4 and release_date[:4].isdigit():
+        fields["year"] = int(release_date[:4])
+        fields["needs_year_review"] = 0
+
+
 def set_movie_enrichment(movie_id: int, **fields) -> None:
     """Persist detail-level fields fetched from a provider's get_vod_info, and
     stamp last_enriched_at so we don't re-fetch this movie again for
@@ -6739,6 +6758,7 @@ def set_movie_enrichment(movie_id: int, **fields) -> None:
         try:
             row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
             fields["last_enriched_at"] = _now()
+            _release_year_fields(row, fields)
             if row is not None:
                 fields["enrich_stable_count"] = _next_enrich_stable_count(row, fields)
             sets = ", ".join(f"{k}=?" for k in fields)
@@ -6784,6 +6804,7 @@ def apply_movie_enrichment_batch(items: list[dict]) -> None:
                         fields = dict(item.get("fields") or {})
                         row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
                         fields["last_enriched_at"] = _now()
+                        _release_year_fields(row, fields)
                         if row is not None:
                             fields["enrich_stable_count"] = _next_enrich_stable_count(row, fields)
                         sets = ", ".join(f"{k}=?" for k in fields)
