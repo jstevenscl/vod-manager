@@ -483,7 +483,11 @@ def _load_retention_refs(conn: sqlite3.Connection, referenced: dict[str, set[int
 
 
 def retention_cleanup(referenced: dict[str, set[int]], *, dry_run: bool = True) -> dict:
-    """Preview or remove TMDB details no longer tied to the VOD catalog."""
+    """Preview or remove TMDB data at the hard cache age.
+
+    Titles outside the catalog are kept until that age so a title that leaves
+    and returns costs no new request; `unreferenced_titles` is informational.
+    """
     cutoff = time.time() - MAX_CACHE_AGE_SECONDS
     with _conn() as conn:
         _load_retention_refs(conn, referenced)
@@ -492,20 +496,51 @@ def retention_cleanup(referenced: dict[str, set[int]], *, dry_run: bool = True) 
             "referenced": conn.execute("SELECT COUNT(*) FROM retention_refs").fetchone()[0],
             "unreferenced_titles": conn.execute("SELECT COUNT(*) FROM titles t WHERE NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type=t.media_type AND r.tmdb_id=t.tmdb_id)").fetchone()[0],
             "expired_referenced_titles": conn.execute("SELECT COUNT(*) FROM titles t JOIN retention_refs r ON r.media_type=t.media_type AND r.tmdb_id=t.tmdb_id WHERE t.fetched_at<=?", (cutoff,)).fetchone()[0],
-            "seasons_removed": conn.execute("SELECT COUNT(*) FROM seasons s WHERE s.fetched_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type='tv' AND r.tmdb_id=s.tmdb_id)", (cutoff,)).fetchone()[0],
+            "titles_removed": conn.execute("SELECT COUNT(*) FROM titles WHERE fetched_at<=?", (cutoff,)).fetchone()[0],
+            "seasons_removed": conn.execute("SELECT COUNT(*) FROM seasons WHERE fetched_at<=?", (cutoff,)).fetchone()[0],
             "searches_removed": conn.execute("SELECT COUNT(*) FROM searches WHERE empty=0 OR fetched_at<=?", (cutoff,)).fetchone()[0],
-            "gone_removed": conn.execute("SELECT COUNT(*) FROM gone g WHERE g.marked_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type=g.media_type AND r.tmdb_id=g.tmdb_id)", (cutoff,)).fetchone()[0],
+            "gone_removed": conn.execute("SELECT COUNT(*) FROM gone WHERE marked_at<=?", (cutoff,)).fetchone()[0],
         }
-        counts["titles_removed"] = counts["unreferenced_titles"] + counts["expired_referenced_titles"]
         if dry_run:
             conn.rollback()
             return counts
-        conn.execute("DELETE FROM title_names WHERE EXISTS (SELECT 1 FROM titles t WHERE t.media_type=title_names.media_type AND t.tmdb_id=title_names.tmdb_id AND (t.fetched_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type=t.media_type AND r.tmdb_id=t.tmdb_id)))", (cutoff,))
-        conn.execute("DELETE FROM titles WHERE fetched_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type=titles.media_type AND r.tmdb_id=titles.tmdb_id)", (cutoff,))
-        conn.execute("DELETE FROM seasons WHERE fetched_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type='tv' AND r.tmdb_id=seasons.tmdb_id)", (cutoff,))
+        conn.execute("DELETE FROM title_names WHERE EXISTS (SELECT 1 FROM titles t WHERE t.media_type=title_names.media_type AND t.tmdb_id=title_names.tmdb_id AND t.fetched_at<=?)", (cutoff,))
+        conn.execute("DELETE FROM titles WHERE fetched_at<=?", (cutoff,))
+        conn.execute("DELETE FROM seasons WHERE fetched_at<=?", (cutoff,))
         conn.execute("DELETE FROM searches WHERE empty=0 OR fetched_at<=?", (cutoff,))
-        conn.execute("DELETE FROM gone WHERE marked_at<=? OR NOT EXISTS (SELECT 1 FROM retention_refs r WHERE r.media_type=gone.media_type AND r.tmdb_id=gone.tmdb_id)", (cutoff,))
+        conn.execute("DELETE FROM gone WHERE marked_at<=?", (cutoff,))
         return counts
+
+
+def popular_export_ids(media_type: str, limit: int) -> set[int]:
+    """The `limit` most popular IDs in TMDB's daily export (adult already skipped)."""
+    if limit <= 0:
+        return set()
+    with _conn() as conn:
+        rows = conn.execute("SELECT tmdb_id FROM export_ids WHERE media_type=? ORDER BY popularity DESC LIMIT ?", (media_type, limit)).fetchall()
+    return {row[0] for row in rows}
+
+
+def free_space_ratio() -> float:
+    """Share of the store file that is free pages left behind by deletes."""
+    with _conn() as conn:
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    return free / pages if pages else 0.0
+
+
+def vacuum_if_fragmented(min_ratio: float = 0.25) -> bool:
+    """VACUUM when at least `min_ratio` of the file is free pages."""
+    if free_space_ratio() < min_ratio:
+        return False
+    conn = _connect()
+    try:
+        conn.isolation_level = None  # VACUUM cannot run inside a transaction
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    return True
 
 
 def list_catalog_refresh_ids(media_type: str, referenced_ids: set[int], limit: int) -> list[int]:

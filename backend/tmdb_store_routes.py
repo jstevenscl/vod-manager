@@ -23,6 +23,7 @@ class StoreSettings(BaseModel):
     daily_budget: int | None = None
     concurrency: int | None = None
     auto_match_batch: int | None = None
+    popular_keep: int | None = None
 
 
 @router.get("/status", dependencies=_GUARDS)
