@@ -665,6 +665,7 @@ _TMDB_STORE_DEFAULTS = {
     "daily_budget": 20000,
     "concurrency": 4,
     "auto_match_batch": 2000,  # no-ID titles auto-matched per burst; 0 = off
+    "popular_keep": 25000,  # most popular TMDB titles kept per type; 0 = catalog only
 }
 
 

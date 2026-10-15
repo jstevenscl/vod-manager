@@ -1805,9 +1805,12 @@ Configuration page and in the README) and limit how long TMDB data may be
 cached (6 months); the key is yours, so following
 [TMDB's API terms](https://www.themoviedb.org/api-terms-of-use) is up to you.
 The optional local TMDB library is off by default; turn it on from the TMDB Library page in the sidebar
-(it needs the TMDB key above). It is catalog-first: it fills known movie and show
-IDs only, refreshes retained records after 150 days, removes unreferenced data
-daily, and never serves data older than 170 days. The TMDB Library page
+(it needs the TMDB key above). It fills your catalog's movie and show IDs first,
+then the most popular TMDB titles (**Popular titles to keep**, default 25,000 movies
+and 25,000 shows; **0 = catalog only**), so newly imported titles are usually local
+already and need no TMDB call. It refreshes records after 150 days, keeps any
+stored title until 170 days, never serves data older than that, and compacts
+the file when deletes leave more than a quarter of it free. The TMDB Library page
 has a cleanup preview, so you can review the affected records before
 applying removal. Once it is on, TMDB's daily ID export is downloaded at most
 once a day (no API key or request budget needed) so name search can be

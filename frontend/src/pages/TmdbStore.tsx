@@ -16,6 +16,7 @@ interface StoreSettings {
   daily_budget: number
   concurrency: number
   auto_match_batch: number
+  popular_keep: number
 }
 interface TypeStats {
   media_type: MediaType
@@ -79,6 +80,7 @@ const SETTING_FIELDS: { key: Exclude<keyof StoreSettings, 'enabled'>; label: str
   { key: 'daily_budget', label: 'Daily request budget', hint: 'Fill bursts stop once this many TMDB requests were made today.' },
   { key: 'concurrency', label: 'Parallel requests', hint: 'Concurrent requests during a burst — keep low to stay light on bandwidth.' },
   { key: 'auto_match_batch', label: 'Titles to match per burst', hint: 'Catalog titles without a TMDB ID matched by name and year after each burst. 0 turns it off.' },
+  { key: 'popular_keep', label: 'Popular titles to keep', hint: 'Also store this many of the most popular TMDB movies and TV shows (each), filled after your catalog, so new titles are usually local already. 0 = catalog only.' },
 ]
 
 export default function TmdbStore() {
@@ -172,7 +174,7 @@ export default function TmdbStore() {
             </div>
             <p className="text-xs text-muted-foreground flex-1 min-w-[16rem]">
               {enabled
-                ? 'On: TMDB details are saved locally and reused only for titles in this app’s current catalog.'
+                ? 'On: TMDB details are saved locally for your catalog and the most popular TMDB titles, and reused instead of calling TMDB.'
                 : 'Off: nothing is stored; every lookup goes straight to TMDB. Use this if disk space is tight.'}
             </p>
             {!enabled && status.db_size_bytes > 0 && (
@@ -196,9 +198,9 @@ export default function TmdbStore() {
       )}
       <SectionCard title="TMDB Library" icon={<Database size={14} />}>
         <p className="text-xs text-muted-foreground">
-          A local copy of TMDB movie and TV details for titles in this app's current catalog. Background fill refreshes
-          known catalog IDs only. Unreferenced data is removed daily, and retained data is refreshed before the six-month
-          TMDB cache limit. It is off until you turn it on above, and needs a TMDB API key under Configuration → API Keys.
+          A local copy of TMDB movie and TV details for this app's catalog plus the most popular TMDB titles. Background
+          fill does catalog IDs first, then popular ones. Any stored title is kept until the six-month TMDB cache limit,
+          and catalog and popular titles are refreshed before it. It is off until you turn it on above, and needs a TMDB API key under Configuration → API Keys.
         </p>
         {statusQuery.isLoading || !status ? (
           <Loader2 size={14} className="animate-spin" />
@@ -296,7 +298,7 @@ export default function TmdbStore() {
             </div>
             {retention.data?.dry_run && (
               <div className="rounded-md border border-border p-2 text-xs space-y-1">
-                <p><b>Cleanup preview:</b> {fmtNum(retention.data.referenced)} catalog references. {fmtNum(retention.data.unreferenced_titles)} unreferenced and {fmtNum(retention.data.expired_referenced_titles)} expired referenced titles would be removed.</p>
+                <p><b>Cleanup preview:</b> {fmtNum(retention.data.referenced)} catalog references; {fmtNum(retention.data.unreferenced_titles)} stored titles outside the catalog are kept until the cache limit. {fmtNum(retention.data.titles_removed)} expired titles ({fmtNum(retention.data.expired_referenced_titles)} in the catalog, refetched next burst) would be removed.</p>
                 <p className="text-muted-foreground">Also removes {fmtNum(retention.data.seasons_removed)} season, {fmtNum(retention.data.searches_removed)} search answer and {fmtNum(retention.data.gone_removed)} unavailable-title records.</p>
                 <Button size="sm" disabled={retention.isPending} onClick={() => askConfirm('Remove the TMDB records shown in this preview? Current catalog items will be refreshed as needed.', () => retention.mutate(false))}>Apply cleanup</Button>
               </div>
