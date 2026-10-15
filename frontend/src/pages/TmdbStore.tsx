@@ -67,6 +67,35 @@ interface LookupResult {
 
 const fmtNum = (n: number) => n.toLocaleString()
 const fmtTime = (ts: number | null) => (ts ? new Date(ts * 1000).toLocaleString() : '—')
+
+type RunJob = 'burst' | 'changes' | 'export' | 'match'
+// Jobs run in the background and a burst with nothing due
+// finished instantly with no feedback, so every job now reports its result.
+const n = (v: unknown) => fmtNum(Number(v ?? 0))
+const perType = (r: Record<string, unknown>, key: string) =>
+  (r[key] ?? {}) as Record<string, unknown>
+function jobResultText(r: Record<string, unknown>): string | null {
+  switch (r.job) {
+    case 'burst':
+      if (r.skipped) return `Last fill burst: skipped — ${r.skipped}`
+      if (!Number(r.fetched) && !Number(r.failed) && !Number(r.gone))
+        return 'Last fill burst: nothing to fetch — every catalog title is stored and up to date'
+      return `Last fill burst: ${n(r.fetched)} fetched, ${n(r.failed)} failed, ${n(r.gone)} no longer on TMDB`
+    case 'changes': {
+      const m = perType(r, 'movie'), t = perType(r, 'tv')
+      return `Last change check: ${n(m.changed_on_tmdb)} movies and ${n(t.changed_on_tmdb)} TV shows changed on TMDB; `
+        + `${n(m.stored_marked)} + ${n(t.stored_marked)} of your stored titles marked for refresh`
+    }
+    case 'export':
+      return `Last TMDB ID list refresh: ${r.movie == null ? 'movies unavailable' : `${n(r.movie)} movie IDs`}, `
+        + `${r.tv == null ? 'TV unavailable' : `${n(r.tv)} TV IDs`}`
+    case 'match':
+      return `Last title match: ${n(r.checked)} checked, ${n(r.matched)} matched, `
+        + `${n(r.ambiguous)} sent to Metadata Review, ${n(r.unmatched)} not found on TMDB`
+    default:
+      return null
+  }
+}
 const fmtBytes = (b: number) => (b > 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`)
 
 function pct(part: number, whole: number) {
@@ -83,12 +112,26 @@ const SETTING_FIELDS: { key: Exclude<keyof StoreSettings, 'enabled'>; label: str
 
 export default function TmdbStore() {
   const qc = useQueryClient()
+  const [pendingRun, setPendingRun] = useState<{ job: RunJob; prevAt: unknown } | null>(null)
   const statusQuery = useQuery<StoreStatus>({
     queryKey: ['tmdb-store-status'],
     queryFn: () => api.get('/tmdb-store/status').then((r) => r.data),
-    refetchInterval: (q) => (q.state.data?.job.running ? 3000 : 30000),
+    refetchInterval: (q) => (pendingRun ? 1500 : q.state.data?.job.running ? 3000 : 30000),
   })
   const status = statusQuery.data
+
+  useEffect(() => {
+    if (!pendingRun || !status) return
+    const r = status.job.last_result
+    const errored = status.job.last_error?.startsWith(`${pendingRun.job}:`)
+    if (!status.job.running && errored) {
+      toast.error(status.job.last_error ?? 'TMDB job failed')
+      setPendingRun(null)
+    } else if (r && r.job === pendingRun.job && r.at !== pendingRun.prevAt) {
+      toast.success(jobResultText(r) ?? 'Done')
+      setPendingRun(null)
+    }
+  }, [status, pendingRun])
 
   const [form, setForm] = useState<StoreSettings | null>(null)
   useEffect(() => {
@@ -122,7 +165,9 @@ export default function TmdbStore() {
     onSettled: () => qc.invalidateQueries({ queryKey: ['tmdb-store-status'] }),
   })
   const runJob = useMutation({
-    mutationFn: (job: 'burst' | 'changes' | 'export' | 'match') => api.post(`/tmdb-store/run/${job}`).then((r) => r.data),
+    mutationFn: (job: RunJob) => api.post(`/tmdb-store/run/${job}`).then((r) => r.data),
+    onMutate: (job) => setPendingRun({ job, prevAt: status?.job.last_result?.at }),
+    onError: () => setPendingRun(null),
     onSettled: () => qc.invalidateQueries({ queryKey: ['tmdb-store-status'] }),
   })
   const retention = useMutation({
@@ -229,12 +274,10 @@ export default function TmdbStore() {
               </p>
             )}
             {status.job.last_error && <p className="text-xs text-destructive">{status.job.last_error}</p>}
-            {status.job.last_result?.job === 'match' && (
+            {status.job.last_result && jobResultText(status.job.last_result) && (
               <p className="text-xs text-muted-foreground">
-                Last title match: {fmtNum(Number(status.job.last_result.checked ?? 0))} checked,{' '}
-                {fmtNum(Number(status.job.last_result.matched ?? 0))} matched,{' '}
-                {fmtNum(Number(status.job.last_result.ambiguous ?? 0))} sent to Metadata Review,{' '}
-                {fmtNum(Number(status.job.last_result.unmatched ?? 0))} not found on TMDB
+                {jobResultText(status.job.last_result)}
+                <span className="opacity-70"> ({fmtTime(Number(status.job.last_result.at) || null)})</span>
               </p>
             )}
             {runError && <p className="text-xs text-destructive">{runError}</p>}
