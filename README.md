@@ -100,6 +100,23 @@ on a schedule. Preview first, export when ready.
 See the [User Guide](USERGUIDE.md#emby-and-jellyfin-the-strm-export) for the
 shared-folder compose setup.
 
+## Downloading files into your library
+
+Prefer real files over streams? **Configuration → Downloads** (off by default)
+saves movies and episodes into a folder (or separate Movies and TV shows folders) named for Emby, Jellyfin and Plex. Pick the
+source when a title has several, or let failover choose; optionally re-encode to a
+smaller H.264/H.265 file (1080p, 720p or phone-sized 480p) while saving, and choose which audio
+languages and subtitles to keep (even without re-encoding). Downloads respect each
+provider's connection limit (a download waits for a free connection and pauses itself,
+then resumes, when a viewer needs it), can be paced per provider
+(speed cap, downloads at once, pause between, an allowed time window), back off by
+themselves when a provider says "slow down", resume after an interruption, and verify
+each file with ffprobe. Unfinished files live in a separate processing folder and move into the
+library only when complete, so nothing partial is ever picked up. See the
+[User Guide](USERGUIDE.md#downloading-files-into-a-library-folder).
+
+![The Downloads card](docs/screenshots/downloads-card.png)
+
 ## Connecting Dispatcharr instances
 
 VOD & DVR Manager distinguishes two separate relationships with Dispatcharr:
@@ -475,7 +492,8 @@ category an exact reflection of its source(s) (e.g. a "Top 100" list that
 cycles over time) — skipped for that pass if any linked source's fetch
 fails, so a transient error never looks like "everything's gone." Lists of
 any length are fetched in full. A category only re-syncs on its own once you set
-Configuration → Refresh Schedule → **List Sync (hrs)** (blank = off, the default;
+Configuration → Refresh Schedule → **List Sync (hrs)**, the one setting that schedules every
+list-linked category at once (blank = off, the default;
 otherwise use **Sync now**), and titles that drop off a list or chart are only
 removed in **Mirror** mode.
 

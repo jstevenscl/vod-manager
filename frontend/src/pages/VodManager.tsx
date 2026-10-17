@@ -19,6 +19,9 @@ interface Provider {
   provider_type: 'xc' | 'plex' | 'emby' | 'jellyfin' | 'library' | 'dispatcharr_dvr'
   shared_connection_limit: number | null
   custom_user_agent: string | null
+  download_speed_limit_mbps?: number | null
+  download_max_concurrent?: number | null
+  download_pause_seconds?: number | null
   has_password: boolean
   movie_count: number
   series_count: number
@@ -2269,6 +2272,350 @@ function MoveEpisodePicker({ initialSeason, initialEpisode, initialName, onPick,
   )
 }
 
+// ── Opt-in downloads (vod_downloader.py) ─────────────────────────────────────
+interface DownloadJob {
+  id: number; kind: 'movie' | 'episode'; title: string; preset: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  note: string | null; error: string | null; bytes_done: number; total_bytes: number | null; progress: number
+  provider_name: string | null; final_path: string | null; final_size: number | null
+}
+interface DownloadSettings {
+  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
+  speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
+  window_enabled: boolean; window_start: number; window_end: number
+}
+interface DownloadStatus {
+  settings: DownloadSettings; problem: string | null; ffmpeg: boolean; in_window: boolean
+  free: { movies: number | null; shows: number | null; movies_path: string; shows_path: string } | null
+  counts: Record<string, number>; jobs: DownloadJob[]; presets: { id: string; label: string }[]
+}
+
+function dlBytes(n: number | null | undefined): string {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function useDownloadStatus(poll = false) {
+  return useQuery<DownloadStatus>({
+    queryKey: ['vod-downloads'],
+    queryFn: () => api.get('/vod/downloads/').then((r) => r.data),
+    staleTime: 30000,
+    refetchInterval: poll ? (q) => ((q.state.data?.counts.running || q.state.data?.counts.queued) ? 2000 : 15000) : false,
+  })
+}
+
+function queueResultText(r: { queued: number; already_queued: number; no_source: number; missing: number; truncated: boolean }): string {
+  const parts: string[] = []
+  if (r.queued) parts.push(`${r.queued} queued`)
+  if (r.already_queued) parts.push(`${r.already_queued} already in the queue`)
+  if (r.no_source) parts.push(`${r.no_source} skipped (no playable source)`)
+  if (r.missing) parts.push(`${r.missing} no longer exist`)
+  if (r.truncated) parts.push('stopped at 2,000 for one request, so narrow the selection and queue the rest')
+  return (parts.join(', ') || 'Nothing to queue') + '. Progress is under Configuration → Downloads.'
+}
+
+function useQueueDownload() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: Record<string, unknown>) => api.post('/vod/downloads/queue/', body).then((r) => r.data),
+    onSuccess: (r) => { qc.invalidateQueries({ queryKey: ['vod-downloads'] }); notify(queueResultText(r)) },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? e?.message ?? 'Could not queue the download.'),
+  })
+}
+
+// One small icon: downloads exactly this movie / episode / source. Hidden while downloads are off.
+function DownloadIconButton({ body, title, size = 12 }: { body: Record<string, unknown>; title: string; size?: number }) {
+  const status = useDownloadStatus()
+  const queue = useQueueDownload()
+  if (!status.data?.settings.enabled) return null
+  return (
+    <button title={title} className="hover:text-foreground disabled:opacity-50" disabled={queue.isPending} onClick={() => queue.mutate(body)}>
+      <Download size={size} />
+    </button>
+  )
+}
+
+// Download a whole movie, or a series (all seasons or one), with a re-encode preset and an optional provider preference.
+function DownloadMenu({ target, label, providers, seasons }: {
+  target: { movie_ids?: number[]; series_ids?: number[] }
+  label: string
+  providers?: { id: number; name: string }[]
+  seasons?: number[]
+}) {
+  const status = useDownloadStatus()
+  const queue = useQueueDownload()
+  const [preset, setPreset] = useState('')
+  const [providerId, setProviderId] = useState('')
+  const [season, setSeason] = useState('')
+  const [langs, setLangs] = useState('')
+  if (!status.data?.settings.enabled) return null
+  const effectivePreset = preset || status.data.settings.default_preset
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5 text-[11px] font-normal">
+      <select className={inputCls('text-[11px]')} value={effectivePreset} onChange={(e) => setPreset(e.target.value)} title="Keep the original file, or re-encode it smaller while downloading">
+        {status.data.presets.map((p) => (
+          <option key={p.id} value={p.id} disabled={p.id !== 'original' && !status.data!.ffmpeg}>{p.label}</option>
+        ))}
+      </select>
+      {providers && providers.length > 1 && (
+        <select className={inputCls('text-[11px]')} value={providerId} onChange={(e) => setProviderId(e.target.value)} title="Which provider's copy to prefer. Falls back to the others when it doesn't have a title.">
+          <option value="">Any provider (normal order)</option>
+          {providers.map((p) => <option key={p.id} value={p.id}>Prefer {p.name}</option>)}
+        </select>
+      )}
+      {seasons && seasons.length > 1 && (
+        <select className={inputCls('text-[11px]')} value={season} onChange={(e) => setSeason(e.target.value)}>
+          <option value="">All seasons</option>
+          {seasons.map((n) => <option key={n} value={n}>Season {n}</option>)}
+        </select>
+      )}
+      <input
+        className={inputCls('w-24 text-[11px]')} value={langs} onChange={(e) => setLangs(e.target.value)}
+        placeholder={status.data.settings.audio_languages ? `audio: ${status.data.settings.audio_languages}` : 'audio: all'}
+        title="Audio languages to keep for this download, for example eng or eng, jpn. Blank follows the setting; 'all' keeps every track."
+      />
+      <Button
+        size="sm" variant="outline" disabled={queue.isPending}
+        onClick={() => queue.mutate({
+          ...target, preset: effectivePreset, audio_languages: langs.trim() || undefined,
+          prefer_provider_id: providerId ? Number(providerId) : undefined,
+          season: season ? Number(season) : undefined,
+        })}
+      >
+        {queue.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Download size={12} className="mr-1" />}{label}
+      </Button>
+    </span>
+  )
+}
+
+// Configuration -> Downloads: settings, the legal note, and the live queue.
+function DownloadsCard() {
+  const qc = useQueryClient()
+  const status = useDownloadStatus(true)
+  const [draft, setDraft] = useState<DownloadSettings | null>(null)
+  const [ack, setAck] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { if (status.data && !draft) setDraft(status.data.settings) }, [status.data, draft])
+  const errText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
+  const refresh = () => qc.invalidateQueries({ queryKey: ['vod-downloads'] })
+  const save = useMutation({
+    mutationFn: (d: DownloadSettings) => api.post('/vod/downloads/settings/', d),
+    onSuccess: () => { setError(null); refresh() },
+    onError: (e: any) => setError(errText(e)),
+  })
+  const cancelJobs = useMutation({ mutationFn: (ids: number[] | null) => api.post('/vod/downloads/cancel/', { job_ids: ids }), onSuccess: refresh })
+  const retryJob = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry/`), onSuccess: refresh })
+  const clearJobs = useMutation({ mutationFn: () => api.post('/vod/downloads/clear/'), onSuccess: refresh })
+  // hands the finished file to the browser you are using (a phone, say) through a short-lived link
+  const saveToDevice = useMutation({
+    mutationFn: (id: number) => api.post(`/vod/downloads/${id}/link/`).then((r) => r.data.url as string),
+    onSuccess: (url) => { window.location.assign(url) },
+    onError: (e: any) => notify(errText(e)),
+  })
+
+  const data = status.data
+  const wasEnabled = !!data?.settings.enabled
+  const needsAck = !!draft?.enabled && !wasEnabled && !ack
+  const counts = data?.counts ?? {}
+  const active = (counts.running ?? 0) + (counts.queued ?? 0)
+  const statusColor: Record<string, string> = { running: 'text-primary', queued: 'text-muted-foreground', done: 'text-emerald-500', failed: 'text-destructive', cancelled: 'text-muted-foreground' }
+
+  return (
+    <SectionCard title="Downloads (save files to your library)" icon={<Download size={14} />}>
+      <p className="text-xs text-muted-foreground">
+        Off by default. Turn this on to save movies and episodes from your providers as real files in a folder, named the way
+        Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year)/Season NN/…</code>).
+        You pick the source (or let failover choose) and can re-encode to a smaller file while downloading. Downloads respect each
+        provider's connection limit and wait their turn behind live viewers.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        Only keep copies of content you have the right to keep. Your provider's terms, and the law where you live, may limit
+        saving streams, and that is your responsibility. This feature never runs unless you turn it on here.
+      </p>
+      {draft && (
+        <div className="space-y-2 text-xs">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <label className="flex items-center gap-1 font-medium">
+              <input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} />
+              Enable downloads
+            </label>
+            <input className={inputCls('w-72')} placeholder="Download folder inside this container, e.g. /downloads" title="Files go in Movies/ and Shows/ inside this folder, unless you set separate folders below." value={draft.output_dir} onChange={(e) => setDraft({ ...draft, output_dir: e.target.value })} />
+            <label className="flex items-center gap-1">Default
+              <select className={inputCls()} value={draft.default_preset} onChange={(e) => setDraft({ ...draft, default_preset: e.target.value })}>
+                {(data?.presets ?? []).map((p) => <option key={p.id} value={p.id} disabled={p.id !== 'original' && !data?.ffmpeg}>{p.label}</option>)}
+              </select>
+            </label>
+            <label className="flex items-center gap-1" title="How many downloads run at once. Each provider still only gets one at a time, and re-encoding uses a lot of CPU.">
+              At once
+              <input className={inputCls('w-12')} type="number" min={1} max={4} value={draft.max_concurrent} onChange={(e) => setDraft({ ...draft, max_concurrent: Math.min(4, Math.max(1, Number(e.target.value) || 1)) })} />
+            </label>
+            <label className="flex items-center gap-1" title="A download stops, and none start, when the folder would drop below this much free space.">
+              Keep free
+              <input className={inputCls('w-14')} type="number" min={0} value={draft.min_free_gb} onChange={(e) => setDraft({ ...draft, min_free_gb: Math.max(0, Number(e.target.value) || 0) })} />
+              GB
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className="font-medium">Separate folders (optional)</span>
+            <input className={inputCls('w-60')} placeholder="Movies folder, e.g. /downloads/movies" title="Movies are saved straight into this folder (Title (Year)/Title (Year).ext), instead of the download folder's Movies subfolder." value={draft.movies_dir} onChange={(e) => setDraft({ ...draft, movies_dir: e.target.value })} />
+            <input className={inputCls('w-60')} placeholder="TV shows folder, e.g. /downloads/tv" title="Episodes are saved straight into this folder (Show (Year)/Season NN/…), instead of the download folder's Shows subfolder." value={draft.shows_dir} onChange={(e) => setDraft({ ...draft, shows_dir: e.target.value })} />
+            <span className="basis-full text-muted-foreground">Leave these blank to use <code>Movies/</code> and <code>Shows/</code> inside the download folder. Set both and the download folder becomes optional.</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className="font-medium">Processing folder (optional)</span>
+            <input className={inputCls('w-72')} placeholder="e.g. /downloads/processing (a fast local disk is best)" title="Downloads and re-encodes happen here; only the finished, checked file is moved into the library." value={draft.work_dir} onChange={(e) => setDraft({ ...draft, work_dir: e.target.value })} />
+            <span className="basis-full text-muted-foreground">Unfinished files live here and move into the library only when complete and verified, so a media server or Tdarr never sees a partial file. Blank = a hidden <code>.processing</code> folder inside each library folder. A re-encode needs room here for the original plus the new file.</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className="font-medium">Languages</span>
+            <label className="flex items-center gap-1" title="Audio languages to keep, e.g. eng or eng, jpn. Blank keeps every track as it is. Tracks with no language tag are always kept, and if nothing matches all audio is kept so a file is never silent.">
+              Keep audio
+              <input className={inputCls('w-40')} placeholder="all (or eng, jpn)" value={draft.audio_languages} onChange={(e) => setDraft({ ...draft, audio_languages: e.target.value })} />
+            </label>
+            <label className="flex items-center gap-1" title="Keep subtitles (in the same languages when a language is set). Off drops them whenever a file is re-encoded or trimmed.">
+              <input type="checkbox" checked={draft.keep_subtitles} onChange={(e) => setDraft({ ...draft, keep_subtitles: e.target.checked })} />
+              Keep subtitles
+            </label>
+            <span className="basis-full text-muted-foreground">A language list also trims <b>Original file</b> downloads (other audio tracks are removed without re-encoding; the file is saved as .mkv). With the list blank, originals are saved untouched. Each download can override it.</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-border/50 pt-2">
+            <span className="font-medium">Pacing defaults</span>
+            <label className="flex items-center gap-1" title="Caps how fast one download pulls from a provider. 0 = no cap. Some providers flag accounts that pull at full speed; others don't mind.">
+              Speed cap
+              <input className={inputCls('w-14')} type="number" min={0} value={draft.speed_limit_mbps} onChange={(e) => setDraft({ ...draft, speed_limit_mbps: Math.max(0, Number(e.target.value) || 0) })} />
+              Mbit/s (0 = none)
+            </label>
+            <label className="flex items-center gap-1" title="How many downloads may run at once from the same provider. Needs the provider's own connection limit to allow it.">
+              At once per provider
+              <input className={inputCls('w-12')} type="number" min={1} max={4} value={draft.provider_concurrent} onChange={(e) => setDraft({ ...draft, provider_concurrent: Math.min(4, Math.max(1, Number(e.target.value) || 1)) })} />
+            </label>
+            <label className="flex items-center gap-1" title="Rest between two downloads from the same provider.">
+              Pause between
+              <input className={inputCls('w-14')} type="number" min={0} value={draft.pause_seconds} onChange={(e) => setDraft({ ...draft, pause_seconds: Math.max(0, Number(e.target.value) || 0) })} />
+              sec
+            </label>
+            <label className="flex items-center gap-1" title="Only START downloads inside this window (this server's local time). Running ones finish.">
+              <input type="checkbox" checked={draft.window_enabled} onChange={(e) => setDraft({ ...draft, window_enabled: e.target.checked })} />
+              Only between
+              <input className={inputCls('w-12')} type="number" min={0} max={23} disabled={!draft.window_enabled} value={draft.window_start} onChange={(e) => setDraft({ ...draft, window_start: Math.min(23, Math.max(0, Number(e.target.value) || 0)) })} />
+              and
+              <input className={inputCls('w-12')} type="number" min={0} max={23} disabled={!draft.window_enabled} value={draft.window_end} onChange={(e) => setDraft({ ...draft, window_end: Math.min(23, Math.max(0, Number(e.target.value) || 0)) })} />
+              o'clock
+            </label>
+            <span className="basis-full text-muted-foreground">
+              Each provider can override these (Providers → Downloads). If a provider answers "slow down" (HTTP 429, 458, 509, 403) the download waits and retries with a growing delay on its own.
+            </span>
+          </div>
+          {draft.enabled && !wasEnabled && (
+            <label className="flex items-start gap-1.5 text-muted-foreground">
+              <input type="checkbox" className="mt-0.5" checked={ack} onChange={(e) => setAck(e.target.checked)} />
+              I understand I'm responsible for having the right to keep copies of what I download.
+            </label>
+          )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button size="sm" disabled={save.isPending || needsAck} onClick={() => save.mutate(draft)}>
+              {save.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save settings'}
+            </Button>
+            {data?.free && (data.free.movies_path === data.free.shows_path || data.free.movies === data.free.shows
+              ? <span className="text-muted-foreground">{dlBytes(data.free.movies)} free</span>
+              : <span className="text-muted-foreground">{dlBytes(data.free.movies)} free for movies, {dlBytes(data.free.shows)} free for TV shows</span>)}
+            {data && !data.ffmpeg && <span className="text-destructive">ffmpeg isn't available here, so only "Original file" downloads work.</span>}
+          </div>
+          {error && <p className="text-destructive">{error}</p>}
+          {!error && data?.problem && <p className="text-destructive">{data.problem}</p>}
+        </div>
+      )}
+
+      {wasEnabled && data && (
+        <div className="space-y-1.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <p className="font-medium">Queue</p>
+            <span className="text-muted-foreground">
+              {counts.running ?? 0} running, {counts.queued ?? 0} waiting, {counts.done ?? 0} done{counts.failed ? `, ${counts.failed} failed` : ''}
+            </span>
+            {active > 0 && <Button size="sm" variant="outline" disabled={cancelJobs.isPending} onClick={() => askConfirm(`Cancel all ${active} queued and running downloads? Partial files are removed.`, () => cancelJobs.mutate(null))}>Cancel all</Button>}
+            {data.jobs.some((j) => ['done', 'failed', 'cancelled'].includes(j.status)) && <Button size="sm" variant="outline" disabled={clearJobs.isPending} onClick={() => clearJobs.mutate()}>Clear finished</Button>}
+          </div>
+          {!data.in_window && <p className="text-muted-foreground">Outside the download window: queued items start at {data.settings.window_start}:00.</p>}
+          {data.jobs.length === 0 && <p className="text-muted-foreground">Nothing queued yet. Use the download button on a movie, an episode, or a source, or select titles and choose Download selected.</p>}
+          {data.jobs.length > 0 && (
+            <table className="w-full">
+              <tbody>
+                {data.jobs.map((j) => (
+                  <tr key={j.id} className="border-t border-border/50 align-top">
+                    <td className="py-1 pr-2">
+                      <div className="break-words">{j.title}</div>
+                      {(j.error || j.note) && <div className={j.error ? 'text-destructive text-[11px]' : 'text-muted-foreground text-[11px]'}>{j.error ?? j.note}</div>}
+                    </td>
+                    <td className="py-1 pr-2 whitespace-nowrap text-muted-foreground">{j.preset === 'original' ? 'original' : j.preset.replace('_', ' ')}</td>
+                    <td className="py-1 pr-2 w-36">
+                      {j.status === 'running' && (
+                        <div className="h-1.5 rounded bg-border overflow-hidden"><div className="h-full bg-primary" style={{ width: `${Math.round(j.progress * 100)}%` }} /></div>
+                      )}
+                      <span className={statusColor[j.status]}>
+                        {j.status === 'running' ? `${Math.round(j.progress * 100)}% · ${dlBytes(j.bytes_done)}${j.provider_name ? ` · ${j.provider_name}` : ''}` : j.status === 'done' ? `done · ${dlBytes(j.final_size)}` : j.status}
+                      </span>
+                    </td>
+                    <td className="py-1 whitespace-nowrap text-right">
+                      {(j.status === 'queued' || j.status === 'running') && <button className="text-muted-foreground hover:text-destructive" title="Cancel" onClick={() => cancelJobs.mutate([j.id])}><X size={12} /></button>}
+                      {j.status === 'done' && <button className="text-muted-foreground hover:text-foreground disabled:opacity-50" title="Save this file to the device you are using" disabled={saveToDevice.isPending} onClick={() => saveToDevice.mutate(j.id)}><Download size={12} /></button>}
+                      {(j.status === 'failed' || j.status === 'cancelled') && <button className="text-muted-foreground hover:text-foreground" title="Try again" onClick={() => retryJob.mutate(j.id)}><RotateCcw size={12} /></button>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <p className="text-muted-foreground">
+            Mount the download folder(s) into this container and into your media server, then add the movies and TV shows folders as
+            libraries. Use a different folder from the .strm export so titles don't appear twice.
+          </p>
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
+// Per-provider download pacing. Blank = follow the global default; 0 speed = explicitly no cap for this provider.
+function ProviderDownloadLimits({ provider }: { provider: Provider }) {
+  const qc = useQueryClient()
+  const status = useDownloadStatus()
+  const [speed, setSpeed] = useState(provider.download_speed_limit_mbps == null ? '' : String(provider.download_speed_limit_mbps))
+  const [conc, setConc] = useState(provider.download_max_concurrent == null ? '' : String(provider.download_max_concurrent))
+  const [pause, setPause] = useState(provider.download_pause_seconds == null ? '' : String(provider.download_pause_seconds))
+  const save = useMutation({
+    mutationFn: () => api.post(`/vod/providers/${provider.id}/download-limits/`, {
+      speed_limit_mbps: speed === '' ? null : Number(speed),
+      max_concurrent: conc === '' ? null : Number(conc),
+      pause_seconds: pause === '' ? null : Number(pause),
+    }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-providers'] }),
+  })
+  const g = status.data?.settings
+  if (!g?.enabled || ['library', 'dispatcharr_dvr'].includes(provider.provider_type)) return null
+  const field = (label: string, value: string, set: (v: string) => void, placeholder: string, title: string) => (
+    <label className="flex items-center gap-1" title={title}>
+      {label}
+      <input className={inputCls('w-16 text-[11px]')} type="number" min={0} value={value} placeholder={placeholder}
+        onChange={(e) => set(e.target.value)} onBlur={() => save.mutate()} />
+    </label>
+  )
+  return (
+    <div className="mt-1 text-[11px] text-muted-foreground space-y-0.5">
+      <p className="font-medium">Downloads (blank = global default)</p>
+      <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+        {field('Mbit/s', speed, setSpeed, g.speed_limit_mbps ? String(g.speed_limit_mbps) : 'none', 'Speed cap for downloads from this provider. 0 = no cap even if the global default has one.')}
+        {field('at once', conc, setConc, String(g.provider_concurrent), 'Downloads at once from this provider. Above 1 only works if the provider\'s max streams allows it.')}
+        {field('pause s', pause, setPause, String(g.pause_seconds), 'Rest between downloads from this provider.')}
+      </div>
+    </div>
+  )
+}
+
 function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, selected, onToggleSelect, mode = 'list', onToggleArchived, onRemoveFromCategory }: {
   movie: Movie
   movieCategories: Category[]
@@ -2503,12 +2850,16 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
       {movie.description && <p className="text-muted-foreground">{movie.description}</p>}
 
       <div>
-        <p className="font-medium mb-1">Sources</p>
+        <div className="flex flex-wrap items-center gap-2 mb-1">
+          <p className="font-medium">Sources</p>
+          <DownloadMenu target={{ movie_ids: [movie.id] }} label="Download" providers={movie.sources.map((s) => ({ id: s.provider_id, name: s.provider_name }))} />
+        </div>
         {movie.sources.map((s) => (
           <div key={s.id} className="text-muted-foreground">
             <div className="flex items-center justify-between">
               <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
               <span className="flex items-center gap-1.5">
+                <DownloadIconButton body={{ movie_ids: [movie.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                 <PlayButton
                   url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
                   transcodedUrl={buildTranscodedPreviewSourceUrl('movie', s.id, xcCredentials)}
@@ -3120,7 +3471,16 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
       })()}
 
       <div>
-        <p className="font-medium mb-1">Episodes</p>
+        <div className="flex flex-wrap items-center gap-2 mb-1">
+          <p className="font-medium">Episodes</p>
+          {series.episodes.length > 0 && (
+            <DownloadMenu
+              target={{ series_ids: [series.id] }} label="Download episodes"
+              providers={[...new Map(series.episodes.flatMap((e) => e.sources).map((s) => [s.provider_id, { id: s.provider_id, name: s.provider_name }])).values()]}
+              seasons={[...new Set(series.episodes.map((e) => e.season_number))].sort((a, b) => a - b)}
+            />
+          )}
+        </div>
         {series.episodes.length === 0 && (
           <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
         )}
@@ -3161,6 +3521,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                     title={`${series.name} S${e.season_number}E${e.episode_number} — ${e.name}`}
                   />
                   <CopyUrlButton url={buildStreamUrl('series', e.export_episode_id, 'mp4', xcCredentials)} />
+                  <DownloadIconButton body={{ episode_ids: [e.id] }} title="Download this episode" />
                 </span>
               </div>
             )}
@@ -3176,6 +3537,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   )}
                 </span>
                 <span className="flex items-center gap-1">
+                  <DownloadIconButton size={11} body={{ episode_ids: [e.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                   <FlagMismatchControl
                     isFlagged={!!s.flagged_mismatch}
                     reason={s.flagged_reason}
@@ -3408,6 +3770,15 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
     name: '', is_smart: false,
     rule_field: 'genre' as typeof RULE_FIELDS[number], rule_op: 'contains' as typeof RULE_OPS[number], rule_value: '',
   })
+  // The global List Sync interval lives in Configuration -> Refresh Schedule; show its current value here so
+  // "global" on a category's schedule dropdown isn't a mystery.
+  const refreshSettings = useQuery<RefreshSettings>({
+    queryKey: ['vod-refresh-settings'],
+    queryFn: () => api.get('/vod/refresh-settings/').then((r) => r.data),
+    staleTime: 30000,
+  })
+  const globalSyncSecs = refreshSettings.data?.tmdb_sync_interval_seconds ?? null
+  const globalSyncText = globalSyncSecs ? `every ${+(globalSyncSecs / 3600).toFixed(1)}h` : 'off'
   const addCategory = useMutation({
     mutationFn: () => api.post('/vod/categories/', {
       name: categoryForm.name,
@@ -3649,6 +4020,12 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
         <span className="text-sm font-medium">{contentType === 'movie' ? 'Movie Categories' : 'TV Show Categories'}</span>
       </div>
       <div className="p-4 text-xs space-y-3 overflow-y-auto">
+        {categories.some((c) => !c.is_smart && !!(c.sync_source || c.sync_sources)) && (
+          <p className="text-muted-foreground">
+            List-linked categories only update when you click Sync now, unless they have a schedule. The dropdown on each one picks hourly
+            to weekly; <b>global</b> follows <b>List Sync (hrs)</b> under <b>Configuration → Refresh Schedule</b>, which is currently <b>{globalSyncText}</b>.
+          </p>
+        )}
         {categories.length > 1 && (
           <>
             <div className="flex items-center gap-1.5">
@@ -3748,15 +4125,15 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 />
                 {!c.is_smart && !!(c.sync_source || c.sync_sources) && (
                   <select
-                    className={inputCls('w-20 text-[10px]')}
-                    title="How often this category re-syncs from its list. Without its own schedule it follows the global List Sync (hrs) setting, which is off by default."
+                    className={inputCls('w-28 text-[10px]')}
+                    title={`How often this category re-syncs from its list. "global" follows List Sync (hrs) under Configuration → Refresh Schedule (currently ${globalSyncText}; off by default, which means only Sync now updates it).`}
                     value={c.schedule_interval_seconds ? String(c.schedule_interval_seconds) : ''}
                     onChange={(e) => {
                       const v = e.target.value
                       setCategoryEvalSchedule.mutate({ id: c.id, schedule_interval_seconds: v ? Number(v) : null, use_ai_evaluation: false })
                     }}
                   >
-                    <option value="">global / manual</option>
+                    <option value="">{globalSyncSecs ? `global (${globalSyncText})` : 'global (off)'}</option>
                     <option value="3600">hourly</option>
                     <option value="21600">every 6h</option>
                     <option value="86400">daily</option>
@@ -4644,6 +5021,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
     onError: (e: any) => { setStrmPreview(null); setStrmError(strmErrorText(e)) },
   })
+
+  const downloadStatus = useDownloadStatus()
+  const queueDownload = useQueueDownload()
+  const downloadsEnabled = !!downloadStatus.data?.settings.enabled
 
   // ── Connected Instances (per-instance XC credentials) ──
   const xcClientsQuery = useQuery<XcClient[]>({
@@ -7577,6 +7958,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
+      <DownloadsCard />
+
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Who VOD & DVR Manager itself reaches out to — the other side of Connected Instances above (who's allowed to
@@ -8688,6 +9071,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                       if (v !== (p.custom_user_agent ?? '')) setProviderUserAgent.mutate({ id: p.id, custom_user_agent: v })
                     }}
                   />
+                  <ProviderDownloadLimits key={`${p.id}-${p.download_speed_limit_mbps}-${p.download_max_concurrent}-${p.download_pause_seconds}`} provider={p} />
                 </td>
                 <td className="py-1 flex items-center gap-1.5">
                   {p.provider_type !== 'library' && (
@@ -11094,6 +11478,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               )}
             </>
           )}
+          {downloadsEnabled && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={selectedMovieIds.size === 0 || queueDownload.isPending}
+              title="Saves the selected movies as files in your download folder (uses the default preset from Configuration → Downloads)"
+              onClick={() => queueDownload.mutate({ movie_ids: Array.from(selectedMovieIds) })}
+            >
+              <Download size={12} className="mr-1" />Download selected ({selectedMovieIds.size})
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -11314,6 +11709,17 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 </span>
               )}
             </>
+          )}
+          {downloadsEnabled && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={selectedSeriesIds.size === 0 || queueDownload.isPending}
+              title="Saves the selected shows (every episode) as files in your download folder (uses the default preset from Configuration → Downloads)"
+              onClick={() => queueDownload.mutate({ series_ids: Array.from(selectedSeriesIds) })}
+            >
+              <Download size={12} className="mr-1" />Download selected ({selectedSeriesIds.size})
+            </Button>
           )}
           <Button
             size="sm"

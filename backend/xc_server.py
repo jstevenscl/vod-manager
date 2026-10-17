@@ -596,6 +596,16 @@ async def _player_api_response(action: str | None, username: str, password: str,
 
 _active_vod_streams: dict[int, int] = {}  # provider_id -> count of VOD streams we're currently relaying
 _active_sub_account_streams: dict[int, int] = {}  # sub_account_id -> same, for vod_manager-4dh
+# File downloads (vod_downloader.py) hold a real provider connection exactly like a stream does, so they
+# are counted separately and checked in BOTH directions by _try_reserve_capacity / _select_upstream_
+# credentials: a download can't start while streams use up the connection(s), and a stream can't start
+# while downloads use them up. A provider with no declared limit is treated as having ONE connection
+# for this purpose, so a download never stacks on top of someone's playback by accident.
+_active_downloads: dict[int, int] = {}              # provider_id -> downloads holding a connection
+_active_sub_account_downloads: dict[int, int] = {}  # sub_account_id -> same
+# Set by vod_downloader: asks the downloads running on these provider ids to pause so a viewer can have the
+# connection (returns True when it signalled any). Viewers always win; the download resumes afterwards.
+_download_preempt_hook = None
 _live_viewer_cache: dict[int, tuple[int, float]] = {}  # dispatcharr_account_id -> (viewer_count, monotonic_at)
 _LIVE_VIEWER_CACHE_TTL = 5.0  # seconds — short, since range-seek requests can fire many proxy calls in quick succession
 
@@ -678,7 +688,7 @@ async def _live_viewer_count(connection: dict, dispatcharr_account_id: int, disp
     return count
 
 
-async def _try_reserve_capacity(provider: dict) -> bool:
+async def _try_reserve_capacity(provider: dict, is_download: bool = False) -> bool:
     """Atomically checks AND claims one connection slot for this provider,
     returning True only if the slot is now ours -- release it with
     _release_capacity if the connect that follows doesn't pan out. Replaces
@@ -727,32 +737,45 @@ async def _try_reserve_capacity(provider: dict) -> bool:
     group = [provider] + siblings
 
     limits = [p["shared_connection_limit"] for p in group if p.get("shared_connection_limit")]
-    if not limits:
-        return True
-    limit = min(limits)
+    limit = min(limits) if limits else 0
+    # Every connection limit the admin declared for this login (the shared live-TV one and/or the account's
+    # own max streams). Only used to size the download gate below; stream-vs-stream behaviour is unchanged.
+    caps = [v for p in group for v in (p.get("shared_connection_limit"), p.get("max_streams")) if v]
+    cap = min(caps) if caps else 0
 
     live_count = 0
     any_live_accounts = False
-    for p in group:
-        live_accounts = await asyncio.to_thread(vod_db.list_provider_live_accounts, p["id"])
-        for link in live_accounts:
-            any_live_accounts = True
-            connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
-            if not connection:
-                continue
-            live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"], link.get("dispatcharr_profile_id"))
-    if not any_live_accounts:
-        return True
+    if limit:
+        for p in group:
+            live_accounts = await asyncio.to_thread(vod_db.list_provider_live_accounts, p["id"])
+            for link in live_accounts:
+                any_live_accounts = True
+                connection = await asyncio.to_thread(vod_db.get_dispatcharr_connection, link["dispatcharr_connection_id"])
+                if not connection:
+                    continue
+                live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"], link.get("dispatcharr_profile_id"))
+    coordinated = bool(limit) and any_live_accounts
 
     async with _capacity_lock:
-        our_count = sum(_active_vod_streams.get(p["id"], 0) for p in group)
-        if live_count + our_count >= limit:
+        streams = sum(_active_vod_streams.get(p["id"], 0) for p in group)
+        downloads = sum(_active_downloads.get(p["id"], 0) for p in group)
+        if is_download:
+            # unknown limit -> assume a single connection, so a download never rides on top of playback
+            if (live_count if coordinated else 0) + streams + downloads >= (cap or 1):
+                return False
+            _active_downloads[provider["id"]] = _active_downloads.get(provider["id"], 0) + 1
+            return True
+        if coordinated:
+            if live_count + streams + downloads >= limit:
+                return False
+        elif downloads and streams + downloads >= (cap or 1):
+            # streams among themselves stay uncoordinated here (as before); only a running download can refuse one
             return False
         _active_vod_streams[provider["id"]] = _active_vod_streams.get(provider["id"], 0) + 1
         return True
 
 
-def _release_capacity(provider: dict, sub_account_id: int | None = None) -> None:
+def _release_capacity(provider: dict, sub_account_id: int | None = None, is_download: bool = False) -> None:
     """Undo a _try_reserve_capacity/_select_upstream_credentials reservation
     that didn't lead to an open stream (connect failed, or upstream returned
     an error status) -- without this the slot leaks forever, since the only
@@ -760,16 +783,39 @@ def _release_capacity(provider: dict, sub_account_id: int | None = None) -> None
     source that never actually opened. sub_account_id, when given, releases
     that sub-account's own counter instead of the provider-level one --
     see _select_upstream_credentials."""
+    sub_counts = _active_sub_account_downloads if is_download else _active_sub_account_streams
+    counts = _active_downloads if is_download else _active_vod_streams
     if sub_account_id is not None:
-        if sub_account_id in _active_sub_account_streams:
-            _active_sub_account_streams[sub_account_id] = max(0, _active_sub_account_streams[sub_account_id] - 1)
+        if sub_account_id in sub_counts:
+            sub_counts[sub_account_id] = max(0, sub_counts[sub_account_id] - 1)
         return
     pid = provider["id"]
-    if pid in _active_vod_streams:
-        _active_vod_streams[pid] = max(0, _active_vod_streams[pid] - 1)
+    if pid in counts:
+        counts[pid] = max(0, counts[pid] - 1)
 
 
-async def _select_upstream_credentials(provider: dict) -> dict | None:
+async def _select_credentials_preempting_downloads(provider: dict) -> dict | None:
+    """Reserve a connection for a viewer. If none is free only because a download is using it, ask that
+    download to pause (it keeps its partial file and resumes later) and take the connection once it lets go."""
+    reservation = await _select_upstream_credentials(provider)
+    if reservation is not None or _download_preempt_hook is None:
+        return reservation
+    siblings = await asyncio.to_thread(vod_db.find_providers_sharing_credentials, provider["id"])
+    ids = {provider["id"], *(p["id"] for p in siblings)}
+    if not (any(_active_downloads.get(i) for i in ids) or any(_active_sub_account_downloads.values())):
+        return None
+    if not _download_preempt_hook(ids):
+        return None
+    logger.info("[xc_server] pausing a download so a viewer can use provider=%s", provider["name"])
+    for _ in range(50):  # up to ~5s for the transfer to notice and let go
+        await asyncio.sleep(0.1)
+        reservation = await _select_upstream_credentials(provider)
+        if reservation is not None:
+            return reservation
+    return None
+
+
+async def _select_upstream_credentials(provider: dict, is_download: bool = False) -> dict | None:
     """vod_manager-4dh: if this provider has sub-accounts (multiple real
     logins nested under one provider entry, Dispatcharr M3U-profile parity),
     picks which one to actually use for this request and reserves its
@@ -797,7 +843,7 @@ async def _select_upstream_credentials(provider: dict) -> dict | None:
     convention of an account's Default profile coming before its other
     profiles), then every sub-account in sort_order, same as before."""
     sub_accounts = await asyncio.to_thread(vod_db.list_provider_sub_accounts, provider["id"])
-    if await _try_reserve_capacity(provider):
+    if await _try_reserve_capacity(provider, is_download):
         return {"username": provider.get("username"), "password": provider.get("password"), "sub_account_id": None}
     if not sub_accounts:
         return None
@@ -815,10 +861,18 @@ async def _select_upstream_credentials(provider: dict) -> dict | None:
                     continue
                 live_count += await _live_viewer_count(connection, link["dispatcharr_account_id"], link.get("dispatcharr_profile_id"))
         async with _capacity_lock:
-            our_count = _active_sub_account_streams.get(sub["id"], 0)
-            if limit and live_count + our_count >= limit:
-                continue
-            _active_sub_account_streams[sub["id"]] = our_count + 1
+            streams = _active_sub_account_streams.get(sub["id"], 0)
+            downloads = _active_sub_account_downloads.get(sub["id"], 0)
+            if is_download:
+                if live_count + streams + downloads >= (limit or 1):  # no declared limit = assume one connection
+                    continue
+                _active_sub_account_downloads[sub["id"]] = downloads + 1
+            else:
+                if limit and live_count + streams + downloads >= limit:
+                    continue
+                if not limit and downloads:  # unlimited as far as streams go, but a download holds the assumed single connection
+                    continue
+                _active_sub_account_streams[sub["id"]] = streams + 1
         return {"username": sub["username"], "password": sub["password"], "sub_account_id": sub["id"]}
 
     return None
@@ -1487,9 +1541,10 @@ async def _proxy_vod_stream(
             vod_db.record_source_success(kind, source["source_id"])
             return FileResponse(local_path, media_type=media_type)
 
-        reservation = await _select_upstream_credentials(provider)
+        reservation = await _select_credentials_preempting_downloads(provider)
         if reservation is None:
-            last_error = "at shared connection capacity"
+            last_error = ("connection in use by a download" if _active_downloads.get(provider["id"])
+                          else "at shared connection capacity")
             attempts.append({"provider": provider["name"], "error": last_error})
             logger.warning("[xc_server] %s stream source %d/%d (%s) at shared capacity id=%s, trying next",
                             kind, idx + 1, len(sources), provider["name"], conn_id)

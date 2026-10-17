@@ -1035,6 +1035,32 @@ def _migrate(conn: sqlite3.Connection) -> None:
         created_at   TEXT,
         PRIMARY KEY (category_id, content_type, item_id)
     )""")
+    # Opt-in file downloads (see vod_downloader.py): one row per movie/episode
+    # queued for download into the library folder.
+    conn.execute("""CREATE TABLE IF NOT EXISTS download_jobs (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind               TEXT NOT NULL,           -- 'movie' | 'episode'
+        item_id            INTEGER NOT NULL,
+        source_id          INTEGER,                 -- exactly this source, or NULL = normal failover order
+        prefer_provider_id INTEGER,                 -- try this provider first when source_id is NULL
+        title              TEXT NOT NULL,
+        preset             TEXT NOT NULL DEFAULT 'original',
+        audio_languages    TEXT,                    -- NULL = follow the setting; 'all' or e.g. 'eng,jpn' overrides it
+        status             TEXT NOT NULL DEFAULT 'queued',  -- queued|running|done|failed|cancelled
+        note               TEXT,
+        error              TEXT,
+        bytes_done         INTEGER NOT NULL DEFAULT 0,
+        total_bytes        INTEGER,
+        progress           REAL NOT NULL DEFAULT 0,
+        provider_name      TEXT,
+        final_path         TEXT,
+        final_size         INTEGER,
+        next_try_at        REAL NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL,
+        started_at         TEXT,
+        finished_at        TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_download_jobs_status ON download_jobs(status)")
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
         # 1 = the name was set deliberately (manual edit or "Use TMDB episode
@@ -1073,6 +1099,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movies", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "needs_year_review", "INTEGER NOT NULL DEFAULT 0"),
         ("providers", "custom_user_agent", "TEXT"),
+        # per-provider download pacing; NULL = use the global default (see vod_downloader.provider_policy)
+        ("download_jobs", "audio_languages", "TEXT"),
+        ("providers", "download_speed_limit_mbps", "INTEGER"),
+        ("providers", "download_max_concurrent", "INTEGER"),
+        ("providers", "download_pause_seconds", "INTEGER"),
         ("providers", "last_catalog_refresh_at", "TEXT"),
         ("xc_clients", "category_allowlist", "TEXT"),
         ("categories", "ai_description", "TEXT"),
@@ -3639,6 +3670,20 @@ def set_provider_max_streams(provider_id: int, max_streams: int) -> None:
             conn.execute("UPDATE providers SET max_streams=?, updated_at=? WHERE id=?", (max_streams, _now(), provider_id))
             _commit_with_retry(conn)
             conn.close()
+        finally:
+            conn.close()
+
+
+def set_provider_download_limits(provider_id: int, speed_limit_mbps: int | None, max_concurrent: int | None,
+                                 pause_seconds: int | None) -> None:
+    """None = follow the global download default for that setting."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE providers SET download_speed_limit_mbps=?, download_max_concurrent=?, download_pause_seconds=?, updated_at=? WHERE id=?",
+                (speed_limit_mbps, max_concurrent, pause_seconds, _now(), provider_id))
+            _commit_with_retry(conn)
         finally:
             conn.close()
 
@@ -13140,3 +13185,157 @@ def list_watch_sessions(
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# ── Opt-in downloads (vod_downloader.py) ─────────────────────────────────────
+
+def enqueue_download(kind: str, item_id: int, title: str, preset: str, source_id: int | None = None,
+                     prefer_provider_id: int | None = None, audio_languages: str | None = None) -> int | None:
+    """Queues one movie/episode. Returns the new job id, or None when the same
+    item is already queued or running (so a double click never downloads twice)."""
+    if kind not in ("movie", "episode"):
+        raise ValueError("kind must be 'movie' or 'episode'")
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            if conn.execute("SELECT 1 FROM download_jobs WHERE kind=? AND item_id=? AND status IN ('queued','running')",
+                            (kind, item_id)).fetchone():
+                return None
+            cur = conn.execute(
+                "INSERT INTO download_jobs (kind, item_id, source_id, prefer_provider_id, title, preset, audio_languages, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (kind, item_id, source_id, prefer_provider_id, title, preset, audio_languages, _now()))
+            _commit_with_retry(conn)
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def get_download_job(job_id: int) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM download_jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_download_jobs(limit: int = 300) -> list[dict]:
+    """Active work first (running, then queued in order), then the most recent finished."""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT * FROM download_jobs
+            ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                     CASE WHEN status IN ('running','queued') THEN id END ASC,
+                     id DESC
+            LIMIT ?""", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def download_job_counts() -> dict:
+    conn = _connect()
+    try:
+        return {r["status"]: r["c"] for r in conn.execute("SELECT status, COUNT(*) c FROM download_jobs GROUP BY status")}
+    finally:
+        conn.close()
+
+
+def next_download_jobs(limit: int, now: float, exclude_ids: set[int] | None = None) -> list[dict]:
+    exclude_ids = exclude_ids or set()
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM download_jobs WHERE status='queued' AND next_try_at<=? ORDER BY id LIMIT ?",
+                            (now, limit + len(exclude_ids))).fetchall()
+        return [dict(r) for r in rows if r["id"] not in exclude_ids][:limit]
+    finally:
+        conn.close()
+
+
+_DOWNLOAD_FIELDS = {"status", "note", "error", "bytes_done", "total_bytes", "progress", "provider_name",
+                    "final_path", "final_size", "next_try_at", "started_at", "finished_at"}
+
+
+def update_download_job(job_id: int, only_if_status: tuple[str, ...] | None = None, **fields) -> bool:
+    """Updates a job. only_if_status guards against overwriting a cancel that
+    arrived while the worker was mid-write."""
+    bad = set(fields) - _DOWNLOAD_FIELDS
+    if bad:
+        raise ValueError(f"unknown download field(s): {sorted(bad)}")
+    if not fields:
+        return False
+    sql = "UPDATE download_jobs SET " + ", ".join(f"{k}=?" for k in fields) + " WHERE id=?"
+    params = [*fields.values(), job_id]
+    if only_if_status:
+        sql += " AND status IN (" + ",".join("?" for _ in only_if_status) + ")"
+        params += list(only_if_status)
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = conn.execute(sql, params).rowcount
+            _commit_with_retry(conn)
+            return n > 0
+        finally:
+            conn.close()
+
+
+def requeue_interrupted_downloads() -> int:
+    """After a restart a 'running' job has no worker; put it back in the queue
+    (a partial file is resumed where the source allows)."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = conn.execute("UPDATE download_jobs SET status='queued', note='Resuming after restart' WHERE status='running'").rowcount
+            _commit_with_retry(conn)
+            return n
+        finally:
+            conn.close()
+
+
+def retry_download_job(job_id: int) -> bool:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = conn.execute(
+                "UPDATE download_jobs SET status='queued', error=NULL, note=NULL, next_try_at=0, finished_at=NULL "
+                "WHERE id=? AND status IN ('failed','cancelled')", (job_id,)).rowcount
+            _commit_with_retry(conn)
+            return n > 0
+        finally:
+            conn.close()
+
+
+def cancel_download_jobs(job_ids: list[int] | None = None) -> list[int]:
+    """Cancels queued/running jobs (all of them when job_ids is None). Returns the ids changed."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            if job_ids is None:
+                ids = [r["id"] for r in conn.execute("SELECT id FROM download_jobs WHERE status IN ('queued','running')")]
+            else:
+                ids = []
+                for chunk in _chunked(list(job_ids)):
+                    ph = ",".join("?" for _ in chunk)
+                    ids += [r["id"] for r in conn.execute(
+                        f"SELECT id FROM download_jobs WHERE status IN ('queued','running') AND id IN ({ph})", chunk)]
+            for chunk in _chunked(ids):
+                ph = ",".join("?" for _ in chunk)
+                conn.execute(f"UPDATE download_jobs SET status='cancelled', note=NULL, finished_at=? WHERE id IN ({ph})", (_now(), *chunk))
+            _commit_with_retry(conn)
+            return ids
+        finally:
+            conn.close()
+
+
+def clear_finished_downloads() -> int:
+    """Removes finished/failed/cancelled rows from the list (never touches files)."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = conn.execute("DELETE FROM download_jobs WHERE status IN ('done','failed','cancelled')").rowcount
+            _commit_with_retry(conn)
+            return n
+        finally:
+            conn.close()

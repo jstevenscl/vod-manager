@@ -7,6 +7,12 @@ services:
       - "8282:8282"
     volumes:
       - vod_manager_data:/app/data
+      # --- Optional: Downloads (Configuration -> Downloads) ----------------
+      # Where saved movie/episode files go. Off until you enable it in the UI;
+      # then set the download folder to /downloads. Replace the left side with a
+      # host path (or named volume) your media server can also read, e.g.
+      #   - /mnt/media/vod-downloads:/downloads
+      # -----------------------------------------------------------------------
       # --- Optional: local-path DVR mode -----------------------------------
       # Only needed if you enable DVR on a Dispatcharr connection AND set a
       # "local path" for it (Configuration -> Dispatcharr Connections -> DVR).

@@ -22,7 +22,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.3.01"
+APP_VERSION = "0.3.02"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -346,6 +346,59 @@ def get_strm_export_settings() -> dict:
 def save_strm_export_settings(settings: dict) -> None:
     clean = {k: settings[k] for k in _STRM_EXPORT_DEFAULTS if k in settings}
     _update_raw(lambda data: data.__setitem__("strm_export", {**(data.get("strm_export") or {}), **clean}))
+
+
+# ── Opt-in file downloads into a library folder (see vod_downloader.py) ──────
+# OFF by default: saving a provider's files to disk is a different act from
+# linking to them, so it only exists once the user turns it on.
+
+DOWNLOAD_PRESETS = ("original", "h264_1080", "h264_720", "h264_480", "hevc_1080", "hevc_720")
+
+_DOWNLOADS_DEFAULTS = {
+    "enabled": False, "output_dir": "", "default_preset": "original",
+    # optional separate roots: movies_dir / shows_dir replace output_dir/Movies and output_dir/Shows
+    "movies_dir": "", "shows_dir": "",
+    # optional processing folder: downloads and encodes happen here and only the finished, verified file is
+    # moved into the library. Blank = a hidden .processing folder inside each library folder.
+    "work_dir": "",
+    # which audio languages to keep ("" = all tracks as they are) and whether to keep subtitles (in those languages)
+    "audio_languages": "", "keep_subtitles": True,
+    "max_concurrent": 1, "min_free_gb": 5,
+    # pacing defaults; every provider can override these (Providers -> Downloads)
+    "speed_limit_mbps": 0,      # 0 = unlimited
+    "provider_concurrent": 1,   # downloads at once from ONE provider
+    "pause_seconds": 0,         # rest between two downloads from the same provider
+    # optional: only START downloads inside this local-time window (hours 0-23)
+    "window_enabled": False, "window_start": 1, "window_end": 7,
+}
+
+
+def get_download_settings() -> dict:
+    saved = _read_raw().get("downloads") or {}
+    out = {**_DOWNLOADS_DEFAULTS, **{k: saved[k] for k in _DOWNLOADS_DEFAULTS if k in saved}}
+    out["enabled"] = bool(out["enabled"])
+    for key in ("output_dir", "movies_dir", "shows_dir", "work_dir"):
+        out[key] = (out[key] or "").strip()
+    out["audio_languages"] = (out["audio_languages"] or "").strip().lower()
+    out["keep_subtitles"] = bool(out["keep_subtitles"])
+    out["max_concurrent"] = min(4, max(1, int(out["max_concurrent"] or 1)))
+    out["min_free_gb"] = max(0, int(out["min_free_gb"] or 0))
+    out["speed_limit_mbps"] = max(0, int(out["speed_limit_mbps"] or 0))
+    out["provider_concurrent"] = min(4, max(1, int(out["provider_concurrent"] or 1)))
+    out["pause_seconds"] = max(0, int(out["pause_seconds"] or 0))
+    out["window_enabled"] = bool(out["window_enabled"])
+    out["window_start"] = min(23, max(0, int(out["window_start"] or 0)))
+    out["window_end"] = min(23, max(0, int(out["window_end"] or 0)))
+    if out["default_preset"] not in DOWNLOAD_PRESETS:
+        out["default_preset"] = "original"
+    return out
+
+
+def save_download_settings(settings: dict) -> None:
+    clean = {k: settings[k] for k in _DOWNLOADS_DEFAULTS if k in settings}
+    if "default_preset" in clean and clean["default_preset"] not in DOWNLOAD_PRESETS:
+        raise ValueError("default_preset must be one of: " + ", ".join(DOWNLOAD_PRESETS))
+    _update_raw(lambda data: data.__setitem__("downloads", {**(data.get("downloads") or {}), **clean}))
 
 
 _AUTO_EPISODE_TITLE_MODES = ("off", "applied", "all")

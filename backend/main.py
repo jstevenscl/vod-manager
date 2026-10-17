@@ -22,6 +22,7 @@ import rclone_client
 import plex_importer
 import auto_episode_titles
 import strm_export
+import vod_downloader
 import tmdb_fill
 from portal_routes import router as portal_router
 from routes import router
@@ -501,6 +502,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_strm_export_scheduler()),
         asyncio.create_task(_auto_episode_titles_scheduler()),
+        asyncio.create_task(vod_downloader.download_loop()),
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),

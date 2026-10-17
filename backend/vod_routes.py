@@ -1,15 +1,19 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from auth import verify_session
 from config import (
     get_strm_export_settings,
     save_strm_export_settings as _save_strm_export_settings,
+    get_download_settings,
+    save_download_settings as _save_download_settings,
     get_auto_episode_titles_mode,
     save_auto_episode_titles_mode,
     get_ai_model,
@@ -65,6 +69,7 @@ import plex_client
 import plex_importer
 import portal_auth
 import strm_export
+import vod_downloader
 import tmdb_sync
 import vod_bulk_ai_service
 import vod_db
@@ -3987,6 +3992,151 @@ async def run_strm_export(dry_run: bool = False):
         raise HTTPException(409, detail=str(exc))
     except OSError as exc:
         raise HTTPException(500, detail=f"Couldn't write to the output folder: {exc}")
+
+
+class DownloadSettingsRequest(BaseModel):
+    enabled: bool = False
+    output_dir: str = ""
+    movies_dir: str = ""
+    shows_dir: str = ""
+    work_dir: str = ""
+    audio_languages: str = ""
+    keep_subtitles: bool = True
+    default_preset: str = "original"
+    max_concurrent: int = 1
+    min_free_gb: int = 5
+    speed_limit_mbps: int = 0
+    provider_concurrent: int = 1
+    pause_seconds: int = 0
+    window_enabled: bool = False
+    window_start: int = 1
+    window_end: int = 7
+
+
+class ProviderDownloadLimits(BaseModel):
+    """None for a field = follow the global default from Configuration -> Downloads."""
+    speed_limit_mbps: Optional[int] = None
+    max_concurrent: Optional[int] = None
+    pause_seconds: Optional[int] = None
+
+
+class DownloadQueueRequest(BaseModel):
+    movie_ids: list[int] = []
+    series_ids: list[int] = []
+    episode_ids: list[int] = []
+    source_id: Optional[int] = None            # one exact source (single movie / episode only)
+    prefer_provider_id: Optional[int] = None   # otherwise: try this provider's copy first
+    preset: Optional[str] = None               # default: the preset saved in the settings
+    season: Optional[int] = None               # with series_ids: only this season
+    audio_languages: Optional[str] = None      # 'all' or e.g. 'eng,jpn'; None = follow the setting
+
+
+class DownloadCancelRequest(BaseModel):
+    job_ids: Optional[list[int]] = None        # None = every queued / running download
+
+
+@router.get("/downloads/", dependencies=_GUARDS)
+async def get_downloads():
+    return await asyncio.to_thread(vod_downloader.get_status)
+
+
+@router.post("/downloads/settings/", dependencies=_GUARDS)
+async def save_download_settings(body: DownloadSettingsRequest):
+    settings = body.model_dump()
+    for key in ("output_dir", "movies_dir", "shows_dir", "work_dir"):
+        settings[key] = settings[key].strip()
+    settings["max_concurrent"] = min(4, max(1, settings["max_concurrent"]))
+    settings["min_free_gb"] = max(0, settings["min_free_gb"])
+    if settings["enabled"] or vod_downloader.configured_dirs(settings):
+        problem = vod_downloader.validate_settings(settings)
+        if problem:
+            raise HTTPException(400, detail=problem)
+    if settings["enabled"]:
+        # prove the folder is usable now, not on the first download
+        roots = vod_downloader.roots_for(settings)
+        folders = [("movies", roots["movie"]), ("TV shows", roots["episode"])]
+        if settings["work_dir"]:
+            folders.append(("processing", Path(settings["work_dir"])))
+        for label, folder in folders:
+            try:
+                await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+                probe = folder / ".vod-manager-write-test"
+                await asyncio.to_thread(probe.write_text, "ok")
+                await asyncio.to_thread(probe.unlink)
+            except OSError as exc:
+                raise HTTPException(400, detail=f"Can't write to the {label} folder ({folder}): {exc}")
+    try:
+        _save_download_settings(settings)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return await asyncio.to_thread(vod_downloader.get_status)
+
+
+@router.post("/providers/{provider_id}/download-limits/", dependencies=_GUARDS)
+async def set_provider_download_limits(provider_id: int, body: ProviderDownloadLimits):
+    if not vod_db.get_provider(provider_id):
+        raise HTTPException(404, detail="provider not found")
+    clamp = lambda v, lo, hi: None if v is None else min(hi, max(lo, v))  # noqa: E731
+    await asyncio.to_thread(
+        vod_db.set_provider_download_limits, provider_id,
+        clamp(body.speed_limit_mbps, 0, 100000), clamp(body.max_concurrent, 1, 4), clamp(body.pause_seconds, 0, 86400))
+    return {"ok": True}
+
+
+@router.post("/downloads/queue/", dependencies=_GUARDS)
+async def queue_downloads(body: DownloadQueueRequest):
+    settings = get_download_settings()
+    if not settings["enabled"]:
+        raise HTTPException(400, detail="Downloads are turned off. Turn them on under Configuration -> Downloads first.")
+    problem = vod_downloader.validate_settings(settings)
+    if problem:
+        raise HTTPException(400, detail=problem)
+    try:
+        return await asyncio.to_thread(
+            vod_downloader.enqueue, body.movie_ids, body.series_ids, body.episode_ids,
+            body.source_id, body.prefer_provider_id, body.preset, body.season, body.audio_languages)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+@router.post("/downloads/cancel/", dependencies=_GUARDS)
+async def cancel_downloads(body: DownloadCancelRequest):
+    ids = await asyncio.to_thread(vod_downloader.cancel, body.job_ids)
+    return {"cancelled": len(ids)}
+
+
+@router.post("/downloads/{job_id}/link/", dependencies=_GUARDS)
+async def download_file_link(job_id: int):
+    """A short-lived link (15 min) to save one finished download to the device you are using."""
+    token = await asyncio.to_thread(vod_downloader.issue_file_link, job_id)
+    if not token:
+        raise HTTPException(404, detail="That download isn't finished, or its file is gone.")
+    return {"url": f"/api/vod/downloads/file/{token}/"}
+
+
+@router.get("/downloads/file/{token}/")
+async def download_file(token: str):
+    # no session guard on purpose: the unguessable, expiring token IS the credential for this one file
+    path = await asyncio.to_thread(vod_downloader.resolve_file_link, token)
+    if path is None:
+        raise HTTPException(404, detail="This link expired. Ask for a new one.")
+    return FileResponse(path, filename=path.name)
+
+
+@router.post("/downloads/{job_id}/retry/", dependencies=_GUARDS)
+async def retry_download(job_id: int):
+    if not await asyncio.to_thread(vod_db.retry_download_job, job_id):
+        raise HTTPException(404, detail="Only a failed or cancelled download can be retried.")
+    vod_downloader._cancel_ids.discard(job_id)
+    return {"ok": True}
+
+
+@router.post("/downloads/clear/", dependencies=_GUARDS)
+async def clear_downloads():
+    finished = [j["id"] for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
+                if j["status"] in ("done", "failed", "cancelled")]
+    await asyncio.to_thread(vod_downloader.purge_work, finished)   # drop their unfinished leftovers too
+    return {"cleared": await asyncio.to_thread(vod_db.clear_finished_downloads)}
 
 
 @router.post("/series/{series_id}/tmdb-episode-titles/", dependencies=_GUARDS)

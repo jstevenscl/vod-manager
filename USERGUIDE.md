@@ -807,6 +807,115 @@ same folder naming convention.
 
 ---
 
+### Downloading files into a library folder
+
+The .strm export links to your providers' streams. If you would rather keep real
+files, **Configuration → Downloads** saves movies and episodes to a folder, named
+the way Emby, Jellyfin and Plex expect (`Movies/Title (Year) [tmdbid-N]/Title (Year).mp4`,
+`Shows/Show (Year)/Season 01/Show - S01E01.mp4`).
+
+**It is off by default.** Saving a provider's files is a different act from linking
+to them, so nothing downloads until you turn it on, pick a folder inside the
+container (mount it from the host, for example `- /mnt/media/vod-downloads:/downloads`,
+then use `/downloads`) and confirm that you have the right to keep copies. Keep it a
+different folder from the .strm export so titles do not show up twice.
+
+**Separate folders for movies and TV shows.** By default files go in `Movies/` and
+`Shows/` inside the download folder. If your media server mounts them separately,
+set a **Movies folder** and a **TV shows folder** under *Separate folders (optional)*
+(for example `/downloads/movies` and `/downloads/tv`, each a mount of its own). Movies then
+go straight into the movies folder (`Title (Year)/Title (Year).mp4`) and episodes
+into the TV folder (`Show (Year)/Season 01/…`), and when you set both the shared download
+folder is optional. The two folders must differ from each other and from the .strm
+export, and the app checks each one is writable when you save. Free space is tracked
+per folder.
+
+![The Downloads card: settings, pacing defaults and the queue](docs/screenshots/downloads-card.png)
+
+Once on, a **Download** button appears:
+
+- on a movie (next to *Sources*) and on a series (next to *Episodes*, with a season
+  picker, and a provider preference for series that more than one provider carries),
+- as a small icon on each episode, and on each individual *source*, which downloads
+  exactly that provider's copy (pick the version you want when a title has several),
+- in the selection bar on the Movies and TV Shows pages (**Download selected**).
+
+![A movie's Download control, a per-source download icon and Download selected](docs/screenshots/download-buttons.png)
+
+Downloads wait in a queue, show live progress under **Configuration → Downloads**, and
+can be cancelled or retried. A title already in the folder is never downloaded twice,
+and a download that was interrupted (restart, dropped connection) resumes where it left
+off.
+
+**Re-encoding.** Provider files are often much larger than you want in a library. Pick
+a preset instead of *Original file* to shrink a file while saving it: H.264 or H.265,
+capped at 1080p or 720p. The provider connection is only used while the original is fetched; the encode
+then runs from the local copy, so it never ties up your provider (it does use CPU,
+which is why *At once* defaults to 1).
+
+**Your provider's connection limit is respected, and viewers always win.** A download
+takes a connection exactly like playback does, and never takes one a viewer is using: it
+waits (*"in use by playback"*). If somebody starts watching while a download is running
+and the provider has no other free connection, the download pauses by itself, keeps what
+it has already saved, and resumes automatically once the connection is free again. A
+provider with no limit set is treated as having one connection, so set the provider's
+**max streams** if it allows more.
+
+**Getting a file onto your phone or tablet.** A finished download has a *Save* icon in
+the queue: tap it from the browser on that device and the file downloads there (the link
+is private to that one file and expires after 15 minutes). The **H.264 480p (phone-sized)**
+preset makes a small file for exactly this. You can also point a media server's
+library at the folder instead.
+
+**Choosing languages.** Many provider files carry several audio tracks (and sometimes
+subtitles) in one file. Under *Configuration → Downloads → Languages*:
+
+- **Keep audio** takes a list such as `eng` or `eng, jpn` (codes or names). Blank keeps every
+  track as it is. Only the listed audio languages stay in the saved file. A track with no language
+  tag is always kept, because it can't be ruled out, and if nothing at all matches every audio track is
+  kept, so a file is never left silent.
+- **Keep subtitles** keeps the subtitle tracks too, in the same languages when you set a list; off
+  drops them whenever a file is re-encoded or trimmed.
+- **It also works without re-encoding.** With a language list set, an *Original file* download has its
+  other audio tracks removed by copying the streams (no quality loss, quick) and is saved as `.mkv`.
+  With the list blank, an original is saved exactly as the provider sent it, and a file that already has
+  only the languages you asked for is saved untouched.
+- **Per download.** The Download control on a movie or series has an *audio* box next to the preset
+  for "this one in Spanish" (`all` keeps every track for that download; blank follows the setting).
+- If a subtitle track can't be carried over, the download is retried once without subtitles instead
+  of failing. Where a title exists as separate copies per language, you can also pick the copy you
+  want with the per-source download icon.
+
+**Being polite to providers.** Providers differ, so pacing is a default that each
+provider can override (**Providers → Downloads**; blank means "use the default"):
+
+| Setting | What it does |
+|---|---|
+| Speed cap (Mbit/s) | Limits how fast one download pulls. Off by default; some providers flag accounts that pull at full speed, others do not mind. |
+| At once per provider | How many downloads may run on one provider together (needs a matching max streams). |
+| Pause between (seconds) | A rest between two downloads from the same provider. |
+| Only between (hours) | Optionally only *start* downloads in a quiet window, such as 1-7. |
+
+If a provider answers "slow down" (HTTP 429, 458, 509 or 403) the download waits and
+retries with a growing delay on its own, and gives up after several refusals so it
+does not keep knocking. Each finished file is also checked with ffprobe, so a provider
+error page saved as a video is rejected rather than left in your library.
+
+**Nothing unfinished ever reaches your library.** Every download and encode happens in
+a **processing folder**, and a file is moved into the movies / TV shows folder only when it
+is complete and has passed the ffprobe check (an encoded file is checked too). So a media
+server, Sonarr or Tdarr watching the library can never pick up a partial or corrupt file.
+Set the **Processing folder** under *Configuration → Downloads* (ideally a fast local
+disk; if it is on the same disk as the library the final move is an instant rename, across
+disks the file is copied under a hidden temporary name first). Left blank, a hidden
+`.processing` folder inside each library folder is used. A re-encode needs room in the
+processing folder for the original plus the new file at the same time. A failed download's
+partial stays there so *Try again* can resume it; **Clear finished** removes the leftovers.
+
+**Free space.** *Keep free (GB)* stops a download, and prevents new ones, before the
+folder fills up. Nothing in the download folder is ever deleted except the app's own
+half-finished files.
+
 ## 7. DVR recordings
 
 DVR isn't a provider you add — it's a capability you turn on for a
@@ -1995,7 +2104,16 @@ Manage Categories (global / hourly / every 6h / daily / weekly) that overrides
 the global interval for just that category, so a chart can refresh daily while
 the others stay manual.
 
+> **Want every list to update on a schedule?** Set it once, for all of them:
+> **Configuration → Refresh Schedule → List Sync (hrs)**, for example `24` for
+> daily. Every list-linked category left on **global** in its dropdown then follows
+> that interval; a category with its own hourly / 6h / daily / weekly choice keeps
+> its own. The dropdown itself shows the current global value (for example
+> *global (every 24h)* or *global (off)*), and Manage Categories states it above the list.
+
 ![Manage Categories: a list-sourced category with its own schedule dropdown](docs/screenshots/list-category-schedule.png)
+
+![Configuration → Refresh Schedule with the List Sync (hrs) setting](docs/screenshots/refresh-schedule-list-sync.png)
 
 ---
 
@@ -2059,6 +2177,20 @@ you gave it during "Connect a new instance" is reachable *from that
 instance's own network position*, not just from your browser — a
 Docker-internal hostname won't resolve from a remote instance, and vice
 versa.
+
+**My list-linked categories never update by themselves.** By default they only
+update when you click **Sync now**. Set **Configuration → Refresh Schedule → List
+Sync (hrs)** (blank = off) to refresh every list-linked category on one schedule, or
+pick hourly / 6h / daily / weekly on an individual category in Manage Categories (§11,
+List Sync).
+
+**A download says "Waiting: … in use by playback" or "at its connection limit".**
+Downloads never take a connection a viewer is using, and a provider with no *max
+streams* set counts as one connection. It starts by itself when the connection frees
+up; set the provider's **max streams** if it really allows more (§6, Downloading
+files). **"… said HTTP 429 (slow down)"** means the provider objected to the pace:
+lower its speed cap or downloads-at-once under **Providers → Downloads**; the download
+retries on its own with a growing delay.
 
 **Movies/series show up as duplicates.** Run Duplicate Finder (§11) — most
 duplication is either a punctuation difference between providers (that
