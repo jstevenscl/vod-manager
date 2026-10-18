@@ -358,19 +358,21 @@ def _free_bytes(path: Path) -> int | None:
 def target_for(job: dict) -> tuple[str, str, int | None]:
     """(folder relative to the movies / TV shows root, file stem, duration) for the job's item.
     Raises DownloadError when the item no longer exists."""
+    # KNM: 2026-10-18 the [tmdbid-N] folder tag can be turned off in Configuration -> Downloads
+    tag = config.get_download_settings()["tmdb_id_in_folder"]
     if job["kind"] == "movie":
         movie = vod_db.get_movie(job["item_id"])
         if not movie:
             raise DownloadError("This movie no longer exists.")
         title = strm_export._title_year(movie["name"], movie.get("year"))
-        folder = f"{title} [tmdbid-{movie['tmdb_id']}]" if movie.get("tmdb_id") else title
+        folder = f"{title} [tmdbid-{movie['tmdb_id']}]" if tag and movie.get("tmdb_id") else title
         return folder, title, movie.get("duration_secs")
     episode = vod_db.get_episode(job["item_id"])
     series = vod_db.get_series(episode["series_id"]) if episode else None
     if not episode or not series:
         raise DownloadError("This episode no longer exists.")
     show_title = strm_export._title_year(series["name"], series.get("year"))
-    show_dir = f"{show_title} [tmdbid-{series['tmdb_id']}]" if series.get("tmdb_id") else show_title
+    show_dir = f"{show_title} [tmdbid-{series['tmdb_id']}]" if tag and series.get("tmdb_id") else show_title
     season, number = int(episode["season_number"]), int(episode["episode_number"])
     stem = f"{strm_export._base_title(series['name'])} - S{season:02d}E{number:02d}"
     return f"{show_dir}/Season {season:02d}", stem, episode.get("duration_secs")

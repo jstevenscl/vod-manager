@@ -812,7 +812,10 @@ same folder naming convention.
 The .strm export links to your providers' streams. If you would rather keep real
 files, **Configuration → Downloads** saves movies and episodes to a folder, named
 the way Emby, Jellyfin and Plex expect (`Movies/Title (Year) [tmdbid-N]/Title (Year).mp4`,
-`Shows/Show (Year)/Season 01/Show - S01E01.mp4`).
+`Shows/Show (Year) [tmdbid-N]/Season 01/Show - S01E01.mp4`). The `[tmdbid-N]` tag
+helps your media server match the right title; untick **TMDB id in folder names**
+to get plain `Title (Year)` and `Show (Year)` folders instead. File names never
+include it.
 
 **It is off by default.** Saving a provider's files is a different act from linking
 to them, so nothing downloads until you turn it on, pick a folder inside the

@@ -2280,7 +2280,7 @@ interface DownloadJob {
   provider_name: string | null; final_path: string | null; final_size: number | null
 }
 interface DownloadSettings {
-  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
+  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; tmdb_id_in_folder: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
   encoder: string; hw_device: string; encode_threads: number
   speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
   window_enabled: boolean; window_start: number; window_end: number
@@ -2437,7 +2437,7 @@ function DownloadsCard() {
     <SectionCard title="Downloads (save files to your library)" icon={<Download size={14} />}>
       <p className="text-xs text-muted-foreground">
         Off by default. Turn this on to save movies and episodes from your providers as real files in a folder, named the way
-        Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year)/Season NN/…</code>).
+        Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year) [tmdbid-N]/Season NN/…</code>; the TMDB id tag can be turned off).
         You pick the source (or let failover choose) and can re-encode to a smaller file while downloading. Downloads respect each
         provider's connection limit and wait their turn behind live viewers.
       </p>
@@ -2472,6 +2472,10 @@ function DownloadsCard() {
             <span className="font-medium">Separate folders (optional)</span>
             <input className={inputCls('w-60')} placeholder="Movies folder, e.g. /downloads/movies" title="Movies are saved straight into this folder (Title (Year)/Title (Year).ext), instead of the download folder's Movies subfolder." value={draft.movies_dir} onChange={(e) => setDraft({ ...draft, movies_dir: e.target.value })} />
             <input className={inputCls('w-60')} placeholder="TV shows folder, e.g. /downloads/tv" title="Episodes are saved straight into this folder (Show (Year)/Season NN/…), instead of the download folder's Shows subfolder." value={draft.shows_dir} onChange={(e) => setDraft({ ...draft, shows_dir: e.target.value })} />
+            <label className="flex items-center gap-1" title="Adds the TMDB id to movie and show folder names, e.g. Title (Year) [tmdbid-603]. Emby, Jellyfin and Plex use it to match the right title. Off = just Title (Year). File names never include it.">
+              <input type="checkbox" checked={draft.tmdb_id_in_folder} onChange={(e) => setDraft({ ...draft, tmdb_id_in_folder: e.target.checked })} />
+              TMDB id in folder names
+            </label>
             <span className="basis-full text-muted-foreground">Leave these blank to use <code>Movies/</code> and <code>Shows/</code> inside the download folder. Set both and the download folder becomes optional.</span>
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">

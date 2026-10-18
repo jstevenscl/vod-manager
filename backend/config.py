@@ -363,6 +363,7 @@ _DOWNLOADS_DEFAULTS = {
     "work_dir": "",
     # which audio languages to keep ("" = all tracks as they are) and whether to keep subtitles (in those languages)
     "audio_languages": "", "keep_subtitles": True,
+    "tmdb_id_in_folder": True,  # KNM: 2026-10-18 optional [tmdbid-N] in download folder names
     "max_concurrent": 1, "min_free_gb": 5,
     # re-encode engine: software (CPU), auto, vaapi (Intel/AMD GPU), qsv (Intel) or nvenc (NVIDIA); hw_device is the
     # render device for vaapi/qsv ("" = the first /dev/dri/renderD*); encode_threads caps the CPU threads (0 = ffmpeg's choice)
@@ -384,6 +385,7 @@ def get_download_settings() -> dict:
         out[key] = (out[key] or "").strip()
     out["audio_languages"] = (out["audio_languages"] or "").strip().lower()
     out["keep_subtitles"] = bool(out["keep_subtitles"])
+    out["tmdb_id_in_folder"] = bool(out["tmdb_id_in_folder"])
     out["max_concurrent"] = min(4, max(1, int(out["max_concurrent"] or 1)))
     out["encoder"] = out["encoder"] if out["encoder"] in ("software", "auto", "vaapi", "qsv", "nvenc") else "software"
     out["hw_device"] = (out["hw_device"] or "").strip()
