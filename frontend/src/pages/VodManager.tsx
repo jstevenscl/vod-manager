@@ -6590,9 +6590,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [autoEpisodeTitlesRunMsg, setAutoEpisodeTitlesRunMsg] = useState<string | null>(null)
   const runAutoEpisodeTitles = useMutation({
-    mutationFn: () => api.post('/vod/auto-episode-titles/run/').then((r) => r.data as { series_checked: number; series_changed: number; episodes_renamed: number; failed: number }),
+    mutationFn: () => api.post('/vod/auto-episode-titles/run/').then((r) => r.data as { series_checked: number; series_changed: number; episodes_renamed: number; from_local?: number; failed: number }),
     onSuccess: (r) => {
-      setAutoEpisodeTitlesRunMsg(`Checked ${r.series_checked} series · renamed ${r.episodes_renamed} episode(s) in ${r.series_changed}${r.failed ? ` · ${r.failed} failed` : ''}`)
+      setAutoEpisodeTitlesRunMsg(`Checked ${r.series_checked} series · renamed ${r.episodes_renamed} episode(s) in ${r.series_changed}${r.from_local ? ` · ${r.from_local} from local TMDB library` : ''}${r.failed ? ` · ${r.failed} failed` : ''}`)
       qc.invalidateQueries({ queryKey: ['vod-auto-episode-titles'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },

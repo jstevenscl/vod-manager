@@ -12630,6 +12630,20 @@ def list_series_due_for_auto_episode_titles(applied_only: bool, checked_before: 
         conn.close()
 
 
+# Lets the automatic pass skip TMDB once local names filled everything.
+def series_has_placeholder_episodes(series_id: int) -> bool:
+    """True while the series still has an unlocked placeholder-named episode."""
+    conn = _connect()
+    try:
+        series = conn.execute("SELECT name FROM series WHERE id=?", (series_id,)).fetchone()
+        if not series:
+            return False
+        rows = conn.execute("SELECT name FROM episodes WHERE series_id=? AND name_locked=0", (series_id,)).fetchall()
+        return any(_is_placeholder_episode_name(r["name"], series["name"]) for r in rows)
+    finally:
+        conn.close()
+
+
 def rename_item(content_type: str, item_id: int, name: str, year: int | None) -> dict:
     """Manually corrects a movie/series' own name/year -- the general
     escape hatch for whatever a provider's own catalog data got wrong (most

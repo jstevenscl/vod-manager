@@ -547,6 +547,32 @@ async def get_series_episode_list_cached(tmdb_id: str) -> list[dict]:
     return episodes
 
 
+# Store-only read for automatic episode titles, so a series the
+# local library can already fill costs no TMDB request (not even the daily
+# newest-season refresh get_series_episode_list does for airing shows).
+async def get_series_episode_list_local(tmdb_id: str) -> list[dict]:
+    """Episodes from the local TMDB library only; [] when the store is off or
+    holds nothing for this show. Never calls TMDB."""
+    if not (store_enabled() and str(tmdb_id).isdigit()):
+        return []
+
+    def _read() -> list[dict]:
+        show = tmdb_store.get_payload("tv", int(tmdb_id))
+        if not show:
+            return []
+        out: list[dict] = []
+        for s in show.get("seasons", []):
+            if s.get("season_number"):
+                out.extend(tmdb_store.get_season(int(tmdb_id), s["season_number"]) or [])
+        return out
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception as exc:
+        logger.warning("[tmdb_sync] local episode list read failed for tmdb_id=%s: %s", tmdb_id, exc)
+        return []
+
+
 async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:
     """TMDB's own canonical title and release year per id. Two Duplicate
     Finder candidates sharing a tmdb_id confirms they're the same real
