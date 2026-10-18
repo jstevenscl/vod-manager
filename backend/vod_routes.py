@@ -4005,12 +4005,20 @@ class DownloadSettingsRequest(BaseModel):
     default_preset: str = "original"
     max_concurrent: int = 1
     min_free_gb: int = 5
+    encoder: str = "software"
+    hw_device: str = ""
+    encode_threads: int = 0
     speed_limit_mbps: int = 0
     provider_concurrent: int = 1
     pause_seconds: int = 0
     window_enabled: bool = False
     window_start: int = 1
     window_end: int = 7
+
+
+class TestEncoderRequest(BaseModel):
+    encoder: str = "auto"
+    hw_device: str = ""
 
 
 class ProviderDownloadLimits(BaseModel):
@@ -4047,6 +4055,12 @@ async def save_download_settings(body: DownloadSettingsRequest):
         settings[key] = settings[key].strip()
     settings["max_concurrent"] = min(4, max(1, settings["max_concurrent"]))
     settings["min_free_gb"] = max(0, settings["min_free_gb"])
+    settings["hw_device"] = settings["hw_device"].strip()
+    settings["encode_threads"] = min(64, max(0, settings["encode_threads"]))
+    if settings["encoder"] not in vod_downloader.ENCODERS:
+        raise HTTPException(400, detail="Unknown encoder. Choose one of: " + ", ".join(vod_downloader.ENCODERS))
+    if settings["hw_device"] and not settings["hw_device"].startswith("/dev/"):
+        raise HTTPException(400, detail="The GPU device must be a path under /dev/ (for example /dev/dri/renderD128).")
     if settings["enabled"] or vod_downloader.configured_dirs(settings):
         problem = vod_downloader.validate_settings(settings)
         if problem:
@@ -4070,6 +4084,16 @@ async def save_download_settings(body: DownloadSettingsRequest):
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     return await asyncio.to_thread(vod_downloader.get_status)
+
+
+@router.post("/downloads/test-encoder/", dependencies=_GUARDS)
+async def test_download_encoder(body: TestEncoderRequest):
+    """Runs a one-second hardware encode so a missing GPU device / driver shows up now, not as a failed download."""
+    if body.encoder not in vod_downloader.ENCODERS:
+        raise HTTPException(400, detail="Unknown encoder.")
+    if body.hw_device.strip() and not body.hw_device.strip().startswith("/dev/"):
+        raise HTTPException(400, detail="The GPU device must be a path under /dev/.")
+    return await vod_downloader.test_encoder(body.encoder, body.hw_device.strip())
 
 
 @router.post("/providers/{provider_id}/download-limits/", dependencies=_GUARDS)

@@ -32,6 +32,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        if sid == "busy":
+            body = b"<html><body><h1>Error</h1>Maximum connections reached for this account</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if sid == "html":
             body = b"<html>login expired</html>"
             self.send_response(200)

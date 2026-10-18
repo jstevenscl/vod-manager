@@ -2281,11 +2281,13 @@ interface DownloadJob {
 }
 interface DownloadSettings {
   enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
+  encoder: string; hw_device: string; encode_threads: number
   speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
   window_enabled: boolean; window_start: number; window_end: number
 }
 interface DownloadStatus {
   settings: DownloadSettings; problem: string | null; ffmpeg: boolean; in_window: boolean
+  hardware?: { render_devices: string[]; nvidia: boolean }
   free: { movies: number | null; shows: number | null; movies_path: string; shows_path: string } | null
   counts: Record<string, number>; jobs: DownloadJob[]; presets: { id: string; label: string }[]
 }
@@ -2399,6 +2401,7 @@ function DownloadsCard() {
   const [draft, setDraft] = useState<DownloadSettings | null>(null)
   const [ack, setAck] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [encTest, setEncTest] = useState<{ ok: boolean; message: string } | null>(null)
   useEffect(() => { if (status.data && !draft) setDraft(status.data.settings) }, [status.data, draft])
   const errText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
   const refresh = () => qc.invalidateQueries({ queryKey: ['vod-downloads'] })
@@ -2406,6 +2409,12 @@ function DownloadsCard() {
     mutationFn: (d: DownloadSettings) => api.post('/vod/downloads/settings/', d),
     onSuccess: () => { setError(null); refresh() },
     onError: (e: any) => setError(errText(e)),
+  })
+  const testEncoder = useMutation({
+    mutationFn: (d: DownloadSettings) => api.post('/vod/downloads/test-encoder/', { encoder: d.encoder, hw_device: d.hw_device }).then((r) => r.data as { ok: boolean; message: string }),
+    onMutate: () => setEncTest(null),
+    onSuccess: (r) => setEncTest(r),
+    onError: (e: any) => setEncTest({ ok: false, message: errText(e) }),
   })
   const cancelJobs = useMutation({ mutationFn: (ids: number[] | null) => api.post('/vod/downloads/cancel/', { job_ids: ids }), onSuccess: refresh })
   const retryJob = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry/`), onSuccess: refresh })
@@ -2481,6 +2490,44 @@ function DownloadsCard() {
               Keep subtitles
             </label>
             <span className="basis-full text-muted-foreground">A language list also trims <b>Original file</b> downloads (other audio tracks are removed without re-encoding; the file is saved as .mkv). With the list blank, originals are saved untouched. Each download can override it.</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className="font-medium">Re-encoding</span>
+            <label className="flex items-center gap-1" title="Software uses the CPU and works everywhere. The GPU options need the GPU shared with the container (see the User Guide). If a GPU encode fails the download falls back to the CPU.">
+              Encoder
+              <select className={inputCls('w-56')} value={draft.encoder} onChange={(e) => { setDraft({ ...draft, encoder: e.target.value }); setEncTest(null) }}>
+                <option value="software">Software (CPU)</option>
+                <option value="auto">Automatic (GPU if present)</option>
+                <option value="vaapi">VAAPI (Intel / AMD GPU)</option>
+                <option value="qsv">Intel Quick Sync (QSV)</option>
+                <option value="nvenc">NVIDIA NVENC</option>
+              </select>
+            </label>
+            {(draft.encoder === 'vaapi' || draft.encoder === 'qsv' || draft.encoder === 'auto') && (
+              <label className="flex items-center gap-1" title="The GPU's render device inside the container. Blank = the first /dev/dri/renderD* found.">
+                GPU device
+                <input className={inputCls('w-48')} placeholder="/dev/dri/renderD128 (auto)" value={draft.hw_device} onChange={(e) => setDraft({ ...draft, hw_device: e.target.value })} />
+              </label>
+            )}
+            {draft.encoder === 'software' && (
+              <label className="flex items-center gap-1" title="Limit how many CPU threads one re-encode may use so the rest of the server stays responsive. 0 = let ffmpeg decide.">
+                CPU threads
+                <input className={inputCls('w-14')} type="number" min={0} max={64} value={draft.encode_threads} onChange={(e) => setDraft({ ...draft, encode_threads: Math.max(0, Number(e.target.value) || 0) })} />
+                (0 = all)
+              </label>
+            )}
+            {draft.encoder !== 'software' && (
+              <button className="px-2 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50" disabled={testEncoder.isPending} onClick={() => testEncoder.mutate(draft)}>
+                {testEncoder.isPending ? 'Testing…' : 'Test encoder'}
+              </button>
+            )}
+            {encTest && <span className={encTest.ok ? 'text-emerald-500' : 'text-destructive'}>{encTest.message}</span>}
+            <span className="basis-full text-muted-foreground">
+              {data?.hardware && (data.hardware.render_devices.length || data.hardware.nvidia)
+                ? `GPU access found in this container: ${[...data.hardware.render_devices, ...(data.hardware.nvidia ? ['NVIDIA'] : [])].join(', ')}. `
+                : 'No GPU is shared with this container, so re-encoding uses the CPU. '}
+              The test uses what you chose above; remember to save.
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-border/50 pt-2">
             <span className="font-medium">Pacing defaults</span>

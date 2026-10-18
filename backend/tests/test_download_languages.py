@@ -91,8 +91,8 @@ def fakes(monkeypatch):
     async def probe(path):
         return MULTI
 
-    async def run(src, part, preset, ua, duration, ctx, plan=None, copy=False):
-        calls.append({"plan": plan, "copy": copy, "preset": preset, "src": str(src)})
+    async def run(src, part, preset, ua, duration, ctx, plan=None, copy=False, **kw):
+        calls.append({"plan": plan, "copy": copy, "preset": preset, "src": str(src), **kw})
         if getattr(run, "fail_with_subs", False) and plan is not None and plan.subs:
             raise vod_downloader.DownloadError("Re-encode failed: Subtitle codec not supported")
         part.write_bytes(b"x" * 4096)

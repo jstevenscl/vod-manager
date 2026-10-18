@@ -46,6 +46,24 @@ services:
       # same as any other bind mount:
       #   - /mnt/nfs/<label>-recordings:/mnt/dvr/<label>:ro
       # -----------------------------------------------------------------------
+    # --- Optional: GPU re-encoding (Configuration -> Downloads -> Re-encoding)
+    # Software (CPU) encoding works with no changes. To let the container use
+    # a GPU, share it here, then pick the encoder in the UI and press
+    # "Test encoder". Put your real settings in docker-compose.override.yml.
+    #
+    # Intel (QSV / VAAPI) or AMD (VAAPI) on Linux:
+    #   devices:
+    #     - /dev/dri:/dev/dri
+    #   group_add:
+    #     - "video"
+    #     - "render"          # or the numeric group id: getent group render
+    #
+    # NVIDIA (NVENC) with the NVIDIA Container Toolkit installed on the host:
+    #   runtime: nvidia
+    #   environment:
+    #     - NVIDIA_VISIBLE_DEVICES=all
+    #     - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    # -----------------------------------------------------------------------
 
 volumes:
   vod_manager_data:

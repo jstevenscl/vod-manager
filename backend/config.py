@@ -22,7 +22,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.3.02"
+APP_VERSION = "0.3.03"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -364,6 +364,9 @@ _DOWNLOADS_DEFAULTS = {
     # which audio languages to keep ("" = all tracks as they are) and whether to keep subtitles (in those languages)
     "audio_languages": "", "keep_subtitles": True,
     "max_concurrent": 1, "min_free_gb": 5,
+    # re-encode engine: software (CPU), auto, vaapi (Intel/AMD GPU), qsv (Intel) or nvenc (NVIDIA); hw_device is the
+    # render device for vaapi/qsv ("" = the first /dev/dri/renderD*); encode_threads caps the CPU threads (0 = ffmpeg's choice)
+    "encoder": "software", "hw_device": "", "encode_threads": 0,
     # pacing defaults; every provider can override these (Providers -> Downloads)
     "speed_limit_mbps": 0,      # 0 = unlimited
     "provider_concurrent": 1,   # downloads at once from ONE provider
@@ -382,6 +385,9 @@ def get_download_settings() -> dict:
     out["audio_languages"] = (out["audio_languages"] or "").strip().lower()
     out["keep_subtitles"] = bool(out["keep_subtitles"])
     out["max_concurrent"] = min(4, max(1, int(out["max_concurrent"] or 1)))
+    out["encoder"] = out["encoder"] if out["encoder"] in ("software", "auto", "vaapi", "qsv", "nvenc") else "software"
+    out["hw_device"] = (out["hw_device"] or "").strip()
+    out["encode_threads"] = min(64, max(0, int(out["encode_threads"] or 0)))
     out["min_free_gb"] = max(0, int(out["min_free_gb"] or 0))
     out["speed_limit_mbps"] = max(0, int(out["speed_limit_mbps"] or 0))
     out["provider_concurrent"] = min(4, max(1, int(out["provider_concurrent"] or 1)))

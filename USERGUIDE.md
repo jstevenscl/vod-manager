@@ -853,6 +853,40 @@ capped at 1080p or 720p. The provider connection is only used while the original
 then runs from the local copy, so it never ties up your provider (it does use CPU,
 which is why *At once* defaults to 1).
 
+**Re-encoding on a GPU (optional).** A software re-encode is CPU-heavy: on a modest server a
+long film can take hours. Under *Configuration → Downloads → Re-encoding* you can pick a hardware
+**Encoder** instead of *Software (CPU)*: *VAAPI* (Intel or AMD on Linux), *Intel Quick Sync (QSV)* or
+*NVIDIA NVENC*. *Automatic* uses a GPU when the container has one. A container only sees a GPU if you
+share it, so add to the `vod-manager` service in your `docker-compose.override.yml`:
+
+```yaml
+# Intel / AMD (VAAPI, QSV)
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "video"
+      - "render"          # or the numeric group id from: getent group render
+
+# NVIDIA (needs the NVIDIA Container Toolkit on the host)
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+```
+
+Recreate the container, choose the encoder and press **Test encoder**: it runs a one-second encode on the
+GPU and tells you at once if the device or driver is missing. If a GPU encode fails during a real
+download, that download falls back to the CPU instead of failing (the *Status* note says so). The
+image includes the Intel media driver; AMD GPUs and some older Intel generations may not work out of the
+box. Hardware encodes are quicker but a little larger than software at the same quality setting.
+Without a GPU, **CPU threads** (software encoder) limits (roughly) how many cores one re-encode uses so the
+rest of the server stays responsive. Re-encoding runs at low priority either way.
+
+**Leaving the encoding to Tdarr (or similar).** If you already run a transcoder, keep the preset on
+*Original file* (and the language list blank): files are saved untouched into the library layout above, and
+the processing folder keeps unfinished files out of sight until they are complete and checked. Point the
+transcoder at the library folders, or at a copy of the finished files.
+
 **Your provider's connection limit is respected, and viewers always win.** A download
 takes a connection exactly like playback does, and never takes one a viewer is using: it
 waits (*"in use by playback"*). If somebody starts watching while a download is running
@@ -2191,6 +2225,17 @@ up; set the provider's **max streams** if it really allows more (§6, Downloadin
 files). **"… said HTTP 429 (slow down)"** means the provider objected to the pace:
 lower its speed cap or downloads-at-once under **Providers → Downloads**; the download
 retries on its own with a growing delay.
+
+**A download fails with "The provider returned a web page instead of a video file."**
+The provider answered with a page instead of the video. The message now shows the HTTP status and the first
+words of that page, which usually say why: an expired or blocked account, a login page, or an unsupported
+link. (If the page says the connection limit is reached, the download simply waits and tries again.) Check
+the title plays from **Preview** on the VOD page; if it does not, the source is dead or the account has
+expired. With several sources, failover moves on to the next one by itself.
+
+**The progress bar sits at 50% while it is re-encoding.** The first half is the download and the second
+half the re-encode. The bar moves with the encode when the file reports its length; if it does not, the bar
+follows how much of the file ffmpeg has read, and the status line shows how much has been written so far.
 
 **Movies/series show up as duplicates.** Run Duplicate Finder (§11) — most
 duplication is either a punctuation difference between providers (that

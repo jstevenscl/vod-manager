@@ -569,6 +569,7 @@ def get_status() -> dict:
         "settings": settings,
         "problem": problem,
         "ffmpeg": ffmpeg_available(),
+        "hardware": detect_hardware(),
         "in_window": in_window(settings),
         "free": free,
         "counts": vod_db.download_job_counts(),
@@ -626,6 +627,31 @@ class _Ctx:
                 raise DownloadError("Stopped: free space on the download folder dropped below the limit you set.")
 
 
+_CAPACITY_WORDS = ("max connection", "maximum", "too many", "connection limit", "limit reached", "already in use", "simultaneous")
+
+
+async def _body_snippet(resp) -> str:
+    """First bit of an unexpected response, flattened to plain text, so the job error says what the provider said."""
+    try:
+        async for chunk in resp.aiter_bytes():
+            text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", chunk[:2000].decode("utf-8", "replace"), flags=re.S | re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
+            return _safe(re.sub(r"\s+", " ", text).strip())[:160]
+    except Exception:
+        pass
+    return ""
+
+
+def _page_error(provider_name: str, status: int, ctype: str, snippet: str) -> Exception:
+    """A provider that answers with a page instead of video is usually saying something: a connection limit
+    (wait and retry) or an expired / blocked account (fail over to the next source)."""
+    if snippet and any(w in snippet.lower() for w in _CAPACITY_WORDS):
+        return _AtCapacity(provider_name, f'the provider says: "{snippet}"', wait=120)
+    kind = (ctype.split(";")[0] or "text").strip()
+    detail = f' It said: "{snippet}".' if snippet else ""
+    return DownloadError(f"The provider returned a web page instead of a video file (HTTP {status}, {kind}).{detail}")
+
+
 async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx, provider_name: str = "provider") -> int:
     """Streams url into part, resuming a previous partial file, at most ctx.rate_bps bytes/second
     when a speed cap applies. Returns the final size."""
@@ -648,7 +674,7 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                         raise DownloadError(f"The provider answered HTTP {resp.status_code}.")
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if ctype.startswith("text/") or "json" in ctype:
-                        raise DownloadError("The provider returned a web page instead of a video file.")
+                        raise _page_error(provider_name, resp.status_code, ctype, await _body_snippet(resp))
                     if resp.status_code == 206 and resume:
                         mode, done = "ab", resume
                         total = None
@@ -707,8 +733,70 @@ async def _copy_local(src: str, part: Path, ctx: _Ctx) -> int:
     return total
 
 
+ENCODERS = ("software", "auto", "vaapi", "qsv", "nvenc")
+_ENCODER_LABELS = {"software": "CPU", "vaapi": "VAAPI", "qsv": "Intel QSV", "nvenc": "NVIDIA NVENC"}
+DEFAULT_RENDER_DEVICE = "/dev/dri/renderD128"
+
+
+def detect_hardware() -> dict:
+    """What GPU access this container actually has (nothing is shared into a container unless compose asks for it)."""
+    render = sorted(str(p) for p in Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").is_dir() else []
+    return {"render_devices": render, "nvidia": any(os.path.exists(p) for p in ("/dev/nvidiactl", "/dev/nvidia0"))}
+
+
+def resolve_encoder(settings: dict | None) -> tuple[str, str | None, str | None]:
+    """(engine, device, why-not): the engine to try first. A GPU engine whose device isn't in the container
+    degrades to the CPU with a reason instead of failing every download."""
+    settings = settings or {}
+    want = settings.get("encoder") or "software"
+    hw = detect_hardware()
+    device = (settings.get("hw_device") or "").strip() or (hw["render_devices"][0] if hw["render_devices"] else DEFAULT_RENDER_DEVICE)
+    if want == "auto":
+        want = "vaapi" if hw["render_devices"] else ("nvenc" if hw["nvidia"] else "software")
+    if want == "software":
+        return "software", None, None
+    if want in ("vaapi", "qsv") and not os.path.exists(device):
+        return "software", None, f"{device} isn't available in the container"
+    if want == "nvenc" and not hw["nvidia"]:
+        return "software", None, "no NVIDIA GPU is available in the container"
+    return want, (device if want != "nvenc" else None), None
+
+
+def _video_args(preset: str, engine: str, device: str | None, threads: int, decode: bool = True) -> tuple[list[str], list[str]]:
+    """(input-side options, output-side options) for the preset on this engine. Hardware paths keep the scale on the
+    CPU (it works for every source codec) and let the GPU decode (when it can; ffmpeg falls back by itself) and encode."""
+    p = PRESETS[preset]
+    hevc = p["codec"] == "libx265"
+    scale = f"scale=-2:'min({p['height']},ih)'"
+    crf = str(p["crf"])
+    if engine == "vaapi":
+        pre = ["-init_hw_device", f"vaapi=hw:{device}", "-filter_hw_device", "hw"]
+        if decode:
+            pre += ["-hwaccel", "vaapi", "-hwaccel_device", "hw"]
+        return pre, ["-vf", f"{scale},format=nv12,hwupload", "-c:v", "hevc_vaapi" if hevc else "h264_vaapi", "-qp", crf]
+    if engine == "qsv":
+        pre = ["-init_hw_device", f"vaapi=va:{device}", "-init_hw_device", "qsv=hw@va", "-filter_hw_device", "hw"]
+        if decode:
+            pre += ["-hwaccel", "vaapi", "-hwaccel_device", "va"]
+        return pre, ["-vf", f"{scale},format=nv12,hwupload=extra_hw_frames=64", "-c:v", "hevc_qsv" if hevc else "h264_qsv",
+                     "-global_quality", crf, "-preset", "medium"]
+    if engine == "nvenc":
+        return (["-hwaccel", "cuda"] if decode else []), [
+            "-vf", f"{scale},format=yuv420p", "-c:v", "hevc_nvenc" if hevc else "h264_nvenc",
+            "-preset", "p4", "-rc", "vbr", "-cq", crf, "-b:v", "0"]
+    post = ["-vf", scale, "-pix_fmt", "yuv420p", "-c:v", p["codec"], "-preset", "fast", "-crf", crf]
+    if hevc:
+        post += ["-x265-params", "log-level=error"]
+    pre: list[str] = []
+    if threads:     # the decoder and the filters spawn their own threads, so cap those too, not just the encoder
+        pre = ["-threads", str(threads), "-filter_threads", str(threads)]
+        post += ["-threads", str(threads)]
+    return pre, post
+
+
 def build_ffmpeg_args(src: str, dst: Path, preset: str, user_agent: str | None, is_http: bool,
-                      plan: TrackPlan | None = None, copy: bool = False) -> list[str]:
+                      plan: TrackPlan | None = None, copy: bool = False,
+                      engine: str = "software", device: str | None = None, threads: int = 0) -> list[str]:
     """ffmpeg command. copy=True keeps every chosen stream as is (language trimming of an original);
     otherwise the video is re-encoded to the preset and the audio to AAC. Without a plan (the file could not be
     probed) all audio is kept and subtitles are dropped."""
@@ -716,6 +804,8 @@ def build_ffmpeg_args(src: str, dst: Path, preset: str, user_agent: str | None, 
     if is_http:
         args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
         args += ["-user_agent", user_agent or xc_server._UPSTREAM_HEADERS.get("User-Agent", "VOD-Manager")]
+    hw_in, video_out = ([], []) if copy else _video_args(preset, engine, device, threads)
+    args += hw_in
     args += ["-fflags", "+genpts+discardcorrupt", "-i", src]
     if plan is None:
         args += ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn"]
@@ -729,11 +819,7 @@ def build_ffmpeg_args(src: str, dst: Path, preset: str, user_agent: str | None, 
     if copy:
         args += ["-c", "copy"]
     else:
-        p = PRESETS[preset]
-        args += ["-vf", f"scale=-2:'min({p['height']},ih)'", "-pix_fmt", "yuv420p",
-                 "-c:v", p["codec"], "-preset", "fast", "-crf", str(p["crf"])]
-        if p["codec"] == "libx265":
-            args += ["-x265-params", "log-level=error"]
+        args += video_out
         args += ["-c:a", "aac", "-b:a", "160k"]
     if plan is not None:
         for k, (_idx, codec) in enumerate(plan.subs):
@@ -749,10 +835,45 @@ def build_ffmpeg_args(src: str, dst: Path, preset: str, user_agent: str | None, 
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
+def _read_fraction(pid: int, src: str, total: int) -> float | None:
+    """How far ffmpeg has read into its input file (Linux /proc). Used for the progress bar when the file carries no
+    duration, which is common for provider MKVs."""
+    try:
+        want = os.path.realpath(src)
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                if os.path.realpath(os.readlink(fd)) != want:
+                    continue
+                for line in Path(f"/proc/{pid}/fdinfo/{fd.name}").read_text().splitlines():
+                    if line.startswith("pos:"):
+                        return min(1.0, int(line.split()[1]) / total)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return None
+
+
+async def _probe_duration(path: str) -> float | None:
+    if not shutil.which("ffprobe") or path.startswith(("http://", "https://")):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), 60)
+        return float(out.decode().strip()) or None
+    except (asyncio.TimeoutError, ValueError, OSError):
+        return None
+
+
 async def _run_ffmpeg(src: str, part: Path, preset: str, user_agent: str | None, known_duration: int | None, ctx: _Ctx,
-                      plan: TrackPlan | None = None, copy: bool = False) -> int:
+                      plan: TrackPlan | None = None, copy: bool = False,
+                      engine: str = "software", device: str | None = None, threads: int = 0) -> int:
     is_http = src.startswith(("http://", "https://"))
-    args = build_ffmpeg_args(src, part, preset, user_agent, is_http, plan, copy)
+    args = build_ffmpeg_args(src, part, preset, user_agent, is_http, plan, copy, engine, device, threads)
+    in_total = os.path.getsize(src) if not is_http and os.path.isfile(src) else 0
+    base_note = ctx.note
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     state = {"duration": float(known_duration) if known_duration else 0.0, "out_us": 0}
     tail: collections.deque = collections.deque(maxlen=6)
@@ -783,7 +904,12 @@ async def _run_ffmpeg(src: str, part: Path, preset: str, user_agent: str | None,
         while True:
             done, _ = await asyncio.wait({waiter}, timeout=1.0)
             size = part.stat().st_size if part.exists() else 0
-            frac = (state["out_us"] / 1e6 / state["duration"]) if state["duration"] else 0.0
+            if state["duration"]:
+                frac = state["out_us"] / 1e6 / state["duration"]
+            else:
+                frac = (in_total and _read_fraction(proc.pid, src, in_total)) or 0.0
+                if not frac and base_note:
+                    ctx.note = f"{base_note} ({size / 1e6:,.0f} MB written so far)"
             ctx.progress(size, None, fraction=min(frac, 0.99))
             if done:
                 break
@@ -803,6 +929,29 @@ async def _run_ffmpeg(src: str, part: Path, preset: str, user_agent: str | None,
         raise DownloadError("Re-encode produced an empty file.")
     ctx.progress(size, size, fraction=1.0, force=True)
     return size
+
+
+async def test_encoder(engine: str, device: str = "") -> dict:
+    """One-second test encode on the chosen engine, with the same options real downloads use."""
+    if not ffmpeg_available():
+        return {"ok": False, "engine": engine, "message": "ffmpeg isn't installed in this container."}
+    eng, dev, why = resolve_encoder({"encoder": engine, "hw_device": device})
+    if why:
+        return {"ok": False, "engine": eng, "message": why[0].upper() + why[1:] + ". Share the GPU with the container (see the User Guide)."}
+    pre, post = _video_args("h264_720", eng, dev, 0, decode=False)
+    args = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *pre,
+            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-t", "1", *post, "-an", "-f", "null", "-"]
+    try:
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), 45)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"ok": False, "engine": eng, "message": "The test encode timed out."}
+    if proc.returncode != 0:
+        tail = " | ".join(_safe(err.decode(errors="replace")).strip().splitlines()[-3:])
+        return {"ok": False, "engine": eng, "message": f"{_ENCODER_LABELS.get(eng, eng)} encode failed: {tail or 'ffmpeg error'}"}
+    return {"ok": True, "engine": eng, "device": dev, "message": f"{_ENCODER_LABELS.get(eng, eng)} works"
+            + (f" on {dev}." if dev else ".")}
 
 
 # ── one job ─────────────────────────────────────────────────────────────────
@@ -880,22 +1029,44 @@ async def _fetch(job: dict, source: dict, dest: Path, ctx: _Ctx, settings: dict)
 
 
 async def _transcode(src: str, out_part: Path, preset: str, duration: int | None, ctx: _Ctx,
-                     plan: TrackPlan | None, copy: bool) -> int:
+                     plan: TrackPlan | None, copy: bool, settings: dict | None = None) -> int:
     """Runs ffmpeg for a re-encode or a language trim. An odd subtitle track that ffmpeg can't carry over must not
-    sink the whole download, so a failure that involved subtitles is retried once without them."""
-    async def run(p: TrackPlan | None) -> int:
-        if p is None and not copy:
-            return await _run_ffmpeg(src, out_part, preset, None, duration, ctx)   # no track plan: the plain encode
-        return await _run_ffmpeg(src, out_part, preset, None, duration, ctx, plan=p, copy=copy)
+    sink the whole download, so a failure that involved subtitles is retried once without them. A GPU engine that
+    fails (missing driver, unsupported source) falls back to the CPU instead of failing the download."""
+    threads = int((settings or {}).get("encode_threads") or 0)
+    engine, device, why = ("software", None, None) if copy else resolve_encoder(settings)
+    base = ctx.note
+    cpu_note = base
+    if why:
+        logger.warning("[download] job=%s: GPU encoding unavailable (%s); using the CPU", ctx.job_id, why)
+        cpu_note = f"{base} (CPU: {why})"
+    chain = [(engine, device)] + ([("software", None)] if engine != "software" else [])
 
-    try:
-        return await run(plan)
-    except DownloadError:
-        if plan is not None and plan.subs:
-            logger.warning("[download] job=%s: ffmpeg failed with subtitles, retrying without them", ctx.job_id)
+    async def run(p: TrackPlan | None, eng: str, dev: str | None) -> int:
+        if p is None and not copy:
+            return await _run_ffmpeg(src, out_part, preset, None, duration, ctx, engine=eng, device=dev, threads=threads)
+        return await _run_ffmpeg(src, out_part, preset, None, duration, ctx, plan=p, copy=copy, engine=eng, device=dev, threads=threads)
+
+    async def with_subs_retry(eng: str, dev: str | None) -> int:
+        try:
+            return await run(plan, eng, dev)
+        except DownloadError:
+            if plan is not None and plan.subs:
+                logger.warning("[download] job=%s: ffmpeg failed with subtitles, retrying without them", ctx.job_id)
+                out_part.unlink(missing_ok=True)
+                return await run(plan.without_subs(), eng, dev)
+            raise
+
+    for i, (eng, dev) in enumerate(chain):
+        ctx.phase(ctx.lo, ctx.hi, (cpu_note if not i else f"{base} (the GPU encoder failed; using the CPU)") if eng == "software"
+                  else f"{base} ({_ENCODER_LABELS[eng]})")
+        try:
+            return await with_subs_retry(eng, dev)
+        except DownloadError as exc:
+            if i == len(chain) - 1:
+                raise
+            logger.warning("[download] job=%s: %s encoding failed (%s); retrying on the CPU", ctx.job_id, eng, exc)
             out_part.unlink(missing_ok=True)
-            return await run(plan.without_subs())
-        raise
 
 
 def _same_device(a: Path, b: Path) -> bool:
@@ -1004,7 +1175,9 @@ async def run_job(job_id: int) -> None:
                     temps = [out_part] + ([kept] if local_input is None else [])
                     out_part.unlink(missing_ok=True)
                     ctx.phase(0.5 if local_input is None else 0.0, 1.0, "Removing other languages" if trim_only else "Re-encoding")
-                    size = await _transcode(encode_in, out_part, preset, duration, ctx, plan, copy=trim_only)
+                    if not duration:
+                        duration = await _probe_duration(encode_in)     # provider files often carry no runtime in the title
+                    size = await _transcode(encode_in, out_part, preset, duration, ctx, plan, copy=trim_only, settings=settings)
                     await _validate_media(out_part)      # the new file is checked too, before it reaches the library
                     final = folder / f"{stem}.mkv"
                     size = await _finalize(out_part, final, ctx)
