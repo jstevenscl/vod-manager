@@ -44,6 +44,24 @@ def test_bad_monitor_rejected(db):
     assert exc.value.status_code == 400
 
 
+# the "as Radarr/Sonarr see them" folder is the finished folder, never the library root
+@pytest.mark.parametrize("kw", [
+    dict(movies_arr_dir="/media/Movies", radarr_root="/media/Movies"),
+    dict(movies_arr_dir="/media/Movies/", radarr_root="/media/Movies"),
+    dict(shows_arr_dir="/media/TV", sonarr_root="/media/TV/"),
+])
+def test_arr_dir_equal_to_root_folder_rejected(db, kw):
+    with pytest.raises(HTTPException) as exc:
+        _save(**kw)
+    assert exc.value.status_code == 400 and "root folder" in exc.value.detail
+
+
+def test_arr_dir_different_from_root_folder_saved(db):
+    out = _save(movies_arr_dir="/media/finished/movies", radarr_root="/media/Movies",
+                shows_arr_dir="", sonarr_root="/media/TV")
+    assert out["movies_arr_dir"] == "/media/finished/movies"
+
+
 class _FakeClient:
     seen = []
 

@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -2664,6 +2664,21 @@ function ImportChip({ job }: { job: DownloadJob }) {
   return <span className={`inline-block whitespace-nowrap rounded border px-1.5 py-px text-[11px] font-medium ${hit[1]}`} title={job.import_note ?? undefined}>{hit[0]}</span>
 }
 
+// hover/focus help for the handoff folder rows -- native title tips were too terse and the
+// arr-folder row got filled with library root folders
+function HelpTip({ children, label }: { children: React.ReactNode; label: string }) {
+  return (
+    <span className="group relative inline-flex align-middle" tabIndex={0} aria-label={label}>
+      <Info size={13} className="text-muted-foreground group-hover:text-foreground cursor-help" />
+      <span role="tooltip" className="pointer-events-none absolute left-0 top-5 z-50 hidden w-80 space-y-1.5 rounded-md border border-border bg-card p-2.5 text-xs font-normal leading-snug text-foreground shadow-lg group-hover:block group-focus:block">
+        {children}
+      </span>
+    </span>
+  )
+}
+
+const trimSlash = (p: string) => p.trim().replace(/[/\\]+$/, '')
+
 function HandoffCard() {
   const qc = useQueryClient()
   const query = useQuery<HandoffSettings>({ queryKey: ['vod-handoff'], queryFn: () => api.get('/vod/handoff/settings/').then((r) => r.data) })
@@ -2689,6 +2704,19 @@ function HandoffCard() {
   })
   if (!draft) return null
   const set = (patch: Partial<HandoffSettings>) => setDraft({ ...draft, ...patch })
+  // catch the "library root folder in the arr-folder box" mistake before saving; the server rejects it too
+  const onSave = () => {
+    for (const [dir, root, app] of [[draft.movies_arr_dir, draft.radarr_root, 'Radarr'], [draft.shows_arr_dir, draft.sonarr_root, 'Sonarr']]) {
+      const d = trimSlash(dir)
+      if (d && d === trimSlash(root)) {
+        const text = `"${d}" is the ${app} root folder (where your library lives), not the finished folder. Enter the folder where finished files appear, as ${app} sees it, or leave it blank if ${app} sees the same path.`
+        setError(text)
+        toast.error(text)
+        return
+      }
+    }
+    save.mutate(draft)
+  }
 
   const appBlock = (kind: ArrKind) => {
     const name = kind === 'radarr' ? 'Radarr' : 'Sonarr'
@@ -2741,14 +2769,30 @@ function HandoffCard() {
         {appBlock('radarr')}
         {appBlock('sonarr')}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border/50 pt-2">
-          <span className="font-medium">Finished folders</span>
-          <input className={inputCls('w-60')} placeholder="Movies, as this container sees it" title="Where finished movies appear, with the same Title (Year)/ folders as the download. Blank = the download folder (no encoder in between)." value={draft.movies_finished_dir} onChange={(e) => set({ movies_finished_dir: e.target.value })} />
-          <input className={inputCls('w-60')} placeholder="TV shows, as this container sees it" title="Where finished episodes appear. Blank = the download folder." value={draft.shows_finished_dir} onChange={(e) => set({ shows_finished_dir: e.target.value })} />
+          <span className="font-medium inline-flex items-center gap-1">
+            Finished folders
+            <HelpTip label="About finished folders">
+              <p>Where a finished download shows up <b>as vod-manager sees it</b>. vod-manager watches this folder and, once the file is there, asks Radarr/Sonarr to import it.</p>
+              <p>If an encoder such as Tdarr writes its output somewhere else, enter that output folder. Leave blank if there's no encoder: the download folder is used.</p>
+              <p>Example: <code>/media/finished/movies</code></p>
+              <p>This is <b>not</b> your library (root) folder like <code>/media/Movies</code>. Radarr/Sonarr move the file there themselves.</p>
+            </HelpTip>
+          </span>
+          <input className={inputCls('w-60')} placeholder="Movies (blank = download folder)" title="Where finished movies appear, with the same Title (Year)/ folders as the download. Blank = the download folder (no encoder in between)." value={draft.movies_finished_dir} onChange={(e) => set({ movies_finished_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows (blank = download folder)" title="Where finished episodes appear. Blank = the download folder." value={draft.shows_finished_dir} onChange={(e) => set({ shows_finished_dir: e.target.value })} />
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <span className="font-medium">Same folders in Radarr/Sonarr</span>
-          <input className={inputCls('w-60')} placeholder="Movies, as Radarr sees it" title="Only needed when Radarr mounts the finished movies folder at a different path. Blank = same path." value={draft.movies_arr_dir} onChange={(e) => set({ movies_arr_dir: e.target.value })} />
-          <input className={inputCls('w-60')} placeholder="TV shows, as Sonarr sees it" title="Only needed when Sonarr mounts the finished shows folder at a different path. Blank = same path." value={draft.shows_arr_dir} onChange={(e) => set({ shows_arr_dir: e.target.value })} />
+          <span className="font-medium inline-flex items-center gap-1">
+            Finished folders as Radarr/Sonarr see them
+            <HelpTip label="About finished folders as Radarr/Sonarr see them">
+              <p>The <b>same finished folders as the row above</b>, written the way the Radarr and Sonarr containers see them. vod-manager uses this path when it tells them where to import from.</p>
+              <p>Only needed when Radarr/Sonarr mount the share at a different path than vod-manager. <b>Leave blank if the paths are the same</b> (most setups).</p>
+              <p>Example: vod-manager sees <code>/downloads/finished/movies</code> but Radarr sees it as <code>/media/finished/movies</code>, so enter <code>/media/finished/movies</code>.</p>
+              <p>This is <b>not</b> the Radarr/Sonarr library or root folder (for example <code>/media/Movies</code>). Pointing it there makes the import fail.</p>
+            </HelpTip>
+          </span>
+          <input className={inputCls('w-60')} placeholder="Movies (blank = same as above)" title="Only needed when Radarr mounts the finished movies folder at a different path. Blank = same path. Not the Radarr root folder." value={draft.movies_arr_dir} onChange={(e) => set({ movies_arr_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows (blank = same as above)" title="Only needed when Sonarr mounts the finished shows folder at a different path. Blank = same path. Not the Sonarr root folder." value={draft.shows_arr_dir} onChange={(e) => set({ shows_arr_dir: e.target.value })} />
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
           <label className="flex items-center gap-1">New shows
@@ -2779,7 +2823,7 @@ function HandoffCard() {
           <span className="basis-full text-muted-foreground">Counted per download from when it finished. Each notice shows in the bell at the top and stays until you acknowledge it.</span>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          <Button size="sm" disabled={save.isPending} onClick={() => save.mutate(draft)}>
+          <Button size="sm" disabled={save.isPending} onClick={onSave}>
             {save.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save handoff'}
           </Button>
         </div>

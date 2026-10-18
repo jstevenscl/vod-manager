@@ -4199,6 +4199,14 @@ async def save_handoff_settings(body: HandoffSettingsRequest):
     hours, fail = settings["stall_hours"], settings["fail_hours"]
     if not hours or not all(a < b for a, b in zip([0] + hours, hours + [fail])):
         raise HTTPException(400, detail="Notice hours must be above 0, increasing, and below the fail hours.")
+    # the arr_dir is the finished folder as Radarr/Sonarr see it; the library root there
+    # makes Radarr/Sonarr import from an empty folder and fail
+    for arr_key, root_key, app in (("movies_arr_dir", "radarr_root", "Radarr"), ("shows_arr_dir", "sonarr_root", "Sonarr")):
+        arr_dir = settings[arr_key].strip().rstrip("/\\")
+        if arr_dir and arr_dir == settings[root_key].strip().rstrip("/\\"):
+            raise HTTPException(400, detail=f"The finished folder as {app} sees it can't be the {app} root folder "
+                                f"({arr_dir}). Enter the folder where finished files appear, as {app} sees it, "
+                                "or leave it blank if the path is the same.")
     await asyncio.to_thread(config.save_handoff_settings, settings)
     return await asyncio.to_thread(config.get_handoff_settings)
 
