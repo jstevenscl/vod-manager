@@ -407,6 +407,82 @@ def save_download_settings(settings: dict) -> None:
     _update_raw(lambda data: data.__setitem__("downloads", {**(data.get("downloads") or {}), **clean}))
 
 
+# library handoff -- finished downloads are imported by Radarr/Sonarr
+# (see arr_handoff.py). Off until a URL + API key is saved for that app.
+_HANDOFF_DEFAULTS = {
+    "radarr_url": "", "sonarr_url": "",
+    # where the finished file appears as vod-manager sees it (blank = the download folder),
+    # and the same folder as Radarr/Sonarr sees it (blank = same path)
+    "movies_finished_dir": "", "shows_finished_dir": "",
+    "movies_arr_dir": "", "shows_arr_dir": "",
+    # only used when vod-manager adds a missing title
+    "radarr_root": "", "radarr_profile_id": 0, "sonarr_root": "", "sonarr_profile_id": 0,
+    "new_show_monitor": "future", "new_movie_monitor": "unmonitored",
+    "stall_hours": [4, 8, 16], "fail_hours": 24,
+}
+_HANDOFF_MONITORS = {"new_show_monitor": ("future", "none"), "new_movie_monitor": ("unmonitored", "monitored")}
+
+
+def get_handoff_settings() -> dict:
+    saved = _read_raw().get("handoff") or {}
+    out = {**_HANDOFF_DEFAULTS, **{k: saved[k] for k in _HANDOFF_DEFAULTS if k in saved}}
+    for key in ("radarr_url", "sonarr_url", "movies_finished_dir", "shows_finished_dir",
+                "movies_arr_dir", "shows_arr_dir", "radarr_root", "sonarr_root"):
+        out[key] = (out[key] or "").strip()
+    for key in ("radarr_url", "sonarr_url"):
+        out[key] = out[key].rstrip("/")
+    for key, allowed in _HANDOFF_MONITORS.items():
+        if out[key] not in allowed:
+            out[key] = _HANDOFF_DEFAULTS[key]
+    out["radarr_profile_id"] = int(out["radarr_profile_id"] or 0)
+    out["sonarr_profile_id"] = int(out["sonarr_profile_id"] or 0)
+    try:
+        hours = [float(h) for h in out["stall_hours"]]
+        fail = float(out["fail_hours"])
+        if not (hours and all(a < b for a, b in zip([0] + hours, hours + [fail]))):
+            raise ValueError
+        out["stall_hours"] = [int(h) if h == int(h) else h for h in hours]
+        out["fail_hours"] = int(fail) if fail == int(fail) else fail
+    except (TypeError, ValueError):
+        out["stall_hours"], out["fail_hours"] = list(_HANDOFF_DEFAULTS["stall_hours"]), _HANDOFF_DEFAULTS["fail_hours"]
+    out["radarr_has_key"] = bool(saved.get("radarr_api_key"))
+    out["sonarr_has_key"] = bool(saved.get("sonarr_api_key"))
+    return out
+
+
+def get_handoff_api_key(app: str) -> str | None:
+    import secrets_util
+    value = (_read_raw().get("handoff") or {}).get(f"{app}_api_key")
+    return secrets_util.decrypt_value(value) if value else None
+
+
+def handoff_enabled(kind: str) -> bool:
+    """kind is a download kind: 'movie' (Radarr) or 'episode' (Sonarr)."""
+    app = "radarr" if kind == "movie" else "sonarr"
+    return bool(get_handoff_settings()[f"{app}_url"] and get_handoff_api_key(app))
+
+
+def save_handoff_settings(settings: dict) -> None:
+    """A blank API key keeps the saved one (it's never sent to the browser); '-' clears it."""
+    import secrets_util
+    clean = {k: settings[k] for k in _HANDOFF_DEFAULTS if k in settings}
+    # Encrypt before taking the config lock: encrypt_value may itself write the key file via _update_raw.
+    keys = {}
+    for app in ("radarr", "sonarr"):
+        key = (settings.get(f"{app}_api_key") or "").strip()
+        keys[app] = None if key == "-" else secrets_util.encrypt_value(key) if key else ""
+
+    def _mutate(data: dict) -> None:
+        current = {**(data.get("handoff") or {}), **clean}
+        for app, enc in keys.items():
+            if enc is None:
+                current.pop(f"{app}_api_key", None)
+            elif enc:
+                current[f"{app}_api_key"] = enc
+        data["handoff"] = current
+    _update_raw(_mutate)
+
+
 _AUTO_EPISODE_TITLE_MODES = ("off", "applied", "all")
 
 

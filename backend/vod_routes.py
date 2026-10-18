@@ -57,6 +57,10 @@ from routes import require_auth
 from secrets_util import hash_password, looks_like_fernet_token
 import ai_assist
 import apply_exclusions_job
+import arr_client
+import arr_handoff
+import config
+import notices
 import auto_episode_titles
 import dispatcharr_dvr_client
 import dispatcharr_dvr_importer
@@ -4155,12 +4159,103 @@ async def retry_download(job_id: int):
     return {"ok": True}
 
 
+# ── library handoff (Radarr/Sonarr) + notices ───────────────────────────
+
+class HandoffSettingsRequest(BaseModel):
+    radarr_url: str = ""
+    sonarr_url: str = ""
+    radarr_api_key: str = ""                   # blank keeps the saved key, '-' clears it
+    sonarr_api_key: str = ""
+    movies_finished_dir: str = ""
+    shows_finished_dir: str = ""
+    movies_arr_dir: str = ""
+    shows_arr_dir: str = ""
+    radarr_root: str = ""
+    radarr_profile_id: int = 0
+    sonarr_root: str = ""
+    sonarr_profile_id: int = 0
+    new_show_monitor: str = "future"
+    new_movie_monitor: str = "unmonitored"
+    stall_hours: list[float] = [4, 8, 16]
+    fail_hours: float = 24
+
+
+class HandoffTestRequest(BaseModel):
+    url: str = ""                              # blank = the saved value
+    api_key: str = ""
+
+
+@router.get("/handoff/settings/", dependencies=_GUARDS)
+async def get_handoff_settings_route():
+    return await asyncio.to_thread(config.get_handoff_settings)
+
+
+@router.post("/handoff/settings/", dependencies=_GUARDS)
+async def save_handoff_settings(body: HandoffSettingsRequest):
+    settings = body.model_dump()
+    for key, allowed in config._HANDOFF_MONITORS.items():
+        if settings[key] not in allowed:
+            raise HTTPException(400, detail=f"{key} must be one of: " + ", ".join(allowed))
+    hours, fail = settings["stall_hours"], settings["fail_hours"]
+    if not hours or not all(a < b for a, b in zip([0] + hours, hours + [fail])):
+        raise HTTPException(400, detail="Notice hours must be above 0, increasing, and below the fail hours.")
+    await asyncio.to_thread(config.save_handoff_settings, settings)
+    return await asyncio.to_thread(config.get_handoff_settings)
+
+
+@router.post("/handoff/test/{kind}", dependencies=_GUARDS)
+async def test_handoff(kind: str, body: HandoffTestRequest):
+    """Checks the connection and returns the root folders and quality profiles to pick from."""
+    if kind not in ("radarr", "sonarr"):
+        raise HTTPException(404, detail="Unknown app.")
+    saved = await asyncio.to_thread(config.get_handoff_settings)
+    url = body.url.strip() or saved[f"{kind}_url"]
+    key = body.api_key.strip() or await asyncio.to_thread(config.get_handoff_api_key, kind)
+    if not url or not key:
+        raise HTTPException(400, detail="Enter the URL and API key first.")
+
+    def _probe():
+        client = arr_client.ArrClient(kind, url, key)
+        return client.system_status(), client.root_folders(), client.quality_profiles()
+
+    try:
+        status, roots, profiles = await asyncio.to_thread(_probe)
+    except arr_client.ArrError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True, "version": (status or {}).get("version"), "root_folders": roots, "profiles": profiles}
+
+
+@router.post("/downloads/{job_id}/retry-import/", dependencies=_GUARDS)
+async def retry_import(job_id: int):
+    job = await asyncio.to_thread(vod_db.get_download_job, job_id)
+    if not job or job.get("import_status") not in ("failed", "timed_out"):
+        raise HTTPException(404, detail="Only a failed or timed-out import can be retried.")
+    await arr_handoff.retry_import(job_id)
+    return {"ok": True}
+
+
+@router.get("/notices/", dependencies=_GUARDS)
+async def list_notices():
+    items = await asyncio.to_thread(notices.list_open)
+    return {"open": items, "count": len(items)}
+
+
+@router.post("/notices/{notice_id}/ack/", dependencies=_GUARDS)
+async def ack_notice(notice_id: int):
+    if not await asyncio.to_thread(notices.acknowledge, notice_id):
+        raise HTTPException(404, detail="Notice not found or already acknowledged.")
+    return {"ok": True}
+
+
 @router.post("/downloads/clear/", dependencies=_GUARDS)
 async def clear_downloads():
-    finished = [j["id"] for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
+    finished = [j for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
                 if j["status"] in ("done", "failed", "cancelled")]
-    await asyncio.to_thread(vod_downloader.purge_work, finished)   # drop their unfinished leftovers too
-    return {"cleared": await asyncio.to_thread(vod_db.clear_finished_downloads)}
+    # keep rows whose library import is still pending, or the watcher loses them
+    pending = [j for j in finished if j.get("import_status") in vod_db.PENDING_IMPORT_STATUSES]
+    clear_ids = [j["id"] for j in finished if j not in pending]
+    await asyncio.to_thread(vod_downloader.purge_work, clear_ids)   # drop their unfinished leftovers too
+    return {"cleared": await asyncio.to_thread(vod_db.clear_finished_downloads), "kept": len(pending)}
 
 
 @router.post("/series/{series_id}/tmdb-episode-titles/", dependencies=_GUARDS)

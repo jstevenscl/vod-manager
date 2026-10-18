@@ -440,12 +440,16 @@ def enqueue(movie_ids: list[int] | None = None, series_ids: list[int] | None = N
         raise ValueError("Nothing selected.")
 
     result = {"queued": 0, "already_queued": 0, "no_source": 0, "missing": 0, "truncated": False, "preset": preset}
+    # library handoff: new jobs are added to Radarr/Sonarr by arr_handoff.resolve_pending
+    handoff = {k: config.handoff_enabled(k) for k in ("movie", "episode")}
 
     def add(kind: str, item_id: int, title: str, src: int | None = None) -> bool:
         if result["queued"] >= MAX_QUEUE_PER_REQUEST:
             result["truncated"] = True
             return False
         jid = vod_db.enqueue_download(kind, item_id, title, preset, src, prefer_provider_id, audio_languages)
+        if jid and handoff[kind]:
+            vod_db.update_import(jid, import_status="add")
         result["queued" if jid else "already_queued"] += 1
         return True
 
@@ -1121,6 +1125,7 @@ async def run_job(job_id: int) -> None:
         if found:
             vod_db.update_download_job(job_id, ("running",), status="done", progress=1.0, final_path=str(found.relative_to(out_root)),
                                        final_size=found.stat().st_size, note="Already in the library", finished_at=vod_db._now())
+            vod_db.mark_import_waiting(job_id)  # hand the file to Radarr/Sonarr
             shutil.rmtree(work, ignore_errors=True)
             return
         sources = await asyncio.to_thread(_ordered_sources, job)
@@ -1199,6 +1204,7 @@ async def run_job(job_id: int) -> None:
             vod_db.update_download_job(job_id, ("running",), status="done", progress=1.0, bytes_done=size, total_bytes=size,
                                        final_path=str(final.relative_to(out_root)), final_size=size, note=None, error=None,
                                        finished_at=vod_db._now())
+            vod_db.mark_import_waiting(job_id)  # hand the file to Radarr/Sonarr
             shutil.rmtree(work, ignore_errors=True)
             logger.info("[download] job=%s done: %s (%d bytes, preset=%s)", job_id, final.relative_to(out_root), size, preset)
             return

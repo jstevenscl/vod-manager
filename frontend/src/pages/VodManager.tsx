@@ -6,6 +6,7 @@ import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, Calenda
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
+import { toast } from '@/lib/toast'
 import { askConfirm, ConfirmDialogHost, notify, NotifyDialogHost } from '@/lib/confirm'
 
 interface Provider {
@@ -2278,6 +2279,8 @@ interface DownloadJob {
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
   note: string | null; error: string | null; bytes_done: number; total_bytes: number | null; progress: number
   provider_name: string | null; final_path: string | null; final_size: number | null
+  import_status?: 'add' | 'ready' | 'needs_manual' | 'waiting' | 'importing' | 'imported' | 'failed' | 'timed_out' | null
+  import_note?: string | null
 }
 interface DownloadSettings {
   enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
@@ -2418,7 +2421,11 @@ function DownloadsCard() {
   })
   const cancelJobs = useMutation({ mutationFn: (ids: number[] | null) => api.post('/vod/downloads/cancel/', { job_ids: ids }), onSuccess: refresh })
   const retryJob = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry/`), onSuccess: refresh })
-  const clearJobs = useMutation({ mutationFn: () => api.post('/vod/downloads/clear/'), onSuccess: refresh })
+  const clearJobs = useMutation({
+    mutationFn: () => api.post('/vod/downloads/clear/').then((r) => r.data as { cleared: number; kept: number }),
+    onSuccess: (r) => { refresh(); if (r.kept) toast.info(`${r.kept} kept: library import still pending`) },
+  })
+  const retryImport = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry-import/`), onSuccess: refresh, onError: (e: any) => toast.error(errText(e)) })
   // hands the finished file to the browser you are using (a phone, say) through a short-lived link
   const saveToDevice = useMutation({
     mutationFn: (id: number) => api.post(`/vod/downloads/${id}/link/`).then((r) => r.data.url as string),
@@ -2599,18 +2606,22 @@ function DownloadsCard() {
                       {(j.error || j.note) && <div className={j.error ? 'text-destructive text-[11px]' : 'text-muted-foreground text-[11px]'}>{j.error ?? j.note}</div>}
                     </td>
                     <td className="py-1 pr-2 whitespace-nowrap text-muted-foreground">{j.preset === 'original' ? 'original' : j.preset.replace('_', ' ')}</td>
-                    <td className="py-1 pr-2 w-36">
+                    <td className={`py-1 pr-2 ${j.import_status ? 'min-w-36' : 'w-36'}`}>
                       {j.status === 'running' && (
                         <div className="h-1.5 rounded bg-border overflow-hidden"><div className="h-full bg-primary" style={{ width: `${Math.round(j.progress * 100)}%` }} /></div>
                       )}
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                       <span className={statusColor[j.status]}>
                         {j.status === 'running' ? `${Math.round(j.progress * 100)}% · ${dlBytes(j.bytes_done)}${j.provider_name ? ` · ${j.provider_name}` : ''}` : j.status === 'done' ? `done · ${dlBytes(j.final_size)}` : j.status}
                       </span>
+                      <ImportChip job={j} />
+                      </div>
                     </td>
                     <td className="py-1 whitespace-nowrap text-right">
                       {(j.status === 'queued' || j.status === 'running') && <button className="text-muted-foreground hover:text-destructive" title="Cancel" onClick={() => cancelJobs.mutate([j.id])}><X size={12} /></button>}
                       {j.status === 'done' && <button className="text-muted-foreground hover:text-foreground disabled:opacity-50" title="Save this file to the device you are using" disabled={saveToDevice.isPending} onClick={() => saveToDevice.mutate(j.id)}><Download size={12} /></button>}
                       {(j.status === 'failed' || j.status === 'cancelled') && <button className="text-muted-foreground hover:text-foreground" title="Try again" onClick={() => retryJob.mutate(j.id)}><RotateCcw size={12} /></button>}
+                      {(j.import_status === 'failed' || j.import_status === 'timed_out') && <button className="ml-1.5 px-1 rounded border border-border text-[10px] hover:bg-accent disabled:opacity-50" title="Look for the finished file again and re-run the import" disabled={retryImport.isPending} onClick={() => retryImport.mutate(j.id)}>Retry import</button>}
                     </td>
                   </tr>
                 ))}
@@ -2623,6 +2634,157 @@ function DownloadsCard() {
           </p>
         </div>
       )}
+    </SectionCard>
+  )
+}
+
+// ── Library handoff: finished downloads go to Radarr/Sonarr (arr_handoff.py) ──
+type ArrKind = 'radarr' | 'sonarr'
+interface HandoffSettings {
+  radarr_url: string; sonarr_url: string; radarr_has_key: boolean; sonarr_has_key: boolean
+  movies_finished_dir: string; shows_finished_dir: string; movies_arr_dir: string; shows_arr_dir: string
+  radarr_root: string; radarr_profile_id: number; sonarr_root: string; sonarr_profile_id: number
+  new_show_monitor: 'future' | 'none'; new_movie_monitor: 'unmonitored' | 'monitored'
+  stall_hours: number[]; fail_hours: number
+}
+interface ArrProbe { version: string | null; root_folders: { id: number; path: string }[]; profiles: { id: number; name: string }[] }
+
+function ImportChip({ job }: { job: DownloadJob }) {
+  const app = job.kind === 'movie' ? 'Radarr' : 'Sonarr'
+  const chip: Record<string, [string, string]> = {
+    needs_manual: [`Add to ${app} manually`, 'border-amber-500/40 bg-amber-500/10 text-amber-500'],
+    waiting: ['Waiting for encoder', 'border-sky-500/50 bg-sky-500/15 text-sky-600 dark:text-sky-300'],
+    importing: [`Importing into ${app}`, 'border-primary/40 bg-primary/10 text-primary'],
+    imported: ['In library', 'border-lime-500/40 bg-lime-500/15 text-lime-500'],
+    failed: ['Import failed', 'border-destructive/40 bg-destructive/10 text-destructive'],
+    timed_out: ['Import timed out', 'border-destructive/40 bg-destructive/10 text-destructive'],
+  }
+  const hit = job.import_status ? chip[job.import_status] : undefined
+  if (!hit) return null
+  return <span className={`inline-block whitespace-nowrap rounded border px-1.5 py-px text-[11px] font-medium ${hit[1]}`} title={job.import_note ?? undefined}>{hit[0]}</span>
+}
+
+function HandoffCard() {
+  const qc = useQueryClient()
+  const query = useQuery<HandoffSettings>({ queryKey: ['vod-handoff'], queryFn: () => api.get('/vod/handoff/settings/').then((r) => r.data) })
+  const [draft, setDraft] = useState<HandoffSettings | null>(null)
+  const [keys, setKeys] = useState<Record<ArrKind, string>>({ radarr: '', sonarr: '' })
+  const [probe, setProbe] = useState<Partial<Record<ArrKind, ArrProbe>>>({})
+  const [testMsg, setTestMsg] = useState<Partial<Record<ArrKind, { ok: boolean; text: string }>>>({})
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { if (query.data && !draft) setDraft(query.data) }, [query.data, draft])
+  const errText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
+  const save = useMutation({
+    mutationFn: (d: HandoffSettings) => api.post('/vod/handoff/settings/', { ...d, radarr_api_key: keys.radarr, sonarr_api_key: keys.sonarr }).then((r) => r.data as HandoffSettings),
+    onSuccess: (saved) => { setError(null); setDraft(saved); setKeys({ radarr: '', sonarr: '' }); qc.setQueryData(['vod-handoff'], saved); toast.success('Library handoff saved') },
+    onError: (e: any) => setError(errText(e)),
+  })
+  const test = useMutation({
+    mutationFn: (kind: ArrKind) => api.post(`/vod/handoff/test/${kind}`, { url: draft?.[`${kind}_url`] ?? '', api_key: keys[kind] }).then((r) => ({ kind, data: r.data as ArrProbe })),
+    onSuccess: ({ kind, data }) => {
+      setProbe((p) => ({ ...p, [kind]: data }))
+      setTestMsg((m) => ({ ...m, [kind]: { ok: true, text: `Connected${data.version ? ` (v${data.version})` : ''}` } }))
+    },
+    onError: (e: any, kind) => setTestMsg((m) => ({ ...m, [kind]: { ok: false, text: errText(e) } })),
+  })
+  if (!draft) return null
+  const set = (patch: Partial<HandoffSettings>) => setDraft({ ...draft, ...patch })
+
+  const appBlock = (kind: ArrKind) => {
+    const name = kind === 'radarr' ? 'Radarr' : 'Sonarr'
+    const p = probe[kind]
+    const root = draft[`${kind}_root`]
+    const profileId = draft[`${kind}_profile_id`]
+    const roots = p?.root_folders.map((r) => r.path) ?? (root ? [root] : [])
+    const profiles = p?.profiles ?? (profileId ? [{ id: profileId, name: `Profile #${profileId}` }] : [])
+    const msg = testMsg[kind]
+    return (
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className="font-medium w-14">{name}</span>
+        <input className={inputCls('w-56')} placeholder={`http://host:${kind === 'radarr' ? 7878 : 8989}`} value={draft[`${kind}_url`]} onChange={(e) => set({ [`${kind}_url`]: e.target.value } as Partial<HandoffSettings>)} />
+        <input className={inputCls('w-56')} type="password" autoComplete="off" placeholder={draft[`${kind}_has_key`] ? 'API key (saved)' : 'API key'} title={`Settings → General → API Key in ${name}. Leave blank to keep the saved key.`} value={keys[kind]} onChange={(e) => setKeys({ ...keys, [kind]: e.target.value })} />
+        <button className="px-2 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50" disabled={test.isPending} onClick={() => test.mutate(kind)}>
+          {test.isPending && test.variables === kind ? 'Testing…' : 'Test'}
+        </button>
+        {msg && <span className={msg.ok ? 'text-emerald-500' : 'text-destructive'}>{msg.text}</span>}
+        <label className="flex items-center gap-1" title={`The ${name} root folder new ${kind === 'radarr' ? 'movies' : 'shows'} are added under. Press Test to load the list.`}>
+          Root folder
+          <select className={inputCls('w-48')} value={root} onChange={(e) => set({ [`${kind}_root`]: e.target.value } as Partial<HandoffSettings>)}>
+            <option value="">{roots.length ? 'Choose…' : 'Press Test first'}</option>
+            {roots.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-1" title={`The quality profile ${name} gives titles it adds.`}>
+          Profile
+          <select className={inputCls('w-40')} value={profileId || ''} onChange={(e) => set({ [`${kind}_profile_id`]: Number(e.target.value) || 0 } as Partial<HandoffSettings>)}>
+            <option value="">{profiles.length ? 'Choose…' : 'Press Test first'}</option>
+            {profiles.map((pr) => <option key={pr.id} value={pr.id}>{pr.name}</option>)}
+          </select>
+        </label>
+      </div>
+    )
+  }
+
+  const hour = (value: number, onChange: (v: number) => void, title: string) => (
+    <input className={inputCls('w-14')} type="number" min={0.5} step={0.5} title={title} value={value} onChange={(e) => onChange(Number(e.target.value) || 0)} />
+  )
+
+  return (
+    <SectionCard title="Library handoff (Radarr / Sonarr)" icon={<ArrowRightLeft size={14} />}>
+      <p className="text-xs text-muted-foreground">
+        Optional. When a download finishes, vod-manager waits for the file to appear in the finished folder (straight away, or after an
+        encoder such as Tdarr is done with it) and asks Radarr or Sonarr to import it, so it lands in your library with their naming and
+        your media server is told. Titles they don't have yet are added when you queue the download. Nothing is ever searched for:
+        new movies are added unmonitored, new shows watch future episodes only.
+      </p>
+      <div className="space-y-2 text-xs">
+        {appBlock('radarr')}
+        {appBlock('sonarr')}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border/50 pt-2">
+          <span className="font-medium">Finished folders</span>
+          <input className={inputCls('w-60')} placeholder="Movies, as this container sees it" title="Where finished movies appear, with the same Title (Year)/ folders as the download. Blank = the download folder (no encoder in between)." value={draft.movies_finished_dir} onChange={(e) => set({ movies_finished_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows, as this container sees it" title="Where finished episodes appear. Blank = the download folder." value={draft.shows_finished_dir} onChange={(e) => set({ shows_finished_dir: e.target.value })} />
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <span className="font-medium">Same folders in Radarr/Sonarr</span>
+          <input className={inputCls('w-60')} placeholder="Movies, as Radarr sees it" title="Only needed when Radarr mounts the finished movies folder at a different path. Blank = same path." value={draft.movies_arr_dir} onChange={(e) => set({ movies_arr_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows, as Sonarr sees it" title="Only needed when Sonarr mounts the finished shows folder at a different path. Blank = same path." value={draft.shows_arr_dir} onChange={(e) => set({ shows_arr_dir: e.target.value })} />
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+          <label className="flex items-center gap-1">New shows
+            <select className={inputCls()} value={draft.new_show_monitor} onChange={(e) => set({ new_show_monitor: e.target.value as HandoffSettings['new_show_monitor'] })}>
+              <option value="future">Monitor future episodes</option>
+              <option value="none">Don't monitor</option>
+            </select>
+          </label>
+          <label className="flex items-center gap-1">New movies
+            <select className={inputCls()} value={draft.new_movie_monitor} onChange={(e) => set({ new_movie_monitor: e.target.value as HandoffSettings['new_movie_monitor'] })}>
+              <option value="unmonitored">Unmonitored</option>
+              <option value="monitored">Monitored</option>
+            </select>
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+          <span className="font-medium">Waiting too long</span>
+          <span>notify after</span>
+          {draft.stall_hours.map((h, i) => (
+            <Fragment key={i}>
+              {hour(h, (v) => set({ stall_hours: draft.stall_hours.map((x, k) => (k === i ? v : x)) }), 'Hours after the download finished. Each one sends a notice you must acknowledge.')}
+              {i < draft.stall_hours.length - 1 && <span>,</span>}
+            </Fragment>
+          ))}
+          <span>hours, give up after</span>
+          {hour(draft.fail_hours, (v) => set({ fail_hours: v }), 'After this many hours without the finished file the import is marked failed.')}
+          <span>hours</span>
+          <span className="basis-full text-muted-foreground">Counted per download from when it finished. Each notice shows in the bell at the top and stays until you acknowledge it.</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button size="sm" disabled={save.isPending} onClick={() => save.mutate(draft)}>
+            {save.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save handoff'}
+          </Button>
+        </div>
+        {error && <p className="text-destructive">{error}</p>}
+      </div>
     </SectionCard>
   )
 }
@@ -8006,6 +8168,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </SectionCard>
 
       <DownloadsCard />
+
+      <HandoffCard />
 
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">

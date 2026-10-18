@@ -1061,6 +1061,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         finished_at        TEXT
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_download_jobs_status ON download_jobs(status)")
+    # persistent notices (notices.py): stay until acknowledged.
+    conn.execute("""CREATE TABLE IF NOT EXISTS notices (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind            TEXT NOT NULL,
+        severity        TEXT NOT NULL DEFAULT 'info',   -- info|warn|error
+        title           TEXT NOT NULL,
+        body            TEXT,
+        job_id          INTEGER,
+        created_at      TEXT NOT NULL,
+        acknowledged_at TEXT
+    )""")
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
         # 1 = the name was set deliberately (manual edit or "Use TMDB episode
@@ -1340,6 +1351,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # sweep only un-archives its own archives. See its docstring.
         ("movies", "review_excluded_language", "INTEGER NOT NULL DEFAULT 0"),
         ("series", "review_excluded_language", "INTEGER NOT NULL DEFAULT 0"),
+        # Library handoff (arr_handoff.py): NULL = not handed to Radarr/Sonarr.
+        # add|ready|needs_manual|waiting|importing|imported|failed|timed_out
+        ("download_jobs", "import_status", "TEXT"),
+        ("download_jobs", "import_stage", "INTEGER NOT NULL DEFAULT 0"),   # stall notices already sent
+        ("download_jobs", "import_note", "TEXT"),
+        ("download_jobs", "arr_id", "INTEGER"),            # Radarr movie id / Sonarr series id
+        ("download_jobs", "import_cmd_id", "INTEGER"),
+        ("download_jobs", "import_cmd_at", "REAL"),
+        ("download_jobs", "import_seen_size", "INTEGER"),  # size-stable check before importing
+        ("download_jobs", "import_seen_at", "REAL"),
+        ("download_jobs", "import_since", "REAL"),         # start of the stall clock
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -13258,6 +13280,75 @@ _DOWNLOAD_FIELDS = {"status", "note", "error", "bytes_done", "total_bytes", "pro
                     "final_path", "final_size", "next_try_at", "started_at", "finished_at"}
 
 
+_IMPORT_FIELDS = {"import_status", "import_stage", "import_note", "arr_id", "import_cmd_id", "import_cmd_at",
+                  "import_seen_size", "import_seen_at", "import_since"}
+_DOWNLOAD_FIELDS |= _IMPORT_FIELDS
+
+
+def update_import(job_id: int, **fields) -> bool:
+    """Updates only the library-handoff columns of a job."""
+    bad = set(fields) - _IMPORT_FIELDS
+    if bad:
+        raise ValueError(f"not an import field: {sorted(bad)}")
+    return update_download_job(job_id, **fields)
+
+
+def mark_import_waiting(job_id: int) -> None:
+    """A finished download being handed to Radarr/Sonarr now waits for its file in the
+    finished folder; starts the stall clock. No-op for jobs without the handoff."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("UPDATE download_jobs SET import_status='waiting', import_stage=0, import_since=? "
+                         "WHERE id=? AND import_status IN ('add','ready','needs_manual')", (time.time(), job_id))
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def list_import_jobs(statuses: tuple[str, ...]) -> list[dict]:
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM download_jobs WHERE import_status IN (" + ",".join("?" for _ in statuses)
+                            + ") ORDER BY id", statuses).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def add_notice(kind: str, severity: str, title: str, body: str | None, job_id: int | None) -> int:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute("INSERT INTO notices (kind, severity, title, body, job_id, created_at) VALUES (?,?,?,?,?,?)",
+                               (kind, severity, title, body, job_id, _now()))
+            _commit_with_retry(conn)
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def list_open_notices() -> list[dict]:
+    conn = _connect()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM notices WHERE acknowledged_at IS NULL ORDER BY id DESC").fetchall()]
+    finally:
+        conn.close()
+
+
+def acknowledge_notice(notice_id: int) -> bool:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = conn.execute("UPDATE notices SET acknowledged_at=? WHERE id=? AND acknowledged_at IS NULL",
+                             (_now(), notice_id)).rowcount
+            _commit_with_retry(conn)
+            return n > 0
+        finally:
+            conn.close()
+
+
 def update_download_job(job_id: int, only_if_status: tuple[str, ...] | None = None, **fields) -> bool:
     """Updates a job. only_if_status guards against overwriting a cancel that
     arrived while the worker was mid-write."""
@@ -13329,12 +13420,20 @@ def cancel_download_jobs(job_ids: list[int] | None = None) -> list[int]:
             conn.close()
 
 
+# rows whose Radarr/Sonarr import is still in flight must survive "Clear finished"
+PENDING_IMPORT_STATUSES = ("add", "ready", "waiting", "importing")
+_CLEARABLE = ("status IN ('done','failed','cancelled') AND "
+              "(import_status IS NULL OR import_status NOT IN ("
+              + ",".join(f"'{s}'" for s in PENDING_IMPORT_STATUSES) + "))")
+
+
 def clear_finished_downloads() -> int:
-    """Removes finished/failed/cancelled rows from the list (never touches files)."""
+    """Removes finished/failed/cancelled rows from the list (never touches files).
+    Rows still waiting on a Radarr/Sonarr import are kept."""
     with _WRITE_LOCK:
         conn = _connect()
         try:
-            n = conn.execute("DELETE FROM download_jobs WHERE status IN ('done','failed','cancelled')").rowcount
+            n = conn.execute(f"DELETE FROM download_jobs WHERE {_CLEARABLE}").rowcount
             _commit_with_retry(conn)
             return n
         finally:
