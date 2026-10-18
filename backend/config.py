@@ -483,6 +483,97 @@ def save_handoff_settings(settings: dict) -> None:
     _update_raw(_mutate)
 
 
+# In Library badge -- the user's own media servers (see library_presence.py).
+# A server is either a link to an existing Plex/Jellyfin/Emby provider (only the provider id
+# is stored; its URL and token are read from the provider when used) or entered by hand.
+LIBRARY_SERVER_TYPES = ("plex", "jellyfin", "emby")
+_LIBRARY_SCAN_HOURS_DEFAULT = 6
+
+
+def _library_refs(libraries) -> list[dict]:
+    return [{"key": str(lib["key"]), "title": lib.get("title") or "", "kind": lib.get("kind") or ""}
+            for lib in libraries or []]
+
+
+def get_library_presence_settings() -> dict:
+    """Provider-linked servers come back as {id, source, provider_id, libraries};
+    library_presence.configured_servers() fills in the provider's details."""
+    saved = _read_raw().get("library_presence") or {}
+    servers = []
+    for s in saved.get("servers") or []:
+        if s.get("source") == "provider":
+            servers.append({"id": s["id"], "source": "provider", "provider_id": int(s["provider_id"]),
+                            "libraries": _library_refs(s.get("libraries"))})
+        else:                                   # entries saved without a source were typed in
+            servers.append({
+                "id": s["id"], "source": "manual", "type": s["type"], "name": s.get("name") or s["type"].title(),
+                "url": s.get("url") or "", "has_key": bool(s.get("api_key")),
+                "libraries": _library_refs(s.get("libraries")),
+            })
+    try:
+        hours = max(1, int(saved.get("scan_hours") or _LIBRARY_SCAN_HOURS_DEFAULT))
+    except (TypeError, ValueError):
+        hours = _LIBRARY_SCAN_HOURS_DEFAULT
+    return {"servers": servers, "scan_hours": hours}
+
+
+def get_library_server_key(server_id: str) -> str | None:
+    """A manual server's key (a provider-linked server uses the provider's)."""
+    import secrets_util
+    for s in (_read_raw().get("library_presence") or {}).get("servers") or []:
+        if s["id"] == server_id and s.get("api_key"):
+            return secrets_util.decrypt_value(s["api_key"])
+    return None
+
+
+def save_library_presence_settings(settings: dict) -> None:
+    """Replaces the server list. A manual server without an id is new; a blank key
+    keeps the saved one for that id (keys are never sent to the browser); '-' clears
+    it. A provider-linked server is keyed provider:<id>, so its scanned rows stay
+    with it if it's unticked and ticked again."""
+    import secrets_util
+    import uuid
+    servers, linked = [], set()
+    for s in settings.get("servers") or []:
+        if s.get("source") == "provider":
+            pid = int(s["provider_id"])
+            if pid not in linked:
+                linked.add(pid)
+                servers.append({"id": f"provider:{pid}", "source": "provider", "provider_id": pid,
+                                "libraries": _library_refs(s.get("libraries")), "_key": None})
+            continue
+        stype = (s.get("type") or "").strip().lower()
+        if stype not in LIBRARY_SERVER_TYPES:
+            raise ValueError("Server type must be one of: " + ", ".join(LIBRARY_SERVER_TYPES))
+        key = (s.get("api_key") or "").strip()
+        servers.append({
+            "id": s.get("id") or uuid.uuid4().hex[:8], "source": "manual", "type": stype,
+            "name": (s.get("name") or "").strip() or stype.title(),
+            "url": (s.get("url") or "").strip().rstrip("/"),
+            "libraries": _library_refs(s.get("libraries")),
+            # Encrypt before taking the config lock: encrypt_value may itself write the key file via _update_raw.
+            "_key": None if key == "-" else secrets_util.encrypt_value(key) if key else "",
+        })
+    try:
+        raw = settings.get("scan_hours")
+        hours = max(1, int(_LIBRARY_SCAN_HOURS_DEFAULT if raw in (None, "") else raw))
+    except (TypeError, ValueError):
+        hours = _LIBRARY_SCAN_HOURS_DEFAULT
+
+    def _mutate(data: dict) -> None:
+        old = {s["id"]: s for s in (data.get("library_presence") or {}).get("servers") or []}
+        out = []
+        for s in servers:
+            enc = s.pop("_key")
+            if enc:
+                s["api_key"] = enc
+            elif enc == "" and old.get(s["id"], {}).get("api_key"):
+                s["api_key"] = old[s["id"]]["api_key"]
+            out.append(s)
+        data["library_presence"] = {**(data.get("library_presence") or {}), "servers": out, "scan_hours": hours}
+    _update_raw(_mutate)
+
+
 _AUTO_EPISODE_TITLE_MODES = ("off", "applied", "all")
 
 

@@ -1072,6 +1072,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
         created_at      TEXT NOT NULL,
         acknowledged_at TEXT
     )""")
+    # In Library badge (library_presence.py): what the user's media
+    # servers hold, replaced per server on each scan. Episode rows carry their show's
+    # ids/title/year. server='import' rows are items a Radarr/Sonarr import just added.
+    conn.execute("""CREATE TABLE IF NOT EXISTS library_presence (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        server      TEXT NOT NULL,
+        server_name TEXT NOT NULL,
+        library     TEXT,
+        kind        TEXT NOT NULL,              -- movie|show|episode
+        tmdb_id     TEXT,
+        imdb_id     TEXT,
+        tvdb_id     TEXT,
+        title       TEXT,
+        year        INTEGER,
+        season      INTEGER,
+        episode     INTEGER,
+        seen_at     TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_library_presence_server ON library_presence(server)")
+    # Which vod-manager items matched (rebuilt locally from library_presence), so cards,
+    # episode lists and the In Library filter read one indexed table.
+    conn.execute("""CREATE TABLE IF NOT EXISTS library_presence_items (
+        kind    TEXT NOT NULL,                  -- movie|series|episode
+        item_id INTEGER NOT NULL,
+        label   TEXT NOT NULL,                  -- e.g. "Plex: Movies"
+        PRIMARY KEY (kind, item_id)
+    )""")
     migrations = [
         ("movies", "last_enriched_at", "TEXT"),
         # 1 = the name was set deliberately (manual edit or "Use TMDB episode
@@ -6568,6 +6595,7 @@ def upsert_movie(name: str, year: int | None = None, **fields) -> int:
 
 def _movie_filter_clause(
     search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> tuple[str, list]:
     where = ["m.review_excluded = ?"]
     params: list = [1 if archived else 0]
@@ -6590,6 +6618,9 @@ def _movie_filter_clause(
         params.append(provider_id)
     if no_tmdb:
         where.append("m.tmdb_id IS NULL")
+    in_lib = _in_library_clause("m", "movie", in_library)  # In Library filter
+    if in_lib:
+        where.append(in_lib)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return clause, params
 
@@ -6597,10 +6628,11 @@ def _movie_filter_clause(
 def list_movies(
     limit: int = 50, offset: int = 0, search: str | None = None, category_id: int | None = None,
     provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> list[dict]:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         rows = conn.execute(
             f"SELECT m.* FROM movies m {clause} ORDER BY m.name LIMIT ? OFFSET ?",
             (*params, limit, offset),
@@ -6613,10 +6645,11 @@ def list_movies(
 
 def count_movies(
     search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> int:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         n = conn.execute(f"SELECT COUNT(*) c FROM movies m {clause}", params).fetchone()["c"]
         conn.close()
         return n
@@ -6626,10 +6659,11 @@ def count_movies(
 
 def list_all_movie_ids(
     search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> list[int]:
     conn = _connect()
     try:
-        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _movie_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         rows = conn.execute(f"SELECT m.id FROM movies m {clause}", params).fetchall()
         conn.close()
         return [r["id"] for r in rows]
@@ -7557,6 +7591,7 @@ def upsert_series(name: str, year: int | None = None, **fields) -> int:
 
 def _series_filter_clause(
     search: str | None, category_id: int | None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> tuple[str, list]:
     where = ["s.review_excluded = ?"]
     params: list = [1 if archived else 0]
@@ -7582,6 +7617,9 @@ def _series_filter_clause(
         params.append(provider_id)
     if no_tmdb:
         where.append("s.tmdb_id IS NULL")
+    in_lib = _in_library_clause("s", "series", in_library)  # In Library filter
+    if in_lib:
+        where.append(in_lib)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return clause, params
 
@@ -7589,10 +7627,11 @@ def _series_filter_clause(
 def list_series(
     limit: int = 50, offset: int = 0, search: str | None = None, category_id: int | None = None,
     provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> list[dict]:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         rows = conn.execute(
             f"""SELECT s.*, p.name AS import_provider_name FROM series s
             LEFT JOIN providers p ON p.id = s.import_provider_id
@@ -7607,10 +7646,11 @@ def list_series(
 
 def count_series(
     search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> int:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         n = conn.execute(f"SELECT COUNT(*) c FROM series s {clause}", params).fetchone()["c"]
         conn.close()
         return n
@@ -7620,10 +7660,11 @@ def count_series(
 
 def list_all_series_ids(
     search: str | None = None, category_id: int | None = None, provider_id: int | None = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: str | None = None,
 ) -> list[int]:
     conn = _connect()
     try:
-        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb)
+        clause, params = _series_filter_clause(search, category_id, provider_id, archived, no_tmdb, in_library)
         rows = conn.execute(f"SELECT s.id FROM series s {clause}", params).fetchall()
         conn.close()
         return [r["id"] for r in rows]
@@ -13347,6 +13388,165 @@ def acknowledge_notice(notice_id: int) -> bool:
             return n > 0
         finally:
             conn.close()
+
+
+# ── In Library badge (library_presence.py) ──────────────────────────────────
+
+_PRESENCE_COLS = ("library", "kind", "tmdb_id", "imdb_id", "tvdb_id", "title", "year", "season", "episode")
+
+
+def _insert_presence(conn: sqlite3.Connection, server: str, server_name: str, rows: list[dict]) -> None:
+    now = _now()
+    conn.executemany(
+        "INSERT INTO library_presence (server, server_name, " + ", ".join(_PRESENCE_COLS) + ", seen_at) "
+        "VALUES (?,?," + ",".join("?" for _ in _PRESENCE_COLS) + ",?)",
+        [(server, server_name, *(r.get(c) for c in _PRESENCE_COLS), now) for r in rows])
+
+
+def replace_library_presence(server: str, server_name: str, rows: list[dict]) -> None:
+    """The whole set for one server, replaced in one transaction."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("DELETE FROM library_presence WHERE server=?", (server,))
+            _insert_presence(conn, server, server_name, rows)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def add_library_presence_rows(server: str, server_name: str, rows: list[dict]) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            _insert_presence(conn, server, server_name, rows)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def delete_library_presence(servers_to_keep: list[str] | None = None, server: str | None = None) -> None:
+    """Drops one server's rows, or every server's rows except servers_to_keep."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            if server is not None:
+                conn.execute("DELETE FROM library_presence WHERE server=?", (server,))
+            else:
+                keep = list(servers_to_keep or [])
+                conn.execute("DELETE FROM library_presence WHERE server NOT IN (" + ",".join("?" for _ in keep) + ")"
+                             if keep else "DELETE FROM library_presence", keep)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+# prune individual import marks once a server lists them or they age out
+def delete_library_presence_ids(ids: list[int]) -> None:
+    if not ids:
+        return
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                conn.execute("DELETE FROM library_presence WHERE id IN (" + ",".join("?" for _ in chunk) + ")", chunk)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def list_library_presence() -> list[dict]:
+    conn = _connect()
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM library_presence ORDER BY id").fetchall()]
+    finally:
+        conn.close()
+
+
+def library_presence_summary() -> dict:
+    """Per server: row count and when it was last scanned."""
+    conn = _connect()
+    try:
+        return {r["server"]: {"count": r["n"], "seen_at": r["seen_at"]} for r in conn.execute(
+            "SELECT server, COUNT(*) n, MAX(seen_at) seen_at FROM library_presence GROUP BY server").fetchall()}
+    finally:
+        conn.close()
+
+
+def presence_match_inputs() -> dict:
+    """Everything matching needs from the catalog, in three reads."""
+    conn = _connect()
+    try:
+        return {
+            "movies": [dict(r) for r in conn.execute("SELECT id, name, year, tmdb_id, imdb_id FROM movies").fetchall()],
+            "series": [dict(r) for r in conn.execute("SELECT id, name, year, tmdb_id, imdb_id FROM series").fetchall()],
+            "episodes": [dict(r) for r in conn.execute(
+                "SELECT id, series_id, season_number, episode_number FROM episodes").fetchall()],
+        }
+    finally:
+        conn.close()
+
+
+def presence_catalog_fingerprint() -> tuple:
+    """Changes whenever matching could give a different answer (titles, ids, rows added/removed)."""
+    conn = _connect()
+    try:
+        out = []
+        for table in ("movies", "series"):
+            out.extend(conn.execute(f"SELECT COUNT(*), MAX(id), MAX(updated_at) FROM {table}").fetchone())
+        out.extend(conn.execute("SELECT COUNT(*), MAX(id) FROM episodes").fetchone())
+        out.extend(conn.execute("SELECT COUNT(*), MAX(id) FROM library_presence").fetchone())
+        return tuple(out)
+    finally:
+        conn.close()
+
+
+def replace_presence_items(items: list[tuple[str, int, str]]) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("DELETE FROM library_presence_items")
+            conn.executemany("INSERT OR REPLACE INTO library_presence_items (kind, item_id, label) VALUES (?,?,?)", items)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def add_presence_items(items: list[tuple[str, int, str]]) -> None:
+    """Marks items present now, keeping any label they already have."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.executemany("INSERT OR IGNORE INTO library_presence_items (kind, item_id, label) VALUES (?,?,?)", items)
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def presence_labels(kind: str, ids: list[int]) -> dict[int, str]:
+    if not ids:
+        return {}
+    conn = _connect()
+    try:
+        out = {}
+        ids = list(ids)
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            for r in conn.execute("SELECT item_id, label FROM library_presence_items WHERE kind=? AND item_id IN ("
+                                  + ",".join("?" for _ in chunk) + ")", (kind, *chunk)).fetchall():
+                out[r["item_id"]] = r["label"]
+        return out
+    finally:
+        conn.close()
+
+
+def _in_library_clause(alias: str, kind: str, in_library: str | None) -> str | None:
+    if in_library == "only":
+        return f"{alias}.id IN (SELECT item_id FROM library_presence_items WHERE kind='{kind}')"
+    if in_library == "hide":
+        return f"{alias}.id NOT IN (SELECT item_id FROM library_presence_items WHERE kind='{kind}')"
+    return None
 
 
 def update_download_job(job_id: int, only_if_status: tuple[str, ...] | None = None, **fields) -> bool:

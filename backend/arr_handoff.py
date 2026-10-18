@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import config
+import library_presence
 import notices
 import vod_db
 from arr_client import ArrClient, ArrError
@@ -191,6 +192,10 @@ def _tick_importing(job: dict, client, settings: dict, now: float) -> None:
     if status == "completed" and client.has_file(job["arr_id"], *_episode_numbers(job)):
         vod_db.update_import(job["id"], import_status="imported", import_note=None)
         logger.info("[handoff] job=%s imported into %s", job["id"], _APP[job["kind"]])
+        try:  # show the In Library badge now, before the next media-server scan
+            library_presence.mark_imported(job)
+        except Exception:
+            logger.exception("[handoff] job=%s in-library mark failed", job["id"])
     elif status in ("completed", "failed", "aborted", "cancelled"):
         found = finished_path_for(job, settings)
         reason = client.rejection_for(_import_target(found, settings, job["kind"])) if found else None

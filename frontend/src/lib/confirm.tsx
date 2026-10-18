@@ -12,11 +12,12 @@ import { Button } from '@/components/ui/button'
 // so any component anywhere can call askConfirm directly without prop
 // drilling; each top-level page mounts one <ConfirmDialogHost /> to
 // actually render it.
-type ConfirmState = { message: string; onConfirm: () => void } | null
+type ConfirmState = { message: string; onConfirm: () => void; confirmLabel?: string } | null
 let _setConfirmDialog: ((state: ConfirmState) => void) | null = null
 
-export function askConfirm(message: string, onConfirm: () => void) {
-  _setConfirmDialog?.({ message, onConfirm })
+// confirmLabel lets a caller name the action, e.g. "Download anyway"
+export function askConfirm(message: string, onConfirm: () => void, confirmLabel?: string) {
+  _setConfirmDialog?.({ message, onConfirm, confirmLabel })
 }
 
 // Same rationale as askConfirm, for the OTHER native dialog that blocks
@@ -83,7 +84,7 @@ export function ConfirmDialogHost() {
           <p className="text-sm whitespace-pre-wrap pr-4">{confirmDialog.message}</p>
           <div className="flex justify-end gap-2">
             <Button size="sm" variant="outline" onClick={() => setConfirmDialog(null)}>Cancel</Button>
-            <Button size="sm" onClick={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}>Confirm</Button>
+            <Button size="sm" onClick={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }}>{confirmDialog.confirmLabel ?? 'Confirm'}</Button>
           </div>
         </div>
       </div>
