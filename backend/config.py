@@ -372,6 +372,7 @@ _DOWNLOADS_DEFAULTS = {
     "speed_limit_mbps": 0,      # 0 = unlimited
     "provider_concurrent": 1,   # downloads at once from ONE provider
     "pause_seconds": 0,         # rest between two downloads from the same provider
+    "reconnect_slow": True,     # drop and resume a transfer that crawls, on a fresh connection
     # optional: only START downloads inside this local-time window (hours 0-23)
     "window_enabled": False, "window_start": 1, "window_end": 7,
 }
@@ -386,6 +387,7 @@ def get_download_settings() -> dict:
     out["audio_languages"] = (out["audio_languages"] or "").strip().lower()
     out["keep_subtitles"] = bool(out["keep_subtitles"])
     out["tmdb_id_in_folder"] = bool(out["tmdb_id_in_folder"])
+    out["reconnect_slow"] = bool(out["reconnect_slow"])
     out["max_concurrent"] = min(4, max(1, int(out["max_concurrent"] or 1)))
     out["encoder"] = out["encoder"] if out["encoder"] in ("software", "auto", "vaapi", "qsv", "nvenc") else "software"
     out["hw_device"] = (out["hw_device"] or "").strip()

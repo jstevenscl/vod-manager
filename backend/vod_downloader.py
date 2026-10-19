@@ -32,6 +32,7 @@ local copy. Nothing is ever deleted from the library folder except our own parti
 
 import asyncio
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -66,6 +67,14 @@ _CAPACITY_WAIT_SECONDS = 60
 _PROGRESS_WRITE_SECONDS = 1.0
 _SPACE_CHECK_SECONDS = 10.0
 _MAX_ATTEMPTS = 3
+# A provider's throughput can swing 10x from one connection to the next, so a transfer that has crawled for a
+# while is dropped and resumed (Range) on a fresh connection. Judged over the last _SLOW_WINDOW seconds.
+_SLOW_WINDOW = 30.0
+_SLOW_FLOOR_BPS = 1_000_000          # below ~1 MB/s ...
+_SLOW_FRACTION = 0.2                 # ... or below a fifth of the best this file has managed
+_SLOW_MIN_REMAINING = 200 * 1024 * 1024
+_SLOW_MAX_RECONNECTS = 4
+_SPEED_WINDOW = 8.0                  # the live MB/s shown in the queue
 _WRITE_CHUNK = 1024 * 1024
 
 _PUSHBACK_STATUSES = (403, 429, 458, 509)
@@ -597,6 +606,7 @@ class _Ctx:
         self.rate_bps = 0           # 0 = unthrottled
         self.lo, self.hi = 0.0, 1.0  # this phase's slice of the 0..1 progress bar
         self.note: str | None = None
+        self.reconnect_slow = True  # drop and resume a crawling transfer on a fresh connection
         self._last_write = 0.0
         self._last_space = 0.0
 
@@ -658,11 +668,29 @@ def _page_error(provider_name: str, status: int, ctype: str, snippet: str) -> Ex
     return DownloadError(f"The provider returned a web page instead of a video file (HTTP {status}, {kind}).{detail}")
 
 
+def _server_id(host: str) -> str:
+    """A short stable id for the server a download was redirected to: same id, same server. The host itself is not shown."""
+    return hashlib.sha1((host or "").encode()).hexdigest()[:5]
+
+
+def _window_rate(samples, window: float) -> float | None:
+    """Bytes/second over the last `window` seconds of (time, bytes) samples, or None until there are enough."""
+    if len(samples) < 2:
+        return None
+    now, cur = samples[-1]
+    old = next(((t, b) for t, b in samples if now - t <= window), samples[0])
+    span = now - old[0]
+    return (cur - old[1]) / span if span >= min(window, 3.0) * 0.8 else None
+
+
 async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx, provider_name: str = "provider") -> int:
     """Streams url into part, resuming a previous partial file, at most ctx.rate_bps bytes/second
-    when a speed cap applies. Returns the final size."""
+    when a speed cap applies. Returns the final size. The queue note shows the live speed and which server
+    the provider redirected to; a transfer that crawls is resumed on a fresh connection (see _SLOW_*)."""
     headers = {"User-Agent": user_agent} if user_agent else dict(xc_server._UPSTREAM_HEADERS)
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
+    attempt, reconnects, peak = 0, 0, 0.0
+    while attempt < _MAX_ATTEMPTS:
+        attempt += 1
         ctx.check()
         resume = part.stat().st_size if part.exists() else 0
         req_headers = dict(headers)
@@ -693,16 +721,43 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                     free = _free_bytes(ctx.out_root)
                     if total and free is not None and free - (total - done) < ctx.min_free:
                         raise DownloadError("Not enough free space for this file with the free-space limit you set.")
+                    # Resuming needs the provider to honour Range. Some send a non-standard value (e.g. "0-123"), so
+                    # anything except none counts; with no header at all a transfer is never dropped on purpose.
+                    ar = (resp.headers.get("accept-ranges") or "").strip().lower()
+                    can_resume = bool(ar) and ar != "none" and bool(total)
+                    sid = _server_id(resp.url.host)
+                    tag = f"server {sid}" + (f" · reconnected {reconnects}×" if reconnects else "")
+                    ctx.note = f"Downloading · {tag}"
                     buf = bytearray()
                     began, began_done = time.monotonic(), done
+                    samples: collections.deque = collections.deque()
+                    last_note, slow = 0.0, False
                     with open(part, mode) as fh:
                         async for chunk in resp.aiter_bytes(256 * 1024):
                             buf += chunk
+                            now = time.monotonic()
+                            samples.append((now, done + len(buf)))
+                            while samples and now - samples[0][0] > _SLOW_WINDOW + 1:
+                                samples.popleft()
                             if ctx.rate_bps:
                                 # sleep long enough that the average since we began stays at the cap
                                 ahead = (done + len(buf) - began_done) / ctx.rate_bps - (time.monotonic() - began)
                                 if ahead > 0:
                                     await asyncio.sleep(min(ahead, 5))
+                            if now - last_note >= 2:
+                                last_note = now
+                                rate = _window_rate(samples, _SPEED_WINDOW)
+                                ctx.note = f"Downloading · {rate / 1e6:.1f} MB/s · {tag}" if rate is not None else f"Downloading · {tag}"
+                            if (ctx.reconnect_slow and can_resume and not ctx.rate_bps and reconnects < _SLOW_MAX_RECONNECTS
+                                    and now - began >= _SLOW_WINDOW and total - (done + len(buf)) >= _SLOW_MIN_REMAINING):
+                                rate = _window_rate(samples, _SLOW_WINDOW)
+                                if rate is not None:
+                                    peak = max(peak, rate)
+                                    if rate < max(_SLOW_FLOOR_BPS, _SLOW_FRACTION * peak):
+                                        logger.info("[download] job=%s slow (%.1f MB/s, best so far %.1f) on server %s; reconnecting (%d/%d)",
+                                                    ctx.job_id, rate / 1e6, peak / 1e6, sid, reconnects + 1, _SLOW_MAX_RECONNECTS)
+                                        slow = True
+                                        break
                             if len(buf) >= _WRITE_CHUNK:
                                 await asyncio.to_thread(fh.write, bytes(buf))
                                 done += len(buf)
@@ -713,6 +768,11 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                             await asyncio.to_thread(fh.write, bytes(buf))
                             done += len(buf)
                     ctx.progress(done, total, force=True)
+                    if slow:
+                        reconnects += 1
+                        attempt -= 1  # dropping a slow connection on purpose is not a failed attempt
+                        await asyncio.sleep(1)
+                        continue
                     if total and done != total:
                         raise httpx.ReadError("connection closed before the whole file arrived")
                     if done < 1024:
@@ -1007,6 +1067,7 @@ async def _fetch(job: dict, source: dict, dest: Path, ctx: _Ctx, settings: dict)
     _provider_active[pid] = _provider_active.get(pid, 0) + 1
     _job_provider[job["id"]] = pid
     ctx.rate_bps = int(policy["speed_mbps"] * 125_000)
+    ctx.reconnect_slow = bool(settings.get("reconnect_slow", True))
     try:
         xc_server._active_sessions[ctx.session_id] = {
             "conn_id": ctx.session_id, "kind": kind, "title": f"{job['title']} (download)", "provider_name": provider["name"],

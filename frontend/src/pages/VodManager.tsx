@@ -2285,7 +2285,7 @@ interface DownloadJob {
   import_note?: string | null
 }
 interface DownloadSettings {
-  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; tmdb_id_in_folder: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
+  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; tmdb_id_in_folder: boolean; reconnect_slow: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
   encoder: string; hw_device: string; encode_threads: number
   speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
   window_enabled: boolean; window_start: number; window_end: number
@@ -2570,6 +2570,10 @@ function DownloadsCard() {
             <label className="flex items-center gap-1" title="How many downloads may run at once from the same provider. Needs the provider's own connection limit to allow it.">
               At once per provider
               <input className={inputCls('w-12')} type="number" min={1} max={4} value={draft.provider_concurrent} onChange={(e) => setDraft({ ...draft, provider_concurrent: Math.min(4, Math.max(1, Number(e.target.value) || 1)) })} />
+            </label>
+            <label className="flex items-center gap-1" title="Provider speeds can swing 10x from one connection to the next. When a large download has crawled for about 30 seconds, drop it and carry on from the same byte on a fresh connection (up to 4 times per file). Never done when you set a speed cap, or if the provider cannot resume.">
+              <input type="checkbox" checked={draft.reconnect_slow} onChange={(e) => setDraft({ ...draft, reconnect_slow: e.target.checked })} />
+              Reconnect when slow
             </label>
             <label className="flex items-center gap-1" title="Rest between two downloads from the same provider.">
               Pause between

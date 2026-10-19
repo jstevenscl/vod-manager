@@ -4034,6 +4034,7 @@ class DownloadSettingsRequest(BaseModel):
     audio_languages: str = ""
     keep_subtitles: bool = True
     tmdb_id_in_folder: bool = True
+    reconnect_slow: bool = True
     default_preset: str = "original"
     max_concurrent: int = 1
     min_free_gb: int = 5

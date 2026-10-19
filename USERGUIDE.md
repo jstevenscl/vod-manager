@@ -940,6 +940,21 @@ provider can override (**Providers → Downloads**; blank means "use the default
 | At once per provider | How many downloads may run on one provider together (needs a matching max streams). |
 | Pause between (seconds) | A rest between two downloads from the same provider. |
 | Only between (hours) | Optionally only *start* downloads in a quiet window, such as 1-7. |
+| Reconnect when slow | Drops a download that has crawled for about 30 seconds and resumes it on a fresh connection (on by default; see below). |
+
+**Seeing how a download is going, and slow providers.** While a download runs, the note under its name in
+the queue shows the live speed and a short **server** id, for example *Downloading · 3.7 MB/s · server 50830*.
+Most providers answer the request by sending the download to one of their own content servers, and that server
+is what you are really downloading from. The id is a short code for it (the address itself is not shown): the
+same id means the same server, so you can see whether slow downloads share one. Provider speeds can also swing
+ten times from one connection to the next, even for the same title and server.
+With **Reconnect when slow** ticked (the default, in the pacing row), a large download that has crawled for about
+half a minute (under roughly 1 MB/s, or under a fifth of the best speed that file has reached) is dropped and carried on
+from the same byte on a fresh connection, up to four times per file; the note then says *reconnected 1×*. It is never
+done when you set a **Speed cap** (the cap is the slowness), when the provider does not support resuming, or
+for the last 200 MB of a file. It uses the same single provider connection throughout. If downloads still crawl,
+try **Pause between** (some providers slow an account that makes many requests in a row), a lower **At once per
+provider**, another source for the same title (each source has its own download icon), or a different time of day.
 
 If a provider answers "slow down" (HTTP 429, 458, 509 or 403) the download waits and
 retries with a growing delay on its own, and gives up after several refusals so it
@@ -2325,6 +2340,12 @@ expired. With several sources, failover moves on to the next one by itself.
 **The progress bar sits at 50% while it is re-encoding.** The first half is the download and the second
 half the re-encode. The bar moves with the encode when the file reports its length; if it does not, the bar
 follows how much of the file ffmpeg has read, and the status line shows how much has been written so far.
+
+**Downloads start fast and then crawl (0.5 to 2 MB/s).** Provider speeds vary a lot per request, and some providers
+slow an account after several big transfers in a row. The queue note shows the live speed and the server id; with
+**Reconnect when slow** on (the default) a crawling transfer is resumed on a fresh connection by itself. You can also add a
+**Pause between** downloads, lower **At once per provider**, pick a different source for the title, or try again later.
+A VPN or other network path can change which server the provider sends you to.
 
 **Movies/series show up as duplicates.** Run Duplicate Finder (§11) — most
 duplication is either a punctuation difference between providers (that
