@@ -13662,13 +13662,22 @@ _CLEARABLE = ("status IN ('done','failed','cancelled') AND "
               + ",".join(f"'{s}'" for s in PENDING_IMPORT_STATUSES) + "))")
 
 
-def clear_finished_downloads() -> int:
+def clear_finished_downloads(job_ids: list[int] | None = None, failed_only: bool = False) -> int:
     """Removes finished/failed/cancelled rows from the list (never touches files).
-    Rows still waiting on a Radarr/Sonarr import are kept."""
+    Rows still waiting on a Radarr/Sonarr import are kept. job_ids limits it to
+    those rows; failed_only to failed/cancelled downloads."""
+    where, params = _CLEARABLE, []
+    if failed_only:
+        where += " AND status IN ('failed','cancelled')"
+    if job_ids is not None:
+        if not job_ids:
+            return 0
+        where += f" AND id IN ({','.join('?' * len(job_ids))})"
+        params = list(job_ids)
     with _WRITE_LOCK:
         conn = _connect()
         try:
-            n = conn.execute(f"DELETE FROM download_jobs WHERE {_CLEARABLE}").rowcount
+            n = conn.execute(f"DELETE FROM download_jobs WHERE {where}", params).rowcount
             _commit_with_retry(conn)
             return n
         finally:

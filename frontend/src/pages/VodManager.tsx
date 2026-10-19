@@ -2442,7 +2442,7 @@ function DownloadsCard() {
   const cancelJobs = useMutation({ mutationFn: (ids: number[] | null) => api.post('/vod/downloads/cancel/', { job_ids: ids }), onSuccess: refresh })
   const retryJob = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry/`), onSuccess: refresh })
   const clearJobs = useMutation({
-    mutationFn: () => api.post('/vod/downloads/clear/').then((r) => r.data as { cleared: number; kept: number }),
+    mutationFn: (body?: { job_ids?: number[]; failed_only?: boolean }) => api.post('/vod/downloads/clear/', body ?? {}).then((r) => r.data as { cleared: number; kept: number }),
     onSuccess: (r) => { refresh(); if (r.kept) toast.info(`${r.kept} kept: library import still pending`) },
   })
   const retryImport = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry-import/`), onSuccess: refresh, onError: (e: any) => toast.error(errText(e)) })
@@ -2620,7 +2620,8 @@ function DownloadsCard() {
               {counts.running ?? 0} running, {counts.queued ?? 0} waiting, {counts.done ?? 0} done{counts.failed ? `, ${counts.failed} failed` : ''}
             </span>
             {active > 0 && <Button size="sm" variant="outline" disabled={cancelJobs.isPending} onClick={() => askConfirm(`Cancel all ${active} queued and running downloads? Partial files are removed.`, () => cancelJobs.mutate(null))}>Cancel all</Button>}
-            {data.jobs.some((j) => ['done', 'failed', 'cancelled'].includes(j.status)) && <Button size="sm" variant="outline" disabled={clearJobs.isPending} onClick={() => clearJobs.mutate()}>Clear finished</Button>}
+            {data.jobs.some((j) => ['done', 'failed', 'cancelled'].includes(j.status)) && <Button size="sm" variant="outline" disabled={clearJobs.isPending} onClick={() => clearJobs.mutate(undefined)}>Clear finished</Button>}
+            {data.jobs.some((j) => j.status === 'failed' || j.status === 'cancelled') && <Button size="sm" variant="outline" disabled={clearJobs.isPending} onClick={() => clearJobs.mutate({ failed_only: true })}>Clear failed</Button>}
           </div>
           {!data.in_window && <p className="text-muted-foreground">Outside the download window: queued items start at {data.settings.window_start}:00.</p>}
           {data.jobs.length === 0 && <p className="text-muted-foreground">Nothing queued yet. Use the download button on a movie, an episode, or a source, or select titles and choose Download selected.</p>}
@@ -2650,6 +2651,7 @@ function DownloadsCard() {
                       {j.status === 'done' && <button className="text-muted-foreground hover:text-foreground disabled:opacity-50" title="Save this file to the device you are using" disabled={saveToDevice.isPending} onClick={() => saveToDevice.mutate(j.id)}><Download size={12} /></button>}
                       {(j.status === 'failed' || j.status === 'cancelled') && <button className="text-muted-foreground hover:text-foreground" title="Try again" onClick={() => retryJob.mutate(j.id)}><RotateCcw size={12} /></button>}
                       {(j.import_status === 'failed' || j.import_status === 'timed_out') && <button className="ml-1.5 px-1 rounded border border-border text-[10px] hover:bg-accent disabled:opacity-50" title="Look for the finished file again and re-run the import" disabled={retryImport.isPending} onClick={() => retryImport.mutate(j.id)}>Retry import</button>}
+                      {['done', 'failed', 'cancelled'].includes(j.status) && !PENDING_IMPORT.includes(j.import_status ?? '') && <button className="ml-1.5 text-muted-foreground hover:text-destructive disabled:opacity-50" title="Remove from the list (the downloaded file is kept)" disabled={clearJobs.isPending} onClick={() => clearJobs.mutate({ job_ids: [j.id] })}><Trash2 size={12} /></button>}
                     </td>
                   </tr>
                 ))}
@@ -2683,6 +2685,9 @@ function InLibraryBadge({ where }: { where?: string | null }) {
   if (!where) return null
   return <span title={`Already in your library (${where})`} className={`inline-flex items-center rounded border px-1.5 py-px text-[10px] font-semibold leading-tight whitespace-nowrap ${IN_LIBRARY_CLS}`}>In Library</span>
 }
+
+// import still in progress: the row stays so the watcher can finish (vod_db.PENDING_IMPORT_STATUSES)
+const PENDING_IMPORT = ['add', 'ready', 'waiting', 'importing']
 
 function ImportChip({ job }: { job: DownloadJob }) {
   const app = job.kind === 'movie' ? 'Radarr' : 'Sonarr'
