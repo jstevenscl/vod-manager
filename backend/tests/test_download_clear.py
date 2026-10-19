@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 import config
 import vod_db
 import vod_downloader
@@ -59,3 +61,33 @@ def test_clear_without_body_still_clears_all_finished(db, tmp_path):
     _job(db, tmp_path, "failed")
     _job(db, tmp_path, "done")
     assert asyncio.run(vod_routes.clear_downloads()) == {"cleared": 2, "kept": 0}
+
+
+def test_force_removes_pending_import_row(db, tmp_path):
+    pending = _job(db, tmp_path, "done", "waiting")
+    assert _clear(job_ids=[pending]) == {"cleared": 0, "kept": 1}
+    assert _clear(job_ids=[pending], force=True) == {"cleared": 1, "kept": 0}
+    assert vod_db.get_download_job(pending) is None
+
+
+def test_force_still_never_touches_active_rows(db, tmp_path):
+    queued = _job(db, tmp_path, "queued")
+    running = _job(db, tmp_path, "running")
+    assert _clear(job_ids=[queued, running], force=True) == {"cleared": 0, "kept": 0}
+    assert all(vod_db.get_download_job(j) for j in (queued, running))
+
+
+@pytest.mark.parametrize("download", ["failed", "cancelled"])
+@pytest.mark.parametrize("handoff", ["add", "ready", "needs_manual"])
+def test_failed_download_with_queued_handoff_is_not_pending(db, tmp_path, download, handoff):
+    jid = _job(db, tmp_path, download, handoff)            # handoff set at enqueue; download never finished
+    assert _clear(job_ids=[jid]) == {"cleared": 1, "kept": 0}
+    jid = _job(db, tmp_path, download, handoff)
+    assert _clear(failed_only=True) == {"cleared": 1, "kept": 0}
+
+
+def test_force_bulk_clears_pending_imports(db, tmp_path):
+    done_pending = _job(db, tmp_path, "done", "waiting")
+    assert _clear() == {"cleared": 0, "kept": 1}
+    assert _clear(force=True) == {"cleared": 1, "kept": 0}
+    assert vod_db.get_download_job(done_pending) is None

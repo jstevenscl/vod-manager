@@ -4389,6 +4389,7 @@ async def ack_notice(notice_id: int):
 class DownloadClearRequest(BaseModel):
     job_ids: list[int] | None = None       # just these rows (the per-row remove)
     failed_only: bool = False              # only failed/cancelled downloads
+    force: bool = False                    # also drop rows still waiting on a library import
 
 
 @router.post("/downloads/clear/", dependencies=_GUARDS)
@@ -4399,10 +4400,11 @@ async def clear_downloads(body: DownloadClearRequest | None = None):
     finished = [j for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
                 if j["status"] in states and (wanted is None or j["id"] in wanted)]
     # keep rows whose library import is still pending, or the watcher loses them
-    pending = [j for j in finished if j.get("import_status") in vod_db.PENDING_IMPORT_STATUSES]
+    pending = [] if body.force else [j for j in finished if j["status"] == "done"
+                                     and j.get("import_status") in vod_db.PENDING_IMPORT_STATUSES]
     clear_ids = [j["id"] for j in finished if j not in pending]
     await asyncio.to_thread(vod_downloader.purge_work, clear_ids)   # drop their unfinished leftovers too
-    cleared = await asyncio.to_thread(vod_db.clear_finished_downloads, body.job_ids, body.failed_only)
+    cleared = await asyncio.to_thread(vod_db.clear_finished_downloads, body.job_ids, body.failed_only, body.force)
     return {"cleared": cleared, "kept": len(pending)}
 
 
