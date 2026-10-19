@@ -144,7 +144,7 @@ async def sync_category(category_id: int) -> dict:
         try:
             items = await _fetch_normalized_items(source)
         except Exception as exc:
-            logger.warning("[vod_list_sync] source=%s failed for category=%s: %s", source, category["name"], exc)
+            logger.warning("[vod_list_sync] source=%s failed for category=%s: %s", source, category["name"], tmdb_sync._redact(exc))
             source_errors[source] = str(exc)
             continue
 
@@ -226,6 +226,6 @@ async def sync_all(only_without_own_schedule: bool = False) -> dict:
         try:
             results[category["name"]] = await sync_category(category["id"])
         except Exception as exc:
-            logger.warning("[vod_list_sync] sync failed for category=%s: %s", category["name"], exc)
+            logger.warning("[vod_list_sync] sync failed for category=%s: %s", category["name"], tmdb_sync._redact(exc))
             results[category["name"]] = {"error": str(exc)}
     return results

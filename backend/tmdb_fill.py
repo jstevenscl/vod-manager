@@ -115,7 +115,7 @@ async def refresh_changes() -> dict:
 
 
 async def run_burst(size: int | None = None) -> dict:
-    """Fill only current catalog IDs that are missing, changed, or aging."""
+    """Fill catalog IDs that are missing, changed, or aging, then popular TMDB titles."""
     settings = get_tmdb_store_settings()
     size = settings["burst_size"] if size is None else size
     budget_left = max(0, settings["daily_budget"] - await asyncio.to_thread(tmdb_store.requests_today))
@@ -129,7 +129,20 @@ async def run_burst(size: int | None = None) -> dict:
         due = await asyncio.to_thread(tmdb_store.list_catalog_refresh_ids, media_type, referenced.get(media_type, set()), per_type)
         work += [(media_type, i) for i in due]
     work = work[:size]
-    counts = {"fetched": 0, "failed": 0, "gone": 0}
+    # Leftover budget pre-fetches the top `popular_keep` export titles per type,
+    # so newly imported titles are usually local already.
+    popular = 0
+    room = size - len(work)
+    if room > 0 and settings.get("popular_keep", 0) > 0:
+        per_type = math.ceil(room / len(tmdb_store.MEDIA_TYPES))
+        for media_type in tmdb_store.MEDIA_TYPES:
+            top = await asyncio.to_thread(tmdb_store.popular_export_ids, media_type, settings["popular_keep"])
+            top -= referenced.get(media_type, set())
+            due = await asyncio.to_thread(tmdb_store.list_catalog_refresh_ids, media_type, top, per_type)
+            due = due[:max(0, size - len(work))]
+            work += [(media_type, i) for i in due]
+            popular += len(due)
+    counts = {"fetched": 0, "failed": 0, "gone": 0, "popular": popular}
     _set(phase="filling", done=0, total=len(work))
     sem = asyncio.Semaphore(max(1, settings["concurrency"]))
 
@@ -152,7 +165,10 @@ async def run_burst(size: int | None = None) -> dict:
 
 async def retention(dry_run: bool = True) -> dict:
     referenced = await asyncio.to_thread(vod_db.list_catalog_tmdb_ids)
-    return await asyncio.to_thread(tmdb_store.retention_cleanup, referenced, dry_run=dry_run)
+    result = await asyncio.to_thread(tmdb_store.retention_cleanup, referenced, dry_run=dry_run)
+    if not dry_run:
+        result["vacuumed"] = await asyncio.to_thread(tmdb_store.vacuum_if_fragmented)
+    return result
 
 
 async def _run(phase: str, coro) -> dict:

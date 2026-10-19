@@ -30,9 +30,10 @@ def test_software_is_the_default_and_threads_can_be_capped():
 def test_vaapi_uses_the_render_device_and_the_gpu_encoder():
     a = args(engine="vaapi", device="/dev/dri/renderD129")
     j = " ".join(a)
-    assert "-init_hw_device vaapi=hw:/dev/dri/renderD129" in j and "-hwaccel vaapi" in j
+    assert "-init_hw_device vaapi=hw:/dev/dri/renderD129" in j
     assert "format=nv12,hwupload" in j and "-c:v h264_vaapi -qp 24" in j and "libx264" not in j
-    assert a.index("-hwaccel") < a.index("-i"), "decoder options must come before the input"
+    assert "-hwaccel" not in a, "the CPU decodes: GPU decode plus a CPU scale copies every frame back"
+    assert a.index("-init_hw_device") < a.index("-i")
     assert "hevc_vaapi" in " ".join(args("hevc_720", engine="vaapi", device="/dev/dri/renderD128"))
 
 
@@ -43,7 +44,7 @@ def test_qsv_goes_through_vaapi_device_init():
 
 def test_nvenc_needs_no_device_path():
     j = " ".join(args(engine="nvenc"))
-    assert "-hwaccel cuda" in j and "-c:v h264_nvenc" in j and "-cq 24" in j and "-vf" in j
+    assert "-hwaccel" not in j and "-c:v h264_nvenc" in j and "-cq 24" in j and "-vf" in j
 
 
 def test_trimming_without_reencoding_never_uses_the_gpu():

@@ -57,6 +57,11 @@ from routes import require_auth
 from secrets_util import hash_password, looks_like_fernet_token
 import ai_assist
 import apply_exclusions_job
+import arr_client
+import arr_handoff
+import library_presence
+import config
+import notices
 import auto_episode_titles
 import dispatcharr_dvr_client
 import dispatcharr_dvr_importer
@@ -1700,6 +1705,8 @@ async def delete_provider(provider_id: int):
     # indexes -- off the event loop so it doesn't stall every other request
     # (including the Activity poll) while it runs.
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
+    # an In Library server linked to this provider goes with it
+    await asyncio.to_thread(library_presence.forget_provider, provider_id)
     await vod_importer.evict_provider_client(provider_id)
     await rclone_client.stop_daemon(provider_id)
     return {"ok": True}
@@ -3410,21 +3417,40 @@ async def bulk_resolve_missing_artwork_progress(job_id: str):
 
 # ── Movies ───────────────────────────────────────────────────────────────────
 
+def _check_in_library(in_library: str | None) -> None:
+    if in_library not in (None, "", "only", "hide"):
+        raise HTTPException(400, detail="in_library must be 'only' or 'hide'")
+
+
+def _attach_series_presence(series_list: list[dict]) -> None:
+    """In Library label on each series, True/False on each episode; local table only."""
+    presence = vod_db.presence_labels("series", [s["id"] for s in series_list])
+    ep_presence = vod_db.presence_labels("episode", [e["id"] for s in series_list for e in s.get("episodes") or []])
+    for s in series_list:
+        s["in_library"] = presence.get(s["id"])
+        for e in s.get("episodes") or []:
+            e["in_library"] = e["id"] in ep_presence
+
+
 @router.get("/movies/", dependencies=_GUARDS)
 async def list_movies(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
     provider_id: Optional[int] = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: Optional[str] = None,
 ):
-    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb)
+    _check_in_library(in_library)
+    movies = vod_db.list_movies(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb, in_library=in_library)
     ids = [m["id"] for m in movies]
     sources_by_id    = vod_db.list_movie_sources_for_ids(ids)
     placements_by_id = vod_db.list_movie_placements_for_ids(ids)
+    presence = vod_db.presence_labels("movie", ids)  # In Library badge, local table only
     for m in movies:
         m["sources"]    = sources_by_id.get(m["id"], [])
         m["placements"] = placements_by_id.get(m["id"], [])
+        m["in_library"] = presence.get(m["id"])
     return {
         "items": movies,
-        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb),
+        "total": vod_db.count_movies(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb, in_library=in_library),
         "limit": limit,
         "offset": offset,
     }
@@ -3722,8 +3748,10 @@ async def enrich_movie(movie_id: int, force: bool = False):
 async def list_series(
     limit: int = 50, offset: int = 0, search: Optional[str] = None, category_id: Optional[int] = None,
     provider_id: Optional[int] = None, archived: bool = False, no_tmdb: bool = False,
+    in_library: Optional[str] = None,
 ):
-    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb)
+    _check_in_library(in_library)
+    series = vod_db.list_series(limit=limit, offset=offset, search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb, in_library=in_library)
     ids = [s["id"] for s in series]
     episodes_by_id   = vod_db.list_episodes_for_series_ids(ids)
     placements_by_id = vod_db.list_series_placements_for_ids(ids)
@@ -3734,9 +3762,10 @@ async def list_series(
         for e in s["episodes"]:
             e["sources"] = episode_sources_by_id.get(e["id"], [])
         s["placements"] = placements_by_id.get(s["id"], [])
+    _attach_series_presence(series)  # In Library badge + episode marks
     return {
         "items": series,
-        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb),
+        "total": vod_db.count_series(search=search, category_id=category_id, provider_id=provider_id, archived=archived, no_tmdb=no_tmdb, in_library=in_library),
         "limit": limit,
         "offset": offset,
     }
@@ -3772,13 +3801,14 @@ async def run_auto_episode_titles():
 @router.get("/series/ids/", dependencies=_GUARDS)
 async def list_series_ids(
     search: Optional[str] = None, category_id: Optional[int] = None, provider_id: Optional[int] = None,
-    archived: bool = False, no_tmdb: bool = False,
+    archived: bool = False, no_tmdb: bool = False, in_library: Optional[str] = None,
 ):
     """Every series id matching the Series page's current filters (not just the
     visible page), so a bulk action can be applied to the whole filtered set."""
+    _check_in_library(in_library)
     ids = await asyncio.to_thread(
         vod_db.list_all_series_ids, search=search, category_id=category_id, provider_id=provider_id,
-        archived=archived, no_tmdb=no_tmdb,
+        archived=archived, no_tmdb=no_tmdb, in_library=in_library,
     )
     return {"ids": ids, "total": len(ids)}
 
@@ -3818,6 +3848,7 @@ async def get_series(series_id: int):
     for e in series["episodes"]:
         e["sources"] = episode_sources_by_id.get(e["id"], [])
     series["placements"] = vod_db.list_series_placements_for_ids([series_id]).get(series_id, [])
+    _attach_series_presence([series])
     return series
 
 
@@ -4002,6 +4033,7 @@ class DownloadSettingsRequest(BaseModel):
     work_dir: str = ""
     audio_languages: str = ""
     keep_subtitles: bool = True
+    tmdb_id_in_folder: bool = True
     default_preset: str = "original"
     max_concurrent: int = 1
     min_free_gb: int = 5
@@ -4155,12 +4187,213 @@ async def retry_download(job_id: int):
     return {"ok": True}
 
 
+# ── library handoff (Radarr/Sonarr) + notices ───────────────────────────
+
+class HandoffSettingsRequest(BaseModel):
+    radarr_url: str = ""
+    sonarr_url: str = ""
+    radarr_api_key: str = ""                   # blank keeps the saved key, '-' clears it
+    sonarr_api_key: str = ""
+    movies_finished_dir: str = ""
+    shows_finished_dir: str = ""
+    movies_arr_dir: str = ""
+    shows_arr_dir: str = ""
+    radarr_root: str = ""
+    radarr_profile_id: int = 0
+    sonarr_root: str = ""
+    sonarr_profile_id: int = 0
+    new_show_monitor: str = "future"
+    new_movie_monitor: str = "unmonitored"
+    stall_hours: list[float] = [4, 8, 16]
+    fail_hours: float = 24
+
+
+class HandoffTestRequest(BaseModel):
+    url: str = ""                              # blank = the saved value
+    api_key: str = ""
+
+
+@router.get("/handoff/settings/", dependencies=_GUARDS)
+async def get_handoff_settings_route():
+    return await asyncio.to_thread(config.get_handoff_settings)
+
+
+@router.post("/handoff/settings/", dependencies=_GUARDS)
+async def save_handoff_settings(body: HandoffSettingsRequest):
+    settings = body.model_dump()
+    for key, allowed in config._HANDOFF_MONITORS.items():
+        if settings[key] not in allowed:
+            raise HTTPException(400, detail=f"{key} must be one of: " + ", ".join(allowed))
+    hours, fail = settings["stall_hours"], settings["fail_hours"]
+    if not hours or not all(a < b for a, b in zip([0] + hours, hours + [fail])):
+        raise HTTPException(400, detail="Notice hours must be above 0, increasing, and below the fail hours.")
+    # the arr_dir is the finished folder as Radarr/Sonarr see it; the library root there
+    # makes Radarr/Sonarr import from an empty folder and fail
+    for arr_key, root_key, app in (("movies_arr_dir", "radarr_root", "Radarr"), ("shows_arr_dir", "sonarr_root", "Sonarr")):
+        arr_dir = settings[arr_key].strip().rstrip("/\\")
+        if arr_dir and arr_dir == settings[root_key].strip().rstrip("/\\"):
+            raise HTTPException(400, detail=f"The finished folder as {app} sees it can't be the {app} root folder "
+                                f"({arr_dir}). Enter the folder where finished files appear, as {app} sees it, "
+                                "or leave it blank if the path is the same.")
+    await asyncio.to_thread(config.save_handoff_settings, settings)
+    return await asyncio.to_thread(config.get_handoff_settings)
+
+
+@router.post("/handoff/test/{kind}", dependencies=_GUARDS)
+async def test_handoff(kind: str, body: HandoffTestRequest):
+    """Checks the connection and returns the root folders and quality profiles to pick from."""
+    if kind not in ("radarr", "sonarr"):
+        raise HTTPException(404, detail="Unknown app.")
+    saved = await asyncio.to_thread(config.get_handoff_settings)
+    url = body.url.strip() or saved[f"{kind}_url"]
+    key = body.api_key.strip() or await asyncio.to_thread(config.get_handoff_api_key, kind)
+    if not url or not key:
+        raise HTTPException(400, detail="Enter the URL and API key first.")
+
+    def _probe():
+        client = arr_client.ArrClient(kind, url, key)
+        return client.system_status(), client.root_folders(), client.quality_profiles()
+
+    try:
+        status, roots, profiles = await asyncio.to_thread(_probe)
+    except arr_client.ArrError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True, "version": (status or {}).get("version"), "root_folders": roots, "profiles": profiles}
+
+
+# ── In Library badge (the user's own Plex / Jellyfin / Emby) ──────────────────
+# Media servers are called only by Test, Scan now and the scheduled scan; every
+# other route here reads the local library_presence tables.
+
+class LibraryServerModel(BaseModel):
+    id: Optional[str] = None                   # None = a new manual server
+    source: str = "manual"                     # "provider": linked to provider_id, nothing else stored
+    provider_id: Optional[int] = None
+    type: str = ""
+    name: str = ""
+    url: str = ""
+    api_key: str = ""                          # blank keeps the saved key, '-' clears it
+    libraries: list[dict] = []                 # [{key, title, kind}] -- only these count
+
+
+class LibraryPresenceSettingsRequest(BaseModel):
+    servers: list[LibraryServerModel] = []
+    scan_hours: int = 6
+
+
+class LibraryServerTestRequest(BaseModel):
+    provider_id: Optional[int] = None          # test a provider with its own URL and token
+    id: Optional[str] = None                   # with a blank api_key: use this manual server's saved key
+    type: str = ""
+    url: str = ""
+    api_key: str = ""
+
+
+def _media_provider(provider_id: int) -> dict | None:
+    provider = vod_db.get_provider(provider_id)
+    if provider and (provider.get("provider_type") or "").lower() in config.LIBRARY_SERVER_TYPES:
+        return provider
+    return None
+
+
+async def _presence_settings_out() -> dict:
+    out = await asyncio.to_thread(config.get_library_presence_settings)
+    out["servers"] = await asyncio.to_thread(library_presence.configured_servers)
+    out["status"] = await asyncio.to_thread(library_presence.status)
+    return out
+
+
+@router.get("/library-presence/settings/", dependencies=_GUARDS)
+async def get_library_presence_settings_route():
+    return await _presence_settings_out()
+
+
+@router.post("/library-presence/settings/", dependencies=_GUARDS)
+async def save_library_presence_settings(body: LibraryPresenceSettingsRequest):
+    for srv in body.servers:
+        if srv.source == "provider" and not (srv.provider_id and await asyncio.to_thread(_media_provider, srv.provider_id)):
+            raise HTTPException(400, detail="Pick a Plex, Jellyfin or Emby provider.")
+    try:
+        await asyncio.to_thread(config.save_library_presence_settings, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    kept = [srv["id"] for srv in await asyncio.to_thread(library_presence.configured_servers)]
+    # a removed server's titles stop counting right away
+    await asyncio.to_thread(vod_db.delete_library_presence, kept + [library_presence.IMPORT_SERVER])
+    await asyncio.to_thread(library_presence.rebuild_matches)
+    return await _presence_settings_out()
+
+
+@router.post("/library-presence/test/", dependencies=_GUARDS)
+async def test_library_server(body: LibraryServerTestRequest):
+    """Checks the connection and lists the server's movie and TV libraries to pick from."""
+    if body.provider_id is not None:
+        provider = await asyncio.to_thread(_media_provider, body.provider_id)
+        if not provider:
+            raise HTTPException(404, detail="Plex / Jellyfin / Emby provider not found")
+        stype = provider["provider_type"].lower()
+        url, key = (provider.get("base_url") or "").rstrip("/"), provider.get("password") or ""
+    else:
+        stype = body.type.strip().lower()
+        if stype not in config.LIBRARY_SERVER_TYPES:
+            raise HTTPException(400, detail="Server type must be Plex, Jellyfin or Emby.")
+        url = body.url.strip().rstrip("/")
+        key = body.api_key.strip()
+        if not key and body.id:
+            key = await asyncio.to_thread(config.get_library_server_key, body.id) or ""
+    if not url or not key:
+        raise HTTPException(400, detail="Enter the URL and token / API key first.")
+    try:
+        out = await library_presence.test_server(stype, url, key)
+    except Exception as exc:
+        raise HTTPException(400, detail="Can't connect: " + library_presence._redact(stype, exc))
+    return {"ok": True, **out}
+
+
+@router.post("/library-presence/scan/", dependencies=_GUARDS)
+async def scan_library_presence():
+    return await library_presence.scan_all()
+
+
+@router.post("/downloads/library-check/", dependencies=_GUARDS)
+async def downloads_library_check(body: DownloadQueueRequest):
+    """What in this queue request is already in the user's library (local table only)."""
+    present = await asyncio.to_thread(
+        library_presence.already_present, body.movie_ids, body.series_ids, body.episode_ids, body.season)
+    return {"present": present, "count": len(present)}
+
+
+@router.post("/downloads/{job_id}/retry-import/", dependencies=_GUARDS)
+async def retry_import(job_id: int):
+    job = await asyncio.to_thread(vod_db.get_download_job, job_id)
+    if not job or job.get("import_status") not in ("failed", "timed_out"):
+        raise HTTPException(404, detail="Only a failed or timed-out import can be retried.")
+    await arr_handoff.retry_import(job_id)
+    return {"ok": True}
+
+
+@router.get("/notices/", dependencies=_GUARDS)
+async def list_notices():
+    items = await asyncio.to_thread(notices.list_open)
+    return {"open": items, "count": len(items)}
+
+
+@router.post("/notices/{notice_id}/ack/", dependencies=_GUARDS)
+async def ack_notice(notice_id: int):
+    if not await asyncio.to_thread(notices.acknowledge, notice_id):
+        raise HTTPException(404, detail="Notice not found or already acknowledged.")
+    return {"ok": True}
+
+
 @router.post("/downloads/clear/", dependencies=_GUARDS)
 async def clear_downloads():
-    finished = [j["id"] for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
+    finished = [j for j in await asyncio.to_thread(vod_db.list_download_jobs, 100000)
                 if j["status"] in ("done", "failed", "cancelled")]
-    await asyncio.to_thread(vod_downloader.purge_work, finished)   # drop their unfinished leftovers too
-    return {"cleared": await asyncio.to_thread(vod_db.clear_finished_downloads)}
+    # keep rows whose library import is still pending, or the watcher loses them
+    pending = [j for j in finished if j.get("import_status") in vod_db.PENDING_IMPORT_STATUSES]
+    clear_ids = [j["id"] for j in finished if j not in pending]
+    await asyncio.to_thread(vod_downloader.purge_work, clear_ids)   # drop their unfinished leftovers too
+    return {"cleared": await asyncio.to_thread(vod_db.clear_finished_downloads), "kept": len(pending)}
 
 
 @router.post("/series/{series_id}/tmdb-episode-titles/", dependencies=_GUARDS)
@@ -4323,6 +4556,7 @@ async def enrich_series(series_id: int, force: bool = False):
     episode_sources_by_id = vod_db.list_episode_sources_for_episode_ids([e["id"] for e in series["episodes"]])
     for e in series["episodes"]:
         e["sources"] = episode_sources_by_id.get(e["id"], [])
+    _attach_series_presence([series])
     return {"fetched": result["fetched"], "reason": result["reason"], "series": series}
 
 

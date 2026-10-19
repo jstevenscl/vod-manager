@@ -12,12 +12,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import ai_assist
+import arr_handoff
 from backup import router as backup_router
 from config import APP_VERSION, LOG_BACKUP_COUNT, LOG_FILE, get_last_enrichment_run, get_strm_export_settings, save_last_enrichment_run
 from diagnostics import router as diagnostics_router
 import dispatcharr_dvr_importer
 import emby_vod_importer
 import library_importer
+import library_presence
 import rclone_client
 import plex_importer
 import auto_episode_titles
@@ -503,6 +505,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_strm_export_scheduler()),
         asyncio.create_task(_auto_episode_titles_scheduler()),
         asyncio.create_task(vod_downloader.download_loop()),
+        asyncio.create_task(arr_handoff.handoff_loop()),  # Radarr/Sonarr import watcher
+        asyncio.create_task(library_presence.scan_loop()),  # In Library scans of the user's media servers
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),

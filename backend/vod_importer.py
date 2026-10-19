@@ -26,6 +26,30 @@ import vod_db
 from xc_server import _redact_upstream_url
 
 
+def _matches_import_title_exclusion(
+    check_name: str, lang: dict | None = None, country: list[str] | None = None,
+) -> bool:
+    """The title-based half of _should_auto_archive: Import Language Exclusion
+    (leading prefix / non-Latin) and Import Country Exclusion (trailing
+    country tag). The XC importer skips these at intake, the same as a saved
+    category exclusion -- storing them archived only for
+    purge_excluded_archived_content to delete them again made every import
+    re-create and re-purge the same titles."""
+    lang = lang if lang is not None else config.get_import_language_exclusion()
+    if lang["exclude_prefixes"]:
+        code = vod_db._name_prefix_code(check_name)
+        if code and code in lang["exclude_prefixes"]:
+            return True
+    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(check_name):
+        return True
+    country = country if country is not None else config.get_import_country_exclusion()
+    if country:
+        code = vod_db._country_suffix_code(check_name)
+        if code and code in country:
+            return True
+    return False
+
+
 def _should_auto_archive(
     name: str, provider_category_name: str | None = None, provider_exclude_categories: list[str] = (),
     exclude_uncategorized: bool = False, lang: dict | None = None, country: list[str] | None = None,
@@ -82,18 +106,8 @@ def _should_auto_archive(
     moment a "strip ES - " display rule existed. `name` remains the default
     for any caller that doesn't have a separate raw title to pass."""
     check_name = raw_name if raw_name is not None else name
-    lang = lang if lang is not None else config.get_import_language_exclusion()
-    if lang["exclude_prefixes"]:
-        code = vod_db._name_prefix_code(check_name)
-        if code and code in lang["exclude_prefixes"]:
-            return True
-    if lang["exclude_non_latin"] and vod_db._is_non_latin_name(check_name):
+    if _matches_import_title_exclusion(check_name, lang, country):
         return True
-    country = country if country is not None else config.get_import_country_exclusion()
-    if country:
-        code = vod_db._country_suffix_code(check_name)
-        if code and code in country:
-            return True
     if provider_category_name:
         if provider_category_name in provider_exclude_categories:
             return True
@@ -505,7 +519,7 @@ async def _import_movies_for_provider(
         category_name = category_names.get(str(s.get("category_id")))
         if ((category_name or "").strip() in saved_excluded) or (
             not (category_name or "").strip() and exclude_uncategorized
-        ):
+        ) or _matches_import_title_exclusion(s.get("name") or "", lang, country):
             skipped_excluded += 1
             continue
         name, year = parse_name_year(s.get("name") or "")
@@ -593,7 +607,7 @@ async def _import_series_for_provider(
         category_name = series_category_names.get(str(s.get("category_id")))
         if ((category_name or "").strip() in saved_excluded) or (
             not (category_name or "").strip() and exclude_uncategorized
-        ):
+        ) or _matches_import_title_exclusion(s.get("name") or "", lang, country):
             skipped_excluded += 1
             continue
         name, year = parse_name_year(s.get("name") or "")

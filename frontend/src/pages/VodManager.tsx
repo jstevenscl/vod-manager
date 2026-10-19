@@ -2,10 +2,11 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
+import { toast } from '@/lib/toast'
 import { askConfirm, ConfirmDialogHost, notify, NotifyDialogHost } from '@/lib/confirm'
 
 interface Provider {
@@ -1355,6 +1356,7 @@ interface Movie {
   flagged_reason?: string | null
   sources: MovieSource[]
   placements: MoviePlacement[]
+  in_library?: string | null   // "Plex: Movies" when the user's media server has it
 }
 
 interface MetadataRule {
@@ -1369,7 +1371,7 @@ interface MetadataRule {
 }
 
 interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
-interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[]; flagged_mismatch?: number; flagged_reason?: string | null }
+interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[]; flagged_mismatch?: number; flagged_reason?: string | null; in_library?: boolean }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
   id: number
@@ -1388,6 +1390,7 @@ interface Series {
   raw_name: string | null
   episodes: Episode[]
   placements: SeriesPlacement[]
+  in_library?: string | null
 }
 
 interface MissingEpisode {
@@ -2278,9 +2281,11 @@ interface DownloadJob {
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
   note: string | null; error: string | null; bytes_done: number; total_bytes: number | null; progress: number
   provider_name: string | null; final_path: string | null; final_size: number | null
+  import_status?: 'add' | 'ready' | 'needs_manual' | 'waiting' | 'importing' | 'imported' | 'failed' | 'timed_out' | null
+  import_note?: string | null
 }
 interface DownloadSettings {
-  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
+  enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; tmdb_id_in_folder: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
   encoder: string; hw_device: string; encode_threads: number
   speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
   window_enabled: boolean; window_start: number; window_end: number
@@ -2320,13 +2325,31 @@ function queueResultText(r: { queued: number; already_queued: number; no_source:
   return (parts.join(', ') || 'Nothing to queue') + '. Progress is under Configuration → Downloads.'
 }
 
+// the queue asks first when the user's media server already has some of it
+function alreadyInLibraryText(present: { title: string; where: string }[]): string {
+  if (present.length === 1) return `Already in your library (${present[0].where}):\n${present[0].title}`
+  const lines = present.slice(0, 15).map((p) => `• ${p.title} (${p.where})`)
+  if (present.length > 15) lines.push(`…and ${present.length - 15} more`)
+  return `${present.length} of these are already in your library:\n${lines.join('\n')}`
+}
+
 function useQueueDownload() {
   const qc = useQueryClient()
-  return useMutation({
+  const mutation = useMutation({
     mutationFn: (body: Record<string, unknown>) => api.post('/vod/downloads/queue/', body).then((r) => r.data),
     onSuccess: (r) => { qc.invalidateQueries({ queryKey: ['vod-downloads'] }); notify(queueResultText(r)) },
     onError: (e: any) => notify(e?.response?.data?.detail ?? e?.message ?? 'Could not queue the download.'),
   })
+  const mutate = (body: Record<string, unknown>) => {
+    api.post('/vod/downloads/library-check/', body)
+      .then((r) => {
+        const present = (r.data?.present ?? []) as { title: string; where: string }[]
+        if (!present.length) mutation.mutate(body)
+        else askConfirm(alreadyInLibraryText(present), () => mutation.mutate(body), 'Download anyway')
+      })
+      .catch(() => mutation.mutate(body))   // the check is a courtesy; never block a download on it
+  }
+  return { ...mutation, mutate }
 }
 
 // One small icon: downloads exactly this movie / episode / source. Hidden while downloads are off.
@@ -2418,7 +2441,11 @@ function DownloadsCard() {
   })
   const cancelJobs = useMutation({ mutationFn: (ids: number[] | null) => api.post('/vod/downloads/cancel/', { job_ids: ids }), onSuccess: refresh })
   const retryJob = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry/`), onSuccess: refresh })
-  const clearJobs = useMutation({ mutationFn: () => api.post('/vod/downloads/clear/'), onSuccess: refresh })
+  const clearJobs = useMutation({
+    mutationFn: () => api.post('/vod/downloads/clear/').then((r) => r.data as { cleared: number; kept: number }),
+    onSuccess: (r) => { refresh(); if (r.kept) toast.info(`${r.kept} kept: library import still pending`) },
+  })
+  const retryImport = useMutation({ mutationFn: (id: number) => api.post(`/vod/downloads/${id}/retry-import/`), onSuccess: refresh, onError: (e: any) => toast.error(errText(e)) })
   // hands the finished file to the browser you are using (a phone, say) through a short-lived link
   const saveToDevice = useMutation({
     mutationFn: (id: number) => api.post(`/vod/downloads/${id}/link/`).then((r) => r.data.url as string),
@@ -2437,7 +2464,7 @@ function DownloadsCard() {
     <SectionCard title="Downloads (save files to your library)" icon={<Download size={14} />}>
       <p className="text-xs text-muted-foreground">
         Off by default. Turn this on to save movies and episodes from your providers as real files in a folder, named the way
-        Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year)/Season NN/…</code>).
+        Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year) [tmdbid-N]/Season NN/…</code>; the TMDB id tag can be turned off).
         You pick the source (or let failover choose) and can re-encode to a smaller file while downloading. Downloads respect each
         provider's connection limit and wait their turn behind live viewers.
       </p>
@@ -2472,6 +2499,10 @@ function DownloadsCard() {
             <span className="font-medium">Separate folders (optional)</span>
             <input className={inputCls('w-60')} placeholder="Movies folder, e.g. /downloads/movies" title="Movies are saved straight into this folder (Title (Year)/Title (Year).ext), instead of the download folder's Movies subfolder." value={draft.movies_dir} onChange={(e) => setDraft({ ...draft, movies_dir: e.target.value })} />
             <input className={inputCls('w-60')} placeholder="TV shows folder, e.g. /downloads/tv" title="Episodes are saved straight into this folder (Show (Year)/Season NN/…), instead of the download folder's Shows subfolder." value={draft.shows_dir} onChange={(e) => setDraft({ ...draft, shows_dir: e.target.value })} />
+            <label className="flex items-center gap-1" title="Adds the TMDB id to movie and show folder names, e.g. Title (Year) [tmdbid-603]. Emby, Jellyfin and Plex use it to match the right title. Off = just Title (Year). File names never include it.">
+              <input type="checkbox" checked={draft.tmdb_id_in_folder} onChange={(e) => setDraft({ ...draft, tmdb_id_in_folder: e.target.checked })} />
+              TMDB id in folder names
+            </label>
             <span className="basis-full text-muted-foreground">Leave these blank to use <code>Movies/</code> and <code>Shows/</code> inside the download folder. Set both and the download folder becomes optional.</span>
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -2599,18 +2630,22 @@ function DownloadsCard() {
                       {(j.error || j.note) && <div className={j.error ? 'text-destructive text-[11px]' : 'text-muted-foreground text-[11px]'}>{j.error ?? j.note}</div>}
                     </td>
                     <td className="py-1 pr-2 whitespace-nowrap text-muted-foreground">{j.preset === 'original' ? 'original' : j.preset.replace('_', ' ')}</td>
-                    <td className="py-1 pr-2 w-36">
+                    <td className={`py-1 pr-2 ${j.import_status ? 'min-w-36' : 'w-36'}`}>
                       {j.status === 'running' && (
                         <div className="h-1.5 rounded bg-border overflow-hidden"><div className="h-full bg-primary" style={{ width: `${Math.round(j.progress * 100)}%` }} /></div>
                       )}
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                       <span className={statusColor[j.status]}>
                         {j.status === 'running' ? `${Math.round(j.progress * 100)}% · ${dlBytes(j.bytes_done)}${j.provider_name ? ` · ${j.provider_name}` : ''}` : j.status === 'done' ? `done · ${dlBytes(j.final_size)}` : j.status}
                       </span>
+                      <ImportChip job={j} />
+                      </div>
                     </td>
                     <td className="py-1 whitespace-nowrap text-right">
                       {(j.status === 'queued' || j.status === 'running') && <button className="text-muted-foreground hover:text-destructive" title="Cancel" onClick={() => cancelJobs.mutate([j.id])}><X size={12} /></button>}
                       {j.status === 'done' && <button className="text-muted-foreground hover:text-foreground disabled:opacity-50" title="Save this file to the device you are using" disabled={saveToDevice.isPending} onClick={() => saveToDevice.mutate(j.id)}><Download size={12} /></button>}
                       {(j.status === 'failed' || j.status === 'cancelled') && <button className="text-muted-foreground hover:text-foreground" title="Try again" onClick={() => retryJob.mutate(j.id)}><RotateCcw size={12} /></button>}
+                      {(j.import_status === 'failed' || j.import_status === 'timed_out') && <button className="ml-1.5 px-1 rounded border border-border text-[10px] hover:bg-accent disabled:opacity-50" title="Look for the finished file again and re-run the import" disabled={retryImport.isPending} onClick={() => retryImport.mutate(j.id)}>Retry import</button>}
                     </td>
                   </tr>
                 ))}
@@ -2623,6 +2658,425 @@ function DownloadsCard() {
           </p>
         </div>
       )}
+    </SectionCard>
+  )
+}
+
+// ── Library handoff: finished downloads go to Radarr/Sonarr (arr_handoff.py) ──
+type ArrKind = 'radarr' | 'sonarr'
+interface HandoffSettings {
+  radarr_url: string; sonarr_url: string; radarr_has_key: boolean; sonarr_has_key: boolean
+  movies_finished_dir: string; shows_finished_dir: string; movies_arr_dir: string; shows_arr_dir: string
+  radarr_root: string; radarr_profile_id: number; sonarr_root: string; sonarr_profile_id: number
+  new_show_monitor: 'future' | 'none'; new_movie_monitor: 'unmonitored' | 'monitored'
+  stall_hours: number[]; fail_hours: number
+}
+interface ArrProbe { version: string | null; root_folders: { id: number; path: string }[]; profiles: { id: number; name: string }[] }
+
+// same lime as the queue's "In library" chip; label says which server/library has it
+const IN_LIBRARY_CLS = 'border-lime-500/40 bg-lime-500/15 text-lime-500'
+function InLibraryBadge({ where }: { where?: string | null }) {
+  if (!where) return null
+  return <span title={`Already in your library (${where})`} className={`inline-flex items-center rounded border px-1.5 py-px text-[10px] font-semibold leading-tight whitespace-nowrap ${IN_LIBRARY_CLS}`}>In Library</span>
+}
+
+function ImportChip({ job }: { job: DownloadJob }) {
+  const app = job.kind === 'movie' ? 'Radarr' : 'Sonarr'
+  const chip: Record<string, [string, string]> = {
+    needs_manual: [`Add to ${app} manually`, 'border-amber-500/40 bg-amber-500/10 text-amber-500'],
+    waiting: ['Waiting for encoder', 'border-sky-500/50 bg-sky-500/15 text-sky-600 dark:text-sky-300'],
+    importing: [`Importing into ${app}`, 'border-primary/40 bg-primary/10 text-primary'],
+    imported: ['In library', 'border-lime-500/40 bg-lime-500/15 text-lime-500'],
+    failed: ['Import failed', 'border-destructive/40 bg-destructive/10 text-destructive'],
+    timed_out: ['Import timed out', 'border-destructive/40 bg-destructive/10 text-destructive'],
+  }
+  const hit = job.import_status ? chip[job.import_status] : undefined
+  if (!hit) return null
+  return <span className={`inline-block whitespace-nowrap rounded border px-1.5 py-px text-[11px] font-medium ${hit[1]}`} title={job.import_note ?? undefined}>{hit[0]}</span>
+}
+
+// hover/focus help for the handoff folder rows -- native title tips were too terse and the
+// arr-folder row got filled with library root folders
+function HelpTip({ children, label }: { children: React.ReactNode; label: string }) {
+  return (
+    <span className="group relative inline-flex align-middle" tabIndex={0} aria-label={label}>
+      <Info size={13} className="text-muted-foreground group-hover:text-foreground cursor-help" />
+      <span role="tooltip" className="pointer-events-none absolute left-0 top-5 z-50 hidden w-80 space-y-1.5 rounded-md border border-border bg-card p-2.5 text-xs font-normal leading-snug text-foreground shadow-lg group-hover:block group-focus:block">
+        {children}
+      </span>
+    </span>
+  )
+}
+
+const trimSlash = (p: string) => p.trim().replace(/[/\\]+$/, '')
+
+function HandoffCard() {
+  const qc = useQueryClient()
+  const query = useQuery<HandoffSettings>({ queryKey: ['vod-handoff'], queryFn: () => api.get('/vod/handoff/settings/').then((r) => r.data) })
+  const [draft, setDraft] = useState<HandoffSettings | null>(null)
+  const [keys, setKeys] = useState<Record<ArrKind, string>>({ radarr: '', sonarr: '' })
+  const [probe, setProbe] = useState<Partial<Record<ArrKind, ArrProbe>>>({})
+  const [testMsg, setTestMsg] = useState<Partial<Record<ArrKind, { ok: boolean; text: string }>>>({})
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => { if (query.data && !draft) setDraft(query.data) }, [query.data, draft])
+  const errText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
+  const save = useMutation({
+    mutationFn: (d: HandoffSettings) => api.post('/vod/handoff/settings/', { ...d, radarr_api_key: keys.radarr, sonarr_api_key: keys.sonarr }).then((r) => r.data as HandoffSettings),
+    onSuccess: (saved) => { setError(null); setDraft(saved); setKeys({ radarr: '', sonarr: '' }); qc.setQueryData(['vod-handoff'], saved); toast.success('Library handoff saved') },
+    onError: (e: any) => setError(errText(e)),
+  })
+  const test = useMutation({
+    mutationFn: (kind: ArrKind) => api.post(`/vod/handoff/test/${kind}`, { url: draft?.[`${kind}_url`] ?? '', api_key: keys[kind] }).then((r) => ({ kind, data: r.data as ArrProbe })),
+    onSuccess: ({ kind, data }) => {
+      setProbe((p) => ({ ...p, [kind]: data }))
+      setTestMsg((m) => ({ ...m, [kind]: { ok: true, text: `Connected${data.version ? ` (v${data.version})` : ''}` } }))
+    },
+    onError: (e: any, kind) => setTestMsg((m) => ({ ...m, [kind]: { ok: false, text: errText(e) } })),
+  })
+  if (!draft) return null
+  const set = (patch: Partial<HandoffSettings>) => setDraft({ ...draft, ...patch })
+  // catch the "library root folder in the arr-folder box" mistake before saving; the server rejects it too
+  const onSave = () => {
+    for (const [dir, root, app] of [[draft.movies_arr_dir, draft.radarr_root, 'Radarr'], [draft.shows_arr_dir, draft.sonarr_root, 'Sonarr']]) {
+      const d = trimSlash(dir)
+      if (d && d === trimSlash(root)) {
+        const text = `"${d}" is the ${app} root folder (where your library lives), not the finished folder. Enter the folder where finished files appear, as ${app} sees it, or leave it blank if ${app} sees the same path.`
+        setError(text)
+        toast.error(text)
+        return
+      }
+    }
+    save.mutate(draft)
+  }
+
+  const appBlock = (kind: ArrKind) => {
+    const name = kind === 'radarr' ? 'Radarr' : 'Sonarr'
+    const p = probe[kind]
+    const root = draft[`${kind}_root`]
+    const profileId = draft[`${kind}_profile_id`]
+    const roots = p?.root_folders.map((r) => r.path) ?? (root ? [root] : [])
+    const profiles = p?.profiles ?? (profileId ? [{ id: profileId, name: `Profile #${profileId}` }] : [])
+    const msg = testMsg[kind]
+    return (
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className="font-medium w-14">{name}</span>
+        <input className={inputCls('w-56')} placeholder={`http://host:${kind === 'radarr' ? 7878 : 8989}`} value={draft[`${kind}_url`]} onChange={(e) => set({ [`${kind}_url`]: e.target.value } as Partial<HandoffSettings>)} />
+        <input className={inputCls('w-56')} type="password" autoComplete="off" placeholder={draft[`${kind}_has_key`] ? 'API key (saved)' : 'API key'} title={`Settings → General → API Key in ${name}. Leave blank to keep the saved key.`} value={keys[kind]} onChange={(e) => setKeys({ ...keys, [kind]: e.target.value })} />
+        <button className="px-2 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50" disabled={test.isPending} onClick={() => test.mutate(kind)}>
+          {test.isPending && test.variables === kind ? 'Testing…' : 'Test'}
+        </button>
+        {msg && <span className={msg.ok ? 'text-emerald-500' : 'text-destructive'}>{msg.text}</span>}
+        <label className="flex items-center gap-1" title={`The ${name} root folder new ${kind === 'radarr' ? 'movies' : 'shows'} are added under. Press Test to load the list.`}>
+          Root folder
+          <select className={inputCls('w-48')} value={root} onChange={(e) => set({ [`${kind}_root`]: e.target.value } as Partial<HandoffSettings>)}>
+            <option value="">{roots.length ? 'Choose…' : 'Press Test first'}</option>
+            {roots.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-1" title={`The quality profile ${name} gives titles it adds.`}>
+          Profile
+          <select className={inputCls('w-40')} value={profileId || ''} onChange={(e) => set({ [`${kind}_profile_id`]: Number(e.target.value) || 0 } as Partial<HandoffSettings>)}>
+            <option value="">{profiles.length ? 'Choose…' : 'Press Test first'}</option>
+            {profiles.map((pr) => <option key={pr.id} value={pr.id}>{pr.name}</option>)}
+          </select>
+        </label>
+      </div>
+    )
+  }
+
+  const hour = (value: number, onChange: (v: number) => void, title: string) => (
+    <input className={inputCls('w-14')} type="number" min={0.5} step={0.5} title={title} value={value} onChange={(e) => onChange(Number(e.target.value) || 0)} />
+  )
+
+  return (
+    <SectionCard title="Library handoff (Radarr / Sonarr)" icon={<ArrowRightLeft size={14} />}>
+      <p className="text-xs text-muted-foreground">
+        Optional. When a download finishes, vod-manager waits for the file to appear in the finished folder (straight away, or after an
+        encoder such as Tdarr is done with it) and asks Radarr or Sonarr to import it, so it lands in your library with their naming and
+        your media server is told. Titles they don't have yet are added when you queue the download. Nothing is ever searched for:
+        new movies are added unmonitored, new shows watch future episodes only.
+      </p>
+      <div className="space-y-2 text-xs">
+        {appBlock('radarr')}
+        {appBlock('sonarr')}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border/50 pt-2">
+          <span className="font-medium inline-flex items-center gap-1">
+            Finished folders
+            <HelpTip label="About finished folders">
+              <p>Where a finished download shows up <b>as vod-manager sees it</b>. vod-manager watches this folder and, once the file is there, asks Radarr/Sonarr to import it.</p>
+              <p>If an encoder such as Tdarr writes its output somewhere else, enter that output folder. Leave blank if there's no encoder: the download folder is used.</p>
+              <p>Example: <code>/media/finished/movies</code></p>
+              <p>This is <b>not</b> your library (root) folder like <code>/media/Movies</code>. Radarr/Sonarr move the file there themselves.</p>
+            </HelpTip>
+          </span>
+          <input className={inputCls('w-60')} placeholder="Movies (blank = download folder)" title="Where finished movies appear, with the same Title (Year)/ folders as the download. Blank = the download folder (no encoder in between)." value={draft.movies_finished_dir} onChange={(e) => set({ movies_finished_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows (blank = download folder)" title="Where finished episodes appear. Blank = the download folder." value={draft.shows_finished_dir} onChange={(e) => set({ shows_finished_dir: e.target.value })} />
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <span className="font-medium inline-flex items-center gap-1">
+            Finished folders as Radarr/Sonarr see them
+            <HelpTip label="About finished folders as Radarr/Sonarr see them">
+              <p>The <b>same finished folders as the row above</b>, written the way the Radarr and Sonarr containers see them. vod-manager uses this path when it tells them where to import from.</p>
+              <p>Only needed when Radarr/Sonarr mount the share at a different path than vod-manager. <b>Leave blank if the paths are the same</b> (most setups).</p>
+              <p>Example: vod-manager sees <code>/downloads/finished/movies</code> but Radarr sees it as <code>/media/finished/movies</code>, so enter <code>/media/finished/movies</code>.</p>
+              <p>This is <b>not</b> the Radarr/Sonarr library or root folder (for example <code>/media/Movies</code>). Pointing it there makes the import fail.</p>
+            </HelpTip>
+          </span>
+          <input className={inputCls('w-60')} placeholder="Movies (blank = same as above)" title="Only needed when Radarr mounts the finished movies folder at a different path. Blank = same path. Not the Radarr root folder." value={draft.movies_arr_dir} onChange={(e) => set({ movies_arr_dir: e.target.value })} />
+          <input className={inputCls('w-60')} placeholder="TV shows (blank = same as above)" title="Only needed when Sonarr mounts the finished shows folder at a different path. Blank = same path. Not the Sonarr root folder." value={draft.shows_arr_dir} onChange={(e) => set({ shows_arr_dir: e.target.value })} />
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+          <label className="flex items-center gap-1">New shows
+            <select className={inputCls()} value={draft.new_show_monitor} onChange={(e) => set({ new_show_monitor: e.target.value as HandoffSettings['new_show_monitor'] })}>
+              <option value="future">Monitor future episodes</option>
+              <option value="none">Don't monitor</option>
+            </select>
+          </label>
+          <label className="flex items-center gap-1">New movies
+            <select className={inputCls()} value={draft.new_movie_monitor} onChange={(e) => set({ new_movie_monitor: e.target.value as HandoffSettings['new_movie_monitor'] })}>
+              <option value="unmonitored">Unmonitored</option>
+              <option value="monitored">Monitored</option>
+            </select>
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+          <span className="font-medium">Waiting too long</span>
+          <span>notify after</span>
+          {draft.stall_hours.map((h, i) => (
+            <Fragment key={i}>
+              {hour(h, (v) => set({ stall_hours: draft.stall_hours.map((x, k) => (k === i ? v : x)) }), 'Hours after the download finished. Each one sends a notice you must acknowledge.')}
+              {i < draft.stall_hours.length - 1 && <span>,</span>}
+            </Fragment>
+          ))}
+          <span>hours, give up after</span>
+          {hour(draft.fail_hours, (v) => set({ fail_hours: v }), 'After this many hours without the finished file the import is marked failed.')}
+          <span>hours</span>
+          <span className="basis-full text-muted-foreground">Counted per download from when it finished. Each notice shows in the bell at the top and stays until you acknowledge it.</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button size="sm" disabled={save.isPending} onClick={onSave}>
+            {save.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save handoff'}
+          </Button>
+        </div>
+        {error && <p className="text-destructive">{error}</p>}
+      </div>
+    </SectionCard>
+  )
+}
+
+// In Library badge settings -- the user's own Plex / Jellyfin / Emby servers.
+// A server is a ticked Plex / Jellyfin / Emby provider (linked by id; the backend reads its URL and
+// token from the provider each time) or, as a fallback, one typed in here. The media servers are
+// called only by Test and Scan; cards read the local table.
+type LibraryServerType = 'plex' | 'jellyfin' | 'emby'
+interface LibraryRef { key: string; title: string; kind: string }
+interface LibraryServer {
+  id: string | null
+  source: 'provider' | 'manual'
+  provider_id?: number | null
+  type: LibraryServerType
+  name: string
+  url: string
+  has_key?: boolean
+  libraries: LibraryRef[]
+}
+interface LibraryScanResult { id: string; name: string; ok: boolean; count: number; error?: string | null }
+interface LibraryPresenceSettings {
+  servers: LibraryServer[]
+  scan_hours: number
+  status?: { last_scan_at: number | null; last_results: LibraryScanResult[]; rows: Record<string, { count: number; seen_at: string }> }
+}
+const LIBRARY_SERVER_LABEL: Record<LibraryServerType, string> = { plex: 'Plex', jellyfin: 'Jellyfin', emby: 'Emby' }
+const isLibraryServerType = (t: string | undefined): t is LibraryServerType => t === 'plex' || t === 'jellyfin' || t === 'emby'
+const blankManualServer = (): LibraryServer => ({ id: null, source: 'manual', type: 'plex', name: '', url: '', libraries: [] })
+
+function LibraryPresenceCard({ providers }: { providers: Provider[] }) {
+  const qc = useQueryClient()
+  const query = useQuery<LibraryPresenceSettings>({ queryKey: ['vod-library-presence'], queryFn: () => api.get('/vod/library-presence/settings/').then((r) => r.data) })
+  const mediaProviders = providers.filter((p) => isLibraryServerType(p.provider_type))
+  const [draft, setDraft] = useState<LibraryPresenceSettings | null>(null)
+  const [keys, setKeys] = useState<Record<number, string>>({})
+  const [found, setFound] = useState<Record<number, LibraryRef[]>>({})
+  const [testMsg, setTestMsg] = useState<Record<number, { ok: boolean; text: string }>>({})
+  const [error, setError] = useState<string | null>(null)
+  // A blank typed-in server is only a form to fill in: it isn't saved and doesn't make the card dirty.
+  const isBlank = (s: LibraryServer, i: number, k: Record<number, string> = keys) => s.source === 'manual' && !s.id && !s.url.trim() && !s.name.trim() && !k[i]
+  const withForm = (d: LibraryPresenceSettings) =>
+    // No Plex / Jellyfin / Emby provider to tick: open the typed-in form straight away.
+    mediaProviders.length === 0 && !d.servers.some((s) => s.source === 'manual') ? { ...d, servers: [...d.servers, blankManualServer()] } : d
+  useEffect(() => { if (query.data && !draft) setDraft(withForm(query.data)) }, [query.data, draft])
+  const errText = (e: any) => e?.response?.data?.detail ?? e?.message ?? 'Request failed.'
+  const loaded = (saved: LibraryPresenceSettings) => {
+    setError(null); setDraft(withForm(saved)); setKeys({}); setFound({}); setTestMsg({})
+    qc.setQueryData(['vod-library-presence'], saved)
+  }
+  const refreshLists = () => { qc.invalidateQueries({ queryKey: ['vod-movies'] }); qc.invalidateQueries({ queryKey: ['vod-series'] }) }
+  const payload = (d: LibraryPresenceSettings, k: Record<number, string> = keys) => d.servers.flatMap((s, i): Record<string, unknown>[] => {
+    if (s.source === 'provider') return [{ source: 'provider', provider_id: s.provider_id, libraries: s.libraries }]
+    if (isBlank(s, i, k)) return []
+    return [{ source: 'manual', id: s.id, type: s.type, name: s.name, url: s.url, api_key: k[i] ?? '', libraries: s.libraries }]
+  })
+  const save = useMutation({
+    mutationFn: (d: LibraryPresenceSettings) => api.post('/vod/library-presence/settings/', { scan_hours: d.scan_hours, servers: payload(d) })
+      .then((r) => r.data as LibraryPresenceSettings),
+    onSuccess: (saved) => { loaded(saved); refreshLists(); toast.success('In Library settings saved') },
+    onError: (e: any) => setError(errText(e)),
+  })
+  const test = useMutation({
+    mutationFn: (i: number) => {
+      const s = draft!.servers[i]
+      const body = s.source === 'provider' ? { provider_id: s.provider_id } : { id: s.id, type: s.type, url: s.url, api_key: keys[i] ?? '' }
+      return api.post('/vod/library-presence/test/', body).then((r) => ({ i, data: r.data as { version?: string | null; libraries: LibraryRef[] } }))
+    },
+    onSuccess: ({ i, data }) => {
+      setFound((f) => ({ ...f, [i]: data.libraries }))
+      setTestMsg((m) => ({ ...m, [i]: { ok: true, text: `Connected${data.version ? ` (v${data.version})` : ''}. Tick the libraries to check.` } }))
+    },
+    onError: (e: any, i) => setTestMsg((m) => ({ ...m, [i]: { ok: false, text: errText(e) } })),
+  })
+  const scan = useMutation({
+    mutationFn: () => api.post('/vod/library-presence/scan/').then((r) => r.data as { servers: LibraryScanResult[]; matched: number }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['vod-library-presence'] }); refreshLists()
+      const bad = r.servers.filter((s) => !s.ok)
+      if (bad.length) notify(`Scan finished with errors:\n${bad.map((s) => `${s.name}: ${s.error ?? 'failed'}`).join('\n')}`)
+      else toast.success(`Scan done: ${r.matched} title${r.matched === 1 ? '' : 's'} in your library`)
+    },
+    onError: (e: any) => notify(errText(e)),
+  })
+  if (!draft) return null
+  const setServer = (i: number, patch: Partial<LibraryServer>) =>
+    setDraft({ ...draft, servers: draft.servers.map((s, k) => (k === i ? { ...s, ...patch } : s)) })
+  // Per-row state (keys, Test results) is by position, so it's cleared when a row is removed.
+  const removeServers = (servers: LibraryServer[]) => { setDraft({ ...draft, servers }); setKeys({}); setFound({}); setTestMsg({}) }
+  const toggleLibrary = (i: number, lib: LibraryRef, on: boolean) => {
+    const cur = draft.servers[i].libraries.filter((l) => l.key !== lib.key)
+    setServer(i, { libraries: on ? [...cur, lib] : cur })
+  }
+  const addServer = (s: LibraryServer) => setDraft({ ...draft, servers: [...draft.servers, s] })
+  const toggleProvider = (p: Provider, on: boolean) => (on
+    ? addServer( { id: `provider:${p.id}`, source: 'provider', provider_id: p.id, type: p.provider_type as LibraryServerType, name: p.name, url: p.base_url, libraries: [] })
+    : removeServers(draft.servers.filter((s) => !(s.source === 'provider' && s.provider_id === p.id))))
+  const status = query.data?.status
+  const comparable = (d: LibraryPresenceSettings, k: Record<number, string>) => JSON.stringify({ scan_hours: d.scan_hours, servers: payload(d, k) })
+  const dirty = comparable(draft, keys) !== comparable(query.data ?? { servers: [], scan_hours: 6 }, {})
+  const manual = draft.servers.map((s, i) => ({ s, i })).filter(({ s }) => s.source === 'manual')
+  const anyServer = draft.servers.some((s, i) => !isBlank(s, i))
+
+  const testButton = (i: number) => (
+    <button className="px-2 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50" disabled={test.isPending} onClick={() => test.mutate(i)}>
+      {test.isPending && test.variables === i ? 'Testing…' : 'Test'}
+    </button>
+  )
+  const statusBits = (s: LibraryServer, i: number) => {
+    const msg = testMsg[i]
+    const rows = s.id ? status?.rows[s.id] : undefined
+    return (
+      <>
+        {msg && <span className={msg.ok ? 'text-emerald-500' : 'text-destructive'}>{msg.text}</span>}
+        {rows && <span className="text-muted-foreground">{rows.count} title{rows.count === 1 ? '' : 's'} found</span>}
+      </>
+    )
+  }
+  const libraryPicker = (s: LibraryServer, i: number) => {
+    const libs = found[i] ?? s.libraries
+    return (
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-medium">Libraries</span>
+        {libs.length === 0 && <span className="text-muted-foreground">Press Test to list them</span>}
+        {libs.map((lib) => (
+          <label key={lib.key} className="flex items-center gap-1">
+            <input type="checkbox" checked={s.libraries.some((l) => l.key === lib.key)} onChange={(e) => toggleLibrary(i, lib, e.target.checked)} />
+            {lib.title}<span className="text-muted-foreground">({lib.kind === 'show' ? 'TV' : 'movies'})</span>
+          </label>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <SectionCard title="In Library (your Plex / Jellyfin / Emby)" icon={<CheckCircle2 size={14} />}>
+      <p className="text-xs text-muted-foreground">
+        Optional. Marks movies, shows and episodes your own media server already has with a lime "In Library" badge, and asks before
+        downloading them again. vod-manager reads the libraries you tick below on a schedule and keeps a local list; cards never call
+        the server. With more than one server, a title counts when any of them has it.
+      </p>
+      <div className="space-y-2 text-xs">
+        {mediaProviders.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-muted-foreground">
+              Tick the providers that are your own library. Their URL and token come from the Providers page, so a change there applies here too.
+            </p>
+            {mediaProviders.map((p) => {
+              const i = draft.servers.findIndex((s) => s.source === 'provider' && s.provider_id === p.id)
+              const s = i >= 0 ? draft.servers[i] : null
+              return (
+                <div key={p.id} className="rounded border border-border/60 p-2 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    <label className="flex items-center gap-1.5 font-medium">
+                      <input type="checkbox" checked={!!s} onChange={(e) => toggleProvider(p, e.target.checked)} />
+                      {p.name}<span className="font-normal text-muted-foreground">({LIBRARY_SERVER_LABEL[p.provider_type as LibraryServerType]})</span>
+                    </label>
+                    {s && testButton(i)}
+                    {s && statusBits(s, i)}
+                  </div>
+                  {s && libraryPicker(s, i)}
+                </div>
+              )
+            })}
+          </div>
+        )}
+        {manual.length > 0 && (
+          <div className="space-y-1.5">
+            {mediaProviders.length > 0 && <p className="font-medium pt-1">Servers that aren't providers</p>}
+            {mediaProviders.length === 0 && (
+              <p className="text-muted-foreground">
+                No Plex, Jellyfin or Emby provider yet, so enter your server here. (Adding it on the Providers page would also import its titles
+                into the catalog; entering it here only checks what it has.)
+              </p>
+            )}
+            {manual.map(({ s, i }) => {
+              const keyWord = s.type === 'plex' ? 'Token' : 'API key'
+              return (
+                <div key={s.id ?? `new-${i}`} className="rounded border border-border/60 p-2 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    <select className={inputCls()} value={s.type} onChange={(e) => setServer(i, { type: e.target.value as LibraryServerType, libraries: [] })}>
+                      {(Object.keys(LIBRARY_SERVER_LABEL) as LibraryServerType[]).map((t) => <option key={t} value={t}>{LIBRARY_SERVER_LABEL[t]}</option>)}
+                    </select>
+                    <input className={inputCls('w-36')} placeholder="Name" value={s.name} onChange={(e) => setServer(i, { name: e.target.value })} />
+                    <input className={inputCls('w-56')} placeholder={s.type === 'plex' ? 'http://host:32400' : 'http://host:8096'} value={s.url} onChange={(e) => setServer(i, { url: e.target.value })} />
+                    <input className={inputCls('w-48')} type="password" autoComplete="off" placeholder={s.has_key ? `${keyWord} (saved)` : keyWord} title="Leave blank to keep the saved one." value={keys[i] ?? ''} onChange={(e) => setKeys({ ...keys, [i]: e.target.value })} />
+                    {testButton(i)}
+                    <button className="text-muted-foreground hover:text-destructive" title="Remove this server (its titles stop counting when you save)" onClick={() => removeServers(draft.servers.filter((_, k) => k !== i))}><Trash2 size={12} /></button>
+                    {statusBits(s, i)}
+                  </div>
+                  {libraryPicker(s, i)}
+                </div>
+              )
+            })}
+          </div>
+        )}
+        <button className="text-muted-foreground underline-offset-2 hover:underline hover:text-foreground" title="For a server you don't want as a provider (a provider's titles are imported into the catalog)." onClick={() => addServer(blankManualServer())}>
+          <Plus size={12} className="inline mr-1" />{manual.length ? 'Add another server' : "Add a server that isn't a provider"}
+        </button>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-border/50 pt-2">
+          <span className="font-medium">Scan every</span>
+          <input className={inputCls('w-14')} type="number" min={1} step={1} title="Hours between scans. A scan also runs right after Radarr / Sonarr import a download." value={draft.scan_hours} onChange={(e) => setDraft({ ...draft, scan_hours: Math.max(1, Math.round(Number(e.target.value) || 1)) })} />
+          <span>hours</span>
+          <span className="text-muted-foreground">
+            {status?.last_scan_at ? `Last scan ${new Date(status.last_scan_at * 1000).toLocaleString()}` : 'Not scanned since the app started'}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button size="sm" disabled={save.isPending} onClick={() => save.mutate(draft)}>
+            {save.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+          </Button>
+          <Button size="sm" variant="outline" disabled={scan.isPending || dirty || !anyServer} title={dirty ? 'Save first' : 'Read the ticked libraries now'} onClick={() => scan.mutate()}>
+            {scan.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}Scan now
+          </Button>
+        </div>
+        {error && <p className="text-destructive">{error}</p>}
+      </div>
     </SectionCard>
   )
 }
@@ -3049,7 +3503,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{movie.name}</p>
-            <p className="text-[11px] text-white/70 mt-0.5">{movie.year ?? ''}</p>
+            <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{movie.year ?? ''}<InLibraryBadge where={movie.in_library} /></p>
           </div>
         </button>
         {movie.sources.length > 0 && (
@@ -3100,6 +3554,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
           {movie.name}{movie.year ? <span className="text-muted-foreground font-normal"> ({movie.year})</span> : ''}
           {!!movie.is_adult && <Chip tone="rec">18+</Chip>}
+          <InLibraryBadge where={movie.in_library} />
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
           {movie.sources.length} source{movie.sources.length === 1 ? '' : 's'} · {movie.placements.length} categor{movie.placements.length === 1 ? 'y' : 'ies'}
@@ -3551,7 +4006,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
               </div>
             ) : (
               <div className="flex items-center justify-between">
-                <span>S{e.season_number}E{e.episode_number} — {e.name}</span>
+                <span>S{e.season_number}E{e.episode_number} — {e.name}{e.in_library && <span title="Already in your library" className="ml-1.5 text-[10px] font-semibold text-lime-500">✓ in library</span>}</span>
                 <span className="flex items-center gap-1.5">
                   <button title="Edit episode number/name" className="hover:text-foreground text-[11px] underline decoration-dotted" onClick={() => startEditEpisode(e)}>edit</button>
                   <FlagMismatchControl
@@ -3692,7 +4147,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{series.name}</p>
-            <p className="text-[11px] text-white/70 mt-0.5">{series.year ?? ''}</p>
+            <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{series.year ?? ''}<InLibraryBadge where={series.in_library} /></p>
           </div>
         </button>
         <div className="px-2.5 py-1.5 flex items-center justify-between text-[10.5px] text-muted-foreground border-t border-border/60">
@@ -3732,6 +4187,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           {open ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
           {series.name}{series.year ? <span className="text-muted-foreground font-normal"> ({series.year})</span> : ''}
           {!!series.is_adult && <Chip tone="rec">18+</Chip>}
+          <InLibraryBadge where={series.in_library} />
         </span>
         <span className="flex items-center gap-2 text-muted-foreground">
           {series.episodes.length} episode{series.episodes.length === 1 ? '' : 's'}
@@ -6590,9 +7046,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   })
   const [autoEpisodeTitlesRunMsg, setAutoEpisodeTitlesRunMsg] = useState<string | null>(null)
   const runAutoEpisodeTitles = useMutation({
-    mutationFn: () => api.post('/vod/auto-episode-titles/run/').then((r) => r.data as { series_checked: number; series_changed: number; episodes_renamed: number; failed: number }),
+    mutationFn: () => api.post('/vod/auto-episode-titles/run/').then((r) => r.data as { series_checked: number; series_changed: number; episodes_renamed: number; from_local?: number; failed: number }),
     onSuccess: (r) => {
-      setAutoEpisodeTitlesRunMsg(`Checked ${r.series_checked} series · renamed ${r.episodes_renamed} episode(s) in ${r.series_changed}${r.failed ? ` · ${r.failed} failed` : ''}`)
+      setAutoEpisodeTitlesRunMsg(`Checked ${r.series_checked} series · renamed ${r.episodes_renamed} episode(s) in ${r.series_changed}${r.from_local ? ` · ${r.from_local} from local TMDB library` : ''}${r.failed ? ` · ${r.failed} failed` : ''}`)
       qc.invalidateQueries({ queryKey: ['vod-auto-episode-titles'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
@@ -6975,6 +7431,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [movieProviderFilter, setMovieProviderFilter] = useState<number | null>(null)
   const [movieShowArchived, setMovieShowArchived] = useState(false)
   const [movieNoTmdb, setMovieNoTmdb] = useState(false)
+  const [movieInLibrary, setMovieInLibrary] = useState<'' | 'only' | 'hide'>('')   // In Library filter
   const [MOVIE_LIMIT, setMovieLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-movies-limit')) || 25
   )
@@ -6984,8 +7441,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setMovieOffset(0)
   }
   const moviesQuery = useQuery<Page<Movie>>({
-    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, movieShowArchived, movieNoTmdb, MOVIE_LIMIT],
-    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined, archived: movieShowArchived, no_tmdb: movieNoTmdb || undefined } }).then((r) => r.data),
+    queryKey: ['vod-movies', movieSearch, movieOffset, movieCategoryFilter, movieProviderFilter, movieShowArchived, movieNoTmdb, movieInLibrary, MOVIE_LIMIT],
+    queryFn:  () => api.get('/vod/movies/', { params: { search: movieSearch || undefined, limit: MOVIE_LIMIT, offset: movieOffset, category_id: movieCategoryFilter ?? undefined, provider_id: movieProviderFilter ?? undefined, archived: movieShowArchived, no_tmdb: movieNoTmdb || undefined, in_library: movieInLibrary || undefined } }).then((r) => r.data),
   })
   const toggleMovieArchived = useMutation({
     mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/movies/${id}/archive/`, null, { params: { archived } }),
@@ -7075,6 +7532,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [seriesProviderFilter, setSeriesProviderFilter] = useState<number | null>(null)
   const [seriesShowArchived, setSeriesShowArchived] = useState(false)
   const [seriesNoTmdb, setSeriesNoTmdb] = useState(false)
+  const [seriesInLibrary, setSeriesInLibrary] = useState<'' | 'only' | 'hide'>('')   // In Library filter
   const [SERIES_LIMIT, setSeriesLimitState] = useState(
     () => Number(localStorage.getItem('vodmanager-series-limit')) || 25
   )
@@ -7084,8 +7542,8 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     setSeriesOffset(0)
   }
   const seriesQuery = useQuery<Page<Series>>({
-    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, seriesShowArchived, seriesNoTmdb, SERIES_LIMIT],
-    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined, archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined } }).then((r) => r.data),
+    queryKey: ['vod-series', seriesSearch, seriesOffset, seriesCategoryFilter, seriesProviderFilter, seriesShowArchived, seriesNoTmdb, seriesInLibrary, SERIES_LIMIT],
+    queryFn:  () => api.get('/vod/series/', { params: { search: seriesSearch || undefined, limit: SERIES_LIMIT, offset: seriesOffset, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined, archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined, in_library: seriesInLibrary || undefined } }).then((r) => r.data),
   })
   const toggleSeriesArchived = useMutation({
     mutationFn: ({ id, archived }: { id: number; archived: boolean }) => api.post(`/vod/series/${id}/archive/`, null, { params: { archived } }),
@@ -7176,7 +7634,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const selectAllFilteredSeries = useMutation({
     mutationFn: async () => (await api.get('/vod/series/ids/', { params: {
       search: seriesSearch || undefined, category_id: seriesCategoryFilter ?? undefined, provider_id: seriesProviderFilter ?? undefined,
-      archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined,
+      archived: seriesShowArchived, no_tmdb: seriesNoTmdb || undefined, in_library: seriesInLibrary || undefined,
     } })).data as { ids: number[]; total: number },
     onSuccess: (r) => { setSelectedSeriesIds(new Set(r.ids)); setBulkEpisodeTitles(null) },
     onError: (e: any) => setBulkSeriesResult(`Failed: ${e?.response?.data?.detail ?? e.message}`),
@@ -8006,6 +8464,11 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       </SectionCard>
 
       <DownloadsCard />
+
+      <HandoffCard />
+
+      {/* wait for providers so the card knows whether to open the typed-in form */}
+      {!providersQuery.isPending && <LibraryPresenceCard providers={providersQuery.data ?? []} />}
 
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
@@ -11384,6 +11847,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
+          <select
+            className={inputCls()}
+            title="Filter by whether your media server already has the title (Settings → In Library)"
+            value={movieInLibrary}
+            onChange={(e) => { setMovieInLibrary(e.target.value as '' | 'only' | 'hide'); setMovieOffset(0) }}
+          >
+            <option value="">In Library: any</option>
+            <option value="hide">Hide In Library</option>
+            <option value="only">Only In Library</option>
+          </select>
           <Button
             size="sm"
             variant={movieNoTmdb ? 'default' : 'outline'}
@@ -11485,7 +11958,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm"
             variant="outline"
-            disabled={!bulkMovieTargetCategory || !moviesQuery.data?.total || bulkPlaceMovies.isPending}
+            disabled={!bulkMovieTargetCategory || !moviesQuery.data?.total || bulkPlaceMovies.isPending || !!movieInLibrary}
             onClick={() => bulkPlaceMovies.mutate({
               category_id: Number(bulkMovieTargetCategory),
               search: movieSearch || undefined,
@@ -11511,7 +11984,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!moviesQuery.data?.total || unplaceMovie.isPending}
+                disabled={!moviesQuery.data?.total || unplaceMovie.isPending || !!movieInLibrary}
                 title="Takes every title matching the current filters out of this category, across all pages"
                 onClick={() => askConfirm(`Remove all ${moviesQuery.data?.total ?? 0} filtered titles from this category? They stay in the pool.`, () => unplaceMovie.mutate({}))}
               >
@@ -11608,6 +12081,16 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           >
             <Archive size={12} className="mr-1" />Archived
           </Button>
+          <select
+            className={inputCls()}
+            title="Filter by whether your media server already has the title (Settings → In Library)"
+            value={seriesInLibrary}
+            onChange={(e) => { setSeriesInLibrary(e.target.value as '' | 'only' | 'hide'); setSeriesOffset(0) }}
+          >
+            <option value="">In Library: any</option>
+            <option value="hide">Hide In Library</option>
+            <option value="only">Only In Library</option>
+          </select>
           <Button
             size="sm"
             variant={seriesNoTmdb ? 'default' : 'outline'}
@@ -11717,7 +12200,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <Button
             size="sm"
             variant="outline"
-            disabled={!bulkSeriesTargetCategory || !seriesQuery.data?.total || bulkPlaceSeries.isPending}
+            disabled={!bulkSeriesTargetCategory || !seriesQuery.data?.total || bulkPlaceSeries.isPending || !!seriesInLibrary}
             onClick={() => bulkPlaceSeries.mutate({
               category_id: Number(bulkSeriesTargetCategory),
               search: seriesSearch || undefined,
@@ -11743,7 +12226,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!seriesQuery.data?.total || unplaceSeries.isPending}
+                disabled={!seriesQuery.data?.total || unplaceSeries.isPending || !!seriesInLibrary}
                 title="Takes every title matching the current filters out of this category, across all pages"
                 onClick={() => askConfirm(`Remove all ${seriesQuery.data?.total ?? 0} filtered titles from this category? They stay in the pool.`, () => unplaceSeries.mutate({}))}
               >

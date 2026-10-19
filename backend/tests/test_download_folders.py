@@ -68,6 +68,34 @@ def test_movie_and_episode_land_in_their_own_folders(db, server, tmp_path):
     assert vod_downloader.file_for_job(2).name == "Great Show - S01E02.mp4"
 
 
+def test_tmdb_id_in_folder_names_is_on_by_default(db):
+    assert config.get_download_settings()["tmdb_id_in_folder"] is True
+
+
+def test_tmdb_id_can_be_left_out_of_folder_names(db, server, tmp_path):
+    films, tv = tmp_path / "films", tmp_path / "tv"
+    _settings(movies_dir=str(films), shows_dir=str(tv), tmdb_id_in_folder=False)
+    mid, pid = _movie(db, server)
+    sid = db.upsert_series("Great Show", 2015)
+    conn = db._connect()
+    conn.execute("UPDATE series SET tmdb_id='888' WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+    eid = db.add_episode(sid, 1, 2, "Two")
+    db.add_episode_source(eid, pid, "55", "mp4")
+    vod_downloader.enqueue(movie_ids=[mid], episode_ids=[eid])
+    assert _run(1)["status"] == "done" and _run(2)["status"] == "done"
+    assert (films / "Some Movie (2001)" / "Some Movie (2001).mp4").read_bytes() == FILE_BYTES
+    assert (tv / "Great Show (2015)" / "Season 01" / "Great Show - S01E02.mp4").read_bytes() == FILE_BYTES
+    assert vod_downloader.file_for_job(1).parent.name == "Some Movie (2001)"
+
+
+def test_save_route_keeps_the_tmdb_id_toggle(db, tmp_path):
+    body = vod_routes.DownloadSettingsRequest(movies_dir=str(tmp_path / "a"), shows_dir=str(tmp_path / "b"), tmdb_id_in_folder=False)
+    asyncio.run(vod_routes.save_download_settings(body))
+    assert config.get_download_settings()["tmdb_id_in_folder"] is False
+
+
 def test_status_reports_free_space_for_each_root(db, tmp_path):
     _settings(movies_dir=str(tmp_path / "films"), shows_dir=str(tmp_path / "tv"))
     free = vod_downloader.get_status()["free"]

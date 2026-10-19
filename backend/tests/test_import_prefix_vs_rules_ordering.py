@@ -74,16 +74,16 @@ def test_movie_import_excludes_stream_after_display_rule_strips_prefix(db, monke
     }])
     lang = {"exclude_prefixes": ["ES"], "exclude_non_latin": False}
 
-    asyncio.run(vod_importer._import_movies_for_provider(
+    result, _, _ = asyncio.run(vod_importer._import_movies_for_provider(
         client, {"id": 4, "name": "TestProvider"}, provider_id=4,
         category_names={"5": "Movies"}, exclude_categories=[], exclude_uncategorized=False,
         lang=lang, country=[],
     ))
 
-    assert captured["items"][0]["auto_archive"] is True, (
-        "ES-prefixed stream should still be flagged for archive via the raw provider "
-        "name, even though the display-name rule already stripped its prefix"
-    )
+    # Excluded titles are skipped at intake (never created), matched via the
+    # raw provider name even though the display-name rule stripped its prefix.
+    assert captured["items"] == [], "ES-prefixed stream should be skipped at import"
+    assert result["movies_skipped_excluded"] == 1
 
 
 def test_series_import_excludes_stream_after_display_rule_strips_prefix(db, monkeypatch):
@@ -104,13 +104,13 @@ def test_series_import_excludes_stream_after_display_rule_strips_prefix(db, monk
     }])
     lang = {"exclude_prefixes": ["ES"], "exclude_non_latin": False}
 
-    asyncio.run(vod_importer._import_series_for_provider(
+    result, _, _ = asyncio.run(vod_importer._import_series_for_provider(
         client, {"id": 4, "name": "TestProvider"}, provider_id=4,
         series_category_names={"5": "Series"}, exclude_categories=[], exclude_uncategorized=False,
         lang=lang, country=[],
     ))
 
-    assert captured["items"][0]["auto_archive"] is True, (
-        "ES-prefixed series should still be flagged for archive via the raw provider "
-        "name, even though the display-name rule already stripped its prefix"
-    )
+    # Excluded titles are skipped at intake (never created), matched via the
+    # raw provider name even though the display-name rule stripped its prefix.
+    assert captured["items"] == [], "ES-prefixed series should be skipped at import"
+    assert result["series_skipped_excluded"] == 1

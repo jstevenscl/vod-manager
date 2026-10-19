@@ -100,3 +100,42 @@ def test_run_once_off_does_nothing_and_survives_a_stale_id(db, monkeypatch):
     monkeypatch.setattr(tmdb_sync, "get_series_episode_list_cached", boom)
     result = asyncio.run(auto_episode_titles.run_once("applied"))
     assert result["failed"] == 1 and result["episodes_renamed"] == 0
+
+
+# Local TMDB library first; TMDB only when local can't fill.
+def _store_show(tmdb_id, season_eps, age=3 * 86400):
+    import tmdb_store
+    config.save_tmdb_store_settings({"enabled": True})
+    tmdb_store.init_db()
+    tmdb_store.upsert_payload("tv", {"id": tmdb_id, "name": "Show A", "seasons": [{"season_number": 1}]})
+    tmdb_store.put_season(tmdb_id, 1, season_eps)
+    with tmdb_store._conn() as conn:  # older than the 24h latest-season refresh window
+        conn.execute("UPDATE seasons SET fetched_at=?", (time.time() - age,))
+
+
+def test_run_once_uses_local_library_without_calling_tmdb(db, monkeypatch):
+    a = _series(db)
+    db.mark_series_auto_episode_titles([a])
+    _store_show(111, TMDB)
+    calls = []
+    _fake_tmdb(monkeypatch, calls)
+
+    result = asyncio.run(auto_episode_titles.run_once("applied"))
+
+    assert calls == []
+    assert result["episodes_renamed"] == 1 and result["from_local"] == 1
+    assert {e["episode_number"]: e["name"] for e in db.list_episodes(a)} == {1: "Pilot", 2: "Real Name"}
+
+
+def test_run_once_calls_tmdb_when_local_cannot_fill(db, monkeypatch):
+    a = _series(db)
+    db.mark_series_auto_episode_titles([a])
+    _store_show(111, [{"season_number": 1, "episode_number": 2, "name": "Second"}])
+    calls = []
+    _fake_tmdb(monkeypatch, calls)
+
+    result = asyncio.run(auto_episode_titles.run_once("applied"))
+
+    assert calls == ["111"]
+    assert result["episodes_renamed"] == 1 and result["from_local"] == 0
+    assert {e["episode_number"]: e["name"] for e in db.list_episodes(a)}[1] == "Pilot"

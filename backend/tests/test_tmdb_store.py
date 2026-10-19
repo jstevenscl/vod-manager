@@ -132,7 +132,7 @@ def test_daily_request_budget(store):
     assert store.requests_today() == 5
 
 
-def test_retention_preview_then_cleanup_keeps_current_catalog(store):
+def test_retention_preview_then_cleanup_removes_only_expired_titles(store):
     store.upsert_payload("movie", _movie(1, "Current"))
     store.upsert_payload("movie", _movie(2, "Removed"))
     store.upsert_payload("tv", _tv(3, "Expired"))
@@ -144,9 +144,9 @@ def test_retention_preview_then_cleanup_keeps_current_catalog(store):
     assert preview["expired_referenced_titles"] == 1
     assert store.get_title("movie", 2) is not None
     result = store.retention_cleanup(refs, dry_run=False)
-    assert result["titles_removed"] == 2
+    assert result["titles_removed"] == 1
     assert store.get_title("movie", 1) is not None
-    assert store.get_title("movie", 2) is None
+    assert store.get_title("movie", 2) is not None
     assert store.get_title("tv", 3) is None
 
 

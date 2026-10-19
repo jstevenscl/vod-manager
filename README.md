@@ -117,6 +117,12 @@ library only when complete, so nothing partial is ever picked up. See the
 
 ![The Downloads card](docs/screenshots/downloads-card.png)
 
+If you run **Radarr** or **Sonarr**, a finished download can be handed to them to import (optional, under
+**Configuration → Library handoff**), so they own the library and its naming; the queue shows each file as it
+goes from *Waiting for encoder* to *Importing* to *In library*. An optional **In Library** badge shows which movies,
+shows and episodes your own Plex, Jellyfin or Emby already has, and asks before you download them again. See the
+[User Guide](USERGUIDE.md#handing-finished-downloads-to-radarr-or-sonarr).
+
 ## Connecting Dispatcharr instances
 
 VOD & DVR Manager distinguishes two separate relationships with Dispatcharr:
@@ -455,8 +461,8 @@ or a filtered slice, and the result names the series that had no TMDB match.
 **Automatic TMDB Episode Titles** (Curation & Maintenance) keeps episode names
 filled in as a provider adds episodes: hourly, it replaces blank or placeholder
 names from TMDB for the series you've already applied titles to (or every
-series with a TMDB id, or off). A real provider name, or one you set or locked,
-is never changed.
+series with a TMDB id, or off), using the local TMDB library first so a normal pass costs
+no TMDB requests. A real provider name, or one you set or locked, is never changed.
 
 ![Automatic TMDB Episode Titles settings](docs/screenshots/auto-episode-titles.png)
 
@@ -544,9 +550,9 @@ You supply your own TMDB API key and are responsible for following
 [TMDB's API terms of use](https://www.themoviedb.org/api-terms-of-use) -- notably that information obtained from
 TMDB may not be cached for longer than 6 months.
 
-The optional local TMDB library is off by default (turn it on from the TMDB Library page). When enabled, it keeps details only for current
-catalog titles, refreshes them after 150 days, and automatically removes
-unreferenced or 170-day-old records. Its cleanup screen always provides a preview
+The optional local TMDB library is off by default (turn it on from the TMDB Library page). When enabled, it keeps details for current
+catalog titles and the most popular TMDB titles, refreshes them after 150 days, and automatically removes
+170-day-old records. Its cleanup screen always provides a preview
 before deleting anything. With it on, titles a provider sent without a TMDB ID are
 matched by name and year in the background (never guessing: uncertain ones go to
 Metadata Review), so the same title from different providers merges into one card.

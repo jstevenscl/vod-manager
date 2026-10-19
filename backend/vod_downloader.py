@@ -358,19 +358,21 @@ def _free_bytes(path: Path) -> int | None:
 def target_for(job: dict) -> tuple[str, str, int | None]:
     """(folder relative to the movies / TV shows root, file stem, duration) for the job's item.
     Raises DownloadError when the item no longer exists."""
+    # KNM: 2026-10-18 the [tmdbid-N] folder tag can be turned off in Configuration -> Downloads
+    tag = config.get_download_settings()["tmdb_id_in_folder"]
     if job["kind"] == "movie":
         movie = vod_db.get_movie(job["item_id"])
         if not movie:
             raise DownloadError("This movie no longer exists.")
         title = strm_export._title_year(movie["name"], movie.get("year"))
-        folder = f"{title} [tmdbid-{movie['tmdb_id']}]" if movie.get("tmdb_id") else title
+        folder = f"{title} [tmdbid-{movie['tmdb_id']}]" if tag and movie.get("tmdb_id") else title
         return folder, title, movie.get("duration_secs")
     episode = vod_db.get_episode(job["item_id"])
     series = vod_db.get_series(episode["series_id"]) if episode else None
     if not episode or not series:
         raise DownloadError("This episode no longer exists.")
     show_title = strm_export._title_year(series["name"], series.get("year"))
-    show_dir = f"{show_title} [tmdbid-{series['tmdb_id']}]" if series.get("tmdb_id") else show_title
+    show_dir = f"{show_title} [tmdbid-{series['tmdb_id']}]" if tag and series.get("tmdb_id") else show_title
     season, number = int(episode["season_number"]), int(episode["episode_number"])
     stem = f"{strm_export._base_title(series['name'])} - S{season:02d}E{number:02d}"
     return f"{show_dir}/Season {season:02d}", stem, episode.get("duration_secs")
@@ -440,12 +442,16 @@ def enqueue(movie_ids: list[int] | None = None, series_ids: list[int] | None = N
         raise ValueError("Nothing selected.")
 
     result = {"queued": 0, "already_queued": 0, "no_source": 0, "missing": 0, "truncated": False, "preset": preset}
+    # library handoff: new jobs are added to Radarr/Sonarr by arr_handoff.resolve_pending
+    handoff = {k: config.handoff_enabled(k) for k in ("movie", "episode")}
 
     def add(kind: str, item_id: int, title: str, src: int | None = None) -> bool:
         if result["queued"] >= MAX_QUEUE_PER_REQUEST:
             result["truncated"] = True
             return False
         jid = vod_db.enqueue_download(kind, item_id, title, preset, src, prefer_provider_id, audio_languages)
+        if jid and handoff[kind]:
+            vod_db.update_import(jid, import_status="add")
         result["queued" if jid else "already_queued"] += 1
         return True
 
@@ -762,26 +768,23 @@ def resolve_encoder(settings: dict | None) -> tuple[str, str | None, str | None]
     return want, (device if want != "nvenc" else None), None
 
 
-def _video_args(preset: str, engine: str, device: str | None, threads: int, decode: bool = True) -> tuple[list[str], list[str]]:
-    """(input-side options, output-side options) for the preset on this engine. Hardware paths keep the scale on the
-    CPU (it works for every source codec) and let the GPU decode (when it can; ffmpeg falls back by itself) and encode."""
+def _video_args(preset: str, engine: str, device: str | None, threads: int) -> tuple[list[str], list[str]]:
+    """(input-side options, output-side options) for the preset on this engine. The CPU decodes and scales and the GPU
+    only encodes. GPU decoding is deliberately off: with the scale on the CPU every decoded frame would be copied
+    back from the GPU, which measured about 25x slower than CPU decoding on an Intel iGPU."""
     p = PRESETS[preset]
     hevc = p["codec"] == "libx265"
     scale = f"scale=-2:'min({p['height']},ih)'"
     crf = str(p["crf"])
     if engine == "vaapi":
         pre = ["-init_hw_device", f"vaapi=hw:{device}", "-filter_hw_device", "hw"]
-        if decode:
-            pre += ["-hwaccel", "vaapi", "-hwaccel_device", "hw"]
         return pre, ["-vf", f"{scale},format=nv12,hwupload", "-c:v", "hevc_vaapi" if hevc else "h264_vaapi", "-qp", crf]
     if engine == "qsv":
         pre = ["-init_hw_device", f"vaapi=va:{device}", "-init_hw_device", "qsv=hw@va", "-filter_hw_device", "hw"]
-        if decode:
-            pre += ["-hwaccel", "vaapi", "-hwaccel_device", "va"]
         return pre, ["-vf", f"{scale},format=nv12,hwupload=extra_hw_frames=64", "-c:v", "hevc_qsv" if hevc else "h264_qsv",
                      "-global_quality", crf, "-preset", "medium"]
     if engine == "nvenc":
-        return (["-hwaccel", "cuda"] if decode else []), [
+        return [], [
             "-vf", f"{scale},format=yuv420p", "-c:v", "hevc_nvenc" if hevc else "h264_nvenc",
             "-preset", "p4", "-rc", "vbr", "-cq", crf, "-b:v", "0"]
     post = ["-vf", scale, "-pix_fmt", "yuv420p", "-c:v", p["codec"], "-preset", "fast", "-crf", crf]
@@ -938,9 +941,11 @@ async def test_encoder(engine: str, device: str = "") -> dict:
     eng, dev, why = resolve_encoder({"encoder": engine, "hw_device": device})
     if why:
         return {"ok": False, "engine": eng, "message": why[0].upper() + why[1:] + ". Share the GPU with the container (see the User Guide)."}
-    pre, post = _video_args("h264_720", eng, dev, 0, decode=False)
+    # Same command shape as a real job: a 1080p source scaled down, 4 seconds, timed so a slow setup shows up.
+    pre, post = _video_args("h264_720", eng, dev, 0)
     args = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *pre,
-            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-t", "1", *post, "-an", "-f", "null", "-"]
+            "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30", "-t", "4", *post, "-an", "-f", "null", "-"]
+    started = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, err = await asyncio.wait_for(proc.communicate(), 45)
@@ -950,8 +955,11 @@ async def test_encoder(engine: str, device: str = "") -> dict:
     if proc.returncode != 0:
         tail = " | ".join(_safe(err.decode(errors="replace")).strip().splitlines()[-3:])
         return {"ok": False, "engine": eng, "message": f"{_ENCODER_LABELS.get(eng, eng)} encode failed: {tail or 'ffmpeg error'}"}
-    return {"ok": True, "engine": eng, "device": dev, "message": f"{_ENCODER_LABELS.get(eng, eng)} works"
-            + (f" on {dev}." if dev else ".")}
+    speed = 4 / max(time.monotonic() - started, 0.01)
+    msg = f"{_ENCODER_LABELS.get(eng, eng)} works" + (f" on {dev}" if dev else "") + f" (about {speed:.1f}x real time on a 1080p test)."
+    if speed < 0.5:
+        msg += " That is slow; the CPU may be a better choice."
+    return {"ok": True, "engine": eng, "device": dev, "speed": round(speed, 2), "message": msg}
 
 
 # ── one job ─────────────────────────────────────────────────────────────────
@@ -1121,6 +1129,7 @@ async def run_job(job_id: int) -> None:
         if found:
             vod_db.update_download_job(job_id, ("running",), status="done", progress=1.0, final_path=str(found.relative_to(out_root)),
                                        final_size=found.stat().st_size, note="Already in the library", finished_at=vod_db._now())
+            vod_db.mark_import_waiting(job_id)  # hand the file to Radarr/Sonarr
             shutil.rmtree(work, ignore_errors=True)
             return
         sources = await asyncio.to_thread(_ordered_sources, job)
@@ -1199,6 +1208,7 @@ async def run_job(job_id: int) -> None:
             vod_db.update_download_job(job_id, ("running",), status="done", progress=1.0, bytes_done=size, total_bytes=size,
                                        final_path=str(final.relative_to(out_root)), final_size=size, note=None, error=None,
                                        finished_at=vod_db._now())
+            vod_db.mark_import_waiting(job_id)  # hand the file to Radarr/Sonarr
             shutil.rmtree(work, ignore_errors=True)
             logger.info("[download] job=%s done: %s (%d bytes, preset=%s)", job_id, final.relative_to(out_root), size, preset)
             return

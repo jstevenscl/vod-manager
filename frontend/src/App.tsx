@@ -9,6 +9,7 @@ import Login from '@/pages/Login'
 import Settings from '@/pages/Settings'
 import TmdbStore from '@/pages/TmdbStore'
 import api from '@/lib/api'
+import NoticesBell from '@/components/NoticesBell'
 
 export const THEMES = ['dark', 'mid', 'light', 'mono', 'warm'] as const
 export type Theme = typeof THEMES[number]
@@ -321,6 +322,7 @@ export default function App() {
               )
             })}
           </div>
+          <NoticesBell />
           <button
             className="text-muted-foreground hover:text-foreground transition-colors p-1.5 rounded hover:bg-accent"
             title="Account settings"

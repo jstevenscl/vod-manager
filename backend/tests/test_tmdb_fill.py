@@ -42,6 +42,7 @@ def _fake_fetch(store, fetched):
 
 
 def test_burst_refreshes_catalog_titles_and_stale_titles(store, monkeypatch):
+    config.save_tmdb_store_settings({"popular_keep": 0})
     store.upsert_payload("movie", _movie(50, "Old"))
     store.mark_changed("movie", [50])
     monkeypatch.setattr(tmdb_fill.vod_db, "list_catalog_tmdb_ids", lambda: {"movie": {1, 2, 50}, "tv": {7}})
