@@ -12923,6 +12923,10 @@ def _to_num(v) -> float | None:
 
 
 def _condition_matches(row: dict, cond: dict) -> bool:
+    # a nested group ({"match", "conditions"}) lets one rule mix fields, e.g. genre in (A, B) AND provider_category X
+    if isinstance(cond.get("conditions"), list):
+        checks = (_condition_matches(row, c) for c in cond["conditions"])
+        return bool(cond["conditions"]) and (all(checks) if cond.get("match", "all") == "all" else any(checks))
     field = cond.get("field")
     op    = cond.get("op")
     value = cond.get("value")
@@ -13175,13 +13179,26 @@ def validate_rule_json(rule_json: str) -> dict:
     if rule.get("match", "all") not in ("all", "any"):
         raise ValueError("match must be 'all' or 'any'.")
     for c in conditions:
-        if not isinstance(c, dict) or c.get("field") not in _SMART_CATEGORY_FIELDS:
-            raise ValueError("Unknown rule field.")
-        if c.get("op") not in RULE_OPS:
-            raise ValueError("Unknown rule operator.")
-        if not str(c.get("value") if c.get("value") is not None else "").strip():
-            raise ValueError("Every condition needs a value.")
+        if isinstance(c, dict) and "conditions" in c:
+            # one level of grouping only: a group holds plain conditions
+            if c.get("match", "all") not in ("all", "any"):
+                raise ValueError("match must be 'all' or 'any'.")
+            if not isinstance(c["conditions"], list) or not c["conditions"]:
+                raise ValueError("Add at least one condition.")
+            for g in c["conditions"]:
+                _validate_rule_condition(g)
+        else:
+            _validate_rule_condition(c)
     return rule
+
+
+def _validate_rule_condition(c) -> None:
+    if not isinstance(c, dict) or c.get("field") not in _SMART_CATEGORY_FIELDS:
+        raise ValueError("Unknown rule field.")
+    if c.get("op") not in RULE_OPS:
+        raise ValueError("Unknown rule operator.")
+    if not str(c.get("value") if c.get("value") is not None else "").strip():
+        raise ValueError("Every condition needs a value.")
 
 
 def set_category_rule(category_id: int, rule_json: str) -> None:

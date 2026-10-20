@@ -1862,15 +1862,25 @@ imported in the first place.
   `Action, Comedy`; a menu then lets you choose **matches any of these** (a title
   needs just one) or **matches all of these** (it needs every one). Number
   comparisons and the 18+ and content rating pickers take a single value.
+  Press **Add condition** to mix fields in one rule (for example genre
+  *Western, Musical* **and** year *gte 1950*); a menu then chooses whether a
+  title must meet **all conditions** or **any condition**.
 
   ![Adding a smart category with several values](docs/screenshots/categories-multi-value.png)
 
   **Editing a rule:** press the **pencil** icon on a smart category to change
   its rule later, without deleting it. **Also remove titles that no longer match
   the new rule** (on by default) takes out titles the old rule had placed;
-  untick it to only add. Titles you removed by hand stay out either way. The
-  built-in *All Movies* / *All TV Shows* categories and rules made of
-  different fields (for example from AI suggestions) can't be edited here.
+  untick it to only add. Titles you removed by hand stay out either way. Every
+  condition can be changed, removed, or added to, including the mixed-field rules
+  the AI suggestion makes. Only the built-in *All Movies* / *All TV Shows*
+  categories can't be edited here.
+
+  Titles can also be placed by hand into a rule-based category (marked
+  **(rule)**) from the **Place in category** menu on the bulk bar. They stay
+  until you remove them, unless you save the rule with **Also remove titles
+  that no longer match** ticked, which clears hand-placed titles that don't fit
+  the rule.
 
   ![Editing a smart category's rule](docs/screenshots/categories-edit-rule.png)
 

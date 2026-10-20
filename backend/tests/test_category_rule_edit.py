@@ -118,3 +118,43 @@ def test_series_category_rule_edit_prunes(db):
     db.evaluate_smart_category(cat)
     res = _edit(cat, _rule(["Comedy"]))
     assert res["pruned"] == 1 and res["matched"] == 0
+
+
+def test_mixed_field_rule_with_a_group_of_values(db):
+    old_action = _movie(db, "Old Action", "Action")
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE movies SET year=1950 WHERE id=?", (old_action,))
+        conn.commit()
+    finally:
+        conn.close()
+    new_action = _movie(db, "New Action", "Action")
+    new_comedy = _movie(db, "New Comedy", "Comedy")
+    new_drama = _movie(db, "New Drama", "Drama")
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE movies SET year=2020 WHERE id IN (?,?,?)", (new_action, new_comedy, new_drama))
+        conn.commit()
+    finally:
+        conn.close()
+    # (genre contains Action OR Comedy) AND year >= 2000
+    rule = json.dumps({"match": "all", "conditions": [
+        {"match": "any", "conditions": [{"field": "genre", "op": "contains", "value": "Action"},
+                                        {"field": "genre", "op": "contains", "value": "Comedy"}]},
+        {"field": "year", "op": "gte", "value": "2000"},
+    ]})
+    cat = db.upsert_category("Mixed", "movie", True, 0, rule)
+    db.evaluate_smart_category(cat)
+    assert _placed(db, cat) == {new_action, new_comedy}
+
+
+@pytest.mark.parametrize("rule", [
+    {"match": "all", "conditions": [{"match": "any", "conditions": []}]},
+    {"match": "all", "conditions": [{"match": "sometimes", "conditions": [{"field": "genre", "op": "contains", "value": "x"}]}]},
+    {"match": "all", "conditions": [{"match": "any", "conditions": [{"field": "genre", "op": "contains", "value": ""}]}]},
+])
+def test_bad_group_is_refused(db, pool, rule):
+    cat = db.upsert_category("G", "movie", True, 0, _rule(["Action"]))
+    with pytest.raises(HTTPException) as e:
+        _edit(cat, json.dumps(rule))
+    assert e.value.status_code == 400

@@ -475,8 +475,8 @@ title in several genres appears in each).
 ![Genre Categories picker](docs/screenshots/genre-categories.png)
 
 **Smart categories** take several values in one rule (type `Action, Comedy` and choose
-*any of* or *all of*), and an existing rule can be edited with the pencil icon in
-Manage Categories (optionally removing titles that no longer match). See the
+*any of* or *all of*; **Add condition** mixes fields), and an existing rule can be edited with
+the pencil icon in Manage Categories (optionally removing titles that no longer match). See the
 [User Guide](USERGUIDE.md#managing-categories).
 
 ![Adding a smart category with several values](docs/screenshots/categories-multi-value.png)
