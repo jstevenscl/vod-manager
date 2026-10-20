@@ -976,6 +976,17 @@ partial stays there so *Try again* can resume it; **Clear finished** removes the
 folder fills up. Nothing in the download folder is ever deleted except the app's own
 half-finished files.
 
+**Tidying the queue.** Every finished, failed or cancelled row has a **trash** icon that removes just that row.
+**Clear finished** removes all finished rows, and **Clear failed** removes only the failed and cancelled ones,
+so your completed downloads stay in the list. Removing a row never deletes the downloaded file.
+
+![The queue with a remove icon on each row and a Clear failed button](docs/screenshots/download-queue-remove.png)
+
+A failed or cancelled download can always be removed, even if the Radarr / Sonarr handoff had already been queued
+for it; that import state is kept, so **Try again** still hands the file over after a successful retry. A finished
+download that is still waiting on Radarr or Sonarr is kept by **Clear finished** and **Clear failed**; its trash
+icon asks for confirmation first, because removing it means the app stops watching for that import.
+
 ### Handing finished downloads to Radarr or Sonarr
 
 If you already run **Radarr** or **Sonarr** (often with an encoder such as Tdarr between the download and
@@ -1005,7 +1016,7 @@ API key are saved under **Configuration → Library handoff (Radarr / Sonarr)**.
 
 Each queue row gets a chip next to its status: **Waiting for encoder** → **Importing into Radarr / Sonarr** →
 **In library**, or **Import failed** / **Import timed out** (hover it for the reason) with a **Retry import**
-button. **Clear finished** keeps rows whose import is still pending, so a file is never forgotten.
+button. **Clear finished** and **Clear failed** keep rows whose import is still pending, so a file is never forgotten (the row's own trash icon can remove one after a confirmation).
 
 **Finished folders as Radarr / Sonarr see them.** If Radarr or Sonarr run in their own containers they may see
 the finished folder under a different path than this app does. Enter the path *as they see it* in the second

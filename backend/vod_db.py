@@ -13657,18 +13657,30 @@ def cancel_download_jobs(job_ids: list[int] | None = None) -> list[int]:
 
 # rows whose Radarr/Sonarr import is still in flight must survive "Clear finished"
 PENDING_IMPORT_STATUSES = ("add", "ready", "waiting", "importing")
-_CLEARABLE = ("status IN ('done','failed','cancelled') AND "
+# a failed/cancelled download never reaches the library, so a handoff state left from enqueue doesn't hold it
+_CLEARABLE = ("(status IN ('failed','cancelled') OR (status='done' AND "
               "(import_status IS NULL OR import_status NOT IN ("
-              + ",".join(f"'{s}'" for s in PENDING_IMPORT_STATUSES) + "))")
+              + ",".join(f"'{s}'" for s in PENDING_IMPORT_STATUSES) + "))))")
 
 
-def clear_finished_downloads() -> int:
+def clear_finished_downloads(job_ids: list[int] | None = None, failed_only: bool = False,
+                             force: bool = False) -> int:
     """Removes finished/failed/cancelled rows from the list (never touches files).
-    Rows still waiting on a Radarr/Sonarr import are kept."""
+    Downloaded rows still waiting on a Radarr/Sonarr import are kept unless force. job_ids
+    limits it to those rows; failed_only to failed/cancelled downloads."""
+    where = "status IN ('done','failed','cancelled')" if force else _CLEARABLE
+    params = []
+    if failed_only:
+        where += " AND status IN ('failed','cancelled')"
+    if job_ids is not None:
+        if not job_ids:
+            return 0
+        where += f" AND id IN ({','.join('?' * len(job_ids))})"
+        params = list(job_ids)
     with _WRITE_LOCK:
         conn = _connect()
         try:
-            n = conn.execute(f"DELETE FROM download_jobs WHERE {_CLEARABLE}").rowcount
+            n = conn.execute(f"DELETE FROM download_jobs WHERE {where}", params).rowcount
             _commit_with_retry(conn)
             return n
         finally:

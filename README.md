@@ -111,7 +111,7 @@ provider's connection limit (a download waits for a free connection and pauses i
 then resumes, when a viewer needs it), can be paced per provider
 (speed cap, downloads at once, pause between, an allowed time window), back off by
 themselves when a provider says "slow down", show live speed, reconnect a crawling transfer on a fresh connection,
-resume after an interruption, and verify
+resume after an interruption, let you remove a single queue row or just the failed ones, and verify
 each file with ffprobe. Unfinished files live in a separate processing folder and move into the
 library only when complete, so nothing partial is ever picked up. See the
 [User Guide](USERGUIDE.md#downloading-files-into-a-library-folder).
