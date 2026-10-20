@@ -13041,7 +13041,7 @@ def set_catchall_include_adult(include_adult: bool) -> list[dict]:
             conn.close()
 
 
-def evaluate_smart_category(category_id: int, ids: set[int] | None = None) -> dict:
+def evaluate_smart_category(category_id: int, ids: set[int] | None = None, prune: bool = False) -> dict:
     """Evaluate a smart category's rule_json against the whole pool (movies or
     series, per the category's content_type) and auto-place every match.
     Never un-places existing matches — same additive semantics as manual
@@ -13060,7 +13060,12 @@ def evaluate_smart_category(category_id: int, ids: set[int] | None = None) -> di
     ids: optional scoping to just this set of movie/series ids instead of
     the whole table (see resweep_smart_categories' matching parameter) --
     None (every caller today) means the full-pool scan, unchanged. An empty
-    (but not None) set means nothing to evaluate; skip the query entirely."""
+    (but not None) set means nothing to evaluate; skip the query entirely.
+
+    prune: after a rule is EDITED, also take out the placements that no longer
+    match it (a plain evaluate only ever adds). Full-pool scans only, and it
+    leaves category_exclusions alone, since this is the rule changing, not a
+    person removing a title on purpose."""
     category = get_category(category_id)
     if not category:
         raise ValueError(f"category {category_id} not found")
@@ -13129,9 +13134,64 @@ def evaluate_smart_category(category_id: int, ids: set[int] | None = None) -> di
         newly_placed = bulk_place_movies_in_category(matched_ids, category_id, respect_exclusions=True)
     else:
         newly_placed = bulk_place_series_in_category(matched_ids, category_id, respect_exclusions=True)
+    result = {"evaluated": len(rows), "matched": len(matched_ids), "newly_placed": newly_placed}
+    if prune and ids is None:
+        result["pruned"] = _prune_category_placements(category_id, category["content_type"], set(matched_ids))
     mark_category_evaluated(category_id)
+    return result
 
-    return {"evaluated": len(rows), "matched": len(matched_ids), "newly_placed": newly_placed}
+
+def _prune_category_placements(category_id: int, content_type: str, keep_ids: set[int]) -> int:
+    table, col = ("movie_category_placements", "movie_id") if content_type == "movie" else ("series_category_placements", "series_id")
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            placed = [r[col] for r in conn.execute(f"SELECT {col} FROM {table} WHERE category_id=?", (category_id,)).fetchall()]
+            stale = [i for i in placed if i not in keep_ids]
+            for chunk in _chunked(stale):
+                conn.execute(f"DELETE FROM {table} WHERE category_id=? AND {col} IN ({','.join('?' for _ in chunk)})", (category_id, *chunk))
+            _commit_with_retry(conn)
+            return len(stale)
+        finally:
+            conn.close()
+
+
+RULE_OPS = ("contains", "equals", "starts_with", "gte", "lte")
+
+
+def validate_rule_json(rule_json: str) -> dict:
+    """Parses and checks a smart-category rule the way _rule_matches reads it, so a bad edit is
+    refused up front instead of saving a rule that silently matches nothing. Raises ValueError."""
+    import json
+    try:
+        rule = json.loads(rule_json)
+    except (TypeError, ValueError):
+        raise ValueError("The rule is not valid JSON.")
+    if not isinstance(rule, dict) or rule.get("match_all"):
+        raise ValueError("Only a rule made of conditions can be saved here.")
+    conditions = rule.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        raise ValueError("Add at least one condition.")
+    if rule.get("match", "all") not in ("all", "any"):
+        raise ValueError("match must be 'all' or 'any'.")
+    for c in conditions:
+        if not isinstance(c, dict) or c.get("field") not in _SMART_CATEGORY_FIELDS:
+            raise ValueError("Unknown rule field.")
+        if c.get("op") not in RULE_OPS:
+            raise ValueError("Unknown rule operator.")
+        if not str(c.get("value") if c.get("value") is not None else "").strip():
+            raise ValueError("Every condition needs a value.")
+    return rule
+
+
+def set_category_rule(category_id: int, rule_json: str) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("UPDATE categories SET rule_json=? WHERE id=? AND is_smart=1", (rule_json, category_id))
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
 
 
 def get_ai_candidate_rows(

@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -1142,6 +1142,47 @@ function Modal({ onClose, children, maxWidth = 'max-w-lg' }: { onClose: () => vo
   )
 }
 
+function RuleFields({ form, onChange }: { form: RuleForm; onChange: (f: RuleForm) => void }) {
+  const set = (patch: Partial<RuleForm>) => onChange({ ...form, ...patch })
+  const many = ruleValues(form).length > 1
+  return (
+    <div className="flex items-center gap-1.5 text-muted-foreground flex-wrap">
+      <span>Rule: field</span>
+      <select className={inputCls()} value={form.field} onChange={(e) => set({ field: e.target.value as RuleForm['field'], value: '' })}>
+        {RULE_FIELDS.map((f) => <option key={f} value={f}>{f}</option>)}
+      </select>
+      <select className={inputCls()} value={form.op} onChange={(e) => set({ op: e.target.value as RuleForm['op'] })}>
+        {RULE_OPS.map((op) => <option key={op} value={op}>{op}</option>)}
+      </select>
+      {form.field === 'is_adult' ? (
+        <select className={inputCls()} value={form.value} onChange={(e) => set({ value: e.target.value })}>
+          <option value="">value…</option>
+          <option value="1">Yes (adult)</option>
+          <option value="0">No</option>
+        </select>
+      ) : form.field === 'content_rating' ? (
+        <select className={inputCls()} value={form.value} onChange={(e) => set({ value: e.target.value })}>
+          <option value="">value…</option>
+          <optgroup label="Movies (MPAA)">
+            {['G', 'PG', 'PG-13', 'R', 'NC-17'].map((v) => <option key={v} value={v}>{v}</option>)}
+          </optgroup>
+          <optgroup label="TV">
+            {['TV-Y', 'TV-Y7', 'TV-G', 'TV-PG', 'TV-14', 'TV-MA'].map((v) => <option key={v} value={v}>{v}</option>)}
+          </optgroup>
+        </select>
+      ) : (
+        <input className={inputCls('w-64')} placeholder={ruleAllowsMany(form) ? 'value, or several: a, b, c' : 'value'} title="Separate several values with commas, for example Action, Comedy" value={form.value} onChange={(e) => set({ value: e.target.value })} />
+      )}
+      {many && (
+        <select className={inputCls()} title="Any of: a title needs just one of the values. All of: it needs every one." value={form.match} onChange={(e) => set({ match: e.target.value as RuleForm['match'] })}>
+          <option value="any">matches any of these</option>
+          <option value="all">matches all of these</option>
+        </select>
+      )}
+    </div>
+  )
+}
+
 interface Category {
   id: number
   name: string
@@ -1239,6 +1280,23 @@ const AI_PROVIDER_MODEL_OPTIONS: Record<AiProvider, { id: string; label: string 
 }
 const RULE_FIELDS = ['name', 'genre', 'year', 'language', 'director', 'is_adult', 'provider_category', 'content_rating'] as const
 const RULE_OPS = ['contains', 'equals', 'starts_with', 'gte', 'lte'] as const
+type RuleForm = { field: typeof RULE_FIELDS[number]; op: typeof RULE_OPS[number]; value: string; match: 'any' | 'all' }
+// several values are typed comma-separated and become one condition each (match any / all); a number compare and the
+// fixed-choice fields take a single value
+const ruleAllowsMany = (f: RuleForm) => f.field !== 'is_adult' && f.field !== 'content_rating' && f.op !== 'gte' && f.op !== 'lte'
+const splitRuleValues = (v: string) => v.split(',').map((x) => x.trim()).filter(Boolean)
+const ruleValues = (f: RuleForm) => (ruleAllowsMany(f) ? splitRuleValues(f.value) : f.value.trim() ? [f.value.trim()] : [])
+const buildRuleJson = (f: RuleForm) => JSON.stringify({ match: f.match, conditions: ruleValues(f).map((value) => ({ field: f.field, op: f.op, value })) })
+// null = a rule this form can't represent (the built-in catch-alls, or conditions on different fields), so it isn't editable here
+function parseRuleForm(ruleJson: string | null): RuleForm | null {
+  try {
+    const r = JSON.parse(ruleJson ?? '')
+    const c = Array.isArray(r?.conditions) ? r.conditions : []
+    if (r?.match_all || !c.length || c.some((x: any) => x.field !== c[0].field || x.op !== c[0].op)) return null
+    if (!(RULE_FIELDS as readonly string[]).includes(c[0].field) || !(RULE_OPS as readonly string[]).includes(c[0].op)) return null
+    return { field: c[0].field, op: c[0].op, value: c.map((x: any) => String(x.value ?? '')).join(', '), match: r.match === 'all' ? 'all' : 'any' }
+  } catch { return null }
+}
 const REWRITABLE_FIELDS = ['name', 'genre', 'description', 'director', 'cast_list', 'country'] as const
 
 // Shared shape/hook for the three bulk-AI-resolve jobs (Needs Year Review,
@@ -4284,8 +4342,13 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
 }) {
   const [categoryForm, setCategoryForm] = useState({
     name: '', is_smart: false,
-    rule_field: 'genre' as typeof RULE_FIELDS[number], rule_op: 'contains' as typeof RULE_OPS[number], rule_value: '',
+    rule_field: 'genre' as typeof RULE_FIELDS[number], rule_op: 'contains' as typeof RULE_OPS[number], rule_value: '', rule_match: 'any' as 'any' | 'all',
   })
+  const ruleFormOf = (): RuleForm => ({ field: categoryForm.rule_field, op: categoryForm.rule_op, value: categoryForm.rule_value, match: categoryForm.rule_match })
+  // editing a smart category's rule (one row open at a time)
+  const [editRuleId, setEditRuleId] = useState<number | null>(null)
+  const [editRule, setEditRule] = useState<RuleForm>({ field: 'genre', op: 'contains', value: '', match: 'any' })
+  const [pruneOnSave, setPruneOnSave] = useState(true)
   // The global List Sync interval lives in Configuration -> Refresh Schedule; show its current value here so
   // "global" on a category's schedule dropdown isn't a mystery.
   const refreshSettings = useQuery<RefreshSettings>({
@@ -4300,13 +4363,11 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
       name: categoryForm.name,
       content_type: contentType,
       is_smart: categoryForm.is_smart,
-      rule_json: categoryForm.is_smart
-        ? JSON.stringify({ match: 'all', conditions: [{ field: categoryForm.rule_field, op: categoryForm.rule_op, value: categoryForm.rule_value }] })
-        : null,
+      rule_json: categoryForm.is_smart ? buildRuleJson(ruleFormOf()) : null,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['vod-categories'] })
-      setCategoryForm({ name: '', is_smart: false, rule_field: 'genre', rule_op: 'contains', rule_value: '' })
+      setCategoryForm({ name: '', is_smart: false, rule_field: 'genre', rule_op: 'contains', rule_value: '', rule_match: 'any' })
     },
   })
   const deleteCategory = useMutation({
@@ -4466,6 +4527,18 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
       qc.invalidateQueries({ queryKey: ['vod-movies'] })
       qc.invalidateQueries({ queryKey: ['vod-series'] })
     },
+  })
+  const saveRule = useMutation({
+    mutationFn: (v: { id: number; rule: RuleForm; prune: boolean }) =>
+      api.post(`/vod/categories/${v.id}/rule/`, { rule_json: buildRuleJson(v.rule), prune: v.prune }).then((r) => r.data as { matched: number; newly_placed: number; pruned: number }),
+    onSuccess: (r) => {
+      setEvaluateResult(`Rule saved: ${r.matched} match, ${r.newly_placed} added${r.pruned ? `, ${r.pruned} removed` : ''}.`)
+      setEditRuleId(null)
+      qc.invalidateQueries({ queryKey: ['vod-categories'] })
+      qc.invalidateQueries({ queryKey: ['vod-movies'] })
+      qc.invalidateQueries({ queryKey: ['vod-series'] })
+    },
+    onError: (e: any) => setEvaluateResult(e?.response?.data?.detail ?? e?.message ?? 'Request failed.'),
   })
   const setCategoryEvalSchedule = useMutation({
     mutationFn: ({ id, schedule_interval_seconds, use_ai_evaluation }: { id: number; schedule_interval_seconds: number | null; use_ai_evaluation: boolean }) =>
@@ -4656,6 +4729,18 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                     <option value="604800">weekly</option>
                   </select>
                 )}
+                {!!c.is_smart && parseRuleForm(c.rule_json) && (
+                  <button
+                    title="Edit this rule"
+                    className={editRuleId === c.id ? 'text-primary hover:text-foreground' : 'text-muted-foreground hover:text-foreground'}
+                    onClick={() => {
+                      if (editRuleId === c.id) { setEditRuleId(null); return }
+                      setEditRule(parseRuleForm(c.rule_json)!); setPruneOnSave(true); setEditRuleId(c.id)
+                    }}
+                  >
+                    <Pencil size={12} />
+                  </button>
+                )}
                 {!!c.is_smart && (
                   <button title="Evaluate rule now" className="text-muted-foreground hover:text-foreground" disabled={evaluateCategory.isPending} onClick={() => evaluateCategory.mutate(c.id)}>
                     <Zap size={12} />
@@ -4730,6 +4815,19 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
                 </button>
               </span>
             </li>
+            {editRuleId === c.id && (
+              <li className="rounded border border-border/50 bg-muted/20 p-2 space-y-1.5">
+                <RuleFields form={editRule} onChange={setEditRule} />
+                <label className="flex items-center gap-1 text-muted-foreground">
+                  <input type="checkbox" checked={pruneOnSave} onChange={(e) => setPruneOnSave(e.target.checked)} />
+                  Also remove titles that no longer match the new rule
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <Button size="sm" disabled={!ruleValues(editRule).length || saveRule.isPending} onClick={() => saveRule.mutate({ id: c.id, rule: editRule, prune: pruneOnSave })}>{saveRule.isPending ? 'Saving…' : 'Save rule'}</Button>
+                  <Button size="sm" variant="outline" onClick={() => setEditRuleId(null)}>Cancel</Button>
+                </div>
+              </li>
+            )}
             {listSyncOpenId === c.id && (
               <li className="rounded border border-border/50 bg-muted/20 p-2 space-y-1.5">
                 {parseCategorySources(c).map((s) => (
@@ -4818,39 +4916,12 @@ function CategoriesModal({ contentType, categories, qc, onView, onClose }: {
             <input type="checkbox" checked={categoryForm.is_smart} onChange={(e) => setCategoryForm({ ...categoryForm, is_smart: e.target.checked })} />
             Smart (rule-based)
           </label>
-          <Button size="sm" disabled={!categoryForm.name || (categoryForm.is_smart && !categoryForm.rule_value) || addCategory.isPending} onClick={() => addCategory.mutate()}>
+          <Button size="sm" disabled={!categoryForm.name || (categoryForm.is_smart && !ruleValues(ruleFormOf()).length) || addCategory.isPending} onClick={() => addCategory.mutate()}>
             <Plus size={12} className="mr-1" /> Add
           </Button>
         </div>
         {categoryForm.is_smart && (
-          <div className="flex items-center gap-1.5 text-muted-foreground flex-wrap">
-            <span>Rule: field</span>
-            <select className={inputCls()} value={categoryForm.rule_field} onChange={(e) => setCategoryForm({ ...categoryForm, rule_field: e.target.value as typeof RULE_FIELDS[number] })}>
-              {RULE_FIELDS.map((f) => <option key={f} value={f}>{f}</option>)}
-            </select>
-            <select className={inputCls()} value={categoryForm.rule_op} onChange={(e) => setCategoryForm({ ...categoryForm, rule_op: e.target.value as typeof RULE_OPS[number] })}>
-              {RULE_OPS.map((op) => <option key={op} value={op}>{op}</option>)}
-            </select>
-            {categoryForm.rule_field === 'is_adult' ? (
-              <select className={inputCls()} value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })}>
-                <option value="">value…</option>
-                <option value="1">Yes (adult)</option>
-                <option value="0">No</option>
-              </select>
-            ) : categoryForm.rule_field === 'content_rating' ? (
-              <select className={inputCls()} value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })}>
-                <option value="">value…</option>
-                <optgroup label="Movies (MPAA)">
-                  {['G', 'PG', 'PG-13', 'R', 'NC-17'].map((v) => <option key={v} value={v}>{v}</option>)}
-                </optgroup>
-                <optgroup label="TV">
-                  {['TV-Y', 'TV-Y7', 'TV-G', 'TV-PG', 'TV-14', 'TV-MA'].map((v) => <option key={v} value={v}>{v}</option>)}
-                </optgroup>
-              </select>
-            ) : (
-              <input className={inputCls()} placeholder="value" value={categoryForm.rule_value} onChange={(e) => setCategoryForm({ ...categoryForm, rule_value: e.target.value })} />
-            )}
-          </div>
+          <RuleFields form={ruleFormOf()} onChange={(f) => setCategoryForm({ ...categoryForm, rule_field: f.field, rule_op: f.op, rule_value: f.value, rule_match: f.match })} />
         )}
 
         <div className="border border-border rounded p-2 space-y-1.5">

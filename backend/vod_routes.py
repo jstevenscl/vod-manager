@@ -2794,6 +2794,26 @@ async def rename_category(category_id: int, name: str):
     return {"ok": True}
 
 
+class CategoryRuleRequest(BaseModel):
+    rule_json: str
+    prune: bool = True      # also take out titles that no longer match the new rule
+
+
+@router.post("/categories/{category_id}/rule/", dependencies=_GUARDS)
+async def set_category_rule(category_id: int, body: CategoryRuleRequest):
+    category = vod_db.get_category(category_id)
+    if not category:
+        raise HTTPException(404, detail="category not found")
+    if not category["is_smart"]:
+        raise HTTPException(400, detail="Only a smart category has a rule.")
+    try:
+        vod_db.validate_rule_json(body.rule_json)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    await asyncio.to_thread(vod_db.set_category_rule, category_id, body.rule_json)
+    return await asyncio.to_thread(vod_db.evaluate_smart_category, category_id, None, body.prune)
+
+
 @router.post("/categories/{category_id}/active/", dependencies=_GUARDS)
 async def set_category_active(category_id: int, is_active: bool):
     if not vod_db.get_category(category_id):

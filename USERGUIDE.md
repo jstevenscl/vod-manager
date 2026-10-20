@@ -1854,6 +1854,26 @@ imported in the first place.
   set a start and end date (month-day, e.g. `10-01` → `11-01`) and the
   category enables/disables itself on those dates every year going forward,
   no need to remember it each season.
+- **Smart (rule-based) categories** fill themselves from a rule. Tick **Smart
+  (rule-based)** when adding a category, pick a field (name, genre, year,
+  language, director, is_adult, provider_category or content_rating) and how to
+  compare it (contains, equals, starts_with, or gte/lte for a number), and type
+  the value. To match **several values**, separate them with commas, for example
+  `Action, Comedy`; a menu then lets you choose **matches any of these** (a title
+  needs just one) or **matches all of these** (it needs every one). Number
+  comparisons and the 18+ and content rating pickers take a single value.
+
+  ![Adding a smart category with several values](docs/screenshots/categories-multi-value.png)
+
+  **Editing a rule:** press the **pencil** icon on a smart category to change
+  its rule later, without deleting it. **Also remove titles that no longer match
+  the new rule** (on by default) takes out titles the old rule had placed;
+  untick it to only add. Titles you removed by hand stay out either way. The
+  built-in *All Movies* / *All TV Shows* categories and rules made of
+  different fields (for example from AI suggestions) can't be edited here.
+
+  ![Editing a smart category's rule](docs/screenshots/categories-edit-rule.png)
+
 - **Search, select, and bulk actions** — the same search bar, **Select
   visible**/**Deselect visible**, and shift-click range-select as the Exclude
   Categories picker, plus bulk **Enable selected**/**Disable selected**/
