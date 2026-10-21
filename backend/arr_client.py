@@ -10,6 +10,8 @@ import httpx
 _LABEL = {"radarr": "Radarr", "sonarr": "Sonarr"}
 _IMPORT_COMMAND = {"radarr": "DownloadedMoviesScan", "sonarr": "DownloadedEpisodesScan"}
 _RESOURCE = {"radarr": "movie", "sonarr": "series"}
+# what Radarr/Sonarr say when they can't tell which title a file is from its folder/file name
+_UNKNOWN_TITLE = {"Unknown Movie", "Unknown Series"}
 
 
 class ArrError(Exception):
@@ -75,9 +77,40 @@ class ArrClient:
                                     "searchForCutoffUnmetEpisodes": False})
         return self._call("POST", f"/{_RESOURCE[self.kind]}", json=body)
 
-    def import_path(self, path: str) -> int:
+    def import_path(self, path: str, arr_id: int | None = None, season: int | None = None,
+                    episode: int | None = None) -> int:
+        """Starts the import of a finished download. Radarr/Sonarr normally work out the title from the folder and
+        file names; when they can't (a different title or year from their own record, the TMDB id tag is not read)
+        and we already know which item this is (arr_id), the file is imported straight onto that item instead."""
+        if arr_id:
+            forced = self._import_known_item(path, arr_id, season, episode)
+            if forced is not None:
+                return forced
         cmd = self._call("POST", "/command", json={"name": _IMPORT_COMMAND[self.kind], "path": path,
                                                    "importMode": "Move"})
+        return int(cmd["id"])
+
+    def _import_known_item(self, path: str, arr_id: int, season: int | None, episode: int | None) -> int | None:
+        """A ManualImport command for files Radarr/Sonarr could not match to a title, or None when the normal scan
+        should run (the names matched, or the files are refused for some other reason the scan will report)."""
+        movie = self.kind == "radarr"
+        folder = path if movie else path.rsplit("/", 1)[0]
+        entries = self._call("GET", "/manualimport", params={"folder": folder, "filterExistingFiles": "false"}) or []
+        if not movie:
+            entries = [e for e in entries if e.get("path") == path]
+        reasons = {r.get("reason") for e in entries for r in e.get("rejections") or []}
+        if not entries or not reasons or not reasons <= _UNKNOWN_TITLE:
+            return None
+        ids: dict = {"movieId": arr_id}
+        if not movie:
+            episode_id = next((e["id"] for e in self._call("GET", "/episode", params={"seriesId": arr_id}) or []
+                               if e.get("seasonNumber") == season and e.get("episodeNumber") == episode), None)
+            if episode_id is None:
+                return None
+            ids = {"seriesId": arr_id, "episodeIds": [episode_id]}
+        files = [{"path": e["path"], **ids, "quality": e["quality"], "languages": e["languages"],
+                  "releaseGroup": e.get("releaseGroup") or "", "indexerFlags": e.get("indexerFlags", 0)} for e in entries]
+        cmd = self._call("POST", "/command", json={"name": "ManualImport", "files": files, "importMode": "move"})
         return int(cmd["id"])
 
     def command(self, cmd_id: int) -> dict:

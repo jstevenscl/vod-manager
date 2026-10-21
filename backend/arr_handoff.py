@@ -182,7 +182,7 @@ def _tick_waiting(job: dict, client, settings: dict, now: float) -> None:
         return
     if now - job["import_seen_at"] < STABLE_SECS:
         return
-    cmd_id = client.import_path(_import_target(found, settings, job["kind"]))
+    cmd_id = client.import_path(_import_target(found, settings, job["kind"]), job["arr_id"], *_episode_numbers(job))
     vod_db.update_import(job["id"], import_status="importing", import_cmd_id=cmd_id, import_cmd_at=now,
                          import_note=None)
 

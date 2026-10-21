@@ -120,7 +120,7 @@ library only when complete, so nothing partial is ever picked up. See the
 
 If you run **Radarr** or **Sonarr**, a finished download can be handed to them to import (optional, under
 **Configuration → Library handoff**), so they own the library and its naming; the queue shows each file as it
-goes from *Waiting for encoder* to *Importing* to *In library*. An optional **In Library** badge shows which movies,
+goes from *Waiting for encoder* to *Importing* to *In library*. If Radarr or Sonarr can't tell which title a file is from its name, the file is imported onto the movie or episode the app already added. An optional **In Library** badge shows which movies,
 shows and episodes your own Plex, Jellyfin or Emby already has, and asks before you download them again. See the
 [User Guide](USERGUIDE.md#handing-finished-downloads-to-radarr-or-sonarr).
 

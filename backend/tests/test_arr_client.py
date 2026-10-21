@@ -143,3 +143,54 @@ def test_connection_error_raises_arr_error():
     with pytest.raises(ArrError) as exc:
         _client("sonarr", handler).system_status()
     assert "Sonarr" in str(exc.value)
+
+
+_Q = {"quality": {"id": 5, "name": "WEBDL-720p"}, "revision": {"version": 1}}
+_L = [{"id": 0, "name": "Unknown"}]
+
+
+def _entry(path, *reasons):
+    return {"path": path, "quality": _Q, "languages": _L, "rejections": [{"reason": r, "type": "permanent"} for r in reasons]}
+
+
+def _commands(seen):
+    return [json.loads(r.content) for r in seen if r.method == "POST" and r.url.path == "/api/v3/command"]
+
+
+def test_radarr_import_forces_the_known_movie_when_the_name_is_unknown():
+    handler, seen = _record({("GET", "/api/v3/manualimport"): [_entry("/f/X (2000) [tmdbid-1]/X.mkv", "Unknown Movie")],
+                             ("POST", "/api/v3/command"): {"id": 9}})
+    assert _client("radarr", handler).import_path("/f/X (2000) [tmdbid-1]", 42) == 9
+    cmd = _commands(seen)[0]
+    assert cmd["name"] == "ManualImport" and cmd["importMode"] == "move"
+    assert cmd["files"][0]["movieId"] == 42 and cmd["files"][0]["path"] == "/f/X (2000) [tmdbid-1]/X.mkv"
+    assert cmd["files"][0]["quality"] == _Q and cmd["files"][0]["languages"] == _L
+
+
+@pytest.mark.parametrize("rejections", [(), ("Sample",), ("Unknown Movie", "Sample")])
+def test_radarr_import_uses_the_normal_scan_unless_only_the_title_is_unknown(rejections):
+    handler, seen = _record({("GET", "/api/v3/manualimport"): [_entry("/f/X/X.mkv", *rejections)],
+                             ("POST", "/api/v3/command"): {"id": 9}})
+    _client("radarr", handler).import_path("/f/X", 42)
+    assert _commands(seen)[0]["name"] == "DownloadedMoviesScan"
+
+
+def test_sonarr_import_forces_the_known_episode_for_that_file_only():
+    path = "/tv/S/Season 01/S - S01E02.mkv"
+    handler, seen = _record({
+        ("GET", "/api/v3/manualimport"): [_entry(path, "Unknown Series"), _entry("/tv/S/Season 01/other.mkv", "Unknown Series")],
+        ("GET", "/api/v3/episode"): [{"id": 100, "seasonNumber": 1, "episodeNumber": 1}, {"id": 101, "seasonNumber": 1, "episodeNumber": 2}],
+        ("POST", "/api/v3/command"): {"id": 10}})
+    assert _client("sonarr", handler).import_path(path, 7, 1, 2) == 10
+    cmd = _commands(seen)[0]
+    assert [f["path"] for f in cmd["files"]] == [path]
+    assert cmd["files"][0]["seriesId"] == 7 and cmd["files"][0]["episodeIds"] == [101]
+
+
+def test_sonarr_import_falls_back_to_the_scan_when_the_episode_is_not_in_sonarr():
+    path = "/tv/S/Season 01/S - S01E09.mkv"
+    handler, seen = _record({("GET", "/api/v3/manualimport"): [_entry(path, "Unknown Series")],
+                             ("GET", "/api/v3/episode"): [{"id": 100, "seasonNumber": 1, "episodeNumber": 1}],
+                             ("POST", "/api/v3/command"): {"id": 11}})
+    _client("sonarr", handler).import_path(path, 7, 1, 9)
+    assert _commands(seen)[0]["name"] == "DownloadedEpisodesScan"

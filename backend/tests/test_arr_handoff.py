@@ -157,7 +157,7 @@ class WatchArr(FakeArr):
         super().__init__({"777": {"title": "Some Movie", "id": 42}} if items is None else items, fail)
         self.cmd_status, self.file, self.rejection = cmd_status, has_file, rejection
 
-    def import_path(self, path):
+    def import_path(self, path, arr_id=None, season=None, episode=None):
         self.calls.append(("import", path))
         if self.fail:
             raise ArrError("Radarr: can't connect")

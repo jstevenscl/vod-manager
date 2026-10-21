@@ -1009,6 +1009,9 @@ API key are saved under **Configuration → Library handoff (Radarr / Sonarr)**.
    your encoder's output folder if an encoder such as Tdarr sits in between). Once the file has stopped growing it
    asks Radarr or Sonarr to import it. The import **moves** the file, so it leaves the finished folder and appears in
    the Radarr / Sonarr library.
+   Radarr and Sonarr normally recognise the title from the folder and file names. If they can't (for example
+   their record has a different year or spelling, the movie has no year so its folder is just `Title [tmdbid-N]`, or an encoder renamed the file), the app imports the file straight
+   onto the movie or episode it already added, so it doesn't fail with "Unknown Movie" / "Unknown Series".
 4. **Confirm.** The app checks that Radarr or Sonarr now has the file. If it refuses, the reason it gives is kept
    and shown.
 
