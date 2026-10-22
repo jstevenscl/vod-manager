@@ -2397,7 +2397,7 @@ interface DownloadJob {
 }
 interface DownloadSettings {
   enabled: boolean; output_dir: string; movies_dir: string; shows_dir: string; work_dir: string; audio_languages: string; keep_subtitles: boolean; tmdb_id_in_folder: boolean; reconnect_slow: boolean; default_preset: string; max_concurrent: number; min_free_gb: number
-  encoder: string; hw_device: string; encode_threads: number
+  encoder: string; hw_device: string; encode_threads: number; min_saving_percent: number
   speed_limit_mbps: number; provider_concurrent: number; pause_seconds: number
   window_enabled: boolean; window_start: number; window_end: number
 }
@@ -2664,6 +2664,11 @@ function DownloadsCard() {
               </button>
             )}
             {encTest && <span className={encTest.ok ? 'text-emerald-500' : 'text-destructive'}>{encTest.message}</span>}
+            <label className="flex items-center gap-1" title="After a re-encode, if the new file is not at least this much smaller than the downloaded original, the original is kept instead. Not used when other-language tracks were removed. 0 = always keep the re-encode.">
+              Keep the original unless it shrinks by
+              <input className={inputCls('w-14')} type="number" min={0} max={90} value={draft.min_saving_percent} onChange={(e) => setDraft({ ...draft, min_saving_percent: Math.min(90, Math.max(0, Number(e.target.value) || 0)) })} />
+              % (0 = off)
+            </label>
             <span className="basis-full text-muted-foreground">
               {data?.hardware && (data.hardware.render_devices.length || data.hardware.nvidia)
                 ? `GPU access found in this container: ${[...data.hardware.render_devices, ...(data.hardware.nvidia ? ['NVIDIA'] : [])].join(', ')}. `

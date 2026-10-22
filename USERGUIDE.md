@@ -893,6 +893,16 @@ the GPU is actually faster than the CPU. Hardware encodes are quicker but a litt
 Without a GPU, **CPU threads** (software encoder) limits (roughly) how many cores one re-encode uses so the
 rest of the server stays responsive. Re-encoding runs at low priority either way.
 
+**VAAPI with nothing to scale.** When the file is already no taller than the preset (for example a 720p
+recording with a 720p or 1080p preset), VAAPI keeps the whole job on the GPU, decoding and encoding with no
+copy through the CPU, so the CPU stays almost idle. A taller file still uses the CPU to scale, as above. If the
+GPU can't decode that file, the download quietly falls back to the normal VAAPI path and then to the CPU.
+
+**Keep the original unless it shrinks.** VAAPI on some GPUs can only encode at a fixed quality, which can
+make an already-compact file *bigger*. After a re-encode, if the new file is not at least **10%** smaller than the
+downloaded original (change it under *Re-encoding*; 0 turns it off), the original is kept instead and saved with
+its own extension. It does not apply when other-language tracks were removed, because the original still has them.
+
 **Leaving the encoding to Tdarr (or similar).** If you already run a transcoder, keep the preset on
 *Original file* (and the language list blank): files are saved untouched into the library layout above, and
 the processing folder keeps unfinished files out of sight until they are complete and checked. Point the

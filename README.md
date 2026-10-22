@@ -105,7 +105,7 @@ shared-folder compose setup.
 Prefer real files over streams? **Configuration → Downloads** (off by default)
 saves movies and episodes into a folder (or separate Movies and TV shows folders) named for Emby, Jellyfin and Plex. Pick the
 source when a title has several, or let failover choose; optionally re-encode to a
-smaller H.264/H.265 file (1080p, 720p or phone-sized 480p) while saving (on the CPU, or an Intel / AMD / NVIDIA GPU), and choose which audio
+smaller H.264/H.265 file (1080p, 720p or phone-sized 480p) while saving (on the CPU, or an Intel / AMD / NVIDIA GPU; the original is kept when a re-encode wouldn't save at least 10%), and choose which audio
 languages and subtitles to keep (even without re-encoding). Downloads respect each
 provider's connection limit (a download waits for a free connection and pauses itself,
 then resumes, when a viewer needs it), can be paced per provider

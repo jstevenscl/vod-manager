@@ -4061,6 +4061,7 @@ class DownloadSettingsRequest(BaseModel):
     encoder: str = "software"
     hw_device: str = ""
     encode_threads: int = 0
+    min_saving_percent: int = 10
     speed_limit_mbps: int = 0
     provider_concurrent: int = 1
     pause_seconds: int = 0
@@ -4110,6 +4111,7 @@ async def save_download_settings(body: DownloadSettingsRequest):
     settings["min_free_gb"] = max(0, settings["min_free_gb"])
     settings["hw_device"] = settings["hw_device"].strip()
     settings["encode_threads"] = min(64, max(0, settings["encode_threads"]))
+    settings["min_saving_percent"] = min(90, max(0, settings["min_saving_percent"]))
     if settings["encoder"] not in vod_downloader.ENCODERS:
         raise HTTPException(400, detail="Unknown encoder. Choose one of: " + ", ".join(vod_downloader.ENCODERS))
     if settings["hw_device"] and not settings["hw_device"].startswith("/dev/"):

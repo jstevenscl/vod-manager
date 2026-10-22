@@ -179,3 +179,91 @@ def test_the_test_button_reports_a_missing_gpu(db, hw, monkeypatch):
     monkeypatch.setattr(vod_downloader, "ffmpeg_available", lambda: True)
     r = asyncio.run(vod_routes.test_download_encoder(vod_routes.TestEncoderRequest(encoder="vaapi")))
     assert r["ok"] is False and "isn't available" in r["message"]
+
+
+# ── all-on-the-GPU step (no scaling needed) and the keep-the-original size guard ─────
+
+def test_vaapi_gpu_pipeline_has_no_cpu_filters():
+    a = args(engine="vaapi-gpu", device="/dev/dri/renderD128")
+    j = " ".join(a)
+    assert "-hwaccel vaapi" in j and "-hwaccel_output_format vaapi" in j and "-c:v h264_vaapi -qp 24" in j
+    assert "-vf" not in a and "hwupload" not in j
+    assert a.index("-hwaccel") < a.index("-i")
+
+
+def test_plan_carries_the_source_height():
+    streams = [{"index": 0, "codec_type": "video", "height": 720}, {"index": 1, "codec_type": "audio", "language": "eng"}]
+    plan = vod_downloader.plan_tracks(streams, [], True)
+    assert plan.src_height == 720 and plan.without_subs().src_height == 720
+
+
+def test_stay_on_gpu_only_when_nothing_needs_scaling():
+    mk = lambda h: vod_downloader.TrackPlan(video=0, src_height=h)
+    assert vod_downloader._can_stay_on_gpu("h264_720", mk(720))
+    assert vod_downloader._can_stay_on_gpu("h264_1080", mk(576))
+    assert not vod_downloader._can_stay_on_gpu("h264_720", mk(1080))
+    assert not vod_downloader._can_stay_on_gpu("h264_720", mk(None)) and not vod_downloader._can_stay_on_gpu("h264_720", None)
+
+
+def test_keeps_original_unless_the_encode_saves_enough():
+    keep = vod_downloader._keeps_original
+    plan = vod_downloader.TrackPlan(video=0)
+    s = {"min_saving_percent": 10}
+    assert keep(s, plan, [], 1000, 1000) and keep(s, plan, [], 1000, 950)       # bigger / saves 5%
+    assert not keep(s, plan, [], 1000, 900) and not keep(s, plan, [], 1000, 500)
+    assert not keep({"min_saving_percent": 0}, plan, [], 1000, 5000), "0 turns the guard off"
+    assert not keep(s, vod_downloader.TrackPlan(video=0, changed=True), [], 1000, 5000), "tracks were dropped: the original has them"
+    assert not keep(s, None, ["en"], 1000, 5000), "a language list we couldn't apply"
+    assert keep(s, None, [], 1000, 5000)
+
+
+def test_the_gpu_only_step_comes_first_and_falls_back(db, server, dl, hw, monkeypatch):
+    hw["render_devices"] = ["/dev/dri/renderD128"]
+    calls = _fake_ffmpeg(monkeypatch, fail_engines=("vaapi-gpu", "vaapi"))
+
+    async def probe(path):
+        return [{"index": 0, "codec_type": "video", "height": 480}]
+
+    monkeypatch.setattr(vod_downloader, "_probe_streams", probe)
+    config.save_download_settings({"encoder": "vaapi", "min_saving_percent": 0})
+    mid, _ = _movie(db, server)
+    vod_downloader.enqueue(movie_ids=[mid], preset="h264_720")
+    assert _run(1)["status"] == "done"
+    assert [c["engine"] for c in calls] == ["vaapi-gpu", "vaapi", "software"]
+
+
+def _encode_of(monkeypatch, nbytes):
+    calls = _fake_ffmpeg(monkeypatch)
+
+    async def run(src, part, preset, ua, duration, ctx, plan=None, copy=False, engine="software", device=None, threads=0):
+        part.write_bytes(b"x" * nbytes)
+        return nbytes
+
+    monkeypatch.setattr(vod_downloader, "_run_ffmpeg", run)
+    return calls
+
+
+def test_a_bloated_reencode_is_replaced_by_the_original(db, server, dl, monkeypatch):
+    _encode_of(monkeypatch, len(FILE_BYTES) + 1)
+    mid, _ = _movie(db, server)
+    config.save_download_settings({"min_saving_percent": 10})
+    vod_downloader.enqueue(movie_ids=[mid], preset="h264_720")
+    job = _run(1)
+    assert job["status"] == "done" and not job["final_path"].endswith(".mkv")
+    assert job["final_size"] == len(FILE_BYTES)
+
+
+def test_a_good_reencode_is_kept(db, server, dl, monkeypatch):
+    _encode_of(monkeypatch, len(FILE_BYTES) // 2)
+    mid, _ = _movie(db, server)
+    vod_downloader.enqueue(movie_ids=[mid], preset="h264_720")
+    job = _run(1)
+    assert job["status"] == "done" and job["final_path"].endswith(".mkv") and job["final_size"] == len(FILE_BYTES) // 2
+
+
+def test_the_guard_can_be_switched_off(db, server, dl, monkeypatch):
+    _encode_of(monkeypatch, len(FILE_BYTES) + 1)
+    mid, _ = _movie(db, server)
+    config.save_download_settings({"min_saving_percent": 0})
+    vod_downloader.enqueue(movie_ids=[mid], preset="h264_720")
+    assert _run(1)["final_path"].endswith(".mkv")

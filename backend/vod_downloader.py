@@ -297,9 +297,10 @@ class TrackPlan:
     audio: list[int] = field(default_factory=list)
     subs: list[tuple[int, str]] = field(default_factory=list)   # (stream index, codec)
     changed: bool = False                                       # differs from "every stream as is"
+    src_height: int | None = None                               # the source video's height, when the probe knew it
 
     def without_subs(self) -> "TrackPlan":
-        return TrackPlan(self.video, self.audio, [], True)
+        return TrackPlan(self.video, self.audio, [], True, self.src_height)
 
 
 def _matching(tracks: list[dict], langs: list[str]) -> list[dict]:
@@ -325,7 +326,8 @@ def plan_tracks(streams: list[dict], langs: list[str], keep_subs: bool) -> Track
         video=videos[0]["index"] if videos else None,
         audio=[a["index"] for a in audio_sel],
         subs=[(s["index"], (s.get("codec_name") or "").lower()) for s in subs_sel],
-        changed=changed)
+        changed=changed,
+        src_height=videos[0].get("height") if videos else None)
 
 
 async def _probe_streams(path: Path | str) -> list[dict] | None:
@@ -333,7 +335,7 @@ async def _probe_streams(path: Path | str) -> list[dict] | None:
     if not shutil.which("ffprobe"):
         return None
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name:stream_tags=language:stream_disposition=attached_pic",
+        "ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,height:stream_tags=language:stream_disposition=attached_pic",
         "-of", "json", str(path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), 90)
@@ -348,6 +350,7 @@ async def _probe_streams(path: Path | str) -> list[dict] | None:
     except ValueError:
         return None
     return [{"index": int(r["index"]), "codec_type": r.get("codec_type"), "codec_name": r.get("codec_name"),
+             "height": int(r["height"]) if r.get("height") else None,
              "language": (r.get("tags") or {}).get("language"), "attached_pic": bool((r.get("disposition") or {}).get("attached_pic"))}
             for r in raw if "index" in r]
 
@@ -800,7 +803,7 @@ async def _copy_local(src: str, part: Path, ctx: _Ctx) -> int:
 
 
 ENCODERS = ("software", "auto", "vaapi", "qsv", "nvenc")
-_ENCODER_LABELS = {"software": "CPU", "vaapi": "VAAPI", "qsv": "Intel QSV", "nvenc": "NVIDIA NVENC"}
+_ENCODER_LABELS = {"software": "CPU", "vaapi": "VAAPI", "vaapi-gpu": "VAAPI, all on the GPU", "qsv": "Intel QSV", "nvenc": "NVIDIA NVENC"}
 DEFAULT_RENDER_DEVICE = "/dev/dri/renderD128"
 
 
@@ -836,6 +839,10 @@ def _video_args(preset: str, engine: str, device: str | None, threads: int) -> t
     hevc = p["codec"] == "libx265"
     scale = f"scale=-2:'min({p['height']},ih)'"
     crf = str(p["crf"])
+    if engine == "vaapi-gpu":
+        # nothing to scale, so the frames can stay on the GPU from decode to encode (no copy back, the CPU stays idle)
+        return (["-hwaccel", "vaapi", "-hwaccel_device", str(device), "-hwaccel_output_format", "vaapi"],
+                ["-c:v", "hevc_vaapi" if hevc else "h264_vaapi", "-qp", crf])
     if engine == "vaapi":
         pre = ["-init_hw_device", f"vaapi=hw:{device}", "-filter_hw_device", "hw"]
         return pre, ["-vf", f"{scale},format=nv12,hwupload", "-c:v", "hevc_vaapi" if hevc else "h264_vaapi", "-qp", crf]
@@ -1110,6 +1117,8 @@ async def _transcode(src: str, out_part: Path, preset: str, duration: int | None
         logger.warning("[download] job=%s: GPU encoding unavailable (%s); using the CPU", ctx.job_id, why)
         cpu_note = f"{base} (CPU: {why})"
     chain = [(engine, device)] + ([("software", None)] if engine != "software" else [])
+    if engine == "vaapi" and not copy and _can_stay_on_gpu(preset, plan):
+        chain.insert(0, ("vaapi-gpu", device))    # a decoder or format the GPU can't take falls through to the next step
 
     async def run(p: TrackPlan | None, eng: str, dev: str | None) -> int:
         if p is None and not copy:
@@ -1136,6 +1145,21 @@ async def _transcode(src: str, out_part: Path, preset: str, duration: int | None
                 raise
             logger.warning("[download] job=%s: %s encoding failed (%s); retrying on the CPU", ctx.job_id, eng, exc)
             out_part.unlink(missing_ok=True)
+
+
+def _can_stay_on_gpu(preset: str, plan: TrackPlan | None) -> bool:
+    """True when the source is already no taller than the preset, so nothing needs scaling on the CPU."""
+    height = plan.src_height if plan is not None else None
+    return bool(height) and height <= PRESETS[preset]["height"]
+
+
+def _keeps_original(settings: dict, plan: TrackPlan | None, langs: list[str], src_size: int, out_size: int) -> bool:
+    """A re-encode that doesn't shrink the file enough is not worth keeping. Not applied when tracks were dropped
+    (the original still has them) or the language list couldn't be applied (no probe)."""
+    pct = int(settings.get("min_saving_percent") or 0)
+    if not pct or not src_size or (plan is not None and plan.changed) or (plan is None and langs):
+        return False
+    return out_size > src_size * (100 - pct) / 100
 
 
 def _same_device(a: Path, b: Path) -> bool:
@@ -1249,8 +1273,16 @@ async def run_job(job_id: int) -> None:
                         duration = await _probe_duration(encode_in)     # provider files often carry no runtime in the title
                     size = await _transcode(encode_in, out_part, preset, duration, ctx, plan, copy=trim_only, settings=settings)
                     await _validate_media(out_part)      # the new file is checked too, before it reaches the library
-                    final = folder / f"{stem}.mkv"
-                    size = await _finalize(out_part, final, ctx)
+                    out_size = out_part.stat().st_size
+                    if local_input is None and not trim_only and _keeps_original(settings, plan, langs, kept.stat().st_size, out_size):
+                        logger.info("[download] job=%s: re-encode %d -> %d bytes saves less than %d%%; keeping the original",
+                                    job_id, kept.stat().st_size, out_size, settings["min_saving_percent"])
+                        out_part.unlink(missing_ok=True)
+                        final = folder / f"{stem}.{src_ext}"
+                        size = await _finalize(kept, final, ctx)
+                    else:
+                        final = folder / f"{stem}.mkv"
+                        size = await _finalize(out_part, final, ctx)
                     if local_input is None:
                         kept.unlink(missing_ok=True)   # only ever our own temp copy, never a library file
                     temps.clear()
