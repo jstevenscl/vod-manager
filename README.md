@@ -102,7 +102,7 @@ shared-folder compose setup.
 
 ## Downloading files into your library
 
-Prefer real files over streams? **Configuration → Downloads** (off by default)
+Prefer real files over streams? **Download Configuration → Downloads** (off by default)
 saves movies and episodes into a folder (or separate Movies and TV shows folders) named for Emby, Jellyfin and Plex. Pick the
 source when a title has several, or let failover choose; optionally re-encode to a
 smaller H.264/H.265 file (1080p, 720p or phone-sized 480p) while saving (on the CPU, or an Intel / AMD / NVIDIA GPU; the original is kept when a re-encode wouldn't save at least 10%), and choose which audio
@@ -125,7 +125,7 @@ provider is unhappy, so it never strains a provider. See the
 [User Guide](USERGUIDE.md#downloading-files-into-a-library-folder).
 
 If you run **Radarr** or **Sonarr**, a finished download can be handed to them to import (optional, under
-**Configuration → Library handoff**), so they own the library and its naming; the queue shows each file as it
+**Download Configuration → Library handoff**), so they own the library and its naming; the queue shows each file as it
 goes from *Waiting for encoder* to *Importing* to *In library*. If Radarr or Sonarr can't tell which title a file is from its name, the file is imported onto the movie or episode the app already added. An optional **In Library** badge shows which movies,
 shows and episodes your own Plex, Jellyfin or Emby already has, and asks before you download them again. See the
 [User Guide](USERGUIDE.md#handing-finished-downloads-to-radarr-or-sonarr).
