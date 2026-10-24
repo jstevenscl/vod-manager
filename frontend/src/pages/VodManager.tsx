@@ -1564,6 +1564,7 @@ interface Movie {
   sources: MovieSource[]
   placements: MoviePlacement[]
   in_library?: string | null   // "Plex: Movies" when the user's media server has it
+  trailer_key?: string | null
 }
 
 interface MetadataRule {
@@ -1598,6 +1599,7 @@ interface Series {
   episodes: Episode[]
   placements: SeriesPlacement[]
   in_library?: string | null
+  trailer_key?: string | null
 }
 
 interface MissingEpisode {
@@ -2529,7 +2531,7 @@ function queueResultText(r: { queued: number; already_queued: number; no_source:
   if (r.no_source) parts.push(`${r.no_source} skipped (no playable source)`)
   if (r.missing) parts.push(`${r.missing} no longer exist`)
   if (r.truncated) parts.push('stopped at 2,000 for one request, so narrow the selection and queue the rest')
-  return (parts.join(', ') || 'Nothing to queue') + '. Progress is under Configuration → Downloads.'
+  return (parts.join(', ') || 'Nothing to queue') + '. Progress is under Download Configuration.'
 }
 
 // the queue asks first when the user's media server already has some of it
@@ -2624,7 +2626,7 @@ function DownloadMenu({ target, label, providers, seasons }: {
   )
 }
 
-// Configuration -> Downloads: settings, the legal note, and the live queue.
+// Download Configuration -> Downloads: settings, the legal note, and the live queue.
 function DownloadsCard() {
   const qc = useQueryClient()
   const status = useDownloadStatus(true)
@@ -2849,11 +2851,11 @@ function DownloadsCard() {
                     <td className="py-1 pr-2 whitespace-nowrap text-muted-foreground">{j.preset === 'original' ? 'original' : j.preset.replace('_', ' ')}</td>
                     <td className={`py-1 pr-2 ${j.import_status ? 'min-w-36' : 'w-36'}`}>
                       {j.status === 'running' && (
-                        <div className="h-1.5 rounded bg-border overflow-hidden"><div className="h-full bg-primary" style={{ width: `${Math.round(j.progress * 100)}%` }} /></div>
+                        <div className="h-1.5 rounded bg-border overflow-hidden"><div className={`h-full bg-primary ${j.total_bytes ? '' : 'animate-pulse opacity-50'}`} style={{ width: j.total_bytes ? `${Math.round(j.progress * 100)}%` : '100%' }} /></div>
                       )}
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                       <span className={statusColor[j.status]}>
-                        {j.status === 'running' ? `${Math.round(j.progress * 100)}% · ${dlBytes(j.bytes_done)}${j.provider_name ? ` · ${j.provider_name}` : ''}` : j.status === 'done' ? `done · ${dlBytes(j.final_size)}` : j.status}
+                        {j.status === 'running' ? `${j.total_bytes ? `${Math.round(j.progress * 100)}%` : 'size unknown'} · ${dlBytes(j.bytes_done)}${j.provider_name ? ` · ${j.provider_name}` : ''}` : j.status === 'done' ? `done · ${dlBytes(j.final_size)}` : j.status}
                       </span>
                       <ImportChip job={j} />
                       </div>
@@ -2898,6 +2900,36 @@ const IN_LIBRARY_CLS = 'border-lime-500/40 bg-lime-500/15 text-lime-500'
 function InLibraryBadge({ where }: { where?: string | null }) {
   if (!where) return null
   return <span title={`Already in your library (${where})`} className={`inline-flex items-center rounded border px-1.5 py-px text-[10px] font-semibold leading-tight whitespace-nowrap ${IN_LIBRARY_CLS}`}>In Library</span>
+}
+
+// trailer_key (from the provider catalog or TMDB, a YouTube id) was only served to XC clients;
+// a red ▶ on the card plays it in an embedded YouTube player.
+function TrailerBadge({ trailerKey, title, className = '' }: { trailerKey?: string | null; title: string; className?: string }) {
+  const [open, setOpen] = useState(false)
+  if (!trailerKey) return null
+  return (
+    <>
+      <button
+        title="Watch trailer"
+        className={`z-10 rounded bg-black/75 px-[7px] py-[3px] text-[0.85rem] leading-none text-red-500 hover:bg-black/90 ${className}`}
+        onClick={(e) => { e.stopPropagation(); setOpen(true) }}
+      >
+        &#9654;
+      </button>
+      {open && (
+        <Modal onClose={() => setOpen(false)} maxWidth="max-w-4xl">
+          <div className="px-4 py-2.5 border-b border-border text-sm font-bold truncate pr-10">{title} — Trailer</div>
+          <iframe
+            src={`https://www.youtube.com/embed/${encodeURIComponent(trailerKey)}?autoplay=1`}
+            title={`${title} trailer`}
+            className="w-full aspect-video bg-black"
+            allow="autoplay; encrypted-media; picture-in-picture"
+            allowFullScreen
+          />
+        </Modal>
+      )}
+    </>
+  )
 }
 
 // import still in progress: the row stays so the watcher can finish (vod_db.PENDING_IMPORT_STATUSES);
@@ -3725,13 +3757,14 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               separate strip below the poster. */}
           <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
           {!!movie.is_adult && (
-            <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
+            <span className={`absolute ${movie.trailer_key ? 'top-8' : 'top-1.5'} right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5`}>18+</span>
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{movie.name}</p>
             <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{movie.year ?? ''}<InLibraryBadge where={movie.in_library} /></p>
           </div>
         </button>
+        <TrailerBadge trailerKey={movie.trailer_key} title={`${movie.name}${movie.year ? ` (${movie.year})` : ''}`} className="absolute top-1.5 right-1.5" />
         {movie.sources.length > 0 && (
           <div className="absolute bottom-14 right-1.5 z-10 opacity-0 group-hover:opacity-100 transition-opacity bg-background/85 rounded" onClick={(e) => e.stopPropagation()}>
             <PlayButton
@@ -4373,13 +4406,14 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           />
           <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
           {!!series.is_adult && (
-            <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
+            <span className={`absolute ${series.trailer_key ? 'top-8' : 'top-1.5'} right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5`}>18+</span>
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{series.name}</p>
             <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{series.year ?? ''}<InLibraryBadge where={series.in_library} /></p>
           </div>
         </button>
+        <TrailerBadge trailerKey={series.trailer_key} title={`${series.name}${series.year ? ` (${series.year})` : ''}`} className="absolute top-1.5 right-1.5" />
         <div className="px-2.5 py-1.5 flex items-center justify-between text-[10.5px] text-muted-foreground border-t border-border/60">
           <span>{series.episodes.length} episode{series.episodes.length === 1 ? '' : 's'}</span>
         </div>
@@ -5665,7 +5699,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'downloads' | 'dvr'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -8160,6 +8194,18 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
+      {/* download, Radarr/Sonarr handoff and In Library settings have their own page */}
+      {activeTab === 'downloads' && (
+      <>
+      <DownloadsCard />
+
+      <HandoffCard />
+
+      {/* wait for providers so the card knows whether to open the typed-in form */}
+      {!providersQuery.isPending && <LibraryPresenceCard providers={providersQuery.data ?? []} />}
+      </>
+      )}
+
       {activeTab === 'config' && (
       <>
       <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
@@ -8704,13 +8750,6 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         )}
       </SectionCard>
-
-      <DownloadsCard />
-
-      <HandoffCard />
-
-      {/* wait for providers so the card knows whether to open the typed-in form */}
-      {!providersQuery.isPending && <LibraryPresenceCard providers={providersQuery.data ?? []} />}
 
       <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
@@ -12245,7 +12284,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               size="sm"
               variant="outline"
               disabled={selectedMovieIds.size === 0 || queueDownload.isPending}
-              title="Saves the selected movies as files in your download folder (uses the default preset from Configuration → Downloads)"
+              title="Saves the selected movies as files in your download folder (uses the default preset from Download Configuration)"
               onClick={() => queueDownload.mutate({ movie_ids: Array.from(selectedMovieIds) })}
             >
               <Download size={12} className="mr-1" />Download selected ({selectedMovieIds.size})
@@ -12487,7 +12526,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               size="sm"
               variant="outline"
               disabled={selectedSeriesIds.size === 0 || queueDownload.isPending}
-              title="Saves the selected shows (every episode) as files in your download folder (uses the default preset from Configuration → Downloads)"
+              title="Saves the selected shows (every episode) as files in your download folder (uses the default preset from Download Configuration)"
               onClick={() => queueDownload.mutate({ series_ids: Array.from(selectedSeriesIds) })}
             >
               <Download size={12} className="mr-1" />Download selected ({selectedSeriesIds.size})

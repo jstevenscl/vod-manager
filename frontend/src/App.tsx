@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CalendarDays, Database, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
-  Palette, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
+  Activity, CalendarDays, Database, Download, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Palette, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
 import Login from '@/pages/Login'
@@ -71,6 +71,7 @@ const NAV_GROUPS: NavGroup[] = [
   ] },
   { label: 'System', items: [
     { label: 'Configuration', icon: <SettingsIcon size={15} />, tab: 'config' },
+    { label: 'Download Configuration', icon: <Download size={15} />, tab: 'downloads' },
   ] },
 ]
 
@@ -82,8 +83,14 @@ export default function App() {
 
   const [activeTab, setActiveTabState] = useState<AppTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'dvr' || saved === 'tmdb' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'tmdb' ? saved : 'movies'
   })
+  // the user can hide/unhide the sidebar menu; remembered per browser
+  const [navHidden, setNavHiddenState] = useState(() => localStorage.getItem('vodmanager-nav-hidden') === '1')
+  function setNavHidden(hidden: boolean) {
+    localStorage.setItem('vodmanager-nav-hidden', hidden ? '1' : '0')
+    setNavHiddenState(hidden)
+  }
   function setActiveTab(t: AppTab) {
     localStorage.setItem('vodmanager-tab', t)
     setActiveTabState(t)
@@ -233,7 +240,8 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen grid grid-cols-[240px_1fr]">
+    <div className={`min-h-screen grid ${navHidden ? 'grid-cols-[1fr]' : 'grid-cols-[240px_1fr]'}`}>
+      {!navHidden && (
       <aside className="sticky top-0 h-screen flex flex-col border-r border-border bg-card px-2.5 py-4 overflow-y-auto">
         <div className="flex items-center gap-2 px-1.5 pb-4">
           <img src="/favicon.svg" width={26} height={26} alt="" className="rounded-md flex-shrink-0" />
@@ -245,6 +253,13 @@ export default function App() {
               </div>
             )}
           </div>
+          <button
+            className="ml-auto flex-shrink-0 text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-accent"
+            title="Hide menu"
+            onClick={() => setNavHidden(true)}
+          >
+            <PanelLeftClose size={15} />
+          </button>
         </div>
         <nav className="flex-1 space-y-3.5">
           {navGroups.map((group) => (
@@ -279,9 +294,19 @@ export default function App() {
           </div>
         </nav>
       </aside>
+      )}
 
       <div className="flex flex-col min-w-0">
         <header className="sticky top-0 z-10 flex flex-wrap items-center gap-3.5 px-5 py-2.5 border-b border-border bg-card">
+          {navHidden && (
+            <button
+              className="text-muted-foreground hover:text-foreground transition-colors p-1.5 rounded hover:bg-accent"
+              title="Show menu"
+              onClick={() => setNavHidden(false)}
+            >
+              <PanelLeftOpen size={15} />
+            </button>
+          )}
           <div className="flex-1 max-w-[380px] flex items-center gap-2 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-muted-foreground/70">
             <Search size={13} className="flex-shrink-0" />
             Search coming soon…

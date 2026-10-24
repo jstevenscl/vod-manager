@@ -708,10 +708,13 @@ def _window_rate(samples, window: float) -> float | None:
     return (cur - old[1]) / span if span >= min(window, 3.0) * 0.8 else None
 
 
-async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx, provider_name: str = "provider") -> int:
+async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx, provider_name: str = "provider",
+                         expected_total: int | None = None) -> int:
     """Streams url into part, resuming a previous partial file, at most ctx.rate_bps bytes/second
     when a speed cap applies. Returns the final size. The queue note shows the live speed and which server
-    the provider redirected to; a transfer that crawls is resumed on a fresh connection (see _SLOW_*)."""
+    the provider redirected to; a transfer that crawls is resumed on a fresh connection (see _SLOW_*).
+    A provider that sends no Content-Length leaves the progress bar without a total; expected_total (the size a
+    Check quality found) stands in for it on the bar only, never for the free-space or completeness checks."""
     headers = {"User-Agent": user_agent} if user_agent else dict(xc_server._UPSTREAM_HEADERS)
     attempt, reconnects, peak = 0, 0, 0.0
     while attempt < _MAX_ATTEMPTS:
@@ -748,6 +751,7 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                     else:
                         mode, done = "wb", 0
                         total = int(resp.headers["content-length"]) if resp.headers.get("content-length", "").isdigit() else None
+                    shown = total or expected_total
                     free = _free_bytes(ctx.out_root)
                     if total and free is not None and free - (total - done) < ctx.min_free:
                         raise DownloadError("Not enough free space for this file with the free-space limit you set.")
@@ -792,12 +796,12 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                                 await asyncio.to_thread(fh.write, bytes(buf))
                                 done += len(buf)
                                 buf.clear()
-                                ctx.progress(done, total)
+                                ctx.progress(done, shown)
                             ctx.check()
                         if buf:
                             await asyncio.to_thread(fh.write, bytes(buf))
                             done += len(buf)
-                    ctx.progress(done, total, force=True)
+                    ctx.progress(done, shown, force=True)
                     if slow:
                         reconnects += 1
                         attempt -= 1  # dropping a slow connection on purpose is not a failed attempt
@@ -1111,7 +1115,7 @@ async def _fetch(job: dict, source: dict, dest: Path, ctx: _Ctx, settings: dict)
         vod_db.update_download_job(job["id"], ("running",), provider_name=provider["name"])
         url = await xc_server._build_upstream_url(kind, provider, source, reservation)
         try:
-            size = await _download_http(url, dest, user_agent, ctx, provider["name"])
+            size = await _download_http(url, dest, user_agent, ctx, provider["name"], source.get("file_size_bytes") or None)
         except _Pushback as pb:
             n = _pushbacks.get(pid, 0) + 1
             _pushbacks[pid] = n

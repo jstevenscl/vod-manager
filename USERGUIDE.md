@@ -83,7 +83,9 @@ Why this matters in practice:
   listing includes a trailer, VOD & DVR Manager keeps it and re-exposes it
   through its own XC feed, so Dispatcharr and other clients that read that
   field can show it — nothing to configure, and nothing is fetched from
-  anywhere else on VOD & DVR Manager's side.
+  anywhere else on VOD & DVR Manager's side. In the web app, a title that has
+  a trailer shows a small ▶ badge on its poster; click it to watch the trailer
+  in a pop-up (see *Movies tab* below).
 - **Recommended deployment**: on the same host/stack as Dispatcharr, since
   the two talk to each other constantly. It's fully capable of running on
   its own separate host too — nothing about it requires colocation, it's
@@ -815,7 +817,7 @@ same folder naming convention.
 ### Downloading files into a library folder
 
 The .strm export links to your providers' streams. If you would rather keep real
-files, **Configuration → Downloads** saves movies and episodes to a folder, named
+files, **Download Configuration → Downloads** saves movies and episodes to a folder, named
 the way Emby, Jellyfin and Plex expect (`Movies/Title (Year) [tmdbid-N]/Title (Year).mp4`,
 `Shows/Show (Year) [tmdbid-N]/Season 01/Show - S01E01.mp4`). The `[tmdbid-N]` tag
 helps your media server match the right title; untick **TMDB id in folder names**
@@ -850,8 +852,10 @@ Once on, a **Download** button appears:
 
 ![A movie's Download control, a per-source download icon and Download selected](docs/screenshots/download-buttons.png)
 
-Downloads wait in a queue, show live progress under **Configuration → Downloads**, and
-can be cancelled or retried. A title already in the folder is never downloaded twice,
+Downloads wait in a queue, show live progress under **Download Configuration → Downloads**, and
+can be cancelled or retried. When a provider does not say how big a file is while it sends it,
+the queue uses the size from a **Check quality** you ran on that source for the percentage; with
+neither, it shows *size unknown* and the amount downloaded so far instead of a misleading 0%. A title already in the folder is never downloaded twice,
 and a download that was interrupted (restart, dropped connection) resumes where it left
 off.
 
@@ -894,7 +898,7 @@ then runs from the local copy, so it never ties up your provider (it does use CP
 which is why *At once* defaults to 1).
 
 **Re-encoding on a GPU (optional).** A software re-encode is CPU-heavy: on a modest server a
-long film can take hours. Under *Configuration → Downloads → Re-encoding* you can pick a hardware
+long film can take hours. Under *Download Configuration → Downloads → Re-encoding* you can pick a hardware
 **Encoder** instead of *Software (CPU)*: *VAAPI* (Intel or AMD on Linux), *Intel Quick Sync (QSV)* or
 *NVIDIA NVENC*. *Automatic* uses a GPU when the container has one. A container only sees a GPU if you
 share it, so add to the `vod-manager` service in your `docker-compose.override.yml`:
@@ -955,7 +959,7 @@ preset makes a small file for exactly this. You can also point a media server's
 library at the folder instead.
 
 **Choosing languages.** Many provider files carry several audio tracks (and sometimes
-subtitles) in one file. Under *Configuration → Downloads → Languages*:
+subtitles) in one file. Under *Download Configuration → Downloads → Languages*:
 
 - **Keep audio** takes a list such as `eng` or `eng, jpn` (codes or names). Blank keeps every
   track as it is. Only the listed audio languages stay in the saved file. A track with no language
@@ -1007,7 +1011,7 @@ error page saved as a video is rejected rather than left in your library.
 a **processing folder**, and a file is moved into the movies / TV shows folder only when it
 is complete and has passed the ffprobe check (an encoded file is checked too). So a media
 server, Sonarr or Tdarr watching the library can never pick up a partial or corrupt file.
-Set the **Processing folder** under *Configuration → Downloads* (ideally a fast local
+Set the **Processing folder** under *Download Configuration → Downloads* (ideally a fast local
 disk; if it is on the same disk as the library the final move is an instant rename, across
 disks the file is copied under a hidden temporary name first). Left blank, a hidden
 `.processing` folder inside each library folder is used. A re-encode needs room in the
@@ -1035,7 +1039,7 @@ If you already run **Radarr** or **Sonarr** (often with an encoder such as Tdarr
 the library), you can let them own the library. VOD & DVR Manager keeps downloading (and, if you ask, encoding)
 exactly as above, then hands the finished file to Radarr or Sonarr to import, so the file lands in their library
 with their naming and your media server is told. It is optional and does nothing until a Radarr or Sonarr URL and
-API key are saved under **Configuration → Library handoff (Radarr / Sonarr)**.
+API key are saved under **Download Configuration → Library handoff (Radarr / Sonarr)**.
 
 ![The Library handoff card, with Radarr and Sonarr connected](docs/screenshots/library-handoff.png)
 
@@ -1076,7 +1080,7 @@ download is checked on its own, so one stuck file never blocks the others.
 
 ### Knowing what your media server already has (In Library)
 
-It is easy to download something you already own. **Configuration → In Library (your Plex / Jellyfin / Emby)**
+It is easy to download something you already own. **Download Configuration → In Library (your Plex / Jellyfin / Emby)**
 lets VOD & DVR Manager read the libraries on your own media server and mark matching titles everywhere they are
 shown. It is optional, and nothing changes until you add a server.
 
@@ -1434,6 +1438,12 @@ currently running, plus the app's own process CPU usage, so you can tell at
 a glance whether something's actively working before digging into a
 specific tab's own progress display.
 
+![The sidebar, with the Download Configuration page under System and the Hide menu button at the top](docs/screenshots/sidebar-download-configuration.png)
+
+To get more room, click the **Hide menu** button at the top of the sidebar.
+The **Show menu** button at the left of the top bar brings it back. Your
+browser remembers which one you picked.
+
 Above the catalog itself, the dashboard always shows two live cards:
 
 - **Activity** — what's playing right now, across every viewer, refreshed
@@ -1490,7 +1500,11 @@ one would work if the client just retried."
 The **Movies** and **TV Shows** tabs below that are the main catalog views,
 each with a **list** or **grid** (poster wall) mode.
 
-![Movies tab, grid view](docs/screenshots/movies-grid.png)
+![Movies tab, grid view, with the trailer badge on titles that have one](docs/screenshots/movies-grid.png)
+
+In grid mode, a title that has a trailer shows a small **▶** badge in the top-right corner of its
+poster. Click it to watch the trailer in a pop-up (YouTube's player, so the browser needs to reach YouTube);
+this does not open the title's detail view. If a title is also marked 18+, that badge sits just below the ▶.
 
 - **Search / provider filter / page size** — top toolbar.
 - **Manage Categories**, **Needs Review**, **Missing Artwork**, **Language

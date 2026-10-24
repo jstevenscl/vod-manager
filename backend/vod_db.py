@@ -7568,7 +7568,7 @@ def get_movie_source_for_streaming(source_id: int) -> dict | None:
     conn = _connect()
     try:
         row = conn.execute("""
-        SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path,
+        SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension, ms.plex_rating_key, ms.local_file_path, ms.file_size_bytes,
                m.id AS movie_id, m.name AS movie_name, m.year AS movie_year, m.duration_secs AS duration_secs
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
@@ -7592,7 +7592,7 @@ def list_movie_sources_for_streaming(movie_id: int) -> list[dict]:
         lang_clause, lang_params = _enabled_languages_clause("ms.language")
         rows = conn.execute(f"""
         SELECT ms.id AS source_id, ms.provider_id, ms.provider_stream_id, ms.container_extension,
-               ms.plex_rating_key, ms.local_file_path, ms.consecutive_failures AS consecutive_failures,
+               ms.plex_rating_key, ms.local_file_path, ms.file_size_bytes, ms.consecutive_failures AS consecutive_failures,
                p.name AS provider_name
         FROM movie_sources ms
         JOIN providers p ON p.id = ms.provider_id
@@ -8719,7 +8719,7 @@ def get_episode_source_for_streaming(source_id: int) -> dict | None:
     conn = _connect()
     try:
         row = conn.execute("""
-        SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path,
+        SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension, es.plex_rating_key, es.local_file_path, es.file_size_bytes,
                e.id AS episode_id, e.name AS episode_name, e.season_number AS season_number, e.episode_number AS episode_number,
                e.duration_secs AS duration_secs, s.id AS series_id, s.name AS series_name
         FROM episode_sources es
@@ -8741,7 +8741,7 @@ def list_episode_sources_for_streaming(episode_id: int) -> list[dict]:
         lang_clause, lang_params = _enabled_languages_clause("es.language")
         rows = conn.execute(f"""
         SELECT es.id AS source_id, es.provider_id, es.provider_stream_id, es.container_extension,
-               es.plex_rating_key, es.local_file_path, es.consecutive_failures AS consecutive_failures,
+               es.plex_rating_key, es.local_file_path, es.file_size_bytes, es.consecutive_failures AS consecutive_failures,
                p.name AS provider_name
         FROM episode_sources es
         JOIN providers p ON p.id = es.provider_id
