@@ -649,10 +649,25 @@ class _Ctx:
 _CAPACITY_WORDS = ("max connection", "maximum", "too many", "connection limit", "limit reached", "already in use", "simultaneous")
 
 
-async def _body_snippet(resp) -> str:
+def _looks_like_video(head: bytes) -> bool:
+    """Some providers serve a real file labelled text/html. The first bytes tell the truth."""
+    return (head[:4] == b"\x1a\x45\xdf\xa3"  # Matroska / WebM
+            or head[4:8] == b"ftyp"  # MP4 / MOV
+            or (head[:4] == b"RIFF" and head[8:12] == b"AVI ")
+            or head[:4] == b"OggS" or head[:3] == b"FLV"
+            or (len(head) >= 376 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47))  # MPEG-TS
+
+
+async def _body_snippet(resp, head: bytes = b"") -> str:
     """First bit of an unexpected response, flattened to plain text, so the job error says what the provider said."""
+    if head and sum(b < 9 or 13 < b < 32 for b in head[:512]) > 5:
+        return ""  # binary, not a page: nothing readable to quote
     try:
-        async for chunk in resp.aiter_bytes():
+        if head:
+            chunks = [head]
+        else:
+            chunks = [c async for c in resp.aiter_bytes()]
+        for chunk in chunks:
             text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", chunk[:2000].decode("utf-8", "replace"), flags=re.S | re.I)
             text = re.sub(r"<[^>]+>", " ", text)
             return _safe(re.sub(r"\s+", " ", text).strip())[:160]
@@ -669,6 +684,13 @@ def _page_error(provider_name: str, status: int, ctype: str, snippet: str) -> Ex
     kind = (ctype.split(";")[0] or "text").strip()
     detail = f' It said: "{snippet}".' if snippet else ""
     return DownloadError(f"The provider returned a web page instead of a video file (HTTP {status}, {kind}).{detail}")
+
+
+async def _prepend(first: bytes, rest):
+    if first:
+        yield first
+    async for chunk in rest:
+        yield chunk
 
 
 def _server_id(host: str) -> str:
@@ -710,8 +732,13 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                     if resp.status_code >= 400:
                         raise DownloadError(f"The provider answered HTTP {resp.status_code}.")
                     ctype = (resp.headers.get("content-type") or "").lower()
+                    chunks = resp.aiter_bytes(256 * 1024)
+                    first = b""
                     if ctype.startswith("text/") or "json" in ctype:
-                        raise _page_error(provider_name, resp.status_code, ctype, await _body_snippet(resp))
+                        # Judge by the bytes, not the label: a mislabelled real file must still download.
+                        first = await anext(chunks, b"")
+                        if not _looks_like_video(first):
+                            raise _page_error(provider_name, resp.status_code, ctype, await _body_snippet(resp, first))
                     if resp.status_code == 206 and resume:
                         mode, done = "ab", resume
                         total = None
@@ -736,7 +763,7 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                     samples: collections.deque = collections.deque()
                     last_note, slow = 0.0, False
                     with open(part, mode) as fh:
-                        async for chunk in resp.aiter_bytes(256 * 1024):
+                        async for chunk in _prepend(first, chunks):
                             buf += chunk
                             now = time.monotonic()
                             samples.append((now, done + len(buf)))

@@ -1177,6 +1177,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("dvr_recording_profiles", "dispatcharr_user_id", "INTEGER"),
         ("movie_sources", "file_size_bytes", "INTEGER"),
         ("episode_sources", "file_size_bytes", "INTEGER"),
+        # On-demand "Check quality" results (vod_probe.py): what the stream really is, measured once and kept.
+        ("movie_sources", "probe_width", "INTEGER"),
+        ("movie_sources", "probe_height", "INTEGER"),
+        ("movie_sources", "probe_codec", "TEXT"),
+        ("movie_sources", "probed_at", "TEXT"),
+        ("episode_sources", "probe_width", "INTEGER"),
+        ("episode_sources", "probe_height", "INTEGER"),
+        ("episode_sources", "probe_codec", "TEXT"),
+        ("episode_sources", "probed_at", "TEXT"),
         ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
         ("dvr_recording_profiles", "backfill_mode", "TEXT"),
@@ -7487,6 +7496,65 @@ def get_movie_export_rows() -> list[dict]:
     """, lang_params).fetchall()
         conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_probe_source(kind: str, source_id: int) -> dict | None:
+    """One source row (movie or episode) for the quality probe, plus its cached probe result."""
+    movie = kind == "movie"
+    src = (get_movie_source_for_streaming if movie else get_episode_source_for_streaming)(source_id)
+    return _probe_row("movie_sources" if movie else "episode_sources", source_id, src) if src else None
+
+
+def _probe_row(table: str, source_id: int, src: dict) -> dict:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"SELECT file_size_bytes, probe_width, probe_height, probe_codec, probed_at FROM {table} WHERE id = ?", (source_id,)).fetchone()
+    finally:
+        conn.close()
+    return {**src, **(dict(row) if row else {})}
+
+
+def list_series_probe_targets(series_id: int, season: int | None = None) -> list[dict]:
+    """One source per episode of a series (or one season), the one a download or playback would use first,
+    with whether it has been checked. Episodes in order."""
+    conn = _connect()
+    try:
+        q = "SELECT id FROM episodes WHERE series_id = ?" + (" AND season_number = ?" if season is not None else "") + \
+            " ORDER BY season_number, episode_number"
+        eps = [r["id"] for r in conn.execute(q, (series_id, season) if season is not None else (series_id,)).fetchall()]
+    finally:
+        conn.close()
+    out = []
+    for eid in eps:
+        srcs = list_episode_sources_for_streaming(eid)
+        if not srcs:
+            continue
+        top = srcs[0]
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT probed_at FROM episode_sources WHERE id = ?", (top["source_id"],)).fetchone()
+        finally:
+            conn.close()
+        out.append({"episode_id": eid, "source_id": top["source_id"], "provider_id": top["provider_id"],
+                    "probed_at": row["probed_at"] if row else None})
+    return out
+
+
+def set_source_probe(kind: str, source_id: int, size: int | None, width: int | None, height: int | None, codec: str | None) -> None:
+    """Keeps a measured result. A size we couldn't measure never wipes one we already had, and a read that found
+    no video is not stamped as checked (the size is kept; it can be tried again)."""
+    table = "movie_sources" if kind == "movie" else "episode_sources"
+    conn = _connect()
+    try:
+        conn.execute(
+            f"UPDATE {table} SET file_size_bytes = COALESCE(?, file_size_bytes), probe_width = ?, probe_height = ?, "
+            f"probe_codec = ?, probed_at = ? WHERE id = ?",
+            (size, width, height, codec,
+             datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds") if height else None, source_id))
+        conn.commit()
     finally:
         conn.close()
 

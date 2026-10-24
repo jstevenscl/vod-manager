@@ -48,6 +48,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if sid in ("mislabelled", "binpage"):
+            body = (b"\x1a\x45\xdf\xa3\x01\x00\x00\x00\x42\x82matroska" + FILE_BYTES) if sid == "mislabelled" \
+                else b"\x00\x01\x02\x03\x04\x05\x06\x07\x0e\x0f\x10\x11" * 20
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         data = FILE_BYTES * (4 if sid == "slow" else 1)
         start = 0
         rng = self.headers.get("Range")

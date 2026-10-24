@@ -855,6 +855,38 @@ can be cancelled or retried. A title already in the folder is never downloaded t
 and a download that was interrupted (restart, dropped connection) resumes where it left
 off.
 
+**Checking resolution and file size before you download.** Providers often carry the same
+title in several qualities, and the list doesn't say which is which. Next to each *source*
+(on a movie and on each episode) there is a **Check quality** button. Press it and the app
+reads the start of that one file from the provider (a few MB, not the whole thing) and shows
+what it really is, for example `1080p · H264 · 4.2 GB`. The result is saved on the source, so
+it is only ever fetched once; the small icon next to it re-checks. Where a provider keeps the
+information at the end of an MP4, the app also reads the end of the file. If a file still
+can't be read you see its size and *resolution unreadable*, and it can be tried again later.
+
+For a whole series or one season, use **Check quality** next to *Episodes*. That starts a
+slow background job: one episode at a time, a random 30 to 60 second pause between episodes
+on the same provider, and only the provider's top-priority source for each episode. Progress
+shows next to the button, and **Cancel** stops it. A season of 24 episodes takes a while on
+purpose. A job covers up to 30 episodes (run it again for the rest) and skips episodes that
+are already checked.
+
+![Check quality results on a series' episodes, and the background Check quality control](docs/screenshots/check-quality.png)
+
+**Providers are protected.** A check is a real connection to your provider, so it follows the
+same rules downloads and playback do:
+
+- it never starts while a download or a viewer is using the provider's connection, or when the
+  provider is at its connection limit (the button says to try again shortly);
+- only one check runs on a provider at a time, with a pause between checks, and no more than
+  eight on one provider in ten minutes;
+- if a provider answers "slow down" (HTTP 403, 429, 458 or 509, or a "maximum connections"
+  page) the provider goes on the same cooldown downloads use, and a background job **pauses and
+  stays paused** until you press **Resume**. It never retries on its own;
+- three episodes in a row that can't be read also pause a job.
+
+The background job lives in memory: a restart stops it, but everything already measured stays.
+
 **Re-encoding.** Provider files are often much larger than you want in a library. Pick
 a preset instead of *Original file* to shrink a file while saving it: H.264 or H.265,
 capped at 1080p or 720p. The provider connection is only used while the original is fetched; the encode

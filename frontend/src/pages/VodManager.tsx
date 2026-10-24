@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, Gauge, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -460,6 +460,102 @@ function PosterThumb({ url, className, fallback }: { url: string | null; classNa
     return <img src={posterSrc(url)} alt="" className={className} loading="lazy" onError={() => setFailed(true)} />
   }
   return <>{fallback !== undefined ? fallback : <div className={`${className} bg-muted`} />}</>
+}
+
+// Same buckets as the server's vod_probe.quality_label.
+function qualityLabel(w?: number | null, h?: number | null): string | null {
+  if (!h) return null
+  const width = w ?? 0
+  if (width >= 3200 || h >= 2000) return '4K'
+  if (width >= 1800 || h >= 1000) return '1080p'
+  if (width >= 1200 || h >= 700) return '720p'
+  if (width >= 700 || h >= 460) return '480p'
+  return `${h}p`
+}
+
+type QualitySource = { id: number; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null }
+
+// On-demand resolution + size for ONE source. The server paces every provider (one at a time, spaced out,
+// never while a download or viewer holds the connection), so a refusal here just says when to try again.
+function QualityCheck({ kind, source, size = 11 }: { kind: 'movie' | 'episode'; source: QualitySource; size?: number }) {
+  const [res, setRes] = useState({ width: source.probe_width, height: source.probe_height, codec: source.probe_codec, bytes: source.file_size_bytes, checked: !!source.probed_at, unreadable: false })
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const check = (force: boolean) => {
+    setBusy(true); setNote(null)
+    api.post('/vod/sources/check-quality/', { kind, source_id: source.id, force })
+      .then((r) => setRes({ width: r.data.width, height: r.data.height, codec: r.data.codec, bytes: r.data.file_size_bytes, checked: !!r.data.checked, unreadable: !!r.data.unreadable }))
+      .catch((e) => setNote(e?.response?.data?.detail ?? e?.message ?? 'Could not check this source.'))
+      .finally(() => setBusy(false))
+  }
+  const label = qualityLabel(res.width, res.height)
+  const parts = [label, res.codec ? res.codec.toUpperCase() : null, res.bytes != null ? formatFileSize(res.bytes) : null].filter(Boolean)
+  return (
+    <span className="flex items-center gap-1.5">
+      {note && <span className="text-destructive">{note}</span>}
+      {res.checked && <span className="text-foreground" title="Measured from the stream itself">{parts.length ? parts.join(' · ') : 'Checked, no video found'}</span>}
+      {res.unreadable && <span title="The provider answered but the start and end of the file had no readable video information">{res.bytes != null ? `${formatFileSize(res.bytes)} · ` : ''}resolution unreadable</span>}
+      <button
+        title={res.checked ? 'Check this source again' : 'Check resolution and file size (reads a few MB from the provider)'}
+        className="hover:text-foreground disabled:opacity-50 flex items-center gap-0.5"
+        disabled={busy}
+        onClick={() => check(res.checked)}
+      >
+        {busy ? <Loader2 size={size} className="animate-spin" /> : <Gauge size={size} />}
+        {!res.checked && !res.unreadable && <span>Check quality</span>}
+      </button>
+    </span>
+  )
+}
+
+type QualityBatch = { id: number; series_id: number; season: number | null; state: 'running' | 'paused' | 'done' | 'cancelled'; message: string; total: number; done: number; failed: number; more_not_queued: number }
+
+// Slow background check of a whole series or one season. The server does one episode at a time with long gaps
+// and stops everything at the first sign the provider is unhappy; this only starts it and shows how it is going.
+function SeriesQualityBatch({ seriesId, seasons }: { seriesId: number; seasons: number[] }) {
+  const qc = useQueryClient()
+  const [season, setSeason] = useState('all')
+  const q = useQuery<QualityBatch[]>({
+    queryKey: ['vod-quality-batch', seriesId],
+    queryFn: () => api.get('/vod/sources/check-quality/batch/', { params: { series_id: seriesId } }).then((r) => r.data),
+    refetchInterval: (query) => ((query.state.data ?? []).some((b) => b.state === 'running' || b.state === 'paused') ? 3000 : false),
+  })
+  const batch = (q.data ?? []).slice(-1)[0]
+  const active = !!batch && (batch.state === 'running' || batch.state === 'paused')
+  const progress = batch ? batch.done + batch.failed : 0
+  useEffect(() => { if (progress > 0) qc.invalidateQueries({ queryKey: ['vod-series'] }) }, [progress, batch?.state])  // eslint-disable-line react-hooks/exhaustive-deps
+  const refresh = () => qc.invalidateQueries({ queryKey: ['vod-quality-batch', seriesId] })
+  const fail = (e: any) => notify(e?.response?.data?.detail ?? e?.message ?? 'Could not start the check.')
+  const start = useMutation({
+    mutationFn: () => api.post('/vod/sources/check-quality/batch/', { series_id: seriesId, season: season === 'all' ? null : Number(season) }).then((r) => r.data),
+    onSuccess: refresh, onError: fail,
+  })
+  const act = (what: 'cancel' | 'resume') => api.post(`/vod/sources/check-quality/batch/${batch!.id}/${what}/`).then(refresh).catch(fail)
+  return (
+    <span className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+      {!active && (
+        <>
+          {seasons.length > 1 && (
+            <select className={inputCls('w-auto')} value={season} onChange={(e) => setSeason(e.target.value)}>
+              <option value="all">All seasons</option>
+              {seasons.map((n) => <option key={n} value={n}>Season {n}</option>)}
+            </select>
+          )}
+          <button
+            title="Checks resolution and file size one episode at a time in the background, with long pauses so the provider isn't strained"
+            className="hover:text-foreground flex items-center gap-1 disabled:opacity-50" disabled={start.isPending} onClick={() => start.mutate()}
+          >
+            {start.isPending ? <Loader2 size={12} className="animate-spin" /> : <Gauge size={12} />} Check quality
+          </button>
+        </>
+      )}
+      {batch && <span className={batch.state === 'paused' ? 'text-amber-500' : undefined}>
+        {active ? `Checking ${progress} of ${batch.total}. ` : ''}{batch.message}{batch.more_not_queued > 0 && batch.state === 'done' ? ` ${batch.more_not_queued} more left: run it again.` : ''}
+      </span>}
+      {batch?.state === 'paused' && <button className="underline hover:text-foreground" onClick={() => act('resume')}>Resume</button>}
+      {active && <button className="underline hover:text-foreground" onClick={() => act('cancel')}>Cancel</button>}
+    </span>
+  )
 }
 
 function formatFileSize(n: number): string {
@@ -1450,7 +1546,7 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
   )
 }
 
-interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
+interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
 interface MoviePlacement { id: number; category_id: number; export_stream_id: number; name_suffix: string; category_name: string }
 interface Movie {
   id: number
@@ -1481,7 +1577,7 @@ interface MetadataRule {
   is_regex: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
 interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[]; flagged_mismatch?: number; flagged_reason?: string | null; in_library?: boolean }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
@@ -3489,6 +3585,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
             <div className="flex items-center justify-between">
               <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
               <span className="flex items-center gap-1.5">
+                <QualityCheck kind="movie" source={s} size={12} />
                 <DownloadIconButton body={{ movie_ids: [movie.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                 <PlayButton
                   url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
@@ -4111,6 +4208,9 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
               seasons={[...new Set(series.episodes.map((e) => e.season_number))].sort((a, b) => a - b)}
             />
           )}
+          {series.episodes.length > 0 && (
+            <SeriesQualityBatch seriesId={series.id} seasons={[...new Set(series.episodes.map((e) => e.season_number))].sort((a, b) => a - b)} />
+          )}
         </div>
         {series.episodes.length === 0 && (
           <p className="text-muted-foreground">No episodes yet — click "Fetch episodes &amp; detail" to pull them from the source provider.</p>
@@ -4168,6 +4268,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                   )}
                 </span>
                 <span className="flex items-center gap-1">
+                  <QualityCheck key={`${s.id}-${s.probed_at ?? ""}`} kind="episode" source={s} />
                   <DownloadIconButton size={11} body={{ episode_ids: [e.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                   <FlagMismatchControl
                     isFlagged={!!s.flagged_mismatch}

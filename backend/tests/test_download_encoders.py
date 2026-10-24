@@ -154,6 +154,20 @@ def test_a_page_error_says_what_the_provider_said(db, server, dl):
     assert "secretpw" not in err and "<html>" not in err
 
 
+def test_a_real_video_labelled_as_html_still_downloads(db, server, dl):
+    mid, _ = _movie(db, server, stream_id="mislabelled")
+    vod_downloader.enqueue(movie_ids=[mid])
+    job = _run(1)
+    assert job["status"] == "done", job.get("error")
+
+
+def test_binary_labelled_as_html_fails_without_printing_garbage(db, server, dl):
+    mid, _ = _movie(db, server, stream_id="binpage")
+    vod_downloader.enqueue(movie_ids=[mid])
+    err = _run(1)["error"]
+    assert "web page instead of a video file" in err and "It said" not in err
+
+
 def test_a_connection_limit_page_waits_instead_of_failing(db, server, dl):
     mid, _ = _movie(db, server, stream_id="busy")
     vod_downloader.enqueue(movie_ids=[mid])

@@ -75,6 +75,7 @@ import plex_importer
 import portal_auth
 import strm_export
 import vod_downloader
+import vod_probe
 import tmdb_sync
 import vod_bulk_ai_service
 import vod_db
@@ -4095,6 +4096,55 @@ class DownloadQueueRequest(BaseModel):
 
 class DownloadCancelRequest(BaseModel):
     job_ids: Optional[list[int]] = None        # None = every queued / running download
+
+
+class SourceQualityRequest(BaseModel):
+    kind: str                       # "movie" or "episode"
+    source_id: int
+    force: bool = False             # re-measure even if a result is already on file
+
+
+@router.post("/sources/check-quality/", dependencies=_GUARDS)
+async def check_source_quality(body: SourceQualityRequest):
+    """On-demand resolution + file size for ONE source. One source per call by design: no bulk / season form."""
+    try:
+        return await vod_probe.probe_source(body.kind, body.source_id, body.force)
+    except vod_probe.ProbeRefused as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(429 if exc.retry_after else 400, detail=str(exc), headers=headers)
+
+
+class QualityBatchRequest(BaseModel):
+    series_id: int
+    season: Optional[int] = None    # None = every season
+
+
+@router.post("/sources/check-quality/batch/", dependencies=_GUARDS)
+async def start_quality_batch(body: QualityBatchRequest):
+    """Background, slow, stop-on-pushback check of a series or one season. See vod_probe's batch section."""
+    try:
+        return await vod_probe.start_batch(body.series_id, body.season)
+    except vod_probe.ProbeRefused as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+@router.get("/sources/check-quality/batch/", dependencies=_GUARDS)
+async def quality_batches(series_id: Optional[int] = None):
+    return vod_probe.list_batches(series_id)
+
+
+@router.post("/sources/check-quality/batch/{batch_id}/cancel/", dependencies=_GUARDS)
+async def cancel_quality_batch(batch_id: int):
+    if not vod_probe.cancel_batch(batch_id):
+        raise HTTPException(404, detail="No such running check.")
+    return {"ok": True}
+
+
+@router.post("/sources/check-quality/batch/{batch_id}/resume/", dependencies=_GUARDS)
+async def resume_quality_batch(batch_id: int):
+    if not vod_probe.resume_batch(batch_id):
+        raise HTTPException(404, detail="That check isn't paused.")
+    return {"ok": True}
 
 
 @router.get("/downloads/", dependencies=_GUARDS)

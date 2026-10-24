@@ -118,6 +118,12 @@ library only when complete, so nothing partial is ever picked up. See the
 
 ![The Downloads card](docs/screenshots/downloads-card.png)
 
+Not sure which of a title's sources is the good one? **Check quality** next to a source reads a few MB of that file and
+shows its real resolution, codec and file size (`1080p · H264 · 4.2 GB`), saved so it is only fetched once. On a series,
+**Check quality** runs as a slow background job, one episode at a time with long pauses, and stops at the first sign the
+provider is unhappy, so it never strains a provider. See the
+[User Guide](USERGUIDE.md#downloading-files-into-a-library-folder).
+
 If you run **Radarr** or **Sonarr**, a finished download can be handed to them to import (optional, under
 **Configuration → Library handoff**), so they own the library and its naming; the queue shows each file as it
 goes from *Waiting for encoder* to *Importing* to *In library*. If Radarr or Sonarr can't tell which title a file is from its name, the file is imported onto the movie or episode the app already added. An optional **In Library** badge shows which movies,
