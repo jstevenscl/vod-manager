@@ -1564,6 +1564,7 @@ interface Movie {
   sources: MovieSource[]
   placements: MoviePlacement[]
   in_library?: string | null   // "Plex: Movies" when the user's media server has it
+  trailer_key?: string | null
 }
 
 interface MetadataRule {
@@ -1598,6 +1599,7 @@ interface Series {
   episodes: Episode[]
   placements: SeriesPlacement[]
   in_library?: string | null
+  trailer_key?: string | null
 }
 
 interface MissingEpisode {
@@ -2900,6 +2902,36 @@ function InLibraryBadge({ where }: { where?: string | null }) {
   return <span title={`Already in your library (${where})`} className={`inline-flex items-center rounded border px-1.5 py-px text-[10px] font-semibold leading-tight whitespace-nowrap ${IN_LIBRARY_CLS}`}>In Library</span>
 }
 
+// trailer_key (from the provider catalog or TMDB, a YouTube id) was only served to XC clients;
+// a red ▶ on the card plays it in an embedded YouTube player.
+function TrailerBadge({ trailerKey, title, className = '' }: { trailerKey?: string | null; title: string; className?: string }) {
+  const [open, setOpen] = useState(false)
+  if (!trailerKey) return null
+  return (
+    <>
+      <button
+        title="Watch trailer"
+        className={`z-10 rounded bg-black/75 px-[7px] py-[3px] text-[0.85rem] leading-none text-red-500 hover:bg-black/90 ${className}`}
+        onClick={(e) => { e.stopPropagation(); setOpen(true) }}
+      >
+        &#9654;
+      </button>
+      {open && (
+        <Modal onClose={() => setOpen(false)} maxWidth="max-w-4xl">
+          <div className="px-4 py-2.5 border-b border-border text-sm font-bold truncate pr-10">{title} — Trailer</div>
+          <iframe
+            src={`https://www.youtube.com/embed/${encodeURIComponent(trailerKey)}?autoplay=1`}
+            title={`${title} trailer`}
+            className="w-full aspect-video bg-black"
+            allow="autoplay; encrypted-media; picture-in-picture"
+            allowFullScreen
+          />
+        </Modal>
+      )}
+    </>
+  )
+}
+
 // import still in progress: the row stays so the watcher can finish (vod_db.PENDING_IMPORT_STATUSES);
 // a failed/cancelled download never reaches the library, so its handoff state doesn't count
 const PENDING_IMPORT = ['add', 'ready', 'waiting', 'importing']
@@ -3725,13 +3757,14 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               separate strip below the poster. */}
           <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
           {!!movie.is_adult && (
-            <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
+            <span className={`absolute ${movie.trailer_key ? 'top-8' : 'top-1.5'} right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5`}>18+</span>
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{movie.name}</p>
             <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{movie.year ?? ''}<InLibraryBadge where={movie.in_library} /></p>
           </div>
         </button>
+        <TrailerBadge trailerKey={movie.trailer_key} title={`${movie.name}${movie.year ? ` (${movie.year})` : ''}`} className="absolute top-1.5 right-1.5" />
         {movie.sources.length > 0 && (
           <div className="absolute bottom-14 right-1.5 z-10 opacity-0 group-hover:opacity-100 transition-opacity bg-background/85 rounded" onClick={(e) => e.stopPropagation()}>
             <PlayButton
@@ -4373,13 +4406,14 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
           />
           <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/85 via-black/35 to-transparent pointer-events-none" />
           {!!series.is_adult && (
-            <span className="absolute top-1.5 right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5">18+</span>
+            <span className={`absolute ${series.trailer_key ? 'top-8' : 'top-1.5'} right-1.5 z-10 text-white text-[10px] font-bold bg-destructive/90 rounded px-1.5 py-0.5`}>18+</span>
           )}
           <div className="absolute inset-x-0 bottom-0 p-2.5 text-white">
             <p className="font-bold text-[13px] leading-tight line-clamp-2 drop-shadow">{series.name}</p>
             <p className="text-[11px] text-white/70 mt-0.5 flex items-center gap-1.5">{series.year ?? ''}<InLibraryBadge where={series.in_library} /></p>
           </div>
         </button>
+        <TrailerBadge trailerKey={series.trailer_key} title={`${series.name}${series.year ? ` (${series.year})` : ''}`} className="absolute top-1.5 right-1.5" />
         <div className="px-2.5 py-1.5 flex items-center justify-between text-[10.5px] text-muted-foreground border-t border-border/60">
           <span>{series.episodes.length} episode{series.episodes.length === 1 ? '' : 's'}</span>
         </div>
