@@ -67,6 +67,8 @@ _CAPACITY_WAIT_SECONDS = 60
 _PROGRESS_WRITE_SECONDS = 1.0
 _SPACE_CHECK_SECONDS = 10.0
 _MAX_ATTEMPTS = 3
+_RETRY_SECONDS = 5          # wait before retry n of a dropped connection: n x this
+_SERVER_ERROR_SECONDS = 15  # a provider answering 5xx gets longer to recover: n x this
 # A provider's throughput can swing 10x from one connection to the next, so a transfer that has crawled for a
 # while is dropped and resumed (Range) on a fresh connection. Judged over the last _SLOW_WINDOW seconds.
 _SLOW_WINDOW = 30.0
@@ -109,6 +111,10 @@ class _Pushback(Exception):
     def __init__(self, provider_name: str, status: int):
         self.provider_name = provider_name
         self.status = status
+
+
+class _ServerError(httpx.HTTPError):
+    """The provider answered 5xx: usually a hiccup on its side, worth a pause and another try on this source."""
 
 
 class _AtCapacity(Exception):
@@ -732,6 +738,8 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                         continue
                     if resp.status_code in _PUSHBACK_STATUSES:
                         raise _Pushback(provider_name, resp.status_code)
+                    if resp.status_code >= 500:
+                        raise _ServerError(f"The provider answered HTTP {resp.status_code}.")
                     if resp.status_code >= 400:
                         raise DownloadError(f"The provider answered HTTP {resp.status_code}.")
                     ctype = (resp.headers.get("content-type") or "").lower()
@@ -813,10 +821,13 @@ async def _download_http(url: str, part: Path, user_agent: str | None, ctx: _Ctx
                         raise DownloadError("The provider sent an empty file.")
                     return done
         except (httpx.TransportError, httpx.HTTPError) as exc:
+            server_error = isinstance(exc, _ServerError)
             if attempt == _MAX_ATTEMPTS:
-                raise DownloadError(f"Connection problem: {_safe(exc) or type(exc).__name__}")
+                raise DownloadError(str(exc) if server_error else f"Connection problem: {_safe(exc) or type(exc).__name__}")
             logger.warning("[download] job=%s transfer interrupted (%s); retry %d/%d", ctx.job_id, type(exc).__name__, attempt, _MAX_ATTEMPTS - 1)
-            await asyncio.sleep(5 * attempt)
+            wait = (_SERVER_ERROR_SECONDS if server_error else _RETRY_SECONDS) * attempt
+            ctx.note = f"Provider hiccup ({str(exc).rstrip('.')}). Trying again in {wait}s" if server_error else ctx.note
+            await asyncio.sleep(wait)
     raise DownloadError("The transfer kept restarting.")
 
 

@@ -196,6 +196,10 @@ and finish time, outcome and summary; `GET /api/vod/sync-history/` lists the
 recent runs (a run still marked running when the app restarts is closed out as
 failed, "interrupted by restart").
 
+**Deleting a provider** also removes the Dispatcharr M3U profile that VOD & DVR Manager created for it on the
+VOD-relay account, so test providers don't leave profiles piling up in Dispatcharr. Only that profile is removed,
+never the profiles of your real IPTV accounts, and the delete still works if Dispatcharr can't be reached.
+
 **Add as inactive.** The add-provider form has an **Add as inactive** checkbox,
 on by default. An *active* provider is imported automatically on the scheduled
 catalog refresh, which for a brand-new provider means straight away — before
@@ -857,7 +861,8 @@ can be cancelled or retried. When a provider does not say how big a file is whil
 the queue uses the size from a **Check quality** you ran on that source for the percentage; with
 neither, it shows *size unknown* and the amount downloaded so far instead of a misleading 0%. A title already in the folder is never downloaded twice,
 and a download that was interrupted (restart, dropped connection) resumes where it left
-off.
+off. If a provider answers with a temporary server error (HTTP 5xx), the download waits a little
+and tries that source again, resuming, before it fails over or gives up.
 
 **Checking resolution and file size before you download.** Providers often carry the same
 title in several qualities, and the list doesn't say which is which. Next to each *source*

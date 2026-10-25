@@ -1230,10 +1230,13 @@ async def poll_watch_sessions(connection: dict) -> dict:
                 position_seconds = float(c["position_seconds"]) if c.get("position_seconds") not in (None, "") else None
             except (TypeError, ValueError):
                 position_seconds = None
-            vod_db.upsert_watch_session(
+            # In a worker thread: both of these wait on vod_db's global write lock, which a long import or
+            # enrichment can hold for seconds. Taken on the event loop that wait froze every API request.
+            await asyncio.to_thread(
+                vod_db.upsert_watch_session,
                 connection["id"], client_id, user_id, username_by_id.get(user_id),
                 c.get("content_type"), c.get("content_name"), c.get("content_uuid"),
                 c.get("client_ip"), int(c.get("bytes_sent") or 0), position_seconds,
             )
-    closed = vod_db.close_stale_watch_sessions(connection["id"], active_client_ids)
+    closed = await asyncio.to_thread(vod_db.close_stale_watch_sessions, connection["id"], active_client_ids)
     return {"active": len(active_client_ids), "closed": closed}

@@ -387,6 +387,29 @@ async def recheck_discovered_credentials(connection: dict) -> dict:
     return {"changed": changed, "unchanged_count": unchanged}
 
 
+async def remove_provider_profiles(refs: list[dict]) -> None:
+    """Deletes the Dispatcharr M3U profiles a deleted provider's sync left on the VOD-relay account(s), so they
+    don't pile up. Only profiles in `refs` (the provider's own sync mapping, on our relay account) are touched,
+    never the real-IPTV-account profiles Discover reads, and never a default profile. Best effort: Dispatcharr
+    being down or the profile already gone must not make the provider delete fail."""
+    for ref in refs:
+        connection = vod_db.get_dispatcharr_connection(ref["connection_id"])
+        account_id = connection and connection.get("vod_relay_account_id")
+        if not account_id:
+            continue
+        try:
+            client = DispatcharrClient(connection["url"], connection["token"])
+            profiles = await client.get(f"/api/m3u/accounts/{account_id}/profiles/")
+            profile = next((p for p in profiles if p.get("id") == ref["profile_id"]), None)
+            if profile is None or profile.get("is_default"):
+                continue
+            await client.delete(f"/api/m3u/accounts/{account_id}/profiles/{ref['profile_id']}/")
+            logger.info("[vod_sync] connection=%s: removed profile %s of a deleted provider", connection["label"], ref["profile_id"])
+        except Exception as exc:
+            logger.warning("[vod_sync] connection=%s: couldn't remove profile %s of a deleted provider: %s",
+                           connection["label"], ref["profile_id"], exc)
+
+
 async def sync_provider(provider_id: int) -> dict:
     """Pushes to every connection with a vod_relay_account_id configured.
     Returns per-connection results so a caller can surface a partial

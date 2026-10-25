@@ -1239,7 +1239,7 @@ def _redact_provider(p: dict) -> dict:
 
 @router.get("/providers/", dependencies=_GUARDS)
 async def list_providers():
-    return [_redact_provider(p) for p in vod_db.list_providers()]
+    return [_redact_provider(p) for p in await asyncio.to_thread(vod_db.list_providers)]
 
 
 @router.post("/providers/", dependencies=_GUARDS)
@@ -1705,7 +1705,10 @@ async def delete_provider(provider_id: int):
     # docstring) can take real time even with the movie_id/episode_id
     # indexes -- off the event loop so it doesn't stall every other request
     # (including the Activity poll) while it runs.
+    profile_refs = await asyncio.to_thread(vod_db.list_provider_sync_profiles, provider_id)
     await asyncio.to_thread(vod_db.delete_provider, provider_id)
+    # its profiles on the Dispatcharr VOD-relay account(s) are ours: remove them (best effort)
+    await vod_sync.remove_provider_profiles(profile_refs)
     # an In Library server linked to this provider goes with it
     await asyncio.to_thread(library_presence.forget_provider, provider_id)
     await vod_importer.evict_provider_client(provider_id)

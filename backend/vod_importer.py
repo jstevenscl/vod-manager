@@ -11,11 +11,14 @@ bounded concurrency instead of a human clicking one movie at a time.
 """
 
 import asyncio
+import contextvars
+import functools
 import logging
 import os
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -1190,6 +1193,23 @@ def _apply_field_rules(content_type: str, fields: dict) -> dict:
     return result
 
 
+# ── dedicated threads for bulk enrichment ────────────────────────────────────
+# A bulk run puts up to 16 enrich chains in flight, and on a big catalog most titles take a fast path (already fresh,
+# inactive provider, ...) made only of short database calls. Through the event loop's shared thread pool those calls
+# kept every worker busy and every other request (the API's own to_thread calls) waited behind them: a downloads
+# status poll took 32 s to over a minute (vod_manager-051). Calls made while a bulk run is working on a title go to
+# this small private pool instead; everything else, an on-demand enrich included, is unchanged.
+_ENRICH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bulk-enrich")
+_in_bulk_enrich: contextvars.ContextVar[bool] = contextvars.ContextVar("in_bulk_enrich", default=False)
+
+
+async def _to_thread(fn, /, *args, **kwargs):
+    """asyncio.to_thread, except inside a bulk enrich run, where it uses _ENRICH_POOL."""
+    if not _in_bulk_enrich.get():
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(_ENRICH_POOL, functools.partial(fn, *args, **kwargs))
+
+
 async def _write_movie_enrichment(
     write_queue: "asyncio.Queue | None", movie_id: int, fields: dict,
     source_id: int | None = None, bitrate: int | None = None,
@@ -1203,9 +1223,9 @@ async def _write_movie_enrichment(
     concurrently-enriching movie/series -- the batching that fixes
     "database is locked" under bulk_enrich_all's concurrency=8."""
     if write_queue is None:
-        await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id, **fields)
+        await _to_thread(vod_db.set_movie_enrichment, movie_id, **fields)
         if source_id is not None and bitrate is not None:
-            await asyncio.to_thread(vod_db.set_movie_source_bitrate, source_id, bitrate)
+            await _to_thread(vod_db.set_movie_source_bitrate, source_id, bitrate)
         return
     done = asyncio.Event()
     await write_queue.put({
@@ -1223,16 +1243,16 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
 
     write_queue: see _write_movie_enrichment's docstring -- passed through by
     bulk_enrich_all, left None for on-demand single-item enrich."""
-    if not force and not await asyncio.to_thread(vod_db.movie_needs_enrichment, movie_id):
+    if not force and not await _to_thread(vod_db.movie_needs_enrichment, movie_id):
         return False
 
-    sources = await asyncio.to_thread(vod_db.list_movie_sources, movie_id)
+    sources = await _to_thread(vod_db.list_movie_sources, movie_id)
     if not sources:
         return False
     source = sources[0]  # active providers sort first
     if not source.get("provider_is_active", 1):
         return False  # only deactivated providers carry it: don't call their API (7rc)
-    provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
+    provider = await _to_thread(vod_db.get_provider, source["provider_id"])
     if not provider:
         return False
 
@@ -1240,7 +1260,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
         # Plex's library listing already hands back full detail at import
         # time (see plex_importer.py) — nothing more to lazily fetch here,
         # just refresh the TTL stamp so the scheduler leaves it alone.
-        await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id)
+        await _to_thread(vod_db.set_movie_enrichment, movie_id)
         return True
 
     if provider.get("provider_type") in ("emby", "jellyfin"):
@@ -1252,7 +1272,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
         async with emby_vod_client.EmbyVodClient(provider) as client:
             item = await client.get_movie_people(source["provider_stream_id"])
         fields = emby_vod_client.extract_common_fields(item)
-        await asyncio.to_thread(
+        await _to_thread(
             vod_db.set_movie_enrichment, movie_id,
             **_apply_field_rules("movie", {
                 "director": fields["director"],
@@ -1268,7 +1288,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
     # which is what bulk_enrich_all's backoff/adaptive-concurrency machinery
     # exists to protect. Only bitrate is skipped this way, since that's
     # per-SOURCE and only the provider's get_vod_info call can supply it.
-    movie_row = await asyncio.to_thread(vod_db.get_movie, movie_id)
+    movie_row = await _to_thread(vod_db.get_movie, movie_id)
     existing_tmdb_id = movie_row.get("tmdb_id") if movie_row else None
     if existing_tmdb_id:
         try:
@@ -1289,7 +1309,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
             # correctly below (tmdb_detail=None), just not logged to the
             # review queue this one time.
             try:
-                await asyncio.to_thread(vod_db.record_tmdb_lookup_failure, "movie", movie_id, existing_tmdb_id)
+                await _to_thread(vod_db.record_tmdb_lookup_failure, "movie", movie_id, existing_tmdb_id)
             except Exception:
                 logger.exception(
                     "[enrich_movie] failed to record tmdb lookup failure for movie_id=%s tmdb_id=%s",
@@ -1298,11 +1318,11 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
             tmdb_detail = None
         else:
             if tmdb_detail:
-                await asyncio.to_thread(vod_db.clear_tmdb_lookup_failure, "movie", movie_id)
+                await _to_thread(vod_db.clear_tmdb_lookup_failure, "movie", movie_id)
         if tmdb_detail:
             name_fields = {}
             if tmdb_detail.get("name"):
-                name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+                name_rules = await _to_thread(vod_db.get_active_rules_for_field, "movie", "name")
                 name_fields["name"] = vod_db.apply_rules_to_value(tmdb_detail["name"], name_rules)
             await _write_movie_enrichment(write_queue, movie_id, {
                 **name_fields,
@@ -1320,7 +1340,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
                 "release_date": tmdb_detail.get("release_date"),
                 "content_rating": tmdb_detail.get("content_rating"),
             })
-            await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
+            await _to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
             return True
         # TMDB lookup failed (no API key configured, bad id, TMDB down) --
         # fall through to the provider so this movie still gets enriched.
@@ -1331,7 +1351,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
         # above failed. Stamp the TTL so it is retried later rather than every
         # scheduler pass, and never fall through to the XC client below (a
         # library's base_url is a filesystem path, not a server).
-        await asyncio.to_thread(vod_db.set_movie_enrichment, movie_id)
+        await _to_thread(vod_db.set_movie_enrichment, movie_id)
         return True
 
     client = XCProviderClient(provider)
@@ -1351,7 +1371,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
     # through, so e.g. a "4K:" prefix-strip rule still applies here too.
     name_fields = {}
     if detail.get("name"):
-        name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "movie", "name")
+        name_rules = await _to_thread(vod_db.get_active_rules_for_field, "movie", "name")
         name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
 
     # bitrate is per-SOURCE (see vod_db.set_movie_source_bitrate's docstring),
@@ -1380,7 +1400,7 @@ async def enrich_movie(movie_id: int, *, force: bool = False, write_queue: "asyn
         },
         source_id=source["id"], bitrate=bitrate,
     )
-    await asyncio.to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
+    await _to_thread(vod_db.auto_merge_movie_by_tmdb, movie_id)
     return True
 
 
@@ -1426,14 +1446,14 @@ async def enrich_series(series_id: int, *, force: bool = False, write_queue: "as
     unrelated concurrent work like a video stream relay. That's what was
     causing playback to stall mid-stream even though the network path to
     the source was fine."""
-    if not force and not await asyncio.to_thread(vod_db.series_needs_enrichment, series_id):
+    if not force and not await _to_thread(vod_db.series_needs_enrichment, series_id):
         return {"fetched": False, "reason": "already up to date"}
 
-    series = await asyncio.to_thread(vod_db.get_series, series_id)
+    series = await _to_thread(vod_db.get_series, series_id)
     if not series:
         return {"fetched": False, "reason": "series not found"}
 
-    sources = await asyncio.to_thread(vod_db.list_series_sources, series_id)
+    sources = await _to_thread(vod_db.list_series_sources, series_id)
     if not sources:
         return {"fetched": False, "reason": "no source provider recorded for this series"}
     sources = [s for s in sources if s.get("provider_is_active", 1)]
@@ -1467,7 +1487,7 @@ async def enrich_series(series_id: int, *, force: bool = False, write_queue: "as
     if not any_fetched:
         return {"fetched": False, "reason": last_reason}
 
-    await asyncio.to_thread(vod_db.set_series_enrich_stable, series_id, all_unchanged)
+    await _to_thread(vod_db.set_series_enrich_stable, series_id, all_unchanged)
     return {"fetched": True, "reason": None}
 
 
@@ -1483,10 +1503,10 @@ async def _enrich_one_series_source(
     applied to this source's whole episode batch (one queued write instead of
     one add_episode + add_episode_source + set_episode_source_bitrate call
     PER EPISODE, each independently lock-contending under bulk_enrich_all)."""
-    if not force and not await asyncio.to_thread(vod_db.series_source_needs_enrichment, source, series_due):
+    if not force and not await _to_thread(vod_db.series_source_needs_enrichment, source, series_due):
         return {"fetched": False, "reason": "already up to date"}
 
-    provider = await asyncio.to_thread(vod_db.get_provider, source["provider_id"])
+    provider = await _to_thread(vod_db.get_provider, source["provider_id"])
     if not provider:
         return {"fetched": False, "reason": "a provider this series was imported from no longer exists"}
 
@@ -1494,7 +1514,7 @@ async def _enrich_one_series_source(
         # Same reasoning as enrich_movie: Plex already gave us full detail
         # and every episode at import time (plex_importer.py) — episodes
         # aren't lazily discovered here the way XC's are.
-        await asyncio.to_thread(
+        await _to_thread(
             vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
         )
         return {"fetched": True, "reason": None}
@@ -1510,17 +1530,17 @@ async def _enrich_one_series_source(
             try:
                 detail = await tmdb_sync.get_series_full_details(str(tmdb_id))
                 if detail:
-                    await asyncio.to_thread(vod_db.set_series_enrichment, series_id, **_apply_field_rules("series", {
+                    await _to_thread(vod_db.set_series_enrichment, series_id, **_apply_field_rules("series", {
                         k: detail.get(k) for k in ("genre", "description", "cast_list")
                     }), poster_url=detail.get("poster_url"), rating=detail.get("rating"),
                         release_date=detail.get("release_date"))
                 eps = await tmdb_sync.get_series_episode_list_cached(str(tmdb_id))
                 names = {(e["season_number"], e["episode_number"]): e["name"] for e in eps if e.get("name")}
                 if names:
-                    await asyncio.to_thread(vod_db.fill_placeholder_episode_names, series_id, names)
+                    await _to_thread(vod_db.fill_placeholder_episode_names, series_id, names)
             except Exception:
                 logger.warning("[_enrich_one_series_source] TMDB enrichment failed for library series_id=%s", series_id, exc_info=True)
-        await asyncio.to_thread(
+        await _to_thread(
             vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
         )
         return {"fetched": True, "reason": None}
@@ -1540,7 +1560,7 @@ async def _enrich_one_series_source(
         # error. Best-effort: log and move on if the bookkeeping write
         # itself fails, rather than let it mask the original failure.
         try:
-            await asyncio.to_thread(
+            await _to_thread(
                 vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
             )
         except Exception:
@@ -1559,7 +1579,7 @@ async def _enrich_one_series_source(
         # identity from (name, year) every pass.
         name_fields = {}
         if detail.get("name"):
-            name_rules = await asyncio.to_thread(vod_db.get_active_rules_for_field, "series", "name")
+            name_rules = await _to_thread(vod_db.get_active_rules_for_field, "series", "name")
             name_fields["name"] = vod_db.apply_rules_to_value(detail["name"], name_rules)
 
         # This provider sends the series' TMDB id under "tmdb", not "tmdb_id"
@@ -1596,14 +1616,14 @@ async def _enrich_one_series_source(
             # whether this (expensive, per-series) call is worth making again.
             "episodes_synced_last_modified": series.get("provider_last_modified"),
         }
-        await asyncio.to_thread(vod_db.set_series_enrichment, series_id, **series_fields)
+        await _to_thread(vod_db.set_series_enrichment, series_id, **series_fields)
         if series_tmdb_id:
-            await asyncio.to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
+            await _to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
     else:
         # Some panels send episodes without an info block. Still record that
         # episodes were synced as of this last_modified (and stamp the TTL),
         # otherwise the series-level gate would report it due on every pass.
-        await asyncio.to_thread(
+        await _to_thread(
             vod_db.set_series_enrichment, series_id,
             episodes_synced_last_modified=series.get("provider_last_modified"),
         )
@@ -1646,7 +1666,7 @@ async def _enrich_one_series_source(
     # "Unchanged" for the TTL backoff: the provider lists exactly the episodes we
     # already hold for it (an ended show with a complete -- or permanently
     # incomplete -- list settles here and is rechecked less and less often).
-    existing_keys = await asyncio.to_thread(vod_db.list_episode_keys, series_id, provider["id"])
+    existing_keys = await _to_thread(vod_db.list_episode_keys, series_id, provider["id"])
     unchanged = {(e["season_number"], e["episode_number"]) for e in episode_items} == existing_keys
 
     if episode_items:
@@ -1655,7 +1675,7 @@ async def _enrich_one_series_source(
         # EPISODE (add_episode, add_episode_source, set_episode_source_bitrate)
         # into one queued write for this whole source's episode list.
         if write_queue is None:
-            await asyncio.to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_items)
+            await _to_thread(vod_db.enrich_series_episodes_batch, series_id, provider["id"], episode_items)
         else:
             done = asyncio.Event()
             await write_queue.put({
@@ -1664,7 +1684,7 @@ async def _enrich_one_series_source(
             })
             await done.wait()
 
-    await asyncio.to_thread(
+    await _to_thread(
         vod_db.set_series_source_enrichment, series_id, source["provider_id"], source["provider_series_id"],
     )
     return {"fetched": True, "reason": None, "unchanged": unchanged}
@@ -1725,14 +1745,15 @@ async def _run_global_writer(queue: "asyncio.Queue") -> None:
     a "done" asyncio.Event the producer is awaiting -- set after the write
     commits so the producing call knows its data is durably written before
     it returns."""
+    _in_bulk_enrich.set(True)  # this task is bulk work: its writes use the private pool too
     while True:
         item = await queue.get()
         if item is None:
             return
         if item["kind"] == "movie":
-            await asyncio.to_thread(vod_db.apply_movie_enrichment_batch, item["items"])
+            await _to_thread(vod_db.apply_movie_enrichment_batch, item["items"])
         else:
-            await asyncio.to_thread(
+            await _to_thread(
                 vod_db.enrich_series_episodes_batch, item["series_id"], item["provider_id"], item["episodes"],
             )
         item["done"].set()
@@ -1743,6 +1764,7 @@ async def _enrich_one(
 ) -> None:
     prefix = _PROGRESS_PREFIX[kind]
     async with sem:
+        _in_bulk_enrich.set(True)
         try:
             if kind == "movie":
                 await enrich_movie(item_id, force=force, write_queue=write_queue)
@@ -1771,6 +1793,16 @@ async def _enrich_one(
             _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
+async def _only_due(movie_ids: list[int], series_ids: list[int]) -> tuple[list[int], list[int]]:
+    """Drops the titles that are still fresh, in one pass on one thread each. Asking per title through the shared
+    thread pool starved every other request on a big catalog (vod_manager-051); enrich_movie / enrich_series still
+    re-check the few that remain."""
+    return tuple(await asyncio.gather(
+        asyncio.to_thread(vod_db.filter_ids_needing_enrichment, "movie", movie_ids),
+        asyncio.to_thread(vod_db.filter_ids_needing_enrichment, "series", series_ids),
+    ))
+
+
 async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     """Enriches every movie and series in the pool, movies and series running
     CONCURRENTLY -- each kind gets its own `concurrency`-sized semaphore, so
@@ -1788,13 +1820,19 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
     long enough to get all the way through movies first."""
     if _ENRICH_PROGRESS["running"]:
         return
-
-    movie_ids  = await asyncio.to_thread(vod_db.list_all_movie_ids)
-    series_ids = await asyncio.to_thread(vod_db.list_all_series_ids)
+    _ENRICH_PROGRESS["running"] = True  # held from here: the id listing / freshness pass below takes real time
+    try:
+        movie_ids  = await asyncio.to_thread(vod_db.list_all_movie_ids)
+        series_ids = await asyncio.to_thread(vod_db.list_all_series_ids)
+        movies_total, series_total = len(movie_ids), len(series_ids)
+        if not force:
+            movie_ids, series_ids = await _only_due(movie_ids, series_ids)
+    except BaseException:
+        _ENRICH_PROGRESS["running"] = False
+        raise
     _ENRICH_PROGRESS.update({
-        "running": True,
-        "movies_total": len(movie_ids), "movies_done": 0, "movies_errors": 0, "movies_backoff_skipped": 0,
-        "series_total": len(series_ids), "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
+        "movies_total": movies_total, "movies_done": movies_total - len(movie_ids), "movies_errors": 0, "movies_backoff_skipped": 0,
+        "series_total": series_total, "series_done": series_total - len(series_ids), "series_errors": 0, "series_backoff_skipped": 0,
         "started_at": time.time(), "finished_at": None,
     })
     logger.info("[vod_importer] bulk enrich starting: %d movies, %d series, concurrency=%d",
