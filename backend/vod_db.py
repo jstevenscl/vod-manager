@@ -8035,17 +8035,21 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
     Source-scoped: a canonical series may have sources from several
     providers, but only a source whose episodes were never discovered
     should consume an automatic enrichment lane."""
+    # KNM: 2026-10-06 -- skip sources in a disabled playback language: playback
+    # filters them out, so fetching their episode lists only spent provider calls.
+    lang_clause, lang_params = _enabled_languages_clause("ss.language")
     conn = _connect()
     try:
-        row = conn.execute("""
+        row = conn.execute(f"""
         SELECT 1
         FROM series_sources ss
         JOIN series s ON s.id=ss.series_id
         WHERE ss.provider_id=?
           AND ss.episodes_last_enriched_at IS NULL
           AND s.review_excluded=0
+          AND {lang_clause}
         LIMIT 1
-    """, (provider_id,)).fetchone()
+    """, (provider_id, *lang_params)).fetchone()
         conn.close()
         return row is not None
     finally:
@@ -8065,12 +8069,16 @@ def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
         if provider_id is not None:
             provider_clause = "AND ss.provider_id=?"
             params = (provider_id,)
+        # KNM: 2026-10-06 -- same disabled-language gate as has_pending_series_source_enrichment.
+        lang_clause, lang_params = _enabled_languages_clause("ss.language")
+        params = (*lang_params, *params)
         rows = conn.execute(f"""
         SELECT ss.id, ss.series_id, ss.provider_id
         FROM series_sources ss
         JOIN series s ON s.id=ss.series_id
         WHERE ss.episodes_last_enriched_at IS NULL
           AND s.review_excluded=0
+          AND {lang_clause}
           {provider_clause}
         ORDER BY ss.id
     """, params).fetchall()
