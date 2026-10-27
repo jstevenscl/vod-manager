@@ -11807,12 +11807,15 @@ def _name_prefix_code(name: str) -> str | None:
 # (e.g. a Kurdish-tagged title filed under an "Africa Movies" category) --
 # the per-item tag is the more specific, more trustworthy signal when present.
 _CATEGORY_PREFIX_BRACKET_RE = re.compile(r"^\[([A-Z]{2,6})\]")
+# KNM: 2026-10-27 -- some providers tag the category at the end ("Series Korean [KR]")
+_CATEGORY_SUFFIX_BRACKET_RE = re.compile(r"\[([A-Z]{2,6})\]$")
 
 
 def _category_prefix_code(category_name: str | None) -> str | None:
     if not category_name:
         return None
-    m = _CATEGORY_PREFIX_BRACKET_RE.match(category_name.strip())
+    name = category_name.strip()
+    m = _CATEGORY_PREFIX_BRACKET_RE.match(name) or _CATEGORY_SUFFIX_BRACKET_RE.search(name)
     if not m:
         return None
     code = m.group(1)
