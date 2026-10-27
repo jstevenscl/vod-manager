@@ -1681,7 +1681,7 @@ in the toolbar renames series and movies only, not episodes.)
 **Automatic TMDB episode titles.** When a provider adds episodes later, they
 usually arrive as "Episode 5" or with the season/episode code in the name.
 **Curation & Maintenance → Automatic TMDB Episode Titles** fills those in for
-you, once an hour (up to 100 series per pass). Choose which series it covers:
+you, once an hour (up to 250 series per pass). Choose which series it covers:
 the ones you have already applied TMDB episode titles to (the default), every
 series with a confirmed TMDB ID, or off. It only replaces blank or placeholder
 names, so a real name your provider sent and any name you set or locked is never

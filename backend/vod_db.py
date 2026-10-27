@@ -3482,6 +3482,23 @@ def movie_owned_by_portal_user(movie_id: int, dispatcharr_user_id: int) -> bool:
         conn.close()
 
 
+# A show counts as the user's when any of its episodes is in their library
+# (portal poster fallback).
+def series_owned_by_portal_user(series_id: int, dispatcharr_user_id: int) -> bool:
+    conn = _connect()
+    try:
+        row = conn.execute("""
+        SELECT 1 FROM episodes e
+        JOIN episode_sources es ON es.episode_id = e.id
+        JOIN episode_source_owners eso ON eso.episode_source_id = es.id
+        WHERE e.series_id = ? AND eso.dispatcharr_user_id = ? LIMIT 1
+    """, (series_id, dispatcharr_user_id)).fetchone()
+        conn.close()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def episode_owned_by_portal_user(episode_id: int, dispatcharr_user_id: int) -> bool:
     conn = _connect()
     try:
@@ -11149,13 +11166,23 @@ def auto_merge_series_by_tmdb_batch(series_ids) -> None:
             logger.exception("[auto_merge_series_by_tmdb_batch] skipped series_id=%s", series_id)
 
 
-def auto_merge_series_tmdb_collisions() -> None:
-    """Reconcile every current exact-TMDB series collision safely."""
+def auto_merge_series_tmdb_collisions(series_ids: set[int] | None = None) -> None:
+    """Reconcile current exact-TMDB series collisions safely. With series_ids,
+    only the collisions those series are part of -- a bulk enrichment run can
+    only have created those, and re-checking every pair that already declined
+    to merge (e.g. different-language siblings) each run is wasted work."""
     if not get_duplicate_finder_auto_merge_tmdb():
         return
+    scope, params = "", []
+    if series_ids is not None:
+        ids = sorted({int(i) for i in series_ids})
+        if not ids:
+            return
+        scope = f"AND tmdb_id IN (SELECT tmdb_id FROM series WHERE id IN ({','.join('?' * len(ids))}))"
+        params = ids
     conn = _connect()
     try:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
         SELECT id FROM series
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
           AND tmdb_id IN (
@@ -11163,8 +11190,9 @@ def auto_merge_series_tmdb_collisions() -> None:
               WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
               GROUP BY tmdb_id HAVING COUNT(*) > 1
           )
+          {scope}
         ORDER BY tmdb_id, id
-    """).fetchall()
+    """, params).fetchall()
         conn.close()
         auto_merge_series_by_tmdb_batch([row["id"] for row in rows])
     finally:

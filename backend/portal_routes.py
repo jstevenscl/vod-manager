@@ -25,6 +25,7 @@ import dispatcharr_dvr_client
 import portal_auth
 import tmdb_sync
 import vod_db
+import vod_importer
 from portal_auth import require_portal_auth
 from secrets_util import decrypt_value, verify_password
 from vod_routes import _parse_epg_datetime, _predict_stream_conflict, _require_dvr_connection, backfill_series_past_seasons
@@ -1028,6 +1029,17 @@ async def portal_library_stream(kind: str, item_id: int, request: Request, token
     # (used for its log-line labels only) -- map our "episode" to "series".
     proxy_kind = "series" if kind == "episode" else "movie"
     return await _proxy_vod_stream(proxy_kind, account["username"], sources, request, title=title)
+
+
+# portal counterpart to vod_routes.poster_fallback, limited
+# to titles in the caller's own library.
+@router.post("/{kind}/{item_id}/poster-fallback/")
+async def portal_poster_fallback(kind: str, item_id: int, account: dict = Depends(require_portal_auth)):
+    user_id = account["dispatcharr_user_id"]
+    owned = {"movie": vod_db.movie_owned_by_portal_user, "series": vod_db.series_owned_by_portal_user}.get(kind)
+    if owned is None or not owned(item_id, user_id):
+        raise HTTPException(404, detail="not found")
+    return {"poster_url": await vod_importer.replace_broken_poster(kind, item_id)}
 
 
 @router.get("/image-proxy")

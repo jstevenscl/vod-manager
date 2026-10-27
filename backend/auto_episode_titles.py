@@ -24,7 +24,8 @@ from config import get_auto_episode_titles_mode
 logger = logging.getLogger(__name__)
 
 RECHECK_SECONDS = 24 * 3600
-MAX_SERIES_PER_RUN = 100
+# 100/hour left a 3k-series backlog ~32h behind; ~1 TMDB call per season
+MAX_SERIES_PER_RUN = 250
 
 _status: dict = {"last_run_at": None, "running": False, "last_result": None}
 _run_lock = asyncio.Lock()

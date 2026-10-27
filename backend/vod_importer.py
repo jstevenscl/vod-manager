@@ -1793,6 +1793,26 @@ async def _enrich_one(
             _ENRICH_PROGRESS[f"{prefix}_done"] += 1
 
 
+async def replace_broken_poster(kind: str, item_id: int) -> str | None:
+    """A card whose stored poster fails to load (dead provider image host, bare
+    TMDB base URL) swaps to its TMDB poster, which is saved. None when there is
+    no TMDB id, TMDB has no poster, or the failing poster already is TMDB's."""
+    item = await _to_thread(vod_db.get_movie if kind == "movie" else vod_db.get_series, item_id)
+    tmdb_id = (item or {}).get("tmdb_id")
+    if not tmdb_id:
+        return None
+    fetch = tmdb_sync.get_movie_full_details if kind == "movie" else tmdb_sync.get_series_full_details
+    try:
+        detail = await fetch(str(tmdb_id))
+    except tmdb_sync.TmdbNotFoundError:
+        return None
+    poster = (detail or {}).get("poster_url")
+    if not poster or poster == item.get("poster_url"):
+        return None
+    await _to_thread(vod_db.bulk_set_poster_url, kind, [item_id], poster)
+    return poster
+
+
 async def _only_due(movie_ids: list[int], series_ids: list[int]) -> tuple[list[int], list[int]]:
     """Drops the titles that are still fresh, in one pass on one thread each. Asking per title through the shared
     thread pool starved every other request on a big catalog (vod_manager-051); enrich_movie / enrich_series still
@@ -1871,7 +1891,7 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
         # returned).
         await write_queue.put(None)
         await writer_task
-        await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions)
+        await asyncio.to_thread(vod_db.auto_merge_series_tmdb_collisions, set(series_ids))
     finally:
         if not writer_task.done():
             writer_task.cancel()
