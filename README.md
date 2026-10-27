@@ -421,13 +421,16 @@ reporting a bug or asking for help.
 
 Curation & Maintenance and the Movies/TV Shows toolbars host a set of
 catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
-language-aware filter and sibling-safe bulk archiving), **Language Filter**
+language-aware filter and sibling-safe bulk archiving; posters that fail to
+load are replaced from TMDB automatically), **Language Filter**
 (the same language filtering over your whole library, not just
 poster-missing items), **Enabled Playback Languages** (a live,
 instantly-reversible playback/export filter by source language — separate
 from the import-time Language Exclusion above; nothing archived or deleted,
 just hidden from playback while unchecked; content a provider tags
-[MULTI-LANG]/[MULTI-SUB] is its own always-visible "MULTI" language), **Duplicate Finder** (matches on
+[MULTI-LANG]/[MULTI-SUB] is its own always-visible "MULTI" language; a
+language tag at the start or end of a provider category name is read, and
+episode lists aren't fetched for languages you've unchecked), **Duplicate Finder** (matches on
 punctuation variants, adjacent-year mislabeling, and TMDB id, with one-click
 bulk merges for both fully-corroborated TMDB-confirmed matches and a second,
 separate tier where only one candidate carries a self-consistent TMDB id; an

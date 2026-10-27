@@ -3482,6 +3482,23 @@ def movie_owned_by_portal_user(movie_id: int, dispatcharr_user_id: int) -> bool:
         conn.close()
 
 
+# A show counts as the user's when any of its episodes is in their library
+# (portal poster fallback).
+def series_owned_by_portal_user(series_id: int, dispatcharr_user_id: int) -> bool:
+    conn = _connect()
+    try:
+        row = conn.execute("""
+        SELECT 1 FROM episodes e
+        JOIN episode_sources es ON es.episode_id = e.id
+        JOIN episode_source_owners eso ON eso.episode_source_id = es.id
+        WHERE e.series_id = ? AND eso.dispatcharr_user_id = ? LIMIT 1
+    """, (series_id, dispatcharr_user_id)).fetchone()
+        conn.close()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def episode_owned_by_portal_user(episode_id: int, dispatcharr_user_id: int) -> bool:
     conn = _connect()
     try:
@@ -8035,17 +8052,21 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
     Source-scoped: a canonical series may have sources from several
     providers, but only a source whose episodes were never discovered
     should consume an automatic enrichment lane."""
+    # KNM: 2026-10-06 -- skip sources in a disabled playback language: playback
+    # filters them out, so fetching their episode lists only spent provider calls.
+    lang_clause, lang_params = _enabled_languages_clause("ss.language")
     conn = _connect()
     try:
-        row = conn.execute("""
+        row = conn.execute(f"""
         SELECT 1
         FROM series_sources ss
         JOIN series s ON s.id=ss.series_id
         WHERE ss.provider_id=?
           AND ss.episodes_last_enriched_at IS NULL
           AND s.review_excluded=0
+          AND {lang_clause}
         LIMIT 1
-    """, (provider_id,)).fetchone()
+    """, (provider_id, *lang_params)).fetchone()
         conn.close()
         return row is not None
     finally:
@@ -8065,12 +8086,16 @@ def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
         if provider_id is not None:
             provider_clause = "AND ss.provider_id=?"
             params = (provider_id,)
+        # KNM: 2026-10-06 -- same disabled-language gate as has_pending_series_source_enrichment.
+        lang_clause, lang_params = _enabled_languages_clause("ss.language")
+        params = (*lang_params, *params)
         rows = conn.execute(f"""
         SELECT ss.id, ss.series_id, ss.provider_id
         FROM series_sources ss
         JOIN series s ON s.id=ss.series_id
         WHERE ss.episodes_last_enriched_at IS NULL
           AND s.review_excluded=0
+          AND {lang_clause}
           {provider_clause}
         ORDER BY ss.id
     """, params).fetchall()
@@ -11149,13 +11174,23 @@ def auto_merge_series_by_tmdb_batch(series_ids) -> None:
             logger.exception("[auto_merge_series_by_tmdb_batch] skipped series_id=%s", series_id)
 
 
-def auto_merge_series_tmdb_collisions() -> None:
-    """Reconcile every current exact-TMDB series collision safely."""
+def auto_merge_series_tmdb_collisions(series_ids: set[int] | None = None) -> None:
+    """Reconcile current exact-TMDB series collisions safely. With series_ids,
+    only the collisions those series are part of -- a bulk enrichment run can
+    only have created those, and re-checking every pair that already declined
+    to merge (e.g. different-language siblings) each run is wasted work."""
     if not get_duplicate_finder_auto_merge_tmdb():
         return
+    scope, params = "", []
+    if series_ids is not None:
+        ids = sorted({int(i) for i in series_ids})
+        if not ids:
+            return
+        scope = f"AND tmdb_id IN (SELECT tmdb_id FROM series WHERE id IN ({','.join('?' * len(ids))}))"
+        params = ids
     conn = _connect()
     try:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
         SELECT id FROM series
         WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
           AND tmdb_id IN (
@@ -11163,8 +11198,9 @@ def auto_merge_series_tmdb_collisions() -> None:
               WHERE tmdb_id IS NOT NULL AND TRIM(tmdb_id) <> ''
               GROUP BY tmdb_id HAVING COUNT(*) > 1
           )
+          {scope}
         ORDER BY tmdb_id, id
-    """).fetchall()
+    """, params).fetchall()
         conn.close()
         auto_merge_series_by_tmdb_batch([row["id"] for row in rows])
     finally:
@@ -11807,12 +11843,15 @@ def _name_prefix_code(name: str) -> str | None:
 # (e.g. a Kurdish-tagged title filed under an "Africa Movies" category) --
 # the per-item tag is the more specific, more trustworthy signal when present.
 _CATEGORY_PREFIX_BRACKET_RE = re.compile(r"^\[([A-Z]{2,6})\]")
+# KNM: 2026-10-27 -- some providers tag the category at the end ("Series Korean [KR]")
+_CATEGORY_SUFFIX_BRACKET_RE = re.compile(r"\[([A-Z]{2,6})\]$")
 
 
 def _category_prefix_code(category_name: str | None) -> str | None:
     if not category_name:
         return None
-    m = _CATEGORY_PREFIX_BRACKET_RE.match(category_name.strip())
+    name = category_name.strip()
+    m = _CATEGORY_PREFIX_BRACKET_RE.match(name) or _CATEGORY_SUFFIX_BRACKET_RE.search(name)
     if not m:
         return None
     code = m.group(1)

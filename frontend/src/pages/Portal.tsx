@@ -204,16 +204,35 @@ function portalPosterSrc(url: string): string {
   return `/api/portal/image-proxy?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`
 }
 
-function PosterTile({ seed, posterUrl, size = 'w-full aspect-[2/3]' }: { seed: string; posterUrl?: string | null; size?: string }) {
+// a poster that fails to load asks the server once for the
+// title's TMDB poster (see portal_routes.portal_poster_fallback).
+const posterFallbackMissed = new Set<string>()
+
+function PosterTile({ seed, posterUrl, size = 'w-full aspect-[2/3]', item }: {
+  seed: string; posterUrl?: string | null; size?: string
+  item?: { kind: 'movie' | 'series'; id: number } | null
+}) {
   const [failed, setFailed] = useState(false)
-  if (posterUrl && !failed) {
+  const [replacement, setReplacement] = useState<string | null>(null)
+  const onError = () => {
+    const key = item ? `${item.kind}:${item.id}` : ''
+    if (!item || replacement || posterFallbackMissed.has(key)) { setFailed(true); return }
+    portalApi.post(`/${item.kind}/${item.id}/poster-fallback/`)
+      .then((r) => {
+        if (r.data?.poster_url) setReplacement(r.data.poster_url)
+        else { posterFallbackMissed.add(key); setFailed(true) }
+      })
+      .catch(() => { posterFallbackMissed.add(key); setFailed(true) })
+  }
+  const src = replacement ?? posterUrl
+  if (src && !failed) {
     return (
       <img
-        src={portalPosterSrc(posterUrl)}
+        src={portalPosterSrc(src)}
         alt=""
         loading="lazy"
         className={`${size} rounded-md object-cover shadow-sm`}
-        onError={() => setFailed(true)}
+        onError={onError}
       />
     )
   }
@@ -231,7 +250,7 @@ function ShowCard({ show, onOpen }: { show: ShowGroup; onOpen: () => void }) {
   return (
     <button onClick={onOpen} className="group text-left rounded-lg border border-border bg-card overflow-hidden shadow-sm hover:border-primary/40 transition-colors">
       <div className="relative">
-        <PosterTile seed={show.seriesName} posterUrl={show.posterUrl} />
+        <PosterTile seed={show.seriesName} posterUrl={show.posterUrl} item={show.seriesId ? { kind: 'series', id: show.seriesId } : null} />
         {upcoming > 0 && (
           <span className="absolute top-1.5 right-1.5 text-[9px] font-bold uppercase tracking-wide bg-primary text-primary-foreground rounded-full px-1.5 py-0.5">
             {upcoming} upcoming
@@ -253,7 +272,7 @@ function MovieCard({ movie, onOpen }: { movie: LibraryMovie; onOpen: () => void 
   return (
     <button onClick={onOpen} className="group text-left rounded-lg border border-border bg-card overflow-hidden shadow-sm hover:border-primary/40 transition-colors">
       <div className="relative">
-        <PosterTile seed={movie.name} posterUrl={movie.poster_url} />
+        <PosterTile seed={movie.name} posterUrl={movie.poster_url} item={{ kind: 'movie', id: movie.id }} />
         <div className="absolute inset-0 bg-black/0 group-hover:bg-black/25 transition-colors" />
       </div>
       <div className="p-2">

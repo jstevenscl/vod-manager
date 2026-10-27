@@ -492,8 +492,12 @@ movie/series with at least one source in a still-enabled language stays
 fully visible either way, even if it also has sources in languages you've
 unchecked. Content a provider tags **[MULTI-LANG]** (category) or **[MULTI-SUB]**
 (title) is multi-track, so it is classed as its own **MULTI** language and is
-never hidden by this filter, whatever languages you leave enabled. Existing
-catalogs pick this up from [Language Backfill](#language-backfill-and-language-split)
+never hidden by this filter, whatever languages you leave enabled. A language
+tag in a provider's category name is read whether it leads (`[KR] Series`) or
+trails (`Series Korean [KR]`); non-language tags such as `[4K]` or `[HD]` are
+ignored. Episode lists are also not fetched for sources in a language you have
+unchecked (saving provider calls); re-checking the language queues them again.
+Existing catalogs pick this up from [Language Backfill](#language-backfill-and-language-split)
 (Curation & Maintenance), which re-tags already-imported sources.
 
 Use Import Language Exclusion when you never want a language cluttering
@@ -1681,7 +1685,7 @@ in the toolbar renames series and movies only, not episodes.)
 **Automatic TMDB episode titles.** When a provider adds episodes later, they
 usually arrive as "Episode 5" or with the season/episode code in the name.
 **Curation & Maintenance → Automatic TMDB Episode Titles** fills those in for
-you, once an hour (up to 100 series per pass). Choose which series it covers:
+you, once an hour (up to 250 series per pass). Choose which series it covers:
 the ones you have already applied TMDB episode titles to (the default), every
 series with a confirmed TMDB ID, or off. It only replaces blank or placeholder
 names, so a real name your provider sent and any name you set or locked is never
@@ -1971,6 +1975,13 @@ browsable, playable, and usable in categories, just no longer flagged as
 needing attention. Useful for content you've decided not to curate further
 (e.g. a language you don't plan to add posters for).
 
+**Broken posters repair themselves.** If a card's poster fails to load (the
+provider's image host is gone, or the stored address has no image path) and
+the title has a TMDB id, the card asks once for TMDB's poster, saves it and
+shows it. A title TMDB has no poster for keeps its normal placeholder and
+isn't asked again that session. The Portal does the same, only for titles in
+the signed-in user's own library.
+
 ### Language Filter
 
 The same language-based filtering as Missing Artwork, but over your *whole*
@@ -2171,8 +2182,12 @@ re-run any time (each becomes a no-op once nothing's left to fix):
   matching) is detected from its raw title and provider category. A source
   written before that detection existed on a given import path — or
   classified by a since-fixed version of it — sits with the wrong value
-  until backfilled. Scan shows what's missing or outdated per table/language
-  code with sample titles; **Backfill N rows** applies it.
+  until backfilled. This includes provider categories that carry the tag at
+  the end of the name (`Series Korean [KR]`), which older versions read as
+  English. Scan shows what's missing or outdated per table/language
+  code with sample titles; **Backfill N rows** applies it, then run
+  **Language Split** to separate any foreign-language copy that had been
+  merged into an English title of the same name.
 - **Language Split** — a movie or series with sources in two languages that
   share no common source can end up merged into a single catalog entry from
   before the auto-merge language gate existed (a shared TMDB id used to be

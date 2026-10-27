@@ -859,6 +859,15 @@ async def image_proxy(url: str, token: str):
     return await fetch_proxied_image(url)
 
 
+# PosterThumb calls this once when a card's poster fails to load; see
+# vod_importer.replace_broken_poster.
+@router.post("/{kind}/{item_id}/poster-fallback/", dependencies=_GUARDS)
+async def poster_fallback(kind: str, item_id: int):
+    if kind not in ("movie", "series"):
+        raise HTTPException(404, detail="unknown kind")
+    return {"poster_url": await vod_importer.replace_broken_poster(kind, item_id)}
+
+
 @router.get("/tmdb-settings/", dependencies=_GUARDS)
 async def get_tmdb_settings():
     return {"has_api_key": bool(get_tmdb_api_key())}
