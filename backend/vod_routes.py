@@ -4116,6 +4116,16 @@ class SourceQualityRequest(BaseModel):
     force: bool = False             # re-measure even if a result is already on file
 
 
+class SourceLanguageProbeRequest(BaseModel):
+    kind: str                       # "movie" or "episode"
+    source_id: int
+    force: bool = False             # inspect again even if a result is already on file
+
+
+class LanguageMismatchDecisionRequest(BaseModel):
+    decision: str                   # approved or rejected
+
+
 @router.post("/sources/check-quality/", dependencies=_GUARDS)
 async def check_source_quality(body: SourceQualityRequest):
     """On-demand resolution + file size for ONE source. One source per call by design: no bulk / season form."""
@@ -4124,6 +4134,42 @@ async def check_source_quality(body: SourceQualityRequest):
     except vod_probe.ProbeRefused as exc:
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
         raise HTTPException(429 if exc.retry_after else 400, detail=str(exc), headers=headers)
+
+
+@router.post("/sources/check-language/", dependencies=_GUARDS)
+async def check_source_language(body: SourceLanguageProbeRequest):
+    """Bounded embedded-audio-tag check; advisory only and never changes eligibility."""
+    try:
+        return await vod_probe.probe_language_source(body.kind, body.source_id, body.force)
+    except vod_probe.ProbeRefused as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(429 if exc.retry_after else 400, detail=str(exc), headers=headers)
+
+
+@router.get("/language-mismatch-report/", dependencies=_GUARDS)
+async def language_mismatch_report():
+    report = await asyncio.to_thread(vod_db.list_language_mismatches)
+    report["trickle"] = vod_probe.language_trickle_status()
+    if report["count"] and not await asyncio.to_thread(vod_db.has_open_notice_kind, "language_mismatch"):
+        await asyncio.to_thread(
+            notices.add, "language_mismatch", "warn", "Language mismatch approval needed",
+            f"{report['count']} source language mismatch{'es' if report['count'] != 1 else ''} need review in the Language Mismatch Report."
+        )
+    return report
+
+
+@router.post("/language-trickle/run/", dependencies=_GUARDS)
+async def run_language_trickle():
+    """Run one bounded manual cycle; the same provider gates and daily cap apply."""
+    return await vod_probe.run_language_trickle_cycle()
+
+
+@router.post("/language-mismatch/{kind}/{source_id}/decision/", dependencies=_GUARDS)
+async def language_mismatch_decision(kind: str, source_id: int, body: LanguageMismatchDecisionRequest):
+    try:
+        return await asyncio.to_thread(vod_db.decide_language_mismatch, kind, source_id, body.decision)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
 
 
 class QualityBatchRequest(BaseModel):

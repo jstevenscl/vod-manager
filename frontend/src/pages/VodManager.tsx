@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, Gauge, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, Gauge, HardDriveDownload, ImageOff, Info, Languages, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -494,6 +494,7 @@ function qualityLabel(w?: number | null, h?: number | null): string | null {
 }
 
 type QualitySource = { id: number; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null }
+type LanguageProbeSource = { id: number; language?: string | null; language_probe_languages?: string | null; language_probe_status?: string | null; language_probe_confidence?: string | null; language_probe_method?: string | null; language_probed_at?: string | null }
 
 // On-demand resolution + size for ONE source. The server paces every provider (one at a time, spaced out,
 // never while a download or viewer holds the connection), so a refusal here just says when to try again.
@@ -523,6 +524,51 @@ function QualityCheck({ kind, source, size = 11 }: { kind: 'movie' | 'episode'; 
       >
         {busy ? <Loader2 size={size} className="animate-spin" /> : <Gauge size={size} />}
         {!res.checked && !res.unreadable && <span>Check quality</span>}
+      </button>
+    </span>
+  )
+}
+
+function LanguageProbe({ kind, source, size = 11 }: { kind: 'movie' | 'episode'; source: LanguageProbeSource; size?: number }) {
+  const [res, setRes] = useState(() => ({
+    configured: source.language ?? null,
+    observed: (() => { try { return JSON.parse(source.language_probe_languages || '[]') } catch { return [] } })() as string[],
+    status: source.language_probe_status ?? null,
+    confidence: source.language_probe_confidence ?? null,
+    checked: !!source.language_probed_at,
+    mismatch: false,
+  }))
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const check = (force: boolean) => {
+    setBusy(true); setNote(null)
+    api.post('/vod/sources/check-language/', { kind, source_id: source.id, force })
+      .then((r) => setRes({
+        configured: r.data.configured_language ?? null,
+        observed: r.data.observed_languages ?? [],
+        status: r.data.status ?? null,
+        confidence: r.data.confidence ?? null,
+        checked: !!r.data.checked,
+        mismatch: !!r.data.mismatch,
+      }))
+      .catch((e) => setNote(e?.response?.data?.detail ?? e?.message ?? 'Could not check language.'))
+      .finally(() => setBusy(false))
+  }
+  const labels = res.observed.map((code) => LANGUAGE_CODE_NAMES[code] ? `${code} (${LANGUAGE_CODE_NAMES[code]})` : code)
+  return (
+    <span className="flex items-center gap-1.5">
+      {note && <span className="text-destructive">{note}</span>}
+      {res.checked && <span className={res.mismatch ? 'text-amber-500' : 'text-muted-foreground'} title="Embedded audio-track tags only; this never changes playback eligibility">
+        {res.status === 'observed' ? `Audio: ${labels.join(', ')}` : 'Audio language: unknown'}{res.mismatch ? ' · review' : ''}
+      </span>}
+      <button
+        title={res.checked ? 'Check embedded audio language tags again' : 'Read a small bounded stream header for embedded audio language tags'}
+        className="hover:text-foreground disabled:opacity-50 flex items-center gap-0.5"
+        disabled={busy}
+        onClick={() => check(res.checked)}
+      >
+        {busy ? <Loader2 size={size} className="animate-spin" /> : <Languages size={size} />}
+        {!res.checked && <span>Check language</span>}
       </button>
     </span>
   )
@@ -1566,7 +1612,7 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
   )
 }
 
-interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
+interface MovieSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; language?: string | null; language_probe_languages?: string | null; language_probe_status?: string | null; language_probe_confidence?: string | null; language_probe_method?: string | null; language_probed_at?: string | null; raw_name?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
 interface MoviePlacement { id: number; category_id: number; export_stream_id: number; name_suffix: string; category_name: string }
 interface Movie {
   id: number
@@ -1598,7 +1644,7 @@ interface MetadataRule {
   is_regex: number
 }
 
-interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
+interface EpisodeSource { id: number; provider_id: number; provider_stream_id: string; container_extension: string; provider_name: string; provider_category_name?: string; file_size_bytes?: number | null; probe_width?: number | null; probe_height?: number | null; probe_codec?: string | null; probed_at?: string | null; language?: string | null; language_probe_languages?: string | null; language_probe_status?: string | null; language_probe_confidence?: string | null; language_probe_method?: string | null; language_probed_at?: string | null; consecutive_failures?: number; last_failed_at?: string | null; flagged_mismatch?: number; flagged_reason?: string | null }
 interface Episode { id: number; season_number: number; episode_number: number; name: string; export_episode_id: number; sources: EpisodeSource[]; flagged_mismatch?: number; flagged_reason?: string | null; in_library?: boolean }
 interface SeriesPlacement { id: number; category_id: number; export_series_id: number; name_suffix: string; category_name: string }
 interface Series {
@@ -3638,6 +3684,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
               <span>{s.provider_name} → {s.provider_stream_id} ({s.container_extension}){s.provider_category_name ? ` · ${s.provider_category_name}` : ''}</span>
               <span className="flex items-center gap-1.5">
                 <QualityCheck kind="movie" source={s} size={12} />
+                <LanguageProbe kind="movie" source={s} size={12} />
                 <DownloadIconButton body={{ movie_ids: [movie.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                 <PlayButton
                   url={buildPreviewSourceUrl('movie', s.id, s.container_extension, xcCredentials)}
@@ -4324,6 +4371,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
                 </span>
                 <span className="flex items-center gap-1">
                   <QualityCheck key={`${s.id}-${s.probed_at ?? ""}`} kind="episode" source={s} />
+                  <LanguageProbe key={`${s.id}-${s.language_probed_at ?? ""}`} kind="episode" source={s} />
                   <DownloadIconButton size={11} body={{ episode_ids: [e.id], source_id: s.id }} title={`Download this copy (${s.provider_name})`} />
                   <FlagMismatchControl
                     isFlagged={!!s.flagged_mismatch}

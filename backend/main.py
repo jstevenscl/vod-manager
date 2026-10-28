@@ -32,6 +32,7 @@ from tmdb_store_routes import router as tmdb_store_router
 import vod_db
 import vod_importer
 import vod_list_sync
+import vod_probe
 from vod_routes import router as vod_router
 from xc_server import _redact_upstream_url, hls_sweep_loop, router as xc_router
 
@@ -510,6 +511,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
+        asyncio.create_task(_episode_trickle_scheduler()),
+        asyncio.create_task(vod_probe.language_trickle_loop()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(tmdb_fill.fill_loop()),
         asyncio.create_task(_category_schedule_loop()),
