@@ -1425,8 +1425,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # that don't exist yet on a brand-new DB at that earlier point.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_flag ON movies(id) WHERE review_excluded=0 AND needs_year_review=1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_missing ON movies(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_no_tmdb ON movies(id) WHERE review_excluded=0 AND tmdb_id IS NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_flag ON series(id) WHERE review_excluded=0 AND needs_year_review=1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_missing ON series(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_no_tmdb ON series(id) WHERE review_excluded=0 AND tmdb_id IS NULL")
     # Heal movies enriched before _release_year_fields existed: held and
     # yearless although TMDB already gave a release date. Archived rows are
     # included so they show their year and a restored card comes back fixed.
@@ -11498,7 +11500,14 @@ def list_metadata_review(content_type: str | None = None) -> dict:
                 f"""SELECT * FROM (
                     SELECT * FROM {table} WHERE review_excluded=0 AND needs_year_review=1
                     UNION
-                    SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_missing
+                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+                    UNION
+                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_no_tmdb
+                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NOT NULL
+                    UNION
+                    SELECT * FROM {table}
+                      WHERE review_excluded=0 AND tmdb_id IS NOT NULL AND TRIM(tmdb_id)=''
                     UNION
                     SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL
                       AND id IN ({_ambiguous_auto_match_ids(table)})
