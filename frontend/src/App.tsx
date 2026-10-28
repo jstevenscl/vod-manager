@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity, CalendarDays, Database, Download, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
+  Languages,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
 import Login from '@/pages/Login'
@@ -10,6 +11,7 @@ import Settings from '@/pages/Settings'
 import TmdbStore from '@/pages/TmdbStore'
 import api from '@/lib/api'
 import NoticesBell from '@/components/NoticesBell'
+import LanguageMismatchReport from '@/pages/LanguageMismatchReport'
 
 export const THEMES = ['dark', 'mid', 'light', 'mono', 'warm'] as const
 export type Theme = typeof THEMES[number]
@@ -30,7 +32,7 @@ function initTheme(): Theme {
 }
 
 type AuthState = 'checking' | 'login' | 'ready'
-type AppTab = VodManagerTab | 'tmdb'
+type AppTab = VodManagerTab | 'tmdb' | 'language-report'
 
 interface NavItem {
   label: string
@@ -72,6 +74,7 @@ const NAV_GROUPS: NavGroup[] = [
   { label: 'System', items: [
     { label: 'Configuration', icon: <SettingsIcon size={15} />, tab: 'config' },
     { label: 'Download Configuration', icon: <Download size={15} />, tab: 'downloads' },
+    { label: 'Language Mismatch Report', icon: <Languages size={15} />, tab: 'language-report' },
   ] },
 ]
 
@@ -83,7 +86,7 @@ export default function App() {
 
   const [activeTab, setActiveTabState] = useState<AppTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'artwork' || saved === 'tmdb' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'artwork' || saved === 'tmdb' || saved === 'language-report' ? saved : 'movies'
   })
   // the user can hide/unhide the sidebar menu; remembered per browser
   const [navHidden, setNavHiddenState] = useState(() => localStorage.getItem('vodmanager-nav-hidden') === '1')
@@ -95,6 +98,14 @@ export default function App() {
     localStorage.setItem('vodmanager-tab', t)
     setActiveTabState(t)
   }
+  useEffect(() => {
+    const openReport = (event: Event) => {
+      const tab = (event as CustomEvent<AppTab>).detail
+      if (tab) setActiveTab(tab)
+    }
+    window.addEventListener('vodmanager-goto', openReport)
+    return () => window.removeEventListener('vodmanager-goto', openReport)
+  }, [])
   const [dvrSubTab, setDvrSubTab] = useState<DvrSubTab>(() => {
     const saved = localStorage.getItem('vodmanager-dvr-subtab')
     return saved === 'scheduled' || saved === 'users' || saved === 'library' || saved === 'metrics' ? saved : 'scheduled'
@@ -368,6 +379,8 @@ export default function App() {
         <main className="flex-1 min-w-0 p-4">
           {activeTab === 'tmdb' ? (
             <TmdbStore />
+          ) : activeTab === 'language-report' ? (
+            <LanguageMismatchReport />
           ) : (
             <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
           )}

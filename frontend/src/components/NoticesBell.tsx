@@ -67,13 +67,16 @@ export default function NoticesBell() {
               {n.body && <div className="text-muted-foreground break-words">{n.body}</div>}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">{new Date(Number(n.created_at) * 1000).toLocaleString()}</span>
-                <button
-                  className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50"
-                  disabled={ack.isPending}
-                  onClick={() => ack.mutate(n.id)}
-                >
-                  <Check size={11} /> Acknowledge
-                </button>
+                <span className="flex items-center gap-1">
+                  {n.kind === 'language_mismatch' && <button className="px-1.5 py-0.5 rounded border border-primary/40 text-primary hover:bg-accent" onClick={() => { window.dispatchEvent(new CustomEvent('vodmanager-goto', { detail: 'language-report' })); setOpen(false) }}>Open report</button>}
+                  <button
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50"
+                    disabled={ack.isPending}
+                    onClick={() => ack.mutate(n.id)}
+                  >
+                    <Check size={11} /> Acknowledge
+                  </button>
+                </span>
               </div>
             </div>
           ))}

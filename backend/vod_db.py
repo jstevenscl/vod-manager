@@ -1182,10 +1182,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "probe_height", "INTEGER"),
         ("movie_sources", "probe_codec", "TEXT"),
         ("movie_sources", "probed_at", "TEXT"),
+        # Lightweight source-language probe results are deliberately separate
+        # from the provider/import language and the quality-probe timestamp.
+        ("movie_sources", "language_probe_languages", "TEXT"),
+        ("movie_sources", "language_probe_status", "TEXT"),
+        ("movie_sources", "language_probe_error", "TEXT"),
+        ("movie_sources", "language_probe_method", "TEXT"),
+        ("movie_sources", "language_probe_confidence", "TEXT"),
+        ("movie_sources", "language_probed_at", "TEXT"),
+        ("movie_sources", "language_probe_decision", "TEXT"),
+        ("movie_sources", "language_probe_decided_at", "TEXT"),
         ("episode_sources", "probe_width", "INTEGER"),
         ("episode_sources", "probe_height", "INTEGER"),
         ("episode_sources", "probe_codec", "TEXT"),
         ("episode_sources", "probed_at", "TEXT"),
+        ("episode_sources", "language_probe_languages", "TEXT"),
+        ("episode_sources", "language_probe_status", "TEXT"),
+        ("episode_sources", "language_probe_error", "TEXT"),
+        ("episode_sources", "language_probe_method", "TEXT"),
+        ("episode_sources", "language_probe_confidence", "TEXT"),
+        ("episode_sources", "language_probed_at", "TEXT"),
+        ("episode_sources", "language_probe_decision", "TEXT"),
+        ("episode_sources", "language_probe_decided_at", "TEXT"),
         ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
         ("dvr_recording_profiles", "backfill_mode", "TEXT"),
@@ -7559,11 +7577,46 @@ def get_probe_source(kind: str, source_id: int) -> dict | None:
     return _probe_row("movie_sources" if movie else "episode_sources", source_id, src) if src else None
 
 
+def get_language_probe_source(kind: str, source_id: int) -> dict | None:
+    """One active source for a language probe, without playback-language gating.
+
+    Language auditing must be able to inspect a source that is already outside
+    the enabled playback set; otherwise the audit could never find a slipped
+    non-wanted source. This does not make the source playable or exported.
+    """
+    table = "movie_sources" if kind == "movie" else "episode_sources"
+    parent = "movies" if kind == "movie" else "episodes"
+    parent_id = "movie_id" if kind == "movie" else "episode_id"
+    conn = _connect()
+    try:
+        row = conn.execute(f"""
+            SELECT src.id AS source_id, src.provider_id, src.provider_stream_id,
+                   src.container_extension, src.plex_rating_key, src.local_file_path,
+                   src.file_size_bytes, src.language, src.language_probe_languages,
+                   src.language_probe_status, src.language_probe_error,
+                   src.language_probe_method, src.language_probe_confidence,
+                   src.language_probed_at, src.language_probe_decision,
+                   src.language_probe_decided_at,
+                   p.name AS provider_name, p.provider_type,
+                   parent.id AS parent_id, parent.name AS parent_name
+            FROM {table} src
+            JOIN providers p ON p.id = src.provider_id
+            JOIN {parent} parent ON parent.id = src.{parent_id}
+            WHERE src.id=? AND p.is_active=1
+        """, (source_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def _probe_row(table: str, source_id: int, src: dict) -> dict:
     conn = _connect()
     try:
         row = conn.execute(
-            f"SELECT file_size_bytes, probe_width, probe_height, probe_codec, probed_at FROM {table} WHERE id = ?", (source_id,)).fetchone()
+            f"""SELECT file_size_bytes, probe_width, probe_height, probe_codec, probed_at,
+                       language_probe_languages, language_probe_status, language_probe_error,
+                       language_probe_method, language_probe_confidence, language_probed_at
+                FROM {table} WHERE id = ?""", (source_id,)).fetchone()
     finally:
         conn.close()
     return {**src, **(dict(row) if row else {})}
@@ -7609,6 +7662,235 @@ def set_source_probe(kind: str, source_id: int, size: int | None, width: int | N
         conn.commit()
     finally:
         conn.close()
+
+
+def set_source_language_probe(kind: str, source_id: int, languages: list[str] | None,
+                              status: str, method: str, confidence: str | None = None,
+                              error: str | None = None) -> None:
+    """Store one lightweight language-check result without changing source.language.
+
+    A failed/unknown check is still stamped so trickle runs do not repeatedly
+    hit the same provider forever. ``languages`` is JSON for stable display and
+    future multi-audio tracks; the explicit status distinguishes unknown from a
+    confidently observed language.
+    """
+    table = "movie_sources" if kind == "movie" else "episode_sources"
+    conn = _connect()
+    try:
+        conn.execute(
+            f"""UPDATE {table}
+                SET language_probe_languages=?, language_probe_status=?,
+                    language_probe_error=?, language_probe_method=?,
+                    language_probe_confidence=?, language_probed_at=?
+                WHERE id=?""",
+            (json.dumps(sorted(set(languages or []))), status, error, method,
+             confidence, datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), source_id),
+        )
+        _commit_with_retry(conn)
+    finally:
+        conn.close()
+
+
+def _language_probe_table(kind: str) -> tuple[str, str, str]:
+    if kind == "movie":
+        return "movie_sources", "movies", "movie_id"
+    if kind == "episode":
+        return "episode_sources", "episodes", "episode_id"
+    raise ValueError("unknown language probe kind")
+
+
+def list_language_mismatches(limit: int = 1000) -> dict:
+    """Pending single-tag mismatches, excluding already archived parents.
+
+    This is intentionally a review report, not an export query. A source is
+    eligible for this report only once and a decision removes it permanently
+    from future checks unless an administrator explicitly forces a recheck.
+    """
+    enabled = sorted(get_enabled_languages())
+    conn = _connect()
+    try:
+        rows = []
+        movie_rows = conn.execute("""
+            SELECT 'movie' AS kind, ms.id AS source_id, m.id AS item_id,
+                   m.name AS title, m.year, m.tmdb_id, ms.language AS configured_language,
+                   ms.language_probe_languages, ms.language_probe_status,
+                   ms.language_probe_confidence, ms.language_probed_at,
+                   p.name AS provider_name
+            FROM movie_sources ms JOIN movies m ON m.id=ms.movie_id
+            JOIN providers p ON p.id=ms.provider_id
+            WHERE p.is_active=1 AND m.review_excluded=0
+              AND ms.language_probe_status='observed'
+              AND ms.language_probe_decision IS NULL
+            ORDER BY ms.language_probed_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+        series_rows = conn.execute("""
+            SELECT 'episode' AS kind, es.id AS source_id, s.id AS item_id,
+                   s.name AS title, s.year, s.tmdb_id, es.language AS configured_language,
+                   es.language_probe_languages, es.language_probe_status,
+                   es.language_probe_confidence, es.language_probed_at,
+                   p.name AS provider_name, e.season_number, e.episode_number,
+                   e.name AS episode_name
+            FROM episode_sources es JOIN episodes e ON e.id=es.episode_id
+            JOIN series s ON s.id=e.series_id JOIN providers p ON p.id=es.provider_id
+            WHERE p.is_active=1 AND s.review_excluded=0
+              AND es.language_probe_status='observed'
+              AND es.language_probe_decision IS NULL
+            ORDER BY es.language_probed_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+        for row in (*movie_rows, *series_rows):
+            item = dict(row)
+            try:
+                observed = sorted(set(json.loads(item.pop("language_probe_languages") or "[]")))
+            except (TypeError, ValueError):
+                observed = []
+            if not observed or observed == [item.get("configured_language")]:
+                continue
+            item["observed_languages"] = observed
+            item["safe_to_apply"] = len(observed) == 1
+            item["proposed_language"] = observed[0] if len(observed) == 1 else None
+            item["proposed_archive"] = bool(len(observed) == 1 and observed[0] not in enabled)
+            item["enabled_languages"] = enabled
+            rows.append(item)
+        return {"enabled_languages": enabled, "count": len(rows), "results": rows}
+    finally:
+        conn.close()
+
+
+def next_language_probe_target() -> dict | None:
+    """Return one unreviewed, unprobed source that is currently export-relevant."""
+    targets = next_language_probe_targets(1, distinct_providers=True)
+    return targets[0] if targets else None
+
+
+def next_language_probe_targets(limit: int = 3, distinct_providers: bool = True) -> list[dict]:
+    """Return up to ``limit`` pending sources.
+
+    The normal single-target path can request one source per provider. The
+    trickle worker requests a larger batch and then runs each provider's queue
+    serially, so one provider is never probed concurrently while the cycle can
+    still make progress on up to the global source limit.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT 'movie' AS kind, ms.id AS source_id, ms.provider_id
+            FROM movie_sources ms JOIN movies m ON m.id=ms.movie_id JOIN providers p ON p.id=ms.provider_id
+            WHERE p.is_active=1 AND m.review_excluded=0 AND ms.language_probe_decision IS NULL
+              AND ms.language_probed_at IS NULL
+              AND EXISTS (SELECT 1 FROM movie_category_placements cp WHERE cp.movie_id=m.id)
+            UNION ALL
+            SELECT 'episode' AS kind, es.id AS source_id, es.provider_id
+            FROM episode_sources es JOIN episodes e ON e.id=es.episode_id
+            JOIN series s ON s.id=e.series_id JOIN providers p ON p.id=es.provider_id
+            WHERE p.is_active=1 AND s.review_excluded=0 AND es.language_probe_decision IS NULL
+              AND es.language_probed_at IS NULL
+              AND EXISTS (SELECT 1 FROM series_category_placements cp WHERE cp.series_id=s.id)
+            ORDER BY source_id LIMIT 200
+        """).fetchall()
+        max_items = max(1, int(limit))
+        if distinct_providers:
+            chosen = []
+            providers = set()
+            for row in rows:
+                item = dict(row)
+                if item["provider_id"] in providers:
+                    continue
+                providers.add(item["provider_id"])
+                chosen.append(item)
+                if len(chosen) >= max_items:
+                    break
+        else:
+            # Round-robin provider buckets so a large catalog from one
+            # provider does not starve sources from the others.
+            buckets: dict[int, list[dict]] = {}
+            provider_order: list[int] = []
+            for row in rows:
+                item = dict(row)
+                pid = item["provider_id"]
+                if pid not in buckets:
+                    buckets[pid] = []
+                    provider_order.append(pid)
+                buckets[pid].append(item)
+            chosen = []
+            while len(chosen) < max_items:
+                added = False
+                for pid in provider_order:
+                    if buckets[pid]:
+                        chosen.append(buckets[pid].pop(0))
+                        added = True
+                        if len(chosen) >= max_items:
+                            break
+                if not added:
+                    break
+        return chosen
+    finally:
+        conn.close()
+
+
+def decide_language_mismatch(kind: str, source_id: int, decision: str) -> dict:
+    """Approve or reject one report row; approved safe mismatches update and gate it."""
+    if decision not in ("approved", "rejected"):
+        raise ValueError("decision must be approved or rejected")
+    table, parent_table, parent_fk = _language_probe_table(kind)
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(f"""
+                SELECT src.*, p.is_active, p.name AS provider_name,
+                       {parent_table}.id AS parent_id
+                FROM {table} src JOIN providers p ON p.id=src.provider_id
+                JOIN {parent_table} ON {parent_table}.id=src.{parent_fk}
+                WHERE src.id=?
+            """, (source_id,)).fetchone()
+            if not row:
+                raise ValueError("language probe source not found")
+            try:
+                observed = sorted(set(json.loads(row["language_probe_languages"] or "[]")))
+            except (TypeError, ValueError):
+                observed = []
+            if decision == "approved" and len(observed) != 1:
+                raise ValueError("only a single observed language can be approved automatically")
+            now = _now()
+            if decision == "rejected":
+                conn.execute(f"UPDATE {table} SET language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
+                             (decision, now, source_id))
+                _commit_with_retry(conn)
+                return {"decision": decision, "source_id": source_id, "applied": False}
+
+            language = observed[0]
+            conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
+                         (language, decision, now, source_id))
+            parent_id = row["parent_id"]
+            if kind == "episode":
+                # Keep the series-level source label aligned with the provider's
+                # observed episode when that provider has a series source row.
+                conn.execute("""UPDATE series_sources SET language=?
+                               WHERE series_id=? AND provider_id=?""",
+                             (language, parent_id, row["provider_id"]))
+                source_langs = _source_languages(conn, "series_sources", "series_id", parent_id)
+                if not source_langs:
+                    source_langs = {language}
+                parent_table = "series"
+                placements = "series_category_placements"
+                placement_key = "series_id"
+            else:
+                source_langs = _source_languages(conn, "movie_sources", "movie_id", parent_id)
+                placements = "movie_category_placements"
+                placement_key = "movie_id"
+            eligible = _any_language_enabled(source_langs, set(get_enabled_languages()))
+            parent_row = conn.execute(f"SELECT review_excluded, review_excluded_manual, review_excluded_language FROM {parent_table} WHERE id=?", (parent_id,)).fetchone()
+            action = "language_updated"
+            if not eligible and parent_row and not parent_row["review_excluded_manual"]:
+                conn.execute(f"UPDATE {parent_table} SET review_excluded=1, review_excluded_language=1, updated_at=? WHERE id=?", (now, parent_id))
+                conn.execute(f"DELETE FROM {placements} WHERE {placement_key}=?", (parent_id,))
+                action = "language_updated_and_archived"
+            elif eligible and parent_row and parent_row["review_excluded_language"] and not parent_row["review_excluded_manual"]:
+                conn.execute(f"UPDATE {parent_table} SET review_excluded=0, review_excluded_language=0, updated_at=? WHERE id=?", (now, parent_id))
+                action = "language_updated_and_restored"
+            _commit_with_retry(conn)
+            return {"decision": decision, "source_id": source_id, "applied": True, "language": language, "action": action}
+        finally:
+            conn.close()
 
 
 def get_movie_source_for_streaming(source_id: int) -> dict | None:
@@ -13667,6 +13949,17 @@ def acknowledge_notice(notice_id: int) -> bool:
 
 
 # ── In Library badge (library_presence.py) ──────────────────────────────────
+def has_open_notice_kind(kind: str) -> bool:
+    conn = _connect()
+    try:
+        return bool(conn.execute(
+            "SELECT 1 FROM notices WHERE kind=? AND acknowledged_at IS NULL LIMIT 1", (kind,)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+# ── In Library badge (library_presence.py) ── KNM: 2026-10-18 ────────────────
 
 _PRESENCE_COLS = ("library", "kind", "tmdb_id", "imdb_id", "tvdb_id", "title", "year", "season", "episode")
 

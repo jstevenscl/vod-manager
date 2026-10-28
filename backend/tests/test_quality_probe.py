@@ -13,6 +13,7 @@ import vod_downloader
 import vod_probe
 import vod_routes
 import xc_server
+import config
 
 TOTAL = 20_000_000
 hits: list[str] = []
@@ -77,6 +78,10 @@ def clean(monkeypatch):
     for d in (vod_probe._last_end, vod_probe._recent, vod_downloader._cooldown_until, vod_downloader._pushbacks,
               vod_downloader._provider_active):
         d.clear()
+    vod_probe._language_provider_blocks.clear()
+    vod_probe._language_claimed_sources.clear()
+    vod_probe._language_trickle_day = ""
+    vod_probe._language_trickle_count = 0
     vod_probe._in_flight.clear()
     vod_probe._running_total = 0
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/" + name)
@@ -120,6 +125,125 @@ def test_quality_labels():
     assert vod_probe.quality_label(1280, 720) == "720p"
     assert vod_probe.quality_label(720, 480) == "480p"
     assert vod_probe.quality_label(None, None) is None
+
+
+def test_language_probe_records_observed_tags_without_changing_configured_language(db, tmp_path, monkeypatch):
+    pid = db.upsert_provider("local-language", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Canary Hindi Movie", 2026)
+    path = tmp_path / "canary.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "canary", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    monkeypatch.setattr(vod_probe, "_ffprobe_audio_languages", lambda p: asyncio.sleep(0, result=["HI"]))
+
+    out = asyncio.run(vod_probe.probe_language_source("movie", sid))
+
+    assert out["observed_languages"] == ["HI"]
+    assert out["status"] == "observed"
+    assert out["mismatch"] is True
+    row = db.get_language_probe_source("movie", sid)
+    assert row["language"] == "EN"
+    assert row["language_probe_status"] == "observed"
+    assert row["language_probe_languages"] == '["HI"]'
+
+
+def test_language_probe_caches_unknown_result(db, tmp_path, monkeypatch):
+    pid = db.upsert_provider("local-language-unknown", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Un tagged Movie", 2026)
+    path = tmp_path / "unknown.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "unknown", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.commit(); conn.close()
+    calls = []
+    async def no_tags(_):
+        calls.append(1)
+        return []
+    monkeypatch.setattr(vod_probe, "_ffprobe_audio_languages", no_tags)
+
+    first = asyncio.run(vod_probe.probe_language_source("movie", sid))
+    second = asyncio.run(vod_probe.probe_language_source("movie", sid))
+
+    assert first["status"] == "unknown" and first["checked"]
+    assert second["status"] == "unknown" and second["checked"]
+    assert len(calls) == 1
+
+
+def test_language_trickle_uses_experimental_limits_and_saved_playback_policy(db, monkeypatch):
+    assert vod_probe.LANGUAGE_GLOBAL_MAX == 15
+    assert vod_probe.LANGUAGE_TRICKLE_DAILY_MAX == 500
+    assert vod_probe.LANGUAGE_WINDOW_MAX is None
+
+    monkeypatch.setattr(config, "CONFIG_FILE", db.DB_PATH.with_name("config.json"))
+    config.save_enabled_languages(["IT", "ES"])
+    assert config.get_enabled_languages() == ["IT", "ES"]
+    assert db.list_language_mismatches()["enabled_languages"] == ["ES", "IT"]
+
+
+def test_language_trickle_runs_up_to_source_limit_per_cycle(monkeypatch):
+    targets = [
+        {"kind": "movie", "source_id": i, "provider_id": 1 if i < 8 else 2}
+        for i in range(15)
+    ]
+
+    async def fake_probe(kind, source_id, force=False, spacing=None):
+        return {"source_id": source_id, "mismatch": False}
+
+    monkeypatch.setattr(vod_probe.vod_db, "next_language_probe_targets", lambda limit, distinct: targets[:limit])
+    monkeypatch.setattr(vod_probe, "probe_language_source", fake_probe)
+
+    result = asyncio.run(vod_probe.run_language_trickle_cycle())
+
+    assert result["targets"] == 15
+    assert len(result["results"]) == 15
+
+
+def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_source(db, tmp_path):
+    pid = db.upsert_provider("report-language", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Report Hindi Movie", 2026)
+    path = tmp_path / "report.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "report", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, ["HI"], "observed", "local_embedded_audio_tags", "high")
+
+    report = db.list_language_mismatches()
+    row = next(r for r in report["results"] if r["source_id"] == sid)
+    assert row["proposed_language"] == "HI" and row["proposed_archive"] is True
+
+    result = db.decide_language_mismatch("movie", sid, "approved")
+    assert result["action"] == "language_updated_and_archived"
+    source = db.get_language_probe_source("movie", sid)
+    assert source["language"] == "HI" and source["language_probe_decision"] == "approved"
+    assert db.get_movie(mid)["review_excluded"] == 1
+    assert not db.list_language_mismatches()["results"]
+
+
+def test_language_provider_error_pauses_provider_until_next_day(monkeypatch):
+    provider = {"id": 901, "name": "limited-provider", "provider_type": "xc"}
+    source = {"provider_id": 901, "provider_stream_id": "x", "container_extension": "mp4"}
+    async def fail_fetch(*args, **kwargs):
+        raise vod_probe.ProbeRefused("HTTP 429", 900, "pushback")
+    async def credentials(*args, **kwargs):
+        return {"sub_account_id": 1}
+    async def build(*args, **kwargs):
+        return "http://provider.invalid/stream"
+    monkeypatch.setattr(vod_probe, "_fetch_head", fail_fetch)
+    monkeypatch.setattr(vod_probe.xc_server, "_select_upstream_credentials", credentials)
+    monkeypatch.setattr(vod_probe.xc_server, "_build_upstream_url", build)
+    monkeypatch.setattr(vod_probe.xc_server, "_release_capacity", lambda *args, **kwargs: None)
+
+    with pytest.raises(vod_probe.ProbeRefused, match="HTTP 429"):
+        asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
+    with pytest.raises(vod_probe.ProbeRefused, match="paused"):
+        asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
 
 
 def test_probe_stores_size_and_resolution_and_is_cached(db, server):
