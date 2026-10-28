@@ -384,6 +384,7 @@ interface MissingArtworkItem {
   id: number
   name: string
   year: number | null
+  tmdb_id?: string | null
 }
 
 interface DuplicateGroupItem {
@@ -395,6 +396,7 @@ interface DuplicateGroupItem {
   source_count: number
   category_count: number
   provider_names: string[]
+  is_adult?: boolean
 }
 
 interface DuplicateGroup {
@@ -1492,7 +1494,7 @@ interface BulkAiJobStatus {
   error: string | null
 }
 
-function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
+function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string, cancelEndpointPrefix?: string) {
   const [jobId, setJobId] = useState<string | null>(null)
   const startMutation = useMutation({
     mutationFn: (body: object) => api.post(startEndpoint, body).then((r) => r.data as { job_id: string }),
@@ -1509,6 +1511,14 @@ function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string) {
     starting: startMutation.isPending,
     startError: (startMutation.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? null,
     job: progressQuery.data ?? null,
+    progressError: progressQuery.error
+      ? ((progressQuery.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Could not read AI job progress. The job may have expired; start it again.')
+      : null,
+    cancel: () => {
+      const id = jobId
+      setJobId(null)
+      if (id && cancelEndpointPrefix) void api.post(`${cancelEndpointPrefix}${id}/cancel/`)
+    },
     reset: () => setJobId(null),
   }
 }
@@ -1928,6 +1938,17 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
   const [expanded, setExpanded] = useState(false)
   const [searchOverride, setSearchOverride] = useState('')
   const [manualPosterUrl, setManualPosterUrl] = useState('')
+  const [autoMatchMessage, setAutoMatchMessage] = useState<string | null>(null)
+  const [autoAppliedKey, setAutoAppliedKey] = useState<string | null>(null)
+
+  const normalizeTitle = (value: string) => value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s*\(\d{4}\)\s*$/, '')
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
 
   // Same reasoning as NeedsReviewRow's search override -- a mangled/
   // punctuation-stripped stored title (the actual cause of most missing
@@ -1946,14 +1967,43 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
     mutationFn: (body: { poster_url: string; tmdb_id?: string; name?: string; year?: number }) =>
       api.post(`/vod/missing-artwork/${contentType}/${item.id}/resolve/`, body),
     onSuccess: () => {
+      notify(`Artwork saved for “${item.name}”. The poster${item.tmdb_id ? '' : ' and TMDB identity'} was applied; the queue is refreshing.`)
       qc.invalidateQueries({ queryKey: ['vod-missing-artwork'] })
+      qc.invalidateQueries({ queryKey: ['vod-missing-artwork-page'] })
+      qc.invalidateQueries({ queryKey: ['vod-missing-artwork-counts'] })
       qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    },
+    onError: (error: any) => {
+      setAutoMatchMessage(`Automatic exact-match save failed: ${error?.response?.data?.detail ?? error.message}`)
     },
   })
 
-  // Same "purely a recommendation" contract as Needs Review's Ask AI --
-  // whichever provider is configured in Settings picks among the same TMDB
-  // candidates shown above; nothing is ever applied without an explicit click.
+  // A deterministic match is safe to apply without another click only when
+  // the normalized title and year agree, the candidate has a poster, and an
+  // existing TMDB id is either absent or already agrees. A conflicting id,
+  // missing year, or multiple plausible candidates stays manual so an
+  // original/remake cannot be silently mixed up.
+  useEffect(() => {
+    const candidates = suggestionsQuery.data ?? []
+    const exact = candidates.filter((candidate) => normalizeTitle(candidate.name) === normalizeTitle(item.name) && !!candidate.poster_url)
+    const match = item.year != null
+      ? exact.find((candidate) => candidate.year === item.year && (!item.tmdb_id || item.tmdb_id === candidate.tmdb_id))
+      : undefined
+    if (!match) return
+    const key = `${match.tmdb_id}:${match.year ?? ''}:${item.year ?? ''}`
+    if (autoAppliedKey === key || resolve.isPending) return
+    setAutoAppliedKey(key)
+    setAutoMatchMessage(`Auto-applied exact TMDB match: ${match.name}${match.year ? ` (${match.year})` : ''}.`)
+    resolve.mutate({
+      poster_url: match.poster_url!,
+      tmdb_id: match.tmdb_id,
+      name: match.name !== item.name ? match.name : undefined,
+      year: match.year ?? undefined,
+    })
+  }, [suggestionsQuery.data, item.name, item.year, item.tmdb_id, autoAppliedKey, resolve.isPending])
+
+  // Ask AI remains an optional recommendation for cases that are not
+  // deterministic exact title/year matches; it never overrides the picker.
   const aiSuggest = useMutation({
     mutationFn: () => api.get(`/vod/missing-artwork/${contentType}/${item.id}/ai-suggest/`, {
       params: searchOverride ? { q: searchOverride } : {},
@@ -1963,8 +2013,12 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
   return (
     <li className="border-b border-border/50 py-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate flex items-center gap-1.5">
-          <input type="checkbox" checked={selected} onChange={onToggleSelect} title="Select for bulk action" />
+        <span
+          className="min-w-0 truncate flex items-center gap-1.5 cursor-pointer"
+          onClick={() => setExpanded((e) => !e)}
+          title="Open artwork suggestions"
+        >
+          <input type="checkbox" checked={selected} onChange={(e) => { e.stopPropagation(); onToggleSelect() }} onClick={(e) => e.stopPropagation()} title="Select for bulk action" />
           <ImageOff size={12} className="text-muted-foreground shrink-0" />
           {item.name} {item.year && <span className="text-muted-foreground">({item.year})</span>}
         </span>
@@ -1975,6 +2029,7 @@ function MissingArtworkRow({ contentType, item, qc, selected, onToggleSelect }: 
 
       {expanded && (
         <div className="mt-2 space-y-2">
+          {autoMatchMessage && <p className="text-xs text-green-500 border border-green-500/30 rounded px-2 py-1">{autoMatchMessage}</p>}
           <div className="flex items-center gap-1.5">
             <span className="text-muted-foreground">search TMDB as:</span>
             <input
@@ -5257,14 +5312,16 @@ function NeedsReviewModal({ contentType, items, qc, xcCredentials, onClose }: {
 // Unlike Needs Review (a small hand-curated flag list), missing-artwork can
 // be thousands of items -- paginated server-side with its own search, same
 // shape as the main Movies/TV Shows lists, rather than ever loading it whole.
-function MissingArtworkModal({ contentType, qc, onClose }: {
+function MissingArtworkModal({ contentType, qc, onClose, onOpenDedicated }: {
   contentType: 'movie' | 'series'
   qc: ReturnType<typeof useQueryClient>
   onClose: () => void
+  onOpenDedicated: () => void
 }) {
   const [search, setSearch] = useState('')
   const [offset, setOffset] = useState(0)
   const [showExcluded, setShowExcluded] = useState(false)
+  const [hideAdult, setHideAdult] = useState(true)
   // Free-text search can't isolate "everything in a foreign script" -- this
   // flags any title containing non-Latin-script characters (Arabic, Thai,
   // CJK, Cyrillic, Greek, Hebrew, Devanagari), so a whole language/region's
@@ -5280,15 +5337,15 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
   const prefixesParam = selectedPrefixes.size ? Array.from(selectedPrefixes).join(',') : undefined
   const LIMIT = 25
   const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
-    queryKey: ['vod-missing-artwork', contentType, search, offset, showExcluded, nonLatinOnly, prefixesParam],
+    queryKey: ['vod-missing-artwork', contentType, search, offset, showExcluded, hideAdult, nonLatinOnly, prefixesParam],
     queryFn:  () => api.get('/vod/missing-artwork/', {
-      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam },
+      params: { content_type: contentType, search: search || undefined, limit: LIMIT, offset, excluded: showExcluded, hide_adult: hideAdult, script: nonLatinOnly ? 'non_latin' : undefined, prefixes: prefixesParam },
     }).then((r) => r.data),
   })
   const prefixesQuery = useQuery<{ code: string; count: number }[]>({
-    queryKey: ['vod-missing-artwork-prefixes', contentType, search, showExcluded, nonLatinOnly],
+    queryKey: ['vod-missing-artwork-prefixes', contentType, search, showExcluded, hideAdult, nonLatinOnly],
     queryFn:  () => api.get('/vod/missing-artwork/prefixes/', {
-      params: { content_type: contentType, search: search || undefined, excluded: showExcluded, script: nonLatinOnly ? 'non_latin' : undefined },
+      params: { content_type: contentType, search: search || undefined, excluded: showExcluded, hide_adult: hideAdult, script: nonLatinOnly ? 'non_latin' : undefined },
     }).then((r) => r.data),
   })
   function togglePrefix(code: string) {
@@ -5374,14 +5431,19 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
     enabled: !showExcluded && selectedIds.size > 0,
   })
 
-  const bulkAi = useBulkAiJob('/vod/missing-artwork/bulk-resolve/', '/vod/missing-artwork/bulk-resolve/')
+  const bulkAi = useBulkAiJob('/vod/missing-artwork/bulk-resolve/', '/vod/missing-artwork/bulk-resolve/', '/vod/missing-artwork/bulk-resolve/')
   useEffect(() => {
     if (bulkAi.job && !bulkAi.job.running) invalidateAfterBulk()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bulkAi.job?.running])
 
+  const closeModal = () => {
+    bulkAi.cancel()
+    onClose()
+  }
+
   return (
-    <Modal onClose={onClose} maxWidth="max-w-2xl">
+    <Modal onClose={closeModal} maxWidth="max-w-2xl">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border gap-2">
         <span className="text-sm font-medium shrink-0">
           Missing Artwork — {contentType === 'movie' ? 'Movies' : 'TV Shows'} ({query.data?.total ?? '…'})
@@ -5389,6 +5451,10 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
         <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer">
           <input type="checkbox" checked={showExcluded} onChange={(e) => { setShowExcluded(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
           Show archived
+        </label>
+        <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer" title="Adult titles remain in the library but are hidden from correction queues by default">
+          <input type="checkbox" checked={hideAdult} onChange={(e) => { setHideAdult(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
+          Hide adult
         </label>
         <label className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 cursor-pointer" title="Titles containing Arabic, Thai, CJK, Cyrillic, Greek, Hebrew, or Devanagari characters">
           <input type="checkbox" checked={nonLatinOnly} onChange={(e) => { setNonLatinOnly(e.target.checked); setOffset(0); setSelectedIds(new Set()) }} />
@@ -5403,6 +5469,10 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
         />
       </div>
       <div className="px-4 pt-3 text-xs space-y-1.5 border-b border-border pb-3">
+        <div className="flex items-center gap-2 rounded border border-primary/30 bg-primary/5 px-2 py-1.5">
+          <span className="text-muted-foreground">For a larger table view with per-title TMDB suggestions, use the dedicated Artwork Review page.</span>
+          <Button size="sm" variant="outline" onClick={onOpenDedicated}>Open Artwork Review</Button>
+        </div>
         <p className="text-muted-foreground">
           {showExcluded
             ? 'Archived items are hidden from Missing Artwork, Needs Review, and Duplicate Finder — still fully browsable/playable, just not flagged as needing attention.'
@@ -5519,6 +5589,87 @@ function MissingArtworkModal({ contentType, qc, onClose }: {
         {query.data && <div className="pt-2"><Pager total={query.data.total} limit={LIMIT} offset={offset} onOffset={setOffset} /></div>}
       </div>
     </Modal>
+  )
+}
+
+function MissingArtworkPage({ contentType, qc, onBack, onContentType }: {
+  contentType: 'movie' | 'series'
+  qc: ReturnType<typeof useQueryClient>
+  onBack: () => void
+  onContentType: (type: 'movie' | 'series') => void
+}) {
+  const [search, setSearch] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [hideAdult, setHideAdult] = useState(true)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const LIMIT = 50
+  const query = useQuery<{ items: MissingArtworkItem[]; total: number }>({
+    queryKey: ['vod-missing-artwork-page', contentType, search, offset, hideAdult],
+    queryFn: () => api.get('/vod/missing-artwork/', { params: {
+      content_type: contentType, search: search || undefined, limit: LIMIT, offset,
+      hide_adult: hideAdult,
+    }}).then((r) => r.data),
+  })
+  const toggle = (id: number) => setSelectedIds((prev) => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
+  const selectAll = () => setSelectedIds(new Set((query.data?.items ?? []).map((item) => item.id)))
+  const clear = () => setSelectedIds(new Set())
+  const bulkAi = useBulkAiJob('/vod/missing-artwork/bulk-resolve/', '/vod/missing-artwork/bulk-resolve/')
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ['vod-missing-artwork'] })
+    qc.invalidateQueries({ queryKey: ['vod-missing-artwork-page'] })
+    qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
+    clear()
+  }
+  useEffect(() => {
+    if (bulkAi.job && !bulkAi.job.running) invalidate()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkAi.job?.running])
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <h2 className="text-base font-semibold">Artwork Review</h2>
+          <p className="text-xs text-muted-foreground">Local TMDB data is checked first; configured TMDB API search is used only when local results are unavailable.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-0.5 rounded border border-border p-0.5">
+            {(['movie', 'series'] as const).map((type) => <button key={type} className={`px-2 py-1 rounded text-xs ${contentType === type ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`} onClick={() => onContentType(type)}>{type === 'movie' ? 'Movies' : 'TV Shows'}</button>)}
+          </div>
+          <Button size="sm" variant="outline" onClick={onBack}>Back</Button>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap rounded border border-border px-3 py-2">
+        <input className={inputCls('w-64')} placeholder="Search title…" value={search} onChange={(e) => { setSearch(e.target.value); setOffset(0); clear() }} />
+        <label className="flex items-center gap-1 text-xs cursor-pointer" title="Adult titles remain playable and browsable; this only hides them from correction queues">
+          <input type="checkbox" checked={hideAdult} onChange={(e) => { setHideAdult(e.target.checked); setOffset(0); clear() }} />
+          Hide adult
+        </label>
+        <Button size="sm" variant="outline" onClick={selectAll} disabled={!query.data?.items.length}>Select all visible</Button>
+        <Button size="sm" variant="outline" onClick={clear} disabled={!selectedIds.size}>Clear</Button>
+        <Button size="sm" variant="outline" disabled={!selectedIds.size || bulkAi.starting || !!bulkAi.job?.running} onClick={() => bulkAi.start({ content_type: contentType, ids: Array.from(selectedIds) })} title="Uses the existing guarded bulk resolver; ambiguous results remain for individual review">
+          {bulkAi.starting || bulkAi.job?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
+          Resolve selected ({selectedIds.size})
+        </Button>
+        <span className="text-xs text-muted-foreground">{query.data?.total ?? '…'} needing review</span>
+      </div>
+      {bulkAi.startError && <p className="text-xs text-destructive">{bulkAi.startError}</p>}
+      {bulkAi.job && <BulkAiJobSummary job={bulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+      <div className="rounded border border-border overflow-hidden">
+        <div className="grid grid-cols-[2rem_1fr_7rem] gap-2 px-3 py-2 text-xs text-muted-foreground border-b border-border bg-muted/20">
+          <span /> <span>Title</span> <span>Year</span>
+        </div>
+        {query.isLoading && <p className="p-4 text-xs text-muted-foreground">Loading artwork queue…</p>}
+        {!query.isLoading && !query.data?.items.length && <p className="p-4 text-xs text-muted-foreground">No missing or malformed poster URLs match this filter.</p>}
+        <ul>
+          {query.data?.items.map((item) => <MissingArtworkRow key={item.id} contentType={contentType} item={item} qc={qc} selected={selectedIds.has(item.id)} onToggleSelect={() => toggle(item.id)} />)}
+        </ul>
+      </div>
+      {query.data && <Pager total={query.data.total} limit={LIMIT} offset={offset} onOffset={(next) => { setOffset(next); clear() }} />}
+    </div>
   )
 }
 
@@ -5723,7 +5874,7 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
   )
 }
 
-export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'downloads' | 'dvr'
+export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'downloads' | 'dvr' | 'artwork'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
@@ -5756,6 +5907,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [tmdbFailuresContentType, setTmdbFailuresContentType] = useState<'movie' | 'series'>('movie')
   const [tmdbFailuresSelected, setTmdbFailuresSelected] = useState<Set<number>>(new Set())
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
+  const [artworkContentType, setArtworkContentType] = useState<'movie' | 'series'>('movie')
   const [libraryLanguageModalOpen, setLibraryLanguageModalOpen] = useState<'movie' | 'series' | null>(null)
 
   // ── Activity (currently open stream relays) ──
@@ -7545,6 +7697,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
   // ── Duplicate finder (punctuation variants + adjacent-year mislabeling) ──
   const [duplicatesContentType, setDuplicatesContentType] = useState<'movie' | 'series'>('movie')
+  const [duplicatesHideAdult, setDuplicatesHideAdult] = useState(true)
   const [duplicatesOffset, setDuplicatesOffset] = useState(0)
   const DUPLICATES_PAGE_SIZE = 50
   const duplicatesQuery = useQuery<DuplicateGroup[]>({
@@ -7593,16 +7746,32 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     mutationFn: () => api.post(`/vod/duplicates/confirm-scan/${duplicatesConfirmJobId}/cancel/`),
   })
   const duplicatesConfirmed = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.confirmed : []
-  const duplicatesConfirmedKeys = new Set(duplicatesConfirmed.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
+  const duplicateGroupsVisibleToReview = (duplicatesQuery.data ?? []).map((group) => ({
+    ...group,
+    items: duplicatesHideAdult ? group.items.filter((item) => !item.is_adult) : group.items,
+  })).filter((group) => group.items.length >= 2)
+  const duplicatesConfirmedVisible = duplicatesHideAdult
+    ? duplicatesConfirmed.filter((candidate) => {
+      const group = (duplicatesQuery.data ?? []).find((item) => groupSignature(item.items) === groupSignature([{ id: candidate.keep_id }, ...candidate.merge_ids.map((id) => ({ id }))]))
+      return !!group && group.items.every((item) => !item.is_adult)
+    })
+    : duplicatesConfirmed
+  const duplicatesConfirmedKeys = new Set(duplicatesConfirmedVisible.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
   // Second pass (GH issue #2): groups where only ONE side of the group
   // carries the shared tmdb_id, but that candidate's own year also matches
   // TMDB's canonical year for it -- "TMDB confirms only this candidate" in
   // the per-item badge below. Less airtight than duplicatesConfirmed (no
   // sibling shares the same id), so kept as its own opt-in bulk action
   // rather than folded into "Merge all confirmed matches".
-  const duplicatesSecondPass = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.second_pass : []
+  const duplicatesSecondPassRaw = confirmScanQuery.data?.status === 'done' ? confirmScanQuery.data.second_pass : []
+  const duplicatesSecondPass = duplicatesHideAdult
+    ? duplicatesSecondPassRaw.filter((candidate) => {
+      const group = (duplicatesQuery.data ?? []).find((item) => groupSignature(item.items) === groupSignature([{ id: candidate.keep_id }, ...candidate.merge_ids.map((id) => ({ id }))]))
+      return !!group && group.items.every((item) => !item.is_adult)
+    })
+    : duplicatesSecondPassRaw
   const duplicatesSecondPassKeys = new Set(duplicatesSecondPass.map((c) => groupSignature([{ id: c.keep_id }, ...c.merge_ids.map((id) => ({ id }))])))
-  const duplicatesNeedsReview = (duplicatesQuery.data ?? []).filter(
+  const duplicatesNeedsReview = duplicateGroupsVisibleToReview.filter(
     (g) => !duplicatesConfirmedKeys.has(groupSignature(g.items)) && !duplicatesSecondPassKeys.has(groupSignature(g.items)),
   )
 
@@ -7628,7 +7797,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const mergeConfirmedDuplicates = useMutation({
     mutationFn: () => api.post('/vod/duplicates/merge-confirmed/', {
       content_type: duplicatesContentType,
-      groups: duplicatesConfirmed.map((c) => ({ keep_id: c.keep_id, merge_ids: c.merge_ids })),
+      groups: duplicatesConfirmedVisible.map((c) => ({ keep_id: c.keep_id, merge_ids: c.merge_ids })),
     }),
     onSuccess: (r) => {
       setDuplicatesConfirmMergeResult(`Merged ${r.data.merged_groups} confirmed group${r.data.merged_groups === 1 ? '' : 's'} (${r.data.merged_items} item${r.data.merged_items === 1 ? '' : 's'}).`)
@@ -8073,6 +8242,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
   return (
     <div className="space-y-4 max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto">
+      {activeTab === 'artwork' && (
+        <MissingArtworkPage contentType={artworkContentType} qc={qc} onBack={() => setActiveTab('movies')} onContentType={setArtworkContentType} />
+      )}
       {defaultCategoriesPromptQuery.data?.show && (
         <Modal onClose={() => answerDefaultCategoriesPrompt.mutate(false)} maxWidth="max-w-md">
           <div className="p-5 space-y-3">
@@ -11981,6 +12153,10 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             {duplicatesQuery.isFetching ? <Loader2 size={12} className="animate-spin mr-1" /> : <RefreshCw size={12} className="mr-1" />}
             Scan
           </Button>
+          <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer" title="Adult titles stay in the library but are hidden from duplicate merge review by default">
+            <input type="checkbox" checked={duplicatesHideAdult} onChange={(e) => { setDuplicatesHideAdult(e.target.checked); setDuplicatesOffset(0) }} />
+            Hide adult
+          </label>
           {duplicatesQuery.data && duplicatesQuery.data.length === 0 && (
             <span className="text-xs text-muted-foreground">Clean — nothing found.</span>
           )}
@@ -12018,15 +12194,15 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <span className="text-xs text-muted-foreground">Cancelled.</span>
             ) : (
               <>
-                <span className="text-xs text-green-400">✓ {duplicatesConfirmed.length} TMDB-confirmed match{duplicatesConfirmed.length === 1 ? '' : 'es'} found (of {confirmScanQuery.data.total} candidate{confirmScanQuery.data.total === 1 ? '' : 's'} checked)</span>
+                <span className="text-xs text-green-400">✓ {duplicatesConfirmedVisible.length} TMDB-confirmed match{duplicatesConfirmedVisible.length === 1 ? '' : 'es'} found (of {confirmScanQuery.data.total} candidate{confirmScanQuery.data.total === 1 ? '' : 's'} checked{duplicatesHideAdult ? ', adult groups hidden' : ''})</span>
                 <Button
                   size="sm"
-                  disabled={!duplicatesConfirmed.length || mergeConfirmedDuplicates.isPending}
+                  disabled={!duplicatesConfirmedVisible.length || mergeConfirmedDuplicates.isPending}
                   onClick={() => mergeConfirmedDuplicates.mutate()}
                   title="Every candidate here shares a confirmed TMDB id -- no manual pick needed. The kept candidate matched TMDB's own title exactly where possible, otherwise it's whichever had the most sources/placements"
                 >
                   {mergeConfirmedDuplicates.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
-                  Merge all confirmed matches ({duplicatesConfirmed.length})
+                  Merge all confirmed matches ({duplicatesConfirmedVisible.length})
                 </Button>
               </>
             )}
@@ -12659,6 +12835,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           contentType={missingArtworkModalOpen}
           qc={qc}
           onClose={() => setMissingArtworkModalOpen(null)}
+          onOpenDedicated={() => { setArtworkContentType(missingArtworkModalOpen); setMissingArtworkModalOpen(null); setActiveTab('artwork') }}
         />
       )}
       {libraryLanguageModalOpen && (

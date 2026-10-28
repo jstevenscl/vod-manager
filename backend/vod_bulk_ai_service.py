@@ -43,6 +43,7 @@ def _new_job(total: int) -> str:
     _jobs[job_id] = {
         "running": True, "total": total, "done": 0,
         "resolved": 0, "skipped": 0, "errors": 0,
+        "cancelled": False,
         "results": [], "error": None,
         "started_at": time.time(), "finished_at": None,
     }
@@ -51,6 +52,25 @@ def _new_job(total: int) -> str:
 
 def get_bulk_ai_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def cancel_bulk_ai_job(job_id: str) -> bool:
+    """Stop a queued bulk-AI job before it starts another item."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return False
+    if not job.get("running"):
+        return False
+    job["cancelled"] = True
+    job["running"] = False
+    job["error"] = "Cancelled by user"
+    job["finished_at"] = time.time()
+    return True
+
+
+def _cancel_requested(job_id: str) -> bool:
+    job = _jobs.get(job_id)
+    return bool(job and job.get("cancelled"))
 
 
 def get_active_bulk_ai_status() -> dict:
@@ -242,10 +262,14 @@ async def _resolve_one_missing_artwork(content_type: str, item_id: int) -> dict:
 async def _run_missing_artwork_job(job_id: str, content_type: str, ids: list[int]) -> None:
     try:
         for item_id in ids:
+            if _cancel_requested(job_id):
+                break
             try:
                 result = await _resolve_one_missing_artwork(content_type, item_id)
             except Exception as exc:
                 result = {"id": item_id, "status": "error", "detail": str(exc)}
+            if _cancel_requested(job_id):
+                break
             _record(job_id, result)
     except Exception as exc:
         _jobs[job_id]["error"] = str(exc)

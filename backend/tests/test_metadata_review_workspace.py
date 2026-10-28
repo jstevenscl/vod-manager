@@ -66,3 +66,12 @@ def test_get_process_cpu_percent_first_call_returns_none_or_float():
 def test_get_active_bulk_ai_status_defaults_idle():
     status = vod_bulk_ai_service.get_active_bulk_ai_status()
     assert status == {"running": False, "done": 0, "total": 0, "jobs": 0}
+def test_bulk_ai_job_can_be_cancelled_before_next_item():
+    job_id = vod_bulk_ai_service._new_job(2)
+
+    assert vod_bulk_ai_service.cancel_bulk_ai_job(job_id) is True
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    assert job["running"] is False
+    assert job["cancelled"] is True
+    assert job["error"] == "Cancelled by user"
+    assert vod_bulk_ai_service.get_active_bulk_ai_status()["running"] is False
