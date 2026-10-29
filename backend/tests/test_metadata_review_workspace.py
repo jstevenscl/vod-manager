@@ -21,7 +21,7 @@ def test_actionable_gap_without_year_review_flag_is_included(db):
     assert "No Identity At All" in names
 
 
-def test_row_with_year_or_tmdb_id_is_excluded(db):
+def test_row_with_year_but_no_tmdb_id_is_included(db):
     provider_id = db.upsert_provider("XC-Test", "http://example.com", "user", "pass")
     db.bulk_import_movies(provider_id, [
         {"name": "Has A Year", "year": 2020, "provider_stream_id": "1", "container_extension": "mkv"},
@@ -29,7 +29,7 @@ def test_row_with_year_or_tmdb_id_is_excluded(db):
 
     review = db.list_metadata_review("movie")
     names = {m["name"] for m in review["movies"]}
-    assert "Has A Year" not in names
+    assert "Has A Year" in names
 
 
 def test_archived_row_is_excluded(db):
@@ -66,3 +66,14 @@ def test_get_process_cpu_percent_first_call_returns_none_or_float():
 def test_get_active_bulk_ai_status_defaults_idle():
     status = vod_bulk_ai_service.get_active_bulk_ai_status()
     assert status == {"running": False, "done": 0, "total": 0, "jobs": 0}
+
+
+def test_bulk_ai_job_can_be_cancelled_before_next_item():
+    job_id = vod_bulk_ai_service._new_job(2)
+
+    assert vod_bulk_ai_service.cancel_bulk_ai_job(job_id) is True
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    assert job["running"] is False
+    assert job["cancelled"] is True
+    assert job["error"] == "Cancelled by user"
+    assert vod_bulk_ai_service.get_active_bulk_ai_status()["running"] is False

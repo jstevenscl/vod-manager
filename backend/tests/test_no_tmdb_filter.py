@@ -39,8 +39,9 @@ def test_movie_no_tmdb_filter(db):
     assert db.count_movies() == 2
 
 
-def test_unmatched_with_year_is_not_in_metadata_review(db):
-    """The gap the filter exists to cover."""
+def test_unmatched_with_year_is_in_metadata_review(db):
+    """Metadata Review should expose the same identity repair path as the
+    no-TMDB library filter, even when the provider supplied a year."""
     ids = _seed(db)
     review = {s["id"] for s in db.list_metadata_review()["series"]}
-    assert ids["un1"] not in review
+    assert ids["un1"] in review

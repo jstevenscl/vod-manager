@@ -411,16 +411,16 @@ async def search_title(query: str, content_type: str) -> list[dict]:
     matches come first, before applying the cap -- TMDB's relative ordering
     is preserved within each group, only the exact/non-exact split is
     forced to the front."""
-    api_key = get_tmdb_api_key()
-    if not api_key:
-        raise ValueError("TMDB API key not configured")
-
     endpoint = "movie" if content_type == "movie" else "tv"
     local = await search_local(endpoint, query)
     if local:
         await note_lookup(True)
         data = {"results": [as_search_item(endpoint, row) for row in local]}
     else:
+        # Local TMDB results must remain usable when the deployment has no
+        # API key. Only the live fallback requires credentials.
+        if not get_tmdb_api_key():
+            raise ValueError("TMDB API key not configured")
         data, _ = await tmdb_search(endpoint, query)
 
     async def _build(item: dict) -> dict:

@@ -1425,8 +1425,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # that don't exist yet on a brand-new DB at that earlier point.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_flag ON movies(id) WHERE review_excluded=0 AND needs_year_review=1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_missing ON movies(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_movies_metadata_review_no_tmdb ON movies(id) WHERE review_excluded=0 AND tmdb_id IS NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_flag ON series(id) WHERE review_excluded=0 AND needs_year_review=1")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_missing ON series(id) WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_series_metadata_review_no_tmdb ON series(id) WHERE review_excluded=0 AND tmdb_id IS NULL")
     # Heal movies enriched before _release_year_fields existed: held and
     # yearless although TMDB already gave a release date. Archived rows are
     # included so they show their year and a restored card comes back fixed.
@@ -11498,7 +11500,15 @@ def list_metadata_review(content_type: str | None = None) -> dict:
                 f"""SELECT * FROM (
                     SELECT * FROM {table} WHERE review_excluded=0 AND needs_year_review=1
                     UNION
-                    SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_missing
+                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+                    UNION
+                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_no_tmdb
+                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NOT NULL
+                        AND id NOT IN ({_reviewed_auto_match_ids(table)})
+                    UNION
+                    SELECT * FROM {table}
+                      WHERE review_excluded=0 AND tmdb_id IS NOT NULL AND TRIM(tmdb_id)=''
                     UNION
                     SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL
                       AND id IN ({_ambiguous_auto_match_ids(table)})
@@ -11517,6 +11527,13 @@ def list_metadata_review(content_type: str | None = None) -> dict:
 def _ambiguous_auto_match_ids(table: str) -> str:
     content_type = "movie" if table == "movies" else "series"
     return f"SELECT item_id FROM tmdb_auto_match WHERE content_type='{content_type}' AND status='ambiguous'"
+
+
+# A reviewer who set a year without an ID settled that title ('reviewed', see
+# resolve_year_review) -- it must not come back to the queue as 'no TMDB ID'.
+def _reviewed_auto_match_ids(table: str) -> str:
+    content_type = "movie" if table == "movies" else "series"
+    return f"SELECT item_id FROM tmdb_auto_match WHERE content_type='{content_type}' AND status='reviewed'"
 
 
 def list_auto_match_work(content_type: str, limit: int, retry_days: int = 7) -> list[dict]:
@@ -11565,8 +11582,12 @@ def _settle_auto_match(content_type: str, item_id: int, *, reviewed: bool = Fals
     conn = _connect()
     try:
         if reviewed:
-            conn.execute("UPDATE tmdb_auto_match SET status='reviewed' WHERE content_type=? AND item_id=?",
-                         (content_type, item_id))
+            # Upsert: a title auto-match never attempted has no row yet, and
+            # the person's decision must still stick.
+            conn.execute(
+                "INSERT INTO tmdb_auto_match(content_type, item_id, status, attempted_at) VALUES(?,?,'reviewed',?) "
+                "ON CONFLICT(content_type, item_id) DO UPDATE SET status='reviewed'",
+                (content_type, item_id, _now()))
         else:
             conn.execute("DELETE FROM tmdb_auto_match WHERE content_type=? AND item_id=?", (content_type, item_id))
         _commit_with_retry(conn)
@@ -12091,22 +12112,25 @@ def apply_language_recompute() -> int:
     return total
 
 
-def _missing_artwork_clause(search: str | None, excluded: bool) -> tuple[str, list]:
-    where = ["(poster_url IS NULL OR poster_url = '')", "review_excluded = ?"]
+def _missing_artwork_clause(search: str | None, excluded: bool, hide_adult: bool = True) -> tuple[str, list]:
+    missing = "(poster_url IS NULL OR TRIM(poster_url) = '' OR (poster_url LIKE 'https://image.tmdb.org/t/p/%' AND poster_url NOT LIKE 'https://image.tmdb.org/t/p/%/%'))"
+    where = [missing, "review_excluded = ?"]
     params: list = [1 if excluded else 0]
+    if hide_adult:
+        where.append("COALESCE(is_adult, 0) = 0")
     if search:
         where.append("name LIKE ?")
         params.append(f"%{search}%")
     return f"WHERE {' AND '.join(where)}", params
 
 
-def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script: str | None, prefixes: list[str] | None = None) -> list:
+def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script: str | None, prefixes: list[str] | None = None, hide_adult: bool = True) -> list:
     """script/prefix filtering can't be expressed in SQL (SQLite has no
     Unicode script/category matching, and a leading-substring group-by is
     awkward in plain SQL), so when either is requested this fetches every
     matching row (already bounded by the poster/search/excluded filters,
     same as any other admin scan in this file) and filters in Python."""
-    clause, params = _missing_artwork_clause(search, excluded)
+    clause, params = _missing_artwork_clause(search, excluded, hide_adult)
     conn = _connect()
     try:
         rows = conn.execute(f"SELECT * FROM {table} {clause} ORDER BY name", params).fetchall()
@@ -12121,12 +12145,12 @@ def _missing_artwork_rows(table: str, search: str | None, excluded: bool, script
         conn.close()
 
 
-def list_missing_artwork_prefixes(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None) -> list[dict]:
+def list_missing_artwork_prefixes(content_type: str, search: str | None = None, excluded: bool = False, script: str | None = None, hide_adult: bool = True) -> list[dict]:
     """Distinct "XX|"-style language-prefix codes actually present in the
     current filter scope, with counts -- powers a picker showing real
     options instead of a fixed guessed-in-advance language list."""
     table = "movies" if content_type == "movie" else "series"
-    rows = _missing_artwork_rows(table, search, excluded, script)
+    rows = _missing_artwork_rows(table, search, excluded, script, hide_adult=hide_adult)
     counts: dict[str, int] = {}
     for r in rows:
         code = _name_prefix_code(r["name"])
@@ -12137,21 +12161,21 @@ def list_missing_artwork_prefixes(content_type: str, search: str | None = None, 
 
 def list_missing_artwork(
     content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
-    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None,
+    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None, hide_adult: bool = True,
 ) -> list[dict]:
     table = "movies" if content_type == "movie" else "series"
-    rows = _missing_artwork_rows(table, search, excluded, script, prefixes)
+    rows = _missing_artwork_rows(table, search, excluded, script, prefixes, hide_adult)
     return [dict(r) for r in rows[offset:offset + limit]]
 
 
 def count_missing_artwork(
     content_type: str, search: str | None = None, excluded: bool = False,
-    script: str | None = None, prefixes: list[str] | None = None,
+    script: str | None = None, prefixes: list[str] | None = None, hide_adult: bool = True,
 ) -> int:
     table = "movies" if content_type == "movie" else "series"
     if script or prefixes:
-        return len(_missing_artwork_rows(table, search, excluded, script, prefixes))
-    clause, params = _missing_artwork_clause(search, excluded)
+        return len(_missing_artwork_rows(table, search, excluded, script, prefixes, hide_adult))
+    clause, params = _missing_artwork_clause(search, excluded, hide_adult)
     conn = _connect()
     try:
         n = conn.execute(f"SELECT COUNT(*) c FROM {table} {clause}", params).fetchone()["c"]
@@ -12163,7 +12187,7 @@ def count_missing_artwork(
 
 def list_missing_artwork_page(
     content_type: str, limit: int = 50, offset: int = 0, search: str | None = None,
-    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None,
+    excluded: bool = False, script: str | None = None, prefixes: list[str] | None = None, hide_adult: bool = True,
 ) -> dict:
     """Combined items+total in one pass -- calling list_missing_artwork and
     count_missing_artwork separately each re-runs the same full-table Python
@@ -12171,21 +12195,21 @@ def list_missing_artwork_page(
     page load, on top of the separate /prefixes/ scan), which is pure waste
     since it's the exact same row set both times."""
     table = "movies" if content_type == "movie" else "series"
-    rows = _missing_artwork_rows(table, search, excluded, script, prefixes)
+    rows = _missing_artwork_rows(table, search, excluded, script, prefixes, hide_adult)
     return {"items": [dict(r) for r in rows[offset:offset + limit]], "total": len(rows)}
 
 
 def list_missing_artwork_ids(
     content_type: str, search: str | None = None, excluded: bool = False,
-    script: str | None = None, prefixes: list[str] | None = None,
+    script: str | None = None, prefixes: list[str] | None = None, hide_adult: bool = True,
 ) -> list[int]:
     """Every matching id, not just one page -- backs the "select all
     matching this search" bulk actions (apply-poster/exclude), same pattern
     as list_all_movie_ids for category bulk-place."""
     table = "movies" if content_type == "movie" else "series"
     if script or prefixes:
-        return [r["id"] for r in _missing_artwork_rows(table, search, excluded, script, prefixes)]
-    clause, params = _missing_artwork_clause(search, excluded)
+        return [r["id"] for r in _missing_artwork_rows(table, search, excluded, script, prefixes, hide_adult)]
+    clause, params = _missing_artwork_clause(search, excluded, hide_adult)
     conn = _connect()
     try:
         rows = conn.execute(f"SELECT id FROM {table} {clause}", params).fetchall()

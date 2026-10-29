@@ -421,8 +421,10 @@ reporting a bug or asking for help.
 
 Curation & Maintenance and the Movies/TV Shows toolbars host a set of
 catalog-quality tools — **Missing Artwork** (bulk poster fixing, with a
-language-aware filter and sibling-safe bulk archiving; posters that fail to
-load are replaced from TMDB automatically), **Language Filter**
+language-aware filter and sibling-safe bulk archiving; a dedicated **Artwork
+Review** page applies exact title-and-year TMDB matches automatically and
+leaves anything uncertain for you; posters that fail to load are replaced from
+TMDB automatically), **Language Filter**
 (the same language filtering over your whole library, not just
 poster-missing items), **Enabled Playback Languages** (a live,
 instantly-reversible playback/export filter by source language — separate
@@ -442,7 +444,9 @@ queue — and an archived item stays archived even when a different
 provider's own import later matches it by name; only re-importing from the
 exact same source it was archived from can bring it back), **Needs Review**
 and the broader sidebar **Metadata Review** (resolve year-ambiguous imports
-and titles a provider left without any TMDB identity at all) alongside its
+and titles a provider left without any TMDB identity at all, with or without a
+year; its local-first TMDB search also powers an inline **Find TMDB match**
+picker in Duplicate Finder) alongside its
 sibling **Incorrect TMDB IDs** (a stored id TMDB itself now confirms is
 gone), and **Orphan Checker** (finds dead rows a provider deletion can
 leave behind — a series whose only source provider no longer exists, or
@@ -460,7 +464,7 @@ Maintenance) is a separate, ongoing setting to have VOD clients see a
 
 **Finding and bulk-fixing titles.** The **No TMDB ID** button on the Movies and
 TV Shows pages lists every title that still has no TMDB match, including
-year-bearing ones the Metadata Review queue doesn't show. **Select all
+year-bearing ones (Metadata Review lists those too). **Select all
 filtered** selects everything matching the current filters across all pages, so
 **TMDB episode titles** (preview first, then Apply) can run over a whole library
 or a filtered slice, and the result names the series that had no TMDB match.

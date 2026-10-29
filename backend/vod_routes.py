@@ -479,6 +479,7 @@ class BulkMissingArtworkPosterRequest(BaseModel):
     excluded: bool = False
     script: Optional[str] = None
     prefixes: Optional[str] = None
+    hide_adult: bool = True
 
 
 class BulkMissingArtworkExcludeRequest(BaseModel):
@@ -491,6 +492,7 @@ class BulkMissingArtworkExcludeRequest(BaseModel):
     prefixes: Optional[str] = None
     keep_codes: Optional[str] = None
     dry_run: bool = False
+    hide_adult: bool = True
 
 
 class BulkLibraryExcludeRequest(BaseModel):
@@ -3281,19 +3283,19 @@ def _split_prefixes(prefixes: Optional[str]) -> Optional[list[str]]:
 @router.get("/missing-artwork/", dependencies=_GUARDS)
 async def list_missing_artwork(
     content_type: str, limit: int = 30, offset: int = 0, search: Optional[str] = None,
-    excluded: bool = False, script: Optional[str] = None, prefixes: Optional[str] = None,
+    excluded: bool = False, script: Optional[str] = None, prefixes: Optional[str] = None, hide_adult: bool = True,
 ):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(prefixes)
-    return vod_db.list_missing_artwork_page(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list)
+    return vod_db.list_missing_artwork_page(content_type, limit=limit, offset=offset, search=search, excluded=excluded, script=script, prefixes=prefix_list, hide_adult=hide_adult)
 
 
 @router.get("/missing-artwork/prefixes/", dependencies=_GUARDS)
-async def missing_artwork_prefixes(content_type: str, search: Optional[str] = None, excluded: bool = False, script: Optional[str] = None):
+async def missing_artwork_prefixes(content_type: str, search: Optional[str] = None, excluded: bool = False, script: Optional[str] = None, hide_adult: bool = True):
     if content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
-    return vod_db.list_missing_artwork_prefixes(content_type, search=search, excluded=excluded, script=script)
+    return vod_db.list_missing_artwork_prefixes(content_type, search=search, excluded=excluded, script=script, hide_adult=hide_adult)
 
 
 @router.post("/missing-artwork/bulk-poster/", dependencies=_GUARDS)
@@ -3303,7 +3305,7 @@ async def bulk_apply_missing_artwork_poster(body: BulkMissingArtworkPosterReques
     if not body.poster_url.strip():
         raise HTTPException(400, detail="poster_url is required")
     prefix_list = _split_prefixes(body.prefixes)
-    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list, hide_adult=body.hide_adult)
     applied = vod_db.bulk_set_poster_url(body.content_type, ids, body.poster_url.strip())
     return {"applied": applied}
 
@@ -3313,7 +3315,7 @@ async def bulk_exclude_missing_artwork(body: BulkMissingArtworkExcludeRequest):
     if body.content_type not in ("movie", "series"):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     prefix_list = _split_prefixes(body.prefixes)
-    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list)
+    ids = body.ids if body.ids is not None else vod_db.list_missing_artwork_ids(body.content_type, search=body.search, excluded=body.excluded, script=body.script, prefixes=prefix_list, hide_adult=body.hide_adult)
     # Always run the sibling check on archive, regardless of which filter
     # (prefix chip, script checkbox, or plain search text) produced the
     # candidate set -- a plain-search-only path used to skip this check
@@ -3446,6 +3448,14 @@ async def bulk_resolve_missing_artwork_progress(job_id: str):
     if job is None:
         raise HTTPException(404, detail="job not found")
     return job
+
+
+@router.post("/missing-artwork/bulk-resolve/{job_id}/cancel/", dependencies=_GUARDS)
+async def cancel_missing_artwork_bulk_resolve(job_id: str):
+    if vod_bulk_ai_service.get_bulk_ai_job(job_id) is None:
+        raise HTTPException(404, detail="job not found")
+    vod_bulk_ai_service.cancel_bulk_ai_job(job_id)
+    return vod_bulk_ai_service.get_bulk_ai_job(job_id)
 
 
 # ── Movies ───────────────────────────────────────────────────────────────────

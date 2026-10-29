@@ -83,7 +83,7 @@ export default function App() {
 
   const [activeTab, setActiveTabState] = useState<AppTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'tmdb' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'artwork' || saved === 'tmdb' ? saved : 'movies'
   })
   // the user can hide/unhide the sidebar menu; remembered per browser
   const [navHidden, setNavHiddenState] = useState(() => localStorage.getItem('vodmanager-nav-hidden') === '1')

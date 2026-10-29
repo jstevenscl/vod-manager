@@ -125,6 +125,22 @@ def test_lookup_local_first_then_live_search_stores(store, monkeypatch):
     assert asyncio.run(tmdb_fill.lookup("supercar", "tv"))["source"] == "local"
 
 
+def test_search_title_uses_local_results_without_api_key(store, monkeypatch):
+    """Duplicate/metadata review must not require TMDB credentials for a
+    title already present in the local store."""
+    store.upsert_payload("movie", _movie(603, "The Matrix"))
+    with store._conn() as conn:
+        conn.execute(
+            "INSERT INTO export_ids (media_type, tmdb_id, name, popularity, name_key) VALUES (?,?,?,?,?)",
+            ("movie", 603, "The Matrix", 100.0, store.name_key(store.normalize("The Matrix"))),
+        )
+    monkeypatch.setattr(tmdb_sync, "get_tmdb_api_key", lambda: None)
+
+    result = asyncio.run(tmdb_sync.search_title("The Matrix", "movie"))
+
+    assert result and result[0]["tmdb_id"] == "603"
+
+
 def test_lookup_by_numeric_id(store, monkeypatch):
     store.upsert_payload("movie", _movie(603, "The Matrix"))
     result = asyncio.run(tmdb_fill.lookup("603", "movie"))
