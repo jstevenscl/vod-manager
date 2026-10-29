@@ -93,6 +93,12 @@ async def import_plex_library(provider_id: int) -> dict:
 
     movie_result = {"movies_created": 0, "movies_matched": 0, "total": 0}
     series_result = {"series_created": 0, "series_matched": 0, "episodes_imported": 0}
+    # Keep the raw provider snapshot separate from the filtered import
+    # payload. A Plex library may be excluded locally, but it is still part
+    # of Plex's complete snapshot and must prevent source reconciliation from
+    # deleting a source merely because of that local policy.
+    seen_movie_stream_ids: set[str] = set()
+    seen_series_ids: set[str] = set()
     # See emby_vod_importer.import_emby_library's identical tracking. Unlike
     # Jellyfin/Emby (where a "movies"/"tvshows" library can end up
     # unclassified purely from user misconfiguration), Plex sections are
@@ -126,6 +132,7 @@ async def import_plex_library(provider_id: int) -> dict:
                     part_key, container = plex_client.extract_part(item)
                     if not part_key:
                         continue
+                    seen_movie_stream_ids.add(part_key)
                     fields = plex_client.extract_common_fields(item)
                     movie_items.append({
                         "name": item.get("title", ""),
@@ -165,6 +172,7 @@ async def import_plex_library(provider_id: int) -> dict:
                     rating_key = show.get("ratingKey")
                     if not rating_key:
                         continue
+                    seen_series_ids.add(str(rating_key))
                     fields = plex_client.extract_common_fields(show)
                     series_items.append({
                         "name": show.get("title", ""),
@@ -189,11 +197,24 @@ async def import_plex_library(provider_id: int) -> dict:
                 for k in series_result:
                     series_result[k] += r.get(k, 0)
 
+    # Plex can change a Part key when a file is replaced or a library is
+    # removed. Reconcile against the complete raw snapshot so old sources
+    # from deleted libraries do not remain in the provider's source pool.
+    # Sources from still-present excluded libraries remain because their raw
+    # IDs are included above.
+    removed = await asyncio.to_thread(
+        vod_db.reconcile_provider_catalog_sources,
+        provider_id,
+        seen_movie_stream_ids=seen_movie_stream_ids,
+        seen_series_ids=seen_series_ids,
+    )
+
     result = {
         "provider": provider["name"],
         "movies_created": movie_result["movies_created"], "movies_matched": movie_result["movies_matched"],
         "series_created": series_result["series_created"], "series_matched": series_result["series_matched"],
         "episodes_imported": series_result["episodes_imported"],
+        "removed": removed,
         "skipped_libraries": skipped_libraries,
     }
     logger.info("[plex_importer] provider=%s result=%s", provider["name"], result)
