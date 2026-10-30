@@ -25,8 +25,10 @@ import time
 from pathlib import Path
 
 from config import (
-    DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb, get_duplicate_finder_quality_prefix_matching,
-    get_enabled_languages, get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id,
+    DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb,
+    get_duplicate_finder_auto_merge_year_tolerance,
+    get_duplicate_finder_quality_prefix_matching, get_enabled_languages, get_primary_language,
+    get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id,
 )
 from secrets_util import decrypt_value, encrypt_value, is_encrypted
 
@@ -7864,10 +7866,14 @@ def reset_language_probe_failure(kind: str, source_id: int) -> None:
             conn.close()
 
 
-def approve_language_probe_source(kind: str, source_id: int) -> dict:
-    """Mark a manually reviewed source as completed without changing its language."""
+def approve_language_probe_source(kind: str, source_id: int, language: str | None = None) -> dict:
+    """Mark a manually reviewed source complete, optionally confirming its language."""
     table = "movie_sources" if kind == "movie" else "episode_sources"
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    enabled = set(get_enabled_languages())
+    confirmed_language = str(language or "").strip().upper() or None
+    if confirmed_language and confirmed_language not in enabled:
+        raise ValueError("confirmed language must be enabled for playback")
     with _WRITE_LOCK:
         conn = _connect()
         try:
@@ -7876,18 +7882,22 @@ def approve_language_probe_source(kind: str, source_id: int) -> dict:
             ).fetchone()
             if not row:
                 raise ValueError("language probe source not found")
-            conn.execute(
-                f"""UPDATE {table}
-                    SET language_probe_status='manual_approved',
-                        language_probe_error=NULL, language_probe_method='manual_playback_review',
-                        language_probe_confidence='manual', language_probe_languages=?,
-                        language_probed_at=?, language_probe_failures=0,
-                        language_probe_last_failed_at=NULL, language_probe_quarantined_at=NULL
-                    WHERE id=?""",
-                (json.dumps([row["language"]] if row["language"] else []), now, source_id),
+            chosen_language = confirmed_language or row["language"]
+            conn.execute(f"""UPDATE {table}
+                SET language=COALESCE(?, language),
+                    language_probe_status='manual_approved',
+                    language_probe_decision='approved', language_probe_decided_at=?,
+                    language_probe_error=NULL,
+                    language_probe_method=?, language_probe_confidence='manual',
+                    language_probe_languages=?, language_probed_at=?, language_probe_failures=0,
+                    language_probe_last_failed_at=NULL, language_probe_quarantined_at=NULL
+                WHERE id=?""",
+                (confirmed_language, now,
+                 "manual_language_confirmed" if confirmed_language else "manual_playback_review",
+                 json.dumps([chosen_language] if chosen_language else []), now, source_id),
             )
             _commit_with_retry(conn)
-            return {"provider_id": row["provider_id"], "configured_language": row["language"]}
+            return {"provider_id": row["provider_id"], "configured_language": chosen_language}
         finally:
             conn.close()
 
@@ -8465,6 +8475,62 @@ def list_language_mismatches(limit: int = 1000) -> dict:
             item["enabled_languages"] = enabled
             rows.append(item)
         return {"enabled_languages": enabled, "count": len(rows), "results": rows}
+    finally:
+        conn.close()
+
+
+def list_language_unknowns(limit: int = 1000) -> dict:
+    """List probe results with no usable embedded language signal.
+
+    Unknown results are intentionally separate from mismatches: they are not
+    evidence that the configured language is wrong and can never imply an
+    archive action.
+    """
+    conn = _connect()
+    try:
+        rows = []
+        for query in ("""
+            SELECT 'movie' AS kind, ms.id AS source_id, m.id AS item_id,
+                   m.name AS title, m.year, m.tmdb_id, ms.container_extension,
+                   ms.language AS configured_language, ms.language_probe_languages,
+                   ms.language_probe_status, ms.language_probe_confidence,
+                   ms.language_probed_at, p.name AS provider_name
+            FROM movie_sources ms JOIN movies m ON m.id=ms.movie_id
+            JOIN providers p ON p.id=ms.provider_id
+            WHERE p.is_active=1 AND m.review_excluded=0
+              AND ms.language_probe_status IN ('unknown','observed')
+              AND ms.language_probe_decision IS NULL
+            ORDER BY ms.language_probed_at DESC LIMIT ?
+        """, """
+            SELECT 'episode' AS kind, es.id AS source_id, s.id AS item_id,
+                   s.name AS title, s.year, s.tmdb_id, es.container_extension,
+                   es.language AS configured_language, es.language_probe_languages,
+                   es.language_probe_status, es.language_probe_confidence,
+                   es.language_probed_at, p.name AS provider_name,
+                   e.season_number, e.episode_number, e.name AS episode_name
+            FROM episode_sources es JOIN episodes e ON e.id=es.episode_id
+            JOIN series s ON s.id=e.series_id JOIN providers p ON p.id=es.provider_id
+            WHERE p.is_active=1 AND s.review_excluded=0
+              AND es.language_probe_status IN ('unknown','observed')
+              AND es.language_probe_decision IS NULL
+            ORDER BY es.language_probed_at DESC LIMIT ?
+        """):
+            for row in conn.execute(query, (limit,)).fetchall():
+                item = dict(row)
+                try:
+                    observed = sorted(set(json.loads(item.pop("language_probe_languages") or "[]")))
+                except (TypeError, ValueError):
+                    observed = []
+                if observed and not all(language == "UNKNOWN" for language in observed):
+                    continue
+                item["observed_languages"] = observed or ["UNKNOWN"]
+                item["safe_to_apply"] = False
+                item["proposed_language"] = None
+                item["proposed_archive"] = False
+                rows.append(item)
+        rows.sort(key=lambda item: item.get("language_probed_at") or "", reverse=True)
+        return {"count": len(rows[:limit]), "enabled_languages": sorted(get_enabled_languages()),
+                "primary_language": get_primary_language(), "results": rows[:limit]}
     finally:
         conn.close()
 

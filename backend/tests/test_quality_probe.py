@@ -423,7 +423,74 @@ def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_sou
     assert not db.list_language_mismatches()["results"]
 
 
-def test_language_provider_error_pauses_provider_until_next_day(monkeypatch):
+def test_unknown_language_is_separate_and_never_archive_approvable(db, tmp_path):
+    pid = db.upsert_provider("unknown-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Tagged Movie", 2026)
+    path = tmp_path / "unknown.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "unknown", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, ["UNKNOWN"], "observed", "local_embedded_audio_tags", "low")
+
+    assert not any(row["source_id"] == sid for row in db.list_language_mismatches()["results"])
+    unknown = next(row for row in db.list_language_unknowns()["results"] if row["source_id"] == sid)
+    assert unknown["proposed_archive"] is False
+    with pytest.raises(ValueError, match="unknown or multiple"):
+        db.decide_language_mismatch("movie", sid, "approved")
+
+    result = db.approve_language_probe_source("movie", sid, "EN")
+    source = db.get_language_probe_source("movie", sid)
+    assert result["configured_language"] == "EN"
+    assert source["language"] == "EN"
+    assert source["language_probe_status"] == "manual_approved"
+    assert source["language_probe_decision"] == "approved"
+    assert source["language_probe_method"] == "manual_language_confirmed"
+    assert source["language_probe_languages"] == '["EN"]'
+    assert not any(row["source_id"] == sid for row in db.list_language_unknowns()["results"])
+    assert not any(row["source_id"] == sid for row in db.next_language_probe_targets(100, distinct_providers=False))
+
+
+def test_unknown_language_can_be_manually_set_to_another_enabled_language(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_enabled_languages(["EN", "RU", "ES"])
+    pid = db.upsert_provider("manual-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Russian Movie", 2026)
+    db.add_movie_source(mid, pid, "unknown-russian", "mkv")
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, [], "unknown", "embedded_audio_tags", "low")
+
+    result = db.approve_language_probe_source("movie", sid, "RU")
+    source = db.get_language_probe_source("movie", sid)
+
+    assert result["configured_language"] == "RU"
+    assert source["language"] == "RU"
+    assert source["language_probe_decision"] == "approved"
+    assert source["language_probe_languages"] == '["RU"]'
+    assert db.list_language_unknowns()["enabled_languages"] == ["EN", "ES", "RU"]
+    assert not any(row["source_id"] == sid for row in db.list_language_unknowns()["results"])
+
+
+def test_unknown_language_confirmation_rejects_disabled_language(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_enabled_languages(["EN"])
+    pid = db.upsert_provider("invalid-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Movie", 2026)
+    db.add_movie_source(mid, pid, "unknown-invalid", "mkv")
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.commit(); conn.close()
+
+    with pytest.raises(ValueError, match="must be enabled"):
+        db.approve_language_probe_source("movie", sid, "RU")
+
+
+def test_language_provider_error_does_not_pause_provider(monkeypatch):
     provider = {"id": 901, "name": "limited-provider", "provider_type": "xc"}
     source = {"provider_id": 901, "provider_stream_id": "x", "container_extension": "mp4"}
     async def fail_fetch(*args, **kwargs):

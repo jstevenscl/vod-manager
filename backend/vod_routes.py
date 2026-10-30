@@ -4138,6 +4138,21 @@ class LanguageMismatchDecisionRequest(BaseModel):
     decision: str                   # approved or rejected
 
 
+class LanguageProbeErrorActionRequest(BaseModel):
+    action: str                     # approve, retry or delete
+    language: Optional[str] = None  # manually confirmed enabled language
+
+
+class LanguageTrickleSettingsRequest(BaseModel):
+    probes_per_cycle: int
+    interval_seconds: int
+    daily_limit: Optional[int] = None
+
+
+class LanguageTrickleEnabledRequest(BaseModel):
+    enabled: bool
+
+
 @router.post("/sources/check-quality/", dependencies=_GUARDS)
 async def check_source_quality(body: SourceQualityRequest):
     """On-demand resolution + file size for ONE source. One source per call by design: no bulk / season form."""
@@ -4180,6 +4195,31 @@ async def language_mismatch_report():
 async def run_language_trickle():
     """Run one bounded manual cycle; the same provider gates and daily cap apply."""
     return await vod_probe.run_language_trickle_cycle()
+
+
+@router.post("/language-probe-errors/{kind}/{source_id}/action/", dependencies=_GUARDS)
+async def language_probe_error_action(kind: str, source_id: int, body: LanguageProbeErrorActionRequest):
+    if body.action not in ("approve", "retry", "delete"):
+        raise HTTPException(400, detail="action must be approve, retry or delete")
+    try:
+        if body.action == "approve":
+            source = await asyncio.to_thread(vod_db.approve_language_probe_source, kind, source_id, body.language)
+            configured = source.get("configured_language")
+            await asyncio.to_thread(
+                vod_db.record_language_probe_run, kind, source_id, source.get("provider_id"),
+                "manual_approved", configured, [configured] if configured else [],
+                config.get_enabled_languages(), False,
+                bool(configured and configured in config.get_enabled_languages()),
+                "Language manually confirmed after playback review." if body.language else "Manually approved after playback review.",
+            )
+            return {"action": "approved", "language": configured}
+        if body.action == "retry":
+            await asyncio.to_thread(vod_db.reset_language_probe_failure, kind, source_id)
+            return {"action": "retry_queued"}
+        await asyncio.to_thread(vod_db.delete_language_probe_source, kind, source_id)
+        return {"action": "deleted"}
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
 
 
 @router.post("/language-mismatch/{kind}/{source_id}/decision/", dependencies=_GUARDS)
