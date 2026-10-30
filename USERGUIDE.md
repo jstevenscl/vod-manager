@@ -1967,6 +1967,15 @@ imported in the first place.
   **Delete selected** buttons once you've checked a few. Deleting a category
   only unplaces items from it — nothing in your pool is touched.
 
+- **Periodic reconciliation** — smart categories are evaluated whenever an
+  import, provider sync, curation change or saved rule change touches them, and
+  on top of that a safety-net pass re-checks every smart category across the
+  whole library every 15 minutes. That pass is on by default; to turn it off,
+  untick **Configuration → Refresh Schedule → Periodic smart-category
+  reconciliation** and press **Save**. The 15-minute interval is fixed and
+  can't be changed. Unticking it stops only that pass — the event-driven
+  evaluation above keeps working.
+
 ### Missing Artwork
 
 Movies/series with no poster — usually because the source provider's own

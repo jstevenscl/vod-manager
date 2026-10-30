@@ -403,6 +403,12 @@ Configuration → Refresh Schedule controls how often background work runs:
   default — enabling it adds new recurring API traffic to whichever
   source(s) each category uses. Any one category can also have its own
   schedule (hourly to weekly) in Manage Categories.
+- **Periodic smart-category reconciliation** — a checkbox, on by default. Every
+  15 minutes a safety-net pass re-evaluates every smart category across the whole
+  library, catching changes that didn't arrive through an import or sync. The
+  15-minute interval is fixed. Turning the box off stops only this pass; smart
+  categories are still evaluated when an import, provider sync, curation change or
+  saved rule change touches them.
 
 ## Backup and restore
 

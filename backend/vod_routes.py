@@ -173,6 +173,7 @@ class RefreshSettingsRequest(BaseModel):
     catalog_refresh_seconds_jellyfin: int
     enrichment_ttl_seconds: int
     tmdb_sync_interval_seconds: Optional[int] = None
+    smart_category_reconciliation_enabled: bool = True
 
 
 class XcClientRequest(BaseModel):
@@ -1173,6 +1174,7 @@ async def save_refresh_settings_route(body: RefreshSettingsRequest):
         body.catalog_refresh_seconds_jellyfin,
         body.enrichment_ttl_seconds,
         body.tmdb_sync_interval_seconds,
+        body.smart_category_reconciliation_enabled,
     )
     return {"ok": True}
 
