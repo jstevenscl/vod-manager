@@ -14,6 +14,10 @@ Providers are protected on every side, because a probe is a real connection to s
   * a result already on file is returned without touching the provider
 There is deliberately no season or series-wide probe: each episode is its own click, and the limits above apply
 to every one of them.
+
+Language auditing reuses the same small, paced request path but is kept
+separate from the quality result. It reads embedded audio-track tags only; it
+never changes the provider language or playback eligibility automatically.
 """
 
 import asyncio
@@ -22,11 +26,14 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
 
 import httpx
+
+import config
 
 import vod_db
 import vod_downloader
@@ -42,10 +49,22 @@ _WINDOW_SECONDS = 600.0
 _WINDOW_MAX = 8                       # probes per provider per window
 _GLOBAL_MAX = 2
 
+# Language trickle defaults: deliberately quieter than normal import traffic.
+LANGUAGE_TRICKLE_INTERVAL = 60.0
+LANGUAGE_TRICKLE_DAILY_MAX = 500
+LANGUAGE_GLOBAL_MAX = 15
+LANGUAGE_WINDOW_SECONDS = 900.0
+LANGUAGE_WINDOW_MAX: int | None = None
+LANGUAGE_CAPACITY_HOLD_SECONDS = 2 * 60 * 60
+
 _in_flight: set[int] = set()          # provider ids with a probe running right now
 _running_total = 0
 _last_end: dict[int, float] = {}
 _recent: dict[int, collections.deque] = {}
+_language_trickle_day = ""
+_language_trickle_count = 0
+_language_provider_blocks: dict[int, str] = {}
+_language_claimed_sources: set[int] = set()
 
 
 class ProbeRefused(Exception):
@@ -56,6 +75,28 @@ class ProbeRefused(Exception):
         self.retry_after = retry_after
         # inflight / cooldown / busy / spacing / window / capacity: just wait.  pushback: the provider said slow down.
         self.kind = kind
+
+
+def _throttle_response(status: int, detail: str) -> bool:
+    if status in (429, 458, 509):
+        return True
+    lowered = (detail or "").lower()
+    if status == 403:
+        return any(term in lowered for term in (
+            "rate limit", "rate-limit", "too many", "throttl", "slow down",
+            "slowdown", "retry-after", "anti-bot", "antibot", "temporarily",
+        ))
+    return any(term in lowered for term in (
+        "rate limit", "rate-limit", "too many requests", "throttl", "slow down",
+        "slowdown", "retry-after",
+    ))
+
+
+def _is_provider_throttle(exc: ProbeRefused) -> bool:
+    if exc.kind == "pushback":
+        return True
+    match = re.search(r"HTTP (\d{3})", str(exc))
+    return bool(match and _throttle_response(int(match.group(1)), str(exc)))
 
 
 def quality_label(width: int | None, height: int | None) -> str | None:
@@ -85,7 +126,26 @@ def result_of(src: dict) -> dict:
     }
 
 
-def _gate(pid: int, name: str, spacing: float | None = None) -> None:
+def language_result_of(src: dict) -> dict:
+    try:
+        languages = json.loads(src.get("language_probe_languages") or "[]")
+    except (TypeError, ValueError):
+        languages = []
+    return {
+        "source_id": src.get("source_id"),
+        "checked": bool(src.get("language_probed_at")),
+        "configured_language": src.get("language"),
+        "observed_languages": languages,
+        "status": src.get("language_probe_status"),
+        "confidence": src.get("language_probe_confidence"),
+        "method": src.get("language_probe_method"),
+        "error": src.get("language_probe_error"),
+        "probed_at": src.get("language_probed_at"),
+    }
+
+
+def _gate(pid: int, name: str, spacing: float | None = None,
+          window_seconds: float = _WINDOW_SECONDS, window_max: int | None = _WINDOW_MAX) -> None:
     """Raises ProbeRefused unless this provider can take a probe right now."""
     now = time.time()
     if pid in _in_flight:
@@ -99,10 +159,10 @@ def _gate(pid: int, name: str, spacing: float | None = None) -> None:
     if gap > 0:
         raise ProbeRefused(f"Easing off {name} between checks. Try again in {int(gap) + 1}s.", int(gap) + 1, "spacing")
     recent = _recent.setdefault(pid, collections.deque())
-    while recent and time.monotonic() - recent[0] > _WINDOW_SECONDS:
+    while recent and time.monotonic() - recent[0] > window_seconds:
         recent.popleft()
-    if len(recent) >= _WINDOW_MAX:
-        wait = int(_WINDOW_SECONDS - (time.monotonic() - recent[0])) + 1
+    if window_max is not None and window_max > 0 and len(recent) >= window_max:
+        wait = int(window_seconds - (time.monotonic() - recent[0])) + 1
         raise ProbeRefused(f"That's a lot of checks on {name} in a short time. Try again in {wait // 60 + 1} min.", wait, "window")
 
 
@@ -145,6 +205,41 @@ async def _ffprobe_video(path: str) -> tuple[int | None, int | None, str | None]
     return None, None, None
 
 
+_LANGUAGE_CODES = {
+    "eng": "EN", "hin": "HI", "fra": "FR", "spa": "ES", "deu": "DE",
+    "ger": "DE", "ita": "IT", "por": "PT", "jpn": "JA", "zho": "ZH",
+    "chi": "ZH", "kor": "KO", "ara": "AR", "rus": "RU", "tam": "TA",
+    "tel": "TE", "mal": "ML", "tha": "TH", "dan": "DA", "nld": "NL",
+    "dut": "NL", "tur": "TR", "pol": "PL", "swe": "SV", "nor": "NO",
+    "fin": "FI", "und": "UNKNOWN",
+}
+
+
+async def _ffprobe_audio_languages(path: str) -> list[str]:
+    """Return embedded audio-track language tags; empty means not tagged/unknown."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream_tags=language:stream_disposition=attached_pic",
+        "-of", "json", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), PROBE_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return []
+    try:
+        streams = json.loads(out.decode(errors="replace")).get("streams") or []
+    except ValueError:
+        return []
+    found = []
+    for stream in streams:
+        raw = ((stream.get("tags") or {}).get("language") or "").strip().lower()
+        if not raw:
+            continue
+        found.append(_LANGUAGE_CODES.get(raw, raw[:3].upper()))
+    return sorted(set(found))
+
+
 def _back_off(pid: int) -> int:
     """Same escalating cooldown the downloader applies when a provider says slow down."""
     n = vod_downloader._pushbacks.get(pid, 0) + 1
@@ -167,7 +262,7 @@ async def _fetch_head(url: str, user_agent: str | None, provider_name: str, pid:
                 wait = _back_off(pid)
                 raise ProbeRefused(f"{provider_name} pushed back (HTTP {resp.status_code}). Backing off for a while.", wait, "pushback")
             if resp.status_code >= 400:
-                raise ProbeRefused(f"{provider_name} answered HTTP {resp.status_code} for this source.")
+                raise ProbeRefused(f"{provider_name} answered HTTP {resp.status_code} for this source.", 900, "provider_error")
             ctype = (resp.headers.get("content-type") or "").lower()
             total = None
             cr = resp.headers.get("content-range", "")
@@ -187,8 +282,8 @@ async def _fetch_head(url: str, user_agent: str | None, provider_name: str, pid:
                 snippet = vod_downloader._safe(data[:300].decode("utf-8", "replace")).lower()
                 if any(w in snippet for w in vod_downloader._CAPACITY_WORDS):
                     vod_downloader._cooldown_until[pid] = time.time() + 120
-                    raise ProbeRefused(f"{provider_name} is at its connection limit. Try again in a couple of minutes.", 120, "pushback")
-                raise ProbeRefused(f"{provider_name} returned a web page instead of a video for this source.")
+                    raise ProbeRefused(f"{provider_name} is at its connection limit. It will be checked again after the capacity hold.", LANGUAGE_CAPACITY_HOLD_SECONDS, "capacity")
+                raise ProbeRefused(f"{provider_name} returned a web page instead of a video for this source.", 900, "provider_error")
             return data, total
 
 
@@ -281,6 +376,288 @@ async def probe_source(kind: str, source_id: int, force: bool = False, spacing: 
     out = result_of(await asyncio.to_thread(vod_db.get_probe_source, kind, source_id))
     out["unreadable"] = height is None      # we reached the provider but found no video to measure
     return out
+
+
+async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: float | None = None) -> list[str]:
+    """Read only the bounded stream header and inspect embedded audio tags."""
+    global _running_total
+    pid = provider["id"]
+    current_day = time.strftime("%Y-%m-%d", time.localtime())
+    blocked = _language_provider_blocks.get(pid)
+    if blocked and blocked.startswith(current_day + ":"):
+        raise ProbeRefused(f"{provider['name']} is paused for this language run: {blocked.split(':', 1)[1]}", 900, "provider_blocked")
+    if blocked:
+        _language_provider_blocks.pop(pid, None)
+    if _running_total >= LANGUAGE_GLOBAL_MAX:
+        raise ProbeRefused("Other checks are running. Try again in a moment.", 10, "busy")
+    _gate(pid, provider["name"], spacing, LANGUAGE_WINDOW_SECONDS, LANGUAGE_WINDOW_MAX)
+    _in_flight.add(pid)
+    _running_total += 1
+    _recent.setdefault(pid, collections.deque()).append(time.monotonic())
+    reservation = None
+    tmp = None
+    try:
+        if not vod_downloader._is_remote_library(provider):
+            reservation = await xc_server._select_upstream_credentials(provider, is_download=True)
+            if reservation is None:
+                raise ProbeRefused(f"{provider['name']} has no free probe connection.", 60, "capacity")
+        url = await xc_server._build_upstream_url("movie" if kind == "movie" else "series", provider, src, reservation)
+        try:
+            data, _ = await asyncio.wait_for(
+                _fetch_head(url, provider.get("custom_user_agent"), provider["name"], pid), PROBE_TIMEOUT)
+        except ProbeRefused as exc:
+            if reservation is not None and exc.kind != "capacity":
+                await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
+            raise
+        except (asyncio.TimeoutError, httpx.HTTPError, OSError):
+            if reservation is not None:
+                await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
+            raise
+        # The provider accepted a media response, so capacity is available.
+        if reservation is not None:
+            await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
+        fd, tmp = tempfile.mkstemp(suffix=".bin", prefix="vodlangprobe-")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return await _ffprobe_audio_languages(tmp)
+    except ProbeRefused as exc:
+        if exc.kind in ("pushback", "capacity", "provider_error", "other"):
+            _language_provider_blocks[pid] = f"{current_day}:{exc}"
+        raise
+    except asyncio.TimeoutError:
+        _language_provider_blocks[pid] = f"{current_day}:timeout"
+        raise ProbeRefused(f"{provider['name']} took too long to answer. Try again later.", 60)
+    except (httpx.HTTPError, OSError) as exc:
+        _language_provider_blocks[pid] = f"{current_day}:connection error"
+        raise ProbeRefused(f"Couldn't reach {provider['name']}: {vod_downloader._safe(exc) or type(exc).__name__}.", 30)
+    finally:
+        _in_flight.discard(pid)
+        _running_total -= 1
+        _last_end[pid] = time.monotonic()
+        if reservation is not None:
+            xc_server._release_capacity(provider, reservation["sub_account_id"], is_download=True)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+async def probe_language_source(kind: str, source_id: int, force: bool = False,
+                                spacing: float | None = None) -> dict:
+    """Advisory embedded-audio-language check for one movie or episode source."""
+    if kind not in ("movie", "episode"):
+        raise ProbeRefused("Unknown kind.")
+    src = await asyncio.to_thread(vod_db.get_language_probe_source, kind, source_id)
+    if not src:
+        raise ProbeRefused("That source doesn't exist or its provider is turned off.")
+    if src.get("language_probed_at") and not force:
+        return language_result_of(src)
+    if not shutil.which("ffprobe"):
+        raise ProbeRefused("ffprobe isn't available on this server, so language can't be checked.")
+    provider = await asyncio.to_thread(vod_db.get_provider, src["provider_id"])
+    if not provider:
+        raise ProbeRefused("The provider no longer exists.")
+    method = "embedded_audio_tags"
+    if provider.get("provider_type") in ("dispatcharr_dvr", "library") and os.path.isfile(src.get("local_file_path") or ""):
+        languages = await _ffprobe_audio_languages(src["local_file_path"])
+        method = "local_embedded_audio_tags"
+    else:
+        languages = await _probe_remote_language(kind, src, provider, spacing)
+    status = "observed" if languages else "unknown"
+    confidence = "high" if languages else "none"
+    await asyncio.to_thread(vod_db.set_source_language_probe, kind, source_id, languages, status, method, confidence)
+    out = language_result_of(await asyncio.to_thread(vod_db.get_language_probe_source, kind, source_id))
+    out["mismatch"] = bool(languages and src.get("language") and src["language"] not in languages)
+    return out
+
+
+async def language_trickle_once(target: dict | None = None) -> dict:
+    """Run at most one quiet audit probe; no automatic source/card changes."""
+    global _language_trickle_day, _language_trickle_count
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    if day != _language_trickle_day:
+        _language_trickle_day, _language_trickle_count = day, 0
+    settings = config.get_language_trickle_settings()
+    daily_limit = settings.get("language_trickle_daily_limit")
+    persisted_count = await asyncio.to_thread(vod_db.language_probe_count_today)
+    current_count = max(_language_trickle_count, persisted_count)
+    if daily_limit is not None and current_count >= int(daily_limit):
+        return {"status": "daily_limit", "checked_today": current_count}
+    if target is None:
+        target = await asyncio.to_thread(vod_db.next_language_probe_target)
+    if not target:
+        return {"status": "idle", "checked_today": current_count}
+    try:
+        result = await probe_language_source(target["kind"], target["source_id"], spacing=0)
+        await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, target["provider_id"])
+        await asyncio.to_thread(
+            vod_db.recover_language_probe_provider,
+            target["provider_id"], settings["language_trickle_probes_per_cycle"],
+        )
+        _language_trickle_count += 1
+        observed = result.get("observed_languages") or []
+        configured = result.get("configured_language")
+        wanted = config.get_enabled_languages()
+        auto_approved = bool(configured and observed and configured in observed)
+        # The report treats any multi-track result or a changed single-track
+        # result as needing review unless the configured language is present.
+        mismatch = bool(observed and not auto_approved and observed != [configured])
+        wanted_match = bool(observed and set(observed).issubset(set(wanted)))
+        if auto_approved:
+            await asyncio.to_thread(vod_db.auto_approve_language_probe_source,
+                                    target["kind"], target["source_id"], observed)
+        await asyncio.to_thread(vod_db.record_language_probe_run,
+                                target["kind"], target["source_id"], target.get("provider_id"),
+                                "auto_approved" if auto_approved else result.get("status") or "observed",
+                                configured, observed,
+                                wanted, mismatch, wanted_match, result.get("error"))
+        if result.get("mismatch"):
+            import notices
+            if not await asyncio.to_thread(vod_db.has_open_notice_kind, "language_mismatch"):
+                await asyncio.to_thread(
+                    notices.add, "language_mismatch", "warn", "Language mismatch approval needed",
+                    "A trickle probe found one or more source language mismatches. Open Language Mismatch Report to review."
+                )
+        return {"status": "checked", "checked_today": max(_language_trickle_count, current_count + 1), "result": result}
+    except ProbeRefused as exc:
+        failure = None
+        capacity_hold = None
+        if exc.kind == "capacity":
+            capacity_hold = await asyncio.to_thread(
+                vod_db.hold_language_probe_provider,
+                target["provider_id"], target["kind"], target["source_id"],
+                str(exc), LANGUAGE_CAPACITY_HOLD_SECONDS,
+            )
+        elif _is_provider_throttle(exc):
+            await asyncio.to_thread(
+                vod_db.record_language_probe_throttle,
+                target["provider_id"],
+                re.search(r"HTTP (\d{3})", str(exc)).group(1) if re.search(r"HTTP (\d{3})", str(exc)) else "PUSHBACK",
+                str(exc), settings["language_trickle_probes_per_cycle"],
+            )
+        elif exc.kind == "provider_error":
+            failure = await asyncio.to_thread(
+                vod_db.record_language_probe_failure,
+                target["kind"], target["source_id"], str(exc),
+            )
+        await asyncio.to_thread(vod_db.record_language_probe_run,
+                                target["kind"], target["source_id"], target.get("provider_id"),
+                                "deferred", None, [], config.get_enabled_languages(), False, False, str(exc))
+        return {"status": "quarantined" if failure and failure["quarantined"] else "capacity_hold" if capacity_hold else "deferred",
+                "checked_today": current_count,
+                "retry_after": LANGUAGE_CAPACITY_HOLD_SECONDS if capacity_hold else exc.retry_after,
+                "next_retry_at": capacity_hold["next_retry_at"] if capacity_hold else None,
+                "message": str(exc), "failures": failure["failures"] if failure else 0}
+    except Exception as exc:
+        logger.exception("[language-probe] trickle check failed for %s", target)
+        return {"status": "error", "checked_today": current_count, "message": str(exc)}
+
+
+def language_trickle_status() -> dict:
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    settings = config.get_language_trickle_settings()
+    try:
+        activity = vod_db.language_probe_activity_today()
+        checked_today = activity["completed"]
+    except Exception:
+        activity = {"attempts": 0, "completed": 0, "deferred": 0, "errors": 0}
+        checked_today = _language_trickle_count if _language_trickle_day == day else 0
+    return {
+        "enabled": bool(settings.get("language_trickle_enabled", False)),
+        "interval_seconds": settings["language_trickle_interval_seconds"],
+        "daily_max": settings["language_trickle_daily_limit"],
+        "checked_today": max(checked_today, _language_trickle_count if _language_trickle_day == day else 0),
+        "attempts_today": activity["attempts"],
+        "deferred_today": activity["deferred"],
+        "errors_today": activity["errors"],
+        "probes_per_cycle": settings["language_trickle_probes_per_cycle"],
+        "language_window_max": LANGUAGE_WINDOW_MAX,
+        "language_window_seconds": LANGUAGE_WINDOW_SECONDS,
+        "providers": vod_db.language_probe_provider_states(settings["language_trickle_probes_per_cycle"]),
+    }
+
+
+async def run_language_trickle_cycle() -> dict:
+    """Run one bounded manual/scheduled cycle without bypassing any gates."""
+    settings = config.get_language_trickle_settings()
+    if not settings.get("language_trickle_enabled", False):
+        return {"targets": 0, "results": [], "trickle": language_trickle_status()}
+    targets = await asyncio.to_thread(
+        vod_db.next_language_probe_targets,
+        settings["language_trickle_probes_per_cycle"], False,
+    )
+    states = {
+        p["provider_id"]: p for p in await asyncio.to_thread(
+            vod_db.language_probe_provider_states,
+            settings["language_trickle_probes_per_cycle"],
+        )
+    }
+    provider_counts: dict[int, int] = {}
+    allowed_targets = []
+    for target in targets:
+        state = states.get(target["provider_id"]) or {
+            "status": "normal",
+            "effective_budget": settings["language_trickle_probes_per_cycle"],
+        }
+        if state["status"] != "normal":
+            continue
+        used = provider_counts.get(target["provider_id"], 0)
+        if used >= state["effective_budget"]:
+            continue
+        provider_counts[target["provider_id"]] = used + 1
+        allowed_targets.append(target)
+    targets = allowed_targets
+    provider_queues: dict[int, list[dict]] = {}
+    for target in targets:
+        provider_queues.setdefault(target["provider_id"], []).append(target)
+    claimed = []
+    for target in targets:
+        if target["source_id"] in _language_claimed_sources:
+            continue
+        _language_claimed_sources.add(target["source_id"])
+        claimed.append(target["source_id"])
+
+    async def run_provider_queue(queue: list[dict]) -> list[dict]:
+        results = []
+        for target in queue:
+            result = await language_trickle_once(target)
+            results.append(result)
+            if result.get("status") == "capacity_hold":
+                # Capacity is provider-scoped. Stop trying sibling sources
+                # until the provider's two-hour retry is due.
+                break
+        return results
+
+    try:
+        queues = [
+            [target for target in queue if target["source_id"] in claimed]
+            for queue in provider_queues.values()
+        ]
+        batches = await asyncio.gather(
+            *(run_provider_queue(queue) for queue in queues if queue),
+            return_exceptions=True,
+        ) if queues else []
+        results = [result for batch in batches for result in (batch if isinstance(batch, list) else [batch])]
+        return {"targets": len(targets), "results": [
+            {"status": r.get("status"), "source_id": r.get("result", {}).get("source_id"), "message": r.get("message")}
+            if isinstance(r, dict) else {"status": "error", "message": str(r)} for r in results
+        ], "trickle": language_trickle_status()}
+    finally:
+        for source_id in claimed:
+            _language_claimed_sources.discard(source_id)
+
+
+async def language_trickle_loop() -> None:
+    """Quietly audit export-relevant sources, one bounded probe per interval."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            if config.get_language_trickle_settings().get("language_trickle_enabled", False):
+                await run_language_trickle_cycle()
+        except Exception:
+            logger.exception("[language-probe] trickle loop failed")
+        await asyncio.sleep(config.get_language_trickle_settings()["language_trickle_interval_seconds"])
 
 
 # ── background season / series checks ───────────────────────────────────────

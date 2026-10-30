@@ -3,6 +3,7 @@ ffprobe isn't needed here: the frame-size read is stubbed, the HTTP side runs ag
 
 import asyncio
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -13,6 +14,7 @@ import vod_downloader
 import vod_probe
 import vod_routes
 import xc_server
+import config
 
 TOTAL = 20_000_000
 hits: list[str] = []
@@ -77,6 +79,10 @@ def clean(monkeypatch):
     for d in (vod_probe._last_end, vod_probe._recent, vod_downloader._cooldown_until, vod_downloader._pushbacks,
               vod_downloader._provider_active):
         d.clear()
+    vod_probe._language_provider_blocks.clear()
+    vod_probe._language_claimed_sources.clear()
+    vod_probe._language_trickle_day = ""
+    vod_probe._language_trickle_count = 0
     vod_probe._in_flight.clear()
     vod_probe._running_total = 0
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/" + name)
@@ -120,6 +126,389 @@ def test_quality_labels():
     assert vod_probe.quality_label(1280, 720) == "720p"
     assert vod_probe.quality_label(720, 480) == "480p"
     assert vod_probe.quality_label(None, None) is None
+
+
+def test_language_probe_records_observed_tags_without_changing_configured_language(db, tmp_path, monkeypatch):
+    pid = db.upsert_provider("local-language", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Canary Hindi Movie", 2026)
+    path = tmp_path / "canary.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "canary", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    monkeypatch.setattr(vod_probe, "_ffprobe_audio_languages", lambda p: asyncio.sleep(0, result=["HI"]))
+
+    out = asyncio.run(vod_probe.probe_language_source("movie", sid))
+
+    assert out["observed_languages"] == ["HI"]
+    assert out["status"] == "observed"
+    assert out["mismatch"] is True
+    row = db.get_language_probe_source("movie", sid)
+    assert row["language"] == "EN"
+    assert row["language_probe_status"] == "observed"
+    assert row["language_probe_languages"] == '["HI"]'
+
+
+def test_language_probe_caches_unknown_result(db, tmp_path, monkeypatch):
+    pid = db.upsert_provider("local-language-unknown", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Un tagged Movie", 2026)
+    path = tmp_path / "unknown.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "unknown", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.commit(); conn.close()
+    calls = []
+    async def no_tags(_):
+        calls.append(1)
+        return []
+    monkeypatch.setattr(vod_probe, "_ffprobe_audio_languages", no_tags)
+
+    first = asyncio.run(vod_probe.probe_language_source("movie", sid))
+    second = asyncio.run(vod_probe.probe_language_source("movie", sid))
+
+    assert first["status"] == "unknown" and first["checked"]
+    assert second["status"] == "unknown" and second["checked"]
+    assert len(calls) == 1
+
+
+def test_language_trickle_uses_experimental_limits_and_saved_playback_policy(db, monkeypatch):
+    assert vod_probe.LANGUAGE_GLOBAL_MAX == 15
+    assert vod_probe.LANGUAGE_TRICKLE_DAILY_MAX == 500
+    assert vod_probe.LANGUAGE_WINDOW_MAX is None
+
+    monkeypatch.setattr(config, "CONFIG_FILE", db.DB_PATH.with_name("config.json"))
+    config.save_enabled_languages(["IT", "ES"])
+    assert config.get_enabled_languages() == ["IT", "ES"]
+    assert db.list_language_mismatches()["enabled_languages"] == ["ES", "IT"]
+
+
+def test_language_trickle_runs_up_to_source_limit_per_cycle(monkeypatch):
+    config.save_language_trickle_settings(15, 180, None, enabled=True)
+    targets = [
+        {"kind": "movie", "source_id": i, "provider_id": 1 if i < 8 else 2}
+        for i in range(15)
+    ]
+
+    async def fake_probe(kind, source_id, force=False, spacing=None):
+        return {"source_id": source_id, "mismatch": False}
+
+    monkeypatch.setattr(vod_probe.vod_db, "next_language_probe_targets", lambda limit, distinct: targets[:limit])
+    monkeypatch.setattr(vod_probe, "probe_language_source", fake_probe)
+
+    result = asyncio.run(vod_probe.run_language_trickle_cycle())
+
+    assert result["targets"] == 15
+    assert len(result["results"]) == 15
+
+
+def test_language_trickle_capacity_refusal_records_two_hour_hold(db, monkeypatch):
+    provider_id = db.upsert_provider("Full Pool", "http://capacity.invalid", "u", "p")
+    config.save_language_trickle_settings(15, 180, None)
+
+    async def no_slot(*args, **kwargs):
+        raise vod_probe.ProbeRefused("No free probe connection", 60, "capacity")
+
+    monkeypatch.setattr(vod_probe, "probe_language_source", no_slot)
+    result = asyncio.run(vod_probe.language_trickle_once(
+        {"kind": "movie", "source_id": 77, "provider_id": provider_id}
+    ))
+
+    assert result["status"] == "capacity_hold"
+    assert result["retry_after"] == 7200
+    hold = db.list_language_probe_capacity_holds()[0]
+    assert hold["provider_id"] == provider_id
+    assert hold["source_id"] == 77
+    assert hold["attempt_count"] == 1
+    assert hold["next_retry_at"] - hold["last_attempt_at"] == 7200
+
+
+def test_language_cycle_stops_provider_queue_after_capacity_refusal(db, monkeypatch):
+    config.save_language_trickle_settings(15, 180, None)
+    config.save_language_trickle_enabled(True)
+    first_provider = db.upsert_provider("Provider A", "http://a.invalid", "u", "p")
+    second_provider = db.upsert_provider("Provider B", "http://b.invalid", "u", "p")
+    targets = [
+        {"kind": "movie", "source_id": 1, "provider_id": first_provider},
+        {"kind": "movie", "source_id": 2, "provider_id": first_provider},
+        {"kind": "movie", "source_id": 3, "provider_id": second_provider},
+    ]
+    monkeypatch.setattr(vod_probe.vod_db, "next_language_probe_targets", lambda *args: targets)
+    attempted = []
+
+    async def fake_once(target):
+        attempted.append(target["source_id"])
+        return {"status": "capacity_hold" if target["source_id"] == 1 else "checked"}
+
+    monkeypatch.setattr(vod_probe, "language_trickle_once", fake_once)
+    result = asyncio.run(vod_probe.run_language_trickle_cycle())
+
+    assert result["targets"] == 3
+    assert set(attempted) == {1, 3}
+
+
+def test_language_trickle_manual_cycle_is_noop_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_language_trickle_settings(15, 180, None)
+    called = []
+    monkeypatch.setattr(vod_probe.vod_db, "next_language_probe_targets", lambda *args: called.append(True))
+
+    result = asyncio.run(vod_probe.run_language_trickle_cycle())
+
+    assert result["targets"] == 0 and result["results"] == []
+    assert called == []
+
+
+def test_language_trickle_settings_allow_unlimited_daily_budget(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_language_trickle_settings(15, 180, None)
+    assert config.get_language_trickle_settings() == {
+        "language_trickle_enabled": False,
+        "language_trickle_probes_per_cycle": 15,
+        "language_trickle_interval_seconds": 180,
+        "language_trickle_daily_limit": None,
+    }
+
+
+def test_language_trickle_enabled_setting_can_be_toggled(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_language_trickle_settings(15, 180, None)
+    config.save_language_trickle_enabled(False)
+    assert config.get_language_trickle_settings()["language_trickle_enabled"] is False
+    config.save_language_trickle_enabled(True)
+    assert config.get_language_trickle_settings()["language_trickle_enabled"] is True
+
+
+def test_provider_throttle_budget_and_gate_escalation(db):
+    provider_id = db.upsert_provider("Throttle Provider", "http://throttle.invalid", "u", "p")
+    state = db.language_probe_provider_state(provider_id, 50)
+    assert state["status"] == "normal" and state["effective_budget"] == 50
+    for _ in range(3):
+        state = db.record_language_probe_throttle(provider_id, "429", "rate limit", 50)
+    assert state["status"] == "normal" and state["effective_budget"] == 40
+
+    for _ in range(9):
+        state = db.record_language_probe_throttle(provider_id, "PUSHBACK", "slow down", 50)
+    assert state["effective_budget"] == 10
+
+    for _ in range(3):
+        state = db.record_language_probe_throttle(provider_id, "429", "rate limit", 50)
+    assert state["status"] == "gating" and state["tier"] == 1
+
+    db.unblock_language_probe_provider(provider_id, 50)
+    state = db.language_probe_provider_state(provider_id, 50)
+    assert state["status"] == "normal" and state["effective_budget"] == 50
+
+
+def test_capacity_hold_uses_two_hour_provider_retry_and_tracks_attempts(db):
+    provider_id = db.upsert_provider("Capacity Provider", "http://capacity.invalid", "u", "p")
+    movie_id = db.upsert_movie("Held Movie", 2026)
+    db.add_movie_source(movie_id, provider_id, "held", "mp4")
+    conn = db._connect()
+    source_id = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (movie_id,)).fetchone()["id"]
+    conn.close()
+
+    first = db.hold_language_probe_provider(provider_id, "movie", source_id,
+                                            "No free connection", hold_seconds=7200, now=1000)
+    second = db.hold_language_probe_provider(provider_id, "movie", source_id,
+                                             "Still at capacity", hold_seconds=7200, now=2000)
+
+    assert first["first_attempt_at"] == 1000
+    assert first["next_retry_at"] == 8200
+    assert second["first_attempt_at"] == 1000
+    assert second["last_attempt_at"] == 2000
+    assert second["next_retry_at"] == 9200
+    assert second["attempt_count"] == 2
+    hold = db.list_language_probe_capacity_holds(now=2000)[0]
+    assert hold["title"] == "Held Movie" and hold["retry_due"] == 0
+    db.clear_language_probe_capacity_hold(provider_id)
+    restarted = db.hold_language_probe_provider(provider_id, "movie", source_id,
+                                                "Capacity became full again", hold_seconds=7200, now=3000)
+    assert restarted["first_attempt_at"] == 3000 and restarted["attempt_count"] == 1
+
+
+def test_capacity_hold_suppresses_provider_until_retry_and_prioritizes_held_source(db):
+    provider_id = db.upsert_provider("Capacity Queue", "http://capacity.invalid", "u", "p")
+    category_id = db.upsert_category("Movies", "movie")
+    source_ids = []
+    for title in ("First Movie", "Second Movie"):
+        movie_id = db.upsert_movie(title, 2026)
+        db.place_movie_in_category(movie_id, category_id)
+        db.add_movie_source(movie_id, provider_id, title, "mp4")
+        conn = db._connect()
+        source_ids.append(conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (movie_id,)).fetchone()["id"])
+        conn.close()
+
+    db.hold_language_probe_provider(provider_id, "movie", source_ids[1],
+                                    "No free connection", hold_seconds=7200)
+    assert db.next_language_probe_targets(10, False) == []
+
+    conn = db._connect()
+    conn.execute("UPDATE language_probe_capacity_provider_state SET next_retry_at=? WHERE provider_id=?",
+                 (time.time() - 1, provider_id))
+    conn.commit()
+    conn.close()
+    targets = db.next_language_probe_targets(10, False)
+    assert targets[0]["source_id"] == source_ids[1]
+
+
+def test_language_trickle_bounds_are_safe(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_language_trickle_settings(2000, 0, None)
+    settings = config.get_language_trickle_settings()
+    assert settings["language_trickle_probes_per_cycle"] == 600
+    assert settings["language_trickle_interval_seconds"] == 90
+
+
+def test_language_audit_stats_keep_daily_probe_history(db):
+    db.record_language_probe_run("movie", 10, 20, "observed", "EN", ["EN"], ["EN"], False, True)
+    db.record_language_probe_run("episode", 11, 21, "observed", "EN", ["HI"], ["EN"], True, False)
+    stats = db.language_audit_stats()
+    assert stats["history"][0]["probes"] == 2
+    assert stats["history"][0]["mismatches"] == 1
+    assert stats["history"][0]["outside_wanted"] == 1
+    assert stats["history"][0]["wanted_only"] == 1
+    assert stats["history"][0]["not_needed"] == 1
+    activity = db.language_probe_activity_today()
+    assert activity["attempts"] == 2 and activity["completed"] == 2
+
+
+def test_language_audit_provider_history_excludes_inactive_providers(db):
+    active = db.upsert_provider("active-language-provider", "", "", "", provider_type="library")
+    inactive = db.upsert_provider("inactive-language-provider", "", "", "", provider_type="library")
+    db.set_provider_active(inactive, False)
+    db.record_language_probe_run("movie", 21, active, "observed", "EN", ["EN"], ["EN"], False, True)
+    db.record_language_probe_run("movie", 22, inactive, "observed", "EN", ["EN"], ["EN"], False, True)
+    providers = {row["provider"] for row in db.language_audit_stats()["provider_history"]}
+    assert "active-language-provider" in providers
+    assert "inactive-language-provider" not in providers
+
+
+def test_language_audit_stats_group_recent_error_codes_by_provider(db):
+    pid = db.upsert_provider("error-code-provider", "", "", "", provider_type="library")
+    db.record_language_probe_run("movie", 31, pid, "deferred", None, [], ["EN"], False, False,
+                                "error-code-provider answered HTTP 404 for this source.")
+    db.record_language_probe_run("movie", 32, pid, "deferred", None, [], ["EN"], False, False,
+                                "error-code-provider asked us to slow down.")
+    db.record_language_probe_run("movie", 33, pid, "deferred", None, [], ["EN"], False, False,
+                                "error-code-provider has no free probe connection.")
+    codes = {(row["provider"], row["code"]): row["count"] for row in db.language_audit_stats()["error_history"]}
+    assert codes[("error-code-provider", "404")] == 1
+    assert codes[("error-code-provider", "PUSHBACK")] == 1
+    assert codes[("error-code-provider", "CAPACITY")] == 1
+
+
+def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_source(db, tmp_path):
+    pid = db.upsert_provider("report-language", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Report Hindi Movie", 2026)
+    path = tmp_path / "report.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "report", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, ["HI"], "observed", "local_embedded_audio_tags", "high")
+
+    report = db.list_language_mismatches()
+    row = next(r for r in report["results"] if r["source_id"] == sid)
+    assert row["proposed_language"] == "HI" and row["proposed_archive"] is True
+
+    result = db.decide_language_mismatch("movie", sid, "approved")
+    assert result["action"] == "language_updated_and_archived"
+    source = db.get_language_probe_source("movie", sid)
+    assert source["language"] == "HI" and source["language_probe_decision"] == "approved"
+    assert db.get_movie(mid)["review_excluded"] == 1
+    assert not db.list_language_mismatches()["results"]
+
+
+def test_unknown_language_is_separate_and_never_archive_approvable(db, tmp_path):
+    pid = db.upsert_provider("unknown-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Tagged Movie", 2026)
+    path = tmp_path / "unknown.mkv"
+    path.write_bytes(b"fixture")
+    db.add_movie_source(mid, pid, "unknown", "mkv", local_file_path=str(path))
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, ["UNKNOWN"], "observed", "local_embedded_audio_tags", "low")
+
+    assert not any(row["source_id"] == sid for row in db.list_language_mismatches()["results"])
+    unknown = next(row for row in db.list_language_unknowns()["results"] if row["source_id"] == sid)
+    assert unknown["proposed_archive"] is False
+    with pytest.raises(ValueError, match="unknown or multiple"):
+        db.decide_language_mismatch("movie", sid, "approved")
+
+    result = db.approve_language_probe_source("movie", sid, "EN")
+    source = db.get_language_probe_source("movie", sid)
+    assert result["configured_language"] == "EN"
+    assert source["language"] == "EN"
+    assert source["language_probe_status"] == "manual_approved"
+    assert source["language_probe_decision"] == "approved"
+    assert source["language_probe_method"] == "manual_language_confirmed"
+    assert source["language_probe_languages"] == '["EN"]'
+    assert not any(row["source_id"] == sid for row in db.list_language_unknowns()["results"])
+    assert not any(row["source_id"] == sid for row in db.next_language_probe_targets(100, distinct_providers=False))
+
+
+def test_unknown_language_can_be_manually_set_to_another_enabled_language(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_enabled_languages(["EN", "RU", "ES"])
+    pid = db.upsert_provider("manual-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Russian Movie", 2026)
+    db.add_movie_source(mid, pid, "unknown-russian", "mkv")
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
+    conn.commit(); conn.close()
+    db.set_source_language_probe("movie", sid, [], "unknown", "embedded_audio_tags", "low")
+
+    result = db.approve_language_probe_source("movie", sid, "RU")
+    source = db.get_language_probe_source("movie", sid)
+
+    assert result["configured_language"] == "RU"
+    assert source["language"] == "RU"
+    assert source["language_probe_decision"] == "approved"
+    assert source["language_probe_languages"] == '["RU"]'
+    assert db.list_language_unknowns()["enabled_languages"] == ["EN", "ES", "RU"]
+    assert not any(row["source_id"] == sid for row in db.list_language_unknowns()["results"])
+
+
+def test_unknown_language_confirmation_rejects_disabled_language(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    config.save_enabled_languages(["EN"])
+    pid = db.upsert_provider("invalid-language-provider", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Unknown Movie", 2026)
+    db.add_movie_source(mid, pid, "unknown-invalid", "mkv")
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.commit(); conn.close()
+
+    with pytest.raises(ValueError, match="must be enabled"):
+        db.approve_language_probe_source("movie", sid, "RU")
+
+
+def test_language_provider_error_does_not_pause_provider(monkeypatch):
+    provider = {"id": 901, "name": "limited-provider", "provider_type": "xc"}
+    source = {"provider_id": 901, "provider_stream_id": "x", "container_extension": "mp4"}
+    async def fail_fetch(*args, **kwargs):
+        raise vod_probe.ProbeRefused("HTTP 429", 900, "pushback")
+    async def credentials(*args, **kwargs):
+        return {"sub_account_id": 1}
+    async def build(*args, **kwargs):
+        return "http://provider.invalid/stream"
+    monkeypatch.setattr(vod_probe, "_fetch_head", fail_fetch)
+    monkeypatch.setattr(vod_probe.xc_server, "_select_upstream_credentials", credentials)
+    monkeypatch.setattr(vod_probe.xc_server, "_build_upstream_url", build)
+    monkeypatch.setattr(vod_probe.xc_server, "_release_capacity", lambda *args, **kwargs: None)
+
+    with pytest.raises(vod_probe.ProbeRefused, match="HTTP 429"):
+        asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
+    with pytest.raises(vod_probe.ProbeRefused, match="paused"):
+        asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
 
 
 def test_probe_stores_size_and_resolution_and_is_cached(db, server):
