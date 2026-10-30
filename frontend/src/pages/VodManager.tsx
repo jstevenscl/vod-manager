@@ -240,6 +240,7 @@ interface RefreshSettings {
   catalog_refresh_seconds_jellyfin: number
   enrichment_ttl_seconds: number
   tmdb_sync_interval_seconds: number | null
+  smart_category_reconciliation_enabled: boolean
 }
 
 interface BackupComponent {
@@ -6642,6 +6643,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: string
     enrichment_ttl_hours: string
     tmdb_sync_hours: string
+    smart_category_reconciliation_enabled: boolean
   } | null>(null)
   const secToHrStr = (s: number | null | undefined) => (s == null ? '' : String(s / 3600))
   const refreshValues = refreshForm ?? (refreshSettingsQuery.data ? {
@@ -6651,6 +6653,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     catalog_refresh_hours_jellyfin: secToHrStr(refreshSettingsQuery.data.catalog_refresh_seconds_jellyfin),
     enrichment_ttl_hours:           secToHrStr(refreshSettingsQuery.data.enrichment_ttl_seconds),
     tmdb_sync_hours:                secToHrStr(refreshSettingsQuery.data.tmdb_sync_interval_seconds),
+    smart_category_reconciliation_enabled: refreshSettingsQuery.data.smart_category_reconciliation_enabled,
   } : null)
   const saveRefreshSettings = useMutation({
     mutationFn: () => {
@@ -6662,6 +6665,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         catalog_refresh_seconds_jellyfin: hrToSec(refreshValues!.catalog_refresh_hours_jellyfin),
         enrichment_ttl_seconds:           hrToSec(refreshValues!.enrichment_ttl_hours),
         tmdb_sync_interval_seconds:       refreshValues!.tmdb_sync_hours.trim() ? hrToSec(refreshValues!.tmdb_sync_hours) : null,
+        smart_category_reconciliation_enabled: refreshValues!.smart_category_reconciliation_enabled,
       })
     },
     onSuccess: () => {
@@ -8815,6 +8819,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               />
             </label>
           </div>
+        )}
+        {refreshValues && (
+          <label className="flex items-start gap-1.5 text-xs mt-3" title="This controls only the independent full-pool reconciliation pass. Imports, provider syncs, curation changes, and saved smart-category rules still evaluate their affected content when those actions occur.">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={refreshValues.smart_category_reconciliation_enabled}
+              onChange={(e) => setRefreshForm({ ...refreshValues, smart_category_reconciliation_enabled: e.target.checked })}
+            />
+            <span>
+              Periodic smart-category reconciliation
+              <span className="block text-muted-foreground">Run the full-pool safety check every 15 minutes. The interval is fixed.</span>
+            </span>
+          </label>
         )}
         <div className="flex items-center gap-1.5">
           <Button

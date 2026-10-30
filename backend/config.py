@@ -815,6 +815,11 @@ _REFRESH_DEFAULTS = {
     "catalog_refresh_seconds_jellyfin": 6 * 3600,
     "enrichment_ttl_seconds":           24 * 3600,
     "tmdb_sync_interval_seconds":       None,
+    # The full-pool smart-category reconciliation is a safety net for changes
+    # that did not arrive through an import/sync event. Keep it enabled by
+    # default for existing installs; admins can turn only this fixed 15-minute
+    # pass off without disabling event-driven category evaluation.
+    "smart_category_reconciliation_enabled": True,
 }
 
 
@@ -830,6 +835,7 @@ def save_refresh_settings(
     catalog_refresh_seconds_jellyfin: int,
     enrichment_ttl_seconds: int,
     tmdb_sync_interval_seconds: int | None,
+    smart_category_reconciliation_enabled: bool,
 ) -> None:
     _update_raw(lambda data: data.update({
         "catalog_refresh_seconds_xc":       max(60, int(catalog_refresh_seconds_xc)),
@@ -838,6 +844,7 @@ def save_refresh_settings(
         "catalog_refresh_seconds_jellyfin": max(60, int(catalog_refresh_seconds_jellyfin)),
         "enrichment_ttl_seconds":           max(60, int(enrichment_ttl_seconds)),
         "tmdb_sync_interval_seconds":       max(60, int(tmdb_sync_interval_seconds)) if tmdb_sync_interval_seconds else None,
+        "smart_category_reconciliation_enabled": bool(smart_category_reconciliation_enabled),
     }))
 
 

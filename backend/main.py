@@ -361,14 +361,18 @@ _UNCATEGORIZED_SWEEP_POLL_SECONDS = 900  # 15 min -- independent of any
 
 
 async def _uncategorized_sweep_loop() -> None:
-    """Background task: re-evaluates every smart category (see
-    resweep_smart_categories) on its own fixed cadence, independent of
-    provider refresh timing -- see _UNCATEGORIZED_SWEEP_POLL_SECONDS above
-    for why this exists as its own loop rather than only ever running as a
-    side effect of something else being due."""
+    """Optional 15-minute safety-net pass for all smart categories.
+
+    This is deliberately separate from event-driven evaluations: imports,
+    provider syncs, curation changes, and saved-rule changes still evaluate
+    their affected category/content when they occur. The setting controls
+    only this full-pool reconciliation pass; its cadence is intentionally not
+    user-configurable.
+    """
     while True:
         try:
-            await vod_importer.resweep_smart_categories()
+            if get_refresh_settings().get("smart_category_reconciliation_enabled", True):
+                await vod_importer.resweep_smart_categories()
         except Exception as exc:
             logger.warning("[uncategorized_sweep_loop] run failed: %s", exc)
         await asyncio.sleep(_UNCATEGORIZED_SWEEP_POLL_SECONDS)
