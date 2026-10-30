@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import Hls from 'hls.js'
-import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, Gauge, HardDriveDownload, ImageOff, Info, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
+import { Activity, AlertCircle, Archive, ArchiveRestore, ArrowRightLeft, CalendarClock, CalendarDays, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Copy, Download, Eye, EyeOff, Film, Flag, Gauge, HardDriveDownload, ImageOff, Info, Languages, LayoutGrid, List, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Sparkles, FolderMinus, Stethoscope, Tag, Trash2, Tv, Type, Upload, Users, Wrench, X, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Chip, inputCls, KpiTile, QuotaBar, SectionCard, StatusPill } from '@/components/dvr-shared'
 import api from '@/lib/api'
@@ -1380,6 +1380,45 @@ const LANGUAGE_CODE_NAMES: Record<string, string> = {
   // shorthand with no reliable interpretation). A wrong guess here is
   // worse than just showing the raw code.
 }
+const PRIMARY_LANGUAGE_OPTIONS: Array<[string, string]> = [
+  ['AA', 'Afar'], ['AB', 'Abkhazian'], ['AE', 'Avestan'], ['AF', 'Afrikaans'], ['AK', 'Akan'],
+  ['AM', 'Amharic'], ['AN', 'Aragonese'], ['AR', 'Arabic'], ['AS', 'Assamese'], ['AV', 'Avaric'],
+  ['AY', 'Aymara'], ['AZ', 'Azerbaijani'], ['BA', 'Bashkir'], ['BE', 'Belarusian'], ['BG', 'Bulgarian'],
+  ['BH', 'Bihari'], ['BI', 'Bislama'], ['BM', 'Bambara'], ['BN', 'Bengali'], ['BO', 'Tibetan'],
+  ['BR', 'Breton'], ['BS', 'Bosnian'], ['CA', 'Catalan'], ['CE', 'Chechen'], ['CH', 'Chamorro'],
+  ['CO', 'Corsican'], ['CR', 'Cree'], ['CS', 'Czech'], ['CU', 'Church Slavic'], ['CV', 'Chuvash'],
+  ['CY', 'Welsh'], ['DA', 'Danish'], ['DE', 'German'], ['DV', 'Divehi'], ['DZ', 'Dzongkha'],
+  ['EE', 'Ewe'], ['EL', 'Greek'], ['EN', 'English'], ['EO', 'Esperanto'], ['ES', 'Spanish'],
+  ['ET', 'Estonian'], ['EU', 'Basque'], ['FA', 'Persian'], ['FF', 'Fulah'], ['FI', 'Finnish'],
+  ['FJ', 'Fijian'], ['FO', 'Faroese'], ['FR', 'French'], ['FY', 'Western Frisian'], ['GA', 'Irish'],
+  ['GD', 'Scottish Gaelic'], ['GL', 'Galician'], ['GN', 'Guarani'], ['GU', 'Gujarati'], ['GV', 'Manx'],
+  ['HA', 'Hausa'], ['HE', 'Hebrew'], ['HI', 'Hindi'], ['HO', 'Hiri Motu'], ['HR', 'Croatian'],
+  ['HT', 'Haitian'], ['HU', 'Hungarian'], ['HY', 'Armenian'], ['HZ', 'Herero'], ['IA', 'Interlingua'],
+  ['ID', 'Indonesian'], ['IE', 'Interlingue'], ['IG', 'Igbo'], ['II', 'Sichuan Yi'], ['IK', 'Inupiaq'],
+  ['IO', 'Ido'], ['IS', 'Icelandic'], ['IT', 'Italian'], ['IU', 'Inuktitut'], ['JA', 'Japanese'],
+  ['JV', 'Javanese'], ['KA', 'Georgian'], ['KG', 'Kongo'], ['KI', 'Kikuyu'], ['KJ', 'Kuanyama'],
+  ['KK', 'Kazakh'], ['KL', 'Kalaallisut'], ['KM', 'Khmer'], ['KN', 'Kannada'], ['KO', 'Korean'],
+  ['KR', 'Kanuri'], ['KS', 'Kashmiri'], ['KU', 'Kurdish'], ['KV', 'Komi'], ['KW', 'Cornish'],
+  ['KY', 'Kyrgyz'], ['LA', 'Latin'], ['LB', 'Luxembourgish'], ['LG', 'Ganda'], ['LI', 'Limburgish'],
+  ['LN', 'Lingala'], ['LO', 'Lao'], ['LT', 'Lithuanian'], ['LU', 'Luba-Katanga'], ['LV', 'Latvian'],
+  ['MG', 'Malagasy'], ['MH', 'Marshallese'], ['MI', 'Māori'], ['MK', 'Macedonian'], ['ML', 'Malayalam'],
+  ['MN', 'Mongolian'], ['MR', 'Marathi'], ['MS', 'Malay'], ['MT', 'Maltese'], ['MY', 'Burmese'],
+  ['NA', 'Nauru'], ['NB', 'Norwegian Bokmål'], ['ND', 'North Ndebele'], ['NE', 'Nepali'], ['NG', 'Ndonga'],
+  ['NL', 'Dutch'], ['NN', 'Norwegian Nynorsk'], ['NO', 'Norwegian'], ['NR', 'South Ndebele'], ['NV', 'Navajo'],
+  ['NY', 'Chichewa'], ['OC', 'Occitan'], ['OJ', 'Ojibwa'], ['OM', 'Oromo'], ['OR', 'Odia'],
+  ['OS', 'Ossetian'], ['PA', 'Punjabi'], ['PI', 'Pali'], ['PL', 'Polish'], ['PS', 'Pashto'],
+  ['PT', 'Portuguese'], ['QU', 'Quechua'], ['RM', 'Romansh'], ['RN', 'Rundi'], ['RO', 'Romanian'],
+  ['RU', 'Russian'], ['RW', 'Kinyarwanda'], ['SA', 'Sanskrit'], ['SC', 'Sardinian'], ['SD', 'Sindhi'],
+  ['SE', 'Northern Sami'], ['SG', 'Sango'], ['SI', 'Sinhala'], ['SK', 'Slovak'], ['SL', 'Slovenian'],
+  ['SM', 'Samoan'], ['SN', 'Shona'], ['SO', 'Somali'], ['SQ', 'Albanian'], ['SR', 'Serbian'],
+  ['SS', 'Swati'], ['ST', 'Southern Sotho'], ['SU', 'Sundanese'], ['SV', 'Swedish'], ['SW', 'Swahili'],
+  ['TA', 'Tamil'], ['TE', 'Telugu'], ['TG', 'Tajik'], ['TH', 'Thai'], ['TI', 'Tigrinya'],
+  ['TK', 'Turkmen'], ['TL', 'Tagalog'], ['TN', 'Tswana'], ['TO', 'Tongan'], ['TR', 'Turkish'],
+  ['TS', 'Tsonga'], ['TT', 'Tatar'], ['TW', 'Twi'], ['TY', 'Tahitian'], ['UG', 'Uyghur'],
+  ['UK', 'Ukrainian'], ['UR', 'Urdu'], ['UZ', 'Uzbek'], ['VE', 'Venda'], ['VI', 'Vietnamese'],
+  ['VO', 'Volapük'], ['WA', 'Walloon'], ['WO', 'Wolof'], ['XH', 'Xhosa'], ['YI', 'Yiddish'],
+  ['YO', 'Yoruba'], ['ZA', 'Zhuang'], ['ZH', 'Chinese'], ['ZU', 'Zulu'],
+]
 // Country-of-origin suffix codes (backend _KNOWN_COUNTRY_SUFFIX_CODES,
 // vod_db._country_suffix_code) -- a separate, trailing-tag provider
 // convention from the leading language prefixes above, e.g. "Married at
@@ -2861,7 +2900,7 @@ function DownloadsCard() {
   const statusColor: Record<string, string> = { running: 'text-primary', queued: 'text-muted-foreground', done: 'text-emerald-500', failed: 'text-destructive', cancelled: 'text-muted-foreground' }
 
   return (
-    <SectionCard title="Downloads (save files to your library)" icon={<Download size={14} />}>
+    <SectionCard title="Downloads (save files to your library)" description="Manage downloads and save completed files to your library." icon={<Download size={14} />}>
       <p className="text-xs text-muted-foreground">
         Off by default. Turn this on to save movies and episodes from your providers as real files in a folder, named the way
         Emby, Jellyfin and Plex expect (<code>Movies/Title (Year) [tmdbid-N]/…</code>, <code>Shows/Show (Year) [tmdbid-N]/Season NN/…</code>; the TMDB id tag can be turned off).
@@ -3237,7 +3276,7 @@ function HandoffCard() {
   )
 
   return (
-    <SectionCard title="Library handoff (Radarr / Sonarr)" icon={<ArrowRightLeft size={14} />}>
+    <SectionCard title="Library handoff (Radarr / Sonarr)" description="Send completed downloads to Radarr or Sonarr." icon={<ArrowRightLeft size={14} />}>
       <p className="text-xs text-muted-foreground">
         Optional. When a download finishes, vod-manager waits for the file to appear in the finished folder (straight away, or after an
         encoder such as Tdarr is done with it) and asks Radarr or Sonarr to import it, so it lands in your library with their naming and
@@ -3443,7 +3482,7 @@ function LibraryPresenceCard({ providers }: { providers: Provider[] }) {
   }
 
   return (
-    <SectionCard title="In Library (your Plex / Jellyfin / Emby)" icon={<CheckCircle2 size={14} />}>
+    <SectionCard title="In Library (your Plex / Jellyfin / Emby)" description="Review items already present in connected libraries." icon={<CheckCircle2 size={14} />}>
       <p className="text-xs text-muted-foreground">
         Optional. Marks movies, shows and episodes your own media server already has with a lime "In Library" badge, and asks before
         downloading them again. vod-manager reads the libraries you tick below on a schedule and keeps a local list; cards never call
@@ -6535,13 +6574,25 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   // so toggling it takes effect immediately on already-imported content in
   // both directions (see vod_db.archive_disabled_language_content, which
   // re-evaluates review_excluded both ways).
-  const enabledLanguagesQuery = useQuery<{ codes: string[] }>({
+  const enabledLanguagesQuery = useQuery<{ codes: string[]; primary_language?: string }>({
     queryKey: ['vod-enabled-languages'],
     queryFn:  () => api.get('/vod/enabled-languages/').then((r) => r.data),
   })
   const saveEnabledLanguages = useMutation({
     mutationFn: (codes: string[]) => api.post('/vod/enabled-languages/', { codes }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] }),
+  })
+  const [primaryLanguageDraft, setPrimaryLanguageDraft] = useState('EN')
+  useEffect(() => {
+    if (enabledLanguagesQuery.data?.primary_language) setPrimaryLanguageDraft(enabledLanguagesQuery.data.primary_language)
+  }, [enabledLanguagesQuery.data?.primary_language])
+  const savePrimaryLanguage = useMutation({
+    mutationFn: (code: string) => api.post('/vod/primary-language/', { code }).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['vod-enabled-languages'] })
+      notify('Primary language saved.')
+    },
+    onError: (err: any) => notify(err?.response?.data?.detail ?? 'Could not save primary language.'),
   })
   const [enabledLanguageDraft, setEnabledLanguageDraft] = useState<Set<string>>(new Set())
   const enabledLanguageDraftInitialized = useRef(false)
@@ -8258,7 +8309,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const mdblistGroups = listGroups((src) => src.startsWith('mdblist:'))
 
   const renderListSection = (cfg: { title: string; intro: string; emptyText: string; groups: { sync_source: string; categories: Category[] }[]; prefix: string; syncTitle: string; idPlaceholder: string; form: { list_id: string; name_template: string; movie_label: string; tv_label: string }; setForm: (f: { list_id: string; name_template: string; movie_label: string; tv_label: string }) => void; addMutation: { mutate: () => void; isPending: boolean } }) => (
-      <SectionCard title={cfg.title} icon={<RefreshCw size={14} />}>
+      <SectionCard title={cfg.title} description="Run and review this background catalog task." icon={<RefreshCw size={14} />}>
         <p className="text-xs text-muted-foreground">{cfg.intro}</p>
         {cfg.groups.length === 0 && <p className="text-xs text-muted-foreground">{cfg.emptyText}</p>}
         <div className="space-y-2">
@@ -8390,7 +8441,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </div>
         </Modal>
       )}
-      <SectionCard title="Activity" icon={<Play size={14} />}>
+      <SectionCard title="Activity" description="See active playback and transfer activity." icon={<Play size={14} />}>
         {!activityQuery.data?.length && <p className="text-xs text-muted-foreground">Nothing playing right now.</p>}
         {!!activityQuery.data?.length && (
           <table className="w-full text-xs">
@@ -8433,7 +8484,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Failed Streams" icon={<AlertCircle size={14} />}>
+      <SectionCard title="Failed Streams" description="Review streams that failed during playback." icon={<AlertCircle size={14} />}>
         <p className="text-xs text-muted-foreground">
           Playback attempts that failed outright (every source exhausted) or broke mid-stream after starting —
           persisted across restarts, unlike Activity above.
@@ -8520,7 +8571,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'config' && (
       <>
-      <SectionCard title="API Keys" icon={<CheckCircle2 size={14} />}>
+      <SectionCard title="API Keys" description="Manage credentials for connected services." icon={<CheckCircle2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           TMDB API key (v3) — used for all TMDB lookups: bulk metadata enrichment, ID matching, trailers, and syncing categories from public TMDB Lists.
         </p>
@@ -8629,7 +8680,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         ))}
       </SectionCard>
 
-      <SectionCard title="Notifications" icon={<Mail size={14} />}>
+      <SectionCard title="Notifications" description="Configure notices and email alerts." icon={<Mail size={14} />}>
         <p className="text-xs text-muted-foreground">
           SMTP — powers DVR disk-quota warnings (see DVR Users below). Sent to this admin recipient list, plus
           each person's own email if they've set one on their portal account (Portal Access below, or they can
@@ -8682,7 +8733,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
       </SectionCard>
 
-      <SectionCard title="Security" icon={<ShieldCheck size={14} />}>
+      <SectionCard title="Security" description="Configure login protection and lockout behavior." icon={<ShieldCheck size={14} />}>
         <p className="text-xs text-muted-foreground">
           Per-IP lockout on the XC login (below Connected Instances) — repeated failed attempts from one
           address get temporarily locked out. Changes apply within ~30s (cached, not re-read on every request).
@@ -8731,7 +8782,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
       </SectionCard>
 
-      <SectionCard title="Navigation" icon={<LayoutGrid size={14} />}>
+      <SectionCard title="Navigation" description="Choose which sections appear in the admin menu." icon={<LayoutGrid size={14} />}>
         <p className="text-xs text-muted-foreground">
           Hide the whole DVR section from the sidebar for installs that don't use it, without touching anything
           already configured — recording rules, scheduled recordings, and portal accounts stay intact and start
@@ -8748,7 +8799,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </label>
       </SectionCard>
 
-      <SectionCard title="Refresh Schedule" icon={<RefreshCw size={14} />}>
+      <SectionCard title="Refresh Schedule" description="Control catalog refresh and background task timing." icon={<RefreshCw size={14} />}>
         <p className="text-xs text-muted-foreground">
           How often each provider type's catalog gets automatically re-imported, how long enrichment (posters,
           cast, genre) is cached before refetching, and how often TMDB Lists auto-sync. Plex/Emby libraries can
@@ -8831,7 +8882,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
       </SectionCard>
 
-      <SectionCard title="Connected Instances" icon={<Zap size={14} />}>
+      <SectionCard title="Connected Instances" description="Manage connected media and Dispatcharr instances." icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Each Dispatcharr instance (or other XC client) pulling from this pool gets its own credential pair —
           use <code className="bg-muted px-1 rounded">{window.location.origin}</code> as the server URL in that
@@ -9003,7 +9054,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
       </SectionCard>
 
-      <SectionCard title="Emby / Jellyfin Library (.strm export)" icon={<HardDriveDownload size={14} />}>
+      <SectionCard title="Emby / Jellyfin Library (.strm export)" description="Export and maintain media-server library links." icon={<HardDriveDownload size={14} />}>
         <p className="text-xs text-muted-foreground">
           Emby and Jellyfin can't use the Xtream (XC) API for movies and shows, but they can scan a folder. This writes your
           curated library as small <code>.strm</code> files (one stream URL each, named the way Emby/Jellyfin expect, with the
@@ -9063,7 +9114,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Dispatcharr Connections" icon={<Zap size={14} />}>
+      <SectionCard title="Dispatcharr Connections" description="Manage Dispatcharr instances and synchronized accounts." icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Who VOD & DVR Manager itself reaches out to — the other side of Connected Instances above (who's allowed to
           reach in). Used to push each provider's stream limit into Dispatcharr's own connection accounting, and
@@ -9475,7 +9526,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )
       })()}
 
-      <SectionCard title="Backup & Restore" icon={<HardDriveDownload size={14} />}>
+      <SectionCard title="Backup & Restore" description="Protect and restore application data." icon={<HardDriveDownload size={14} />}>
         <p className="text-xs text-muted-foreground">
           Each piece can be backed up, restored, or reset independently — e.g. wipe a corrupt
           database without touching saved credentials, or roll back just the config.
@@ -9528,7 +9579,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </table>
       </SectionCard>
 
-      <SectionCard title="Diagnostics" icon={<Stethoscope size={14} />}>
+      <SectionCard title="Diagnostics" description="Inspect system health and troubleshooting details." icon={<Stethoscope size={14} />}>
         <p className="text-xs text-muted-foreground">
           Downloads this app's own log history with provider credentials, hostnames, and IP addresses
           scrubbed — safe to share when reporting a bug or asking for help.
@@ -9543,7 +9594,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'recovery' && (
       <>
-      <SectionCard title="Stream Recovery" icon={<Activity size={14} />}>
+      <SectionCard title="Stream Recovery" description="Review and recover interrupted stream activity." icon={<Activity size={14} />}>
         <p className="text-xs text-muted-foreground">
           Movies are hidden from client VOD listings only after every active playable source repeatedly fails.
           Test an individual provider copy below. A successful stream immediately restores the movie; a failed test leaves it blocked.
@@ -9603,7 +9654,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'metadata' && (
       <>
-      <SectionCard title="Metadata Review" icon={<Search size={14} />}>
+      <SectionCard title="Metadata Review" description="Review titles needing metadata attention." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
           Fix active movies and shows the provider left without a usable TMDB identity, whether or not a year is present, plus the held ambiguous-year queue.
           Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
@@ -9707,7 +9758,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           </>
         )}
       </SectionCard>
-      <SectionCard title="Incorrect TMDB IDs" icon={<Search size={14} />}>
+      <SectionCard title="Incorrect TMDB IDs" description="Review catalog items with TMDB lookups that need correction." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
           Titles whose stored TMDB ID TMDB itself has confirmed no longer exists (a 404 on lookup) — different from
           Metadata Review above, which is for titles with no TMDB identity at all. Search TMDB and select the exact
@@ -9793,11 +9844,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
-      <SectionCard title="Rich Metadata (posters, genre, cast)" icon={<Sparkles size={14} />}>
-        <p className="text-xs text-muted-foreground">
-          Fetches detail (genre, poster, description, cast) from each item's source provider for every movie
-          and series in the pool. Runs in the background — safe to navigate away while it works.
-        </p>
+      <SectionCard title="Rich Metadata (posters, genre, cast)" description="Fetch poster, genre, description, and cast details in the background." icon={<Sparkles size={14} />}>
         <div className="flex items-center gap-1.5">
           <Button size="sm" disabled={!!enrichProgress?.running || startBulkEnrich.isPending} onClick={() => startBulkEnrich.mutate(false)}>
             {enrichProgress?.running ? <Loader2 size={12} className="animate-spin mr-1" /> : <Sparkles size={12} className="mr-1" />}
@@ -9867,7 +9914,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'config' && (
       <>
-      <SectionCard title="Title & Metadata Rules" icon={<Zap size={14} />}>
+      <SectionCard title="Title & Metadata Rules" description="Control automatic title cleanup and metadata behavior." icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Find/replace applied to imported text, e.g. stripping a provider's own quality-tier prefix ("4K: Movie" → "Movie").
           Matches plain text by default (safest for the common case — a stray regex character like "|" can't accidentally
@@ -9948,7 +9995,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'providers' && (
       <>
-      <SectionCard title="Providers" icon={<RefreshCw size={14} />}>
+      <SectionCard title="Providers" description="Manage provider accounts, limits, and catalog access." icon={<RefreshCw size={14} />}>
         <p className="text-sm text-muted-foreground">
           Every catalog source feeding the pool -- Xtream Codes, Plex, Emby, Jellyfin, or a folder of your own files (local, SMB or NFS mount). (DVR is enabled per Dispatcharr
           connection in Configuration, not added here.)
@@ -10636,6 +10683,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
+      <div className="grid gap-4 lg:grid-cols-3 items-stretch">
       <SectionCard title="Enabled Playback Languages" icon={<Play size={14} />}>
         <p className="text-xs text-muted-foreground">
           Which source languages are allowed for playback/export, right now — a live filter, not an import-time rule
@@ -10877,13 +10925,39 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           Save selected countries
         </Button>
       </SectionCard>
+      </div>
+      <SectionCard title="Primary Language" description="Choose the default language used during detection and correction." icon={<Languages size={14} />}>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="text-xs font-medium" htmlFor="primary-playback-language">Primary language</label>
+          <select
+            id="primary-playback-language"
+            className={inputCls('min-w-48')}
+            value={primaryLanguageDraft}
+            onChange={(e) => setPrimaryLanguageDraft(e.target.value)}
+            disabled={savePrimaryLanguage.isPending || (enabledLanguagesQuery.data?.codes ?? []).length === 0}
+          >
+            {PRIMARY_LANGUAGE_OPTIONS.map(([code, name]) => (
+              <option key={code} value={code}>{code} — {name}</option>
+            ))}
+          </select>
+          <Button
+            size="sm"
+            disabled={savePrimaryLanguage.isPending || !(enabledLanguagesQuery.data?.codes ?? []).includes(primaryLanguageDraft)}
+            onClick={() => savePrimaryLanguage.mutate(primaryLanguageDraft)}
+          >
+            {savePrimaryLanguage.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : null}
+            Save primary language
+          </Button>
+        </div>
+      </SectionCard>
       </>
       )}
+
 
       {activeTab === 'dvr' && (
       <>
         {!dvrProviders.length ? (
-          <SectionCard title="DVR" icon={<CalendarClock size={14} />}>
+      <SectionCard title="DVR" description="Manage recordings, users, rules, and DVR libraries." icon={<CalendarClock size={14} />}>
             <p className="text-xs text-muted-foreground">
               DVR isn't enabled on any Dispatcharr connection yet. Go to Configuration → Dispatcharr Connections and click "Enable DVR" on the one you want to use.
             </p>
@@ -10905,7 +10979,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
             {dvrSubTab === 'scheduled' && (
               <>
-                <SectionCard title="Recording Rules" icon={<CalendarClock size={14} />}>
+                <SectionCard title="Recording Rules" description="Control recording schedules and retention." icon={<CalendarClock size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     Each rule schedules real Dispatcharr recordings for a specific show on a specific channel, and
                     re-checks for new episodes automatically. When one finishes, it's routed into the categories
@@ -11104,7 +11178,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </div>
                 </SectionCard>
 
-                <SectionCard title="Upcoming Recordings" icon={<CalendarDays size={14} />}>
+                <SectionCard title="Upcoming Recordings" description="Review scheduled recordings and their status." icon={<CalendarDays size={14} />}>
                   {dvrUpcomingQuery.isLoading && <p className="text-xs text-muted-foreground">Loading…</p>}
                   {dvrUpcomingQuery.data && !dvrUpcomingQuery.data.length && (
                     <p className="text-xs text-muted-foreground">Nothing scheduled right now.</p>
@@ -11140,7 +11214,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
             {dvrSubTab === 'users' && (
               <>
-              <SectionCard title="Users" icon={<Users size={14} />}>
+              <SectionCard title="Users" description="Manage DVR users and per-user limits." icon={<Users size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Opt-in per person -- only enforced for someone listed here. Stream reserve predicts whether a new
                   recording rule could require more simultaneous recordings than their Dispatcharr account allows.
@@ -11431,7 +11505,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                 {dvrLimitError && <p className="text-xs text-destructive">{dvrLimitError}</p>}
               </SectionCard>
 
-              <SectionCard title="Portal Access" icon={<ShieldCheck size={14} />}>
+              <SectionCard title="Portal Access" description="Configure portal access and user-facing settings." icon={<ShieldCheck size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Lets a person log into their own DVR portal -- schedule recordings, see their upcoming recordings and
                   usage, browse what they've recorded -- through a login that's separate from both this admin panel and
@@ -11538,7 +11612,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             )}
 
             {dvrSubTab === 'library' && (
-              <SectionCard title="DVR Library" icon={<HardDriveDownload size={14} />}>
+              <SectionCard title="DVR Library" description="Review recordings and imported DVR media." icon={<HardDriveDownload size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Everything this provider has recorded and imported into the pool. Deleting here only removes this
                   provider's own copy -- if the same title is also sourced from somewhere else, that copy is
@@ -11644,7 +11718,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             )}
 
             {dvrSubTab === 'missing' && (
-              <SectionCard title="Missing Episodes" icon={<Search size={14} />}>
+              <SectionCard title="Missing Episodes" description="Find episodes missing from configured libraries." icon={<Search size={14} />}>
                 <p className="text-sm text-muted-foreground">
                   Every gap across every monitored show with an active recording rule -- not just ones this provider
                   has already recorded an episode for. Unmonitor a rule (the eye icon under Scheduled) to keep a show
@@ -11675,7 +11749,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
             {dvrSubTab === 'metrics' && (
               <>
-                <SectionCard title="People" icon={<Users size={14} />}>
+                <SectionCard title="People" description="Review people metadata linked to catalog titles." icon={<Users size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     Storage and real watch activity per person, from Dispatcharr's own live connection stats
                     (confirmed live it carries a real per-person identity, polled into history in the background).
@@ -11709,7 +11783,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </div>
                 </SectionCard>
 
-                <SectionCard title="Recording Load by Channel" icon={<CalendarClock size={14} />}>
+                <SectionCard title="Recording Load by Channel" description="See recording demand across channels." icon={<CalendarClock size={14} />}>
                   <p className="text-sm text-muted-foreground">How many active recording rules target each channel -- useful for spotting one channel carrying most of the load, or a rule pointed at the wrong channel.</p>
                   {(() => {
                     const byChannel = new Map<number, number>()
@@ -11732,7 +11806,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   })()}
                 </SectionCard>
 
-                <SectionCard title="Rule Health" icon={<CalendarDays size={14} />}>
+                <SectionCard title="Rule Health" description="Check recording rule coverage and health." icon={<CalendarDays size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     On-demand check only -- re-searches each rule's own channel right now. 0 matches means either a
                     genuine hiatus/break or something worth a closer look, not necessarily broken.
@@ -11765,7 +11839,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </div>
                 </SectionCard>
 
-                <SectionCard title="Unresolved Missing Episodes" icon={<Search size={14} />}>
+                <SectionCard title="Unresolved Missing Episodes" description="Review missing episodes needing manual resolution." icon={<Search size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     Episodes the DVR Library's "Find" action couldn't locate anywhere -- not already in the pool, and
                     no EPG airing found either. Worth checking manually against Plex/Emby/Jellyfin if configured.
@@ -11788,7 +11862,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </div>
                 </SectionCard>
 
-                <SectionCard title="Failed Recording Replacements" icon={<CalendarClock size={14} />}>
+                <SectionCard title="Failed Recording Replacements" description="Review failed recording replacement attempts." icon={<CalendarClock size={14} />}>
                   <p className="text-sm text-muted-foreground">
                     Recordings Dispatcharr scheduled and attempted but that genuinely failed -- Dispatcharr never
                     retries these on its own. VOD & DVR Manager looks for the same episode's next airing on any channel in
@@ -11827,7 +11901,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'curation' && (
       <>
-      <SectionCard title="Orphan Checker" icon={<Trash2 size={14} />}>
+      <SectionCard title="Orphan Checker" description="Find files or records no longer linked to catalog items." icon={<Trash2 size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds dead rows a provider deletion (or a bug) can leave behind: series whose only source provider no
           longer exists, and movies/episodes with zero sources at all. Doesn't flag series with no episodes yet —
@@ -11881,7 +11955,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Uncategorized Checker" icon={<Search size={14} />}>
+      <SectionCard title="Uncategorized Checker" description="Find catalog items without a usable category." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds movies/series with real sources that still aren't visible to Dispatcharr, because they're in zero
           categories -- the catch-all sweep (All Movies/All TV Shows) should normally catch these on its own within
@@ -11934,7 +12008,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Language Backfill" icon={<Search size={14} />}>
+      <SectionCard title="Language Backfill" description="Recompute language tags and preview existing catalog changes." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
           Every source's language (used by Enabled Playback Languages, Import Language Exclusion, and Duplicate
           Finder's language matching) is detected from its raw title and provider category. Rows written before that
@@ -11988,7 +12062,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Language Split" icon={<Search size={14} />}>
+      <SectionCard title="Language Split" description="Preview and apply language-based catalog separation." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
           A movie/series with sources in two languages that share no common source got auto-merged together back
           when auto-merging only checked for a shared TMDB id -- before the current auto-merge language gate existed.
@@ -12038,7 +12112,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         ))}
       </SectionCard>
 
-      <SectionCard title="Stream Priority" icon={<Zap size={14} />}>
+      <SectionCard title="Stream Priority" description="Choose how sources are prioritized for playback." icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           When a title has sources from more than one provider, which one plays: by provider priority (Providers
           page), by quality (detected from "4K"/"UHD"/"FHD"/"HD" markers in the provider's own stream name or
@@ -12057,7 +12131,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </select>
       </SectionCard>
 
-      <SectionCard title="Genre Categories" icon={<Tag size={14} />}>
+      <SectionCard title="Genre Categories" description="Manage category placement based on TMDB genres." icon={<Tag size={14} />}>
         <p className="text-xs text-muted-foreground">
           Replace provider categories like "EN - ACTION &amp; WAR" with plain genres. Pick genres from your library and
           this creates one smart category for each (named after the genre, rule "genre contains …", so a title in
@@ -12121,7 +12195,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         {genreResult && <p className="text-xs text-muted-foreground">{genreResult}</p>}
       </SectionCard>
 
-      <SectionCard title="Automatic TMDB Episode Titles" icon={<Sparkles size={14} />}>
+      <SectionCard title="Automatic TMDB Episode Titles" description="Update episode names from TMDB when matches are available." icon={<Sparkles size={14} />}>
         <p className="text-xs text-muted-foreground">
           When a provider adds episodes later, their names often arrive as "Episode 5" or with the season/episode code
           in them. This fills those in from TMDB on its own (hourly, up to 100 series per pass) instead of you
@@ -12159,7 +12233,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </div>
       </SectionCard>
 
-      <SectionCard title="Client Title Format" icon={<Type size={14} />}>
+      <SectionCard title="Client Title Format" description="Choose how titles are formatted for clients." icon={<Type size={14} />}>
         <p className="text-xs text-muted-foreground">
           Controls only what VOD clients (Dispatcharr, TiviMate, etc.) see in the title text — the pool's own name/
           year fields, dedup matching, and Title & Metadata Rules are unaffected. Combine with "Apply TMDB Titles"
@@ -12177,7 +12251,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         </label>
       </SectionCard>
 
-      <SectionCard title="Flagged Content" icon={<Flag size={14} />}>
+      <SectionCard title="Flagged Content" description="Review content marked for follow-up." icon={<Flag size={14} />}>
         <p className="text-xs text-muted-foreground">
           Items a human reported as "this isn't actually what its label says" -- at the movie/series, episode, or
           single-provider-source level (see the flag icon on any item's detail view). Resolving here just clears
@@ -12234,7 +12308,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         )}
       </SectionCard>
 
-      <SectionCard title="Duplicate Finder" icon={<Copy size={14} />}>
+      <SectionCard title="Duplicate Finder" description="Find possible duplicate movies and shows for review." icon={<Copy size={14} />}>
         <p className="text-xs text-muted-foreground">
           Finds pool entries that look like the same real title split into two rows: names that only differ by
           cosmetic punctuation (a colon, a dash, quote style), or the same name with years one apart (a provider
@@ -12424,7 +12498,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'movies' && (
       <>
-      <SectionCard title="Movies" icon={<Film size={14} />}>
+      <SectionCard title="Movies" description="Browse and manage movie sources." icon={<Film size={14} />} collapsible={false}>
         <div className="flex items-center gap-1.5 flex-wrap">
           <input
             className={inputCls('w-64')}
@@ -12658,7 +12732,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'series' && (
       <>
-      <SectionCard title="TV Shows" icon={<Tv size={14} />}>
+      <SectionCard title="TV Shows" description="Browse and manage show sources." icon={<Tv size={14} />} collapsible={false}>
         <div className="flex items-center gap-1.5 flex-wrap">
           <input
             className={inputCls('w-64')}
