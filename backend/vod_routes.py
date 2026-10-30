@@ -4162,6 +4162,12 @@ async def check_source_language(body: SourceLanguageProbeRequest):
 async def language_mismatch_report():
     report = await asyncio.to_thread(vod_db.list_language_mismatches)
     report["trickle"] = vod_probe.language_trickle_status()
+    report["stats"] = await asyncio.to_thread(vod_db.language_audit_stats)
+    report["errors"] = await asyncio.to_thread(vod_db.list_language_probe_errors)
+    report["capacity_holds"] = await asyncio.to_thread(vod_db.list_language_probe_capacity_holds)
+    # The backlog card represents actual actionable mismatch rows, not every
+    # observed source. Wanted-only probe results are history, not review work.
+    report["stats"]["pending_review"] = report["count"]
     if report["count"] and not await asyncio.to_thread(vod_db.has_open_notice_kind, "language_mismatch"):
         await asyncio.to_thread(
             notices.add, "language_mismatch", "warn", "Language mismatch approval needed",

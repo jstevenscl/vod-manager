@@ -52,6 +52,7 @@ LANGUAGE_TRICKLE_DAILY_MAX = 500
 LANGUAGE_GLOBAL_MAX = 15
 LANGUAGE_WINDOW_SECONDS = 900.0
 LANGUAGE_WINDOW_MAX: int | None = None
+LANGUAGE_CAPACITY_HOLD_SECONDS = 2 * 60 * 60
 
 _in_flight: set[int] = set()          # provider ids with a probe running right now
 _running_total = 0
@@ -256,7 +257,7 @@ async def _fetch_head(url: str, user_agent: str | None, provider_name: str, pid:
                 snippet = vod_downloader._safe(data[:300].decode("utf-8", "replace")).lower()
                 if any(w in snippet for w in vod_downloader._CAPACITY_WORDS):
                     vod_downloader._cooldown_until[pid] = time.time() + 120
-                    raise ProbeRefused(f"{provider_name} is at its connection limit. Try again in a couple of minutes.", 120, "pushback")
+                    raise ProbeRefused(f"{provider_name} is at its connection limit. It will be checked again after the capacity hold.", LANGUAGE_CAPACITY_HOLD_SECONDS, "capacity")
                 raise ProbeRefused(f"{provider_name} returned a web page instead of a video for this source.", 900, "provider_error")
             return data, total
 
@@ -376,8 +377,20 @@ async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: 
             if reservation is None:
                 raise ProbeRefused(f"{provider['name']} has no free probe connection.", 60, "capacity")
         url = await xc_server._build_upstream_url("movie" if kind == "movie" else "series", provider, src, reservation)
-        data, _ = await asyncio.wait_for(
-            _fetch_head(url, provider.get("custom_user_agent"), provider["name"], pid), PROBE_TIMEOUT)
+        try:
+            data, _ = await asyncio.wait_for(
+                _fetch_head(url, provider.get("custom_user_agent"), provider["name"], pid), PROBE_TIMEOUT)
+        except ProbeRefused as exc:
+            if reservation is not None and exc.kind != "capacity":
+                await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
+            raise
+        except (asyncio.TimeoutError, httpx.HTTPError, OSError):
+            if reservation is not None:
+                await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
+            raise
+        # The provider accepted a media response, so capacity is available.
+        if reservation is not None:
+            await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
         fd, tmp = tempfile.mkstemp(suffix=".bin", prefix="vodlangprobe-")
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -448,6 +461,11 @@ async def language_trickle_once(target: dict | None = None) -> dict:
         return {"status": "idle", "checked_today": _language_trickle_count}
     try:
         result = await probe_language_source(target["kind"], target["source_id"], spacing=0)
+        await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, target["provider_id"])
+        await asyncio.to_thread(
+            vod_db.recover_language_probe_provider,
+            target["provider_id"], settings["language_trickle_probes_per_cycle"],
+        )
         _language_trickle_count += 1
         if result.get("mismatch"):
             import notices
@@ -458,7 +476,34 @@ async def language_trickle_once(target: dict | None = None) -> dict:
                 )
         return {"status": "checked", "checked_today": _language_trickle_count, "result": result}
     except ProbeRefused as exc:
-        return {"status": "deferred", "checked_today": _language_trickle_count, "retry_after": exc.retry_after, "message": str(exc)}
+        failure = None
+        capacity_hold = None
+        if exc.kind == "capacity":
+            capacity_hold = await asyncio.to_thread(
+                vod_db.hold_language_probe_provider,
+                target["provider_id"], target["kind"], target["source_id"],
+                str(exc), LANGUAGE_CAPACITY_HOLD_SECONDS,
+            )
+        elif _is_provider_throttle(exc):
+            await asyncio.to_thread(
+                vod_db.record_language_probe_throttle,
+                target["provider_id"],
+                re.search(r"HTTP (\d{3})", str(exc)).group(1) if re.search(r"HTTP (\d{3})", str(exc)) else "PUSHBACK",
+                str(exc), settings["language_trickle_probes_per_cycle"],
+            )
+        elif exc.kind == "provider_error":
+            failure = await asyncio.to_thread(
+                vod_db.record_language_probe_failure,
+                target["kind"], target["source_id"], str(exc),
+            )
+        await asyncio.to_thread(vod_db.record_language_probe_run,
+                                target["kind"], target["source_id"], target.get("provider_id"),
+                                "deferred", None, [], config.get_enabled_languages(), False, False, str(exc))
+        return {"status": "quarantined" if failure and failure["quarantined"] else "capacity_hold" if capacity_hold else "deferred",
+                "checked_today": current_count,
+                "retry_after": LANGUAGE_CAPACITY_HOLD_SECONDS if capacity_hold else exc.retry_after,
+                "next_retry_at": capacity_hold["next_retry_at"] if capacity_hold else None,
+                "message": str(exc), "failures": failure["failures"] if failure else 0}
     except Exception as exc:
         logger.exception("[language-probe] trickle check failed for %s", target)
         return {"status": "error", "checked_today": _language_trickle_count, "message": str(exc)}
@@ -495,10 +540,9 @@ async def run_language_trickle_cycle() -> dict:
         for target in queue:
             result = await language_trickle_once(target)
             results.append(result)
-            # A provider pushback, timeout, or capacity error pauses that
-            # provider for the day; do not immediately hammer its remaining
-            # queued sources in the same cycle.
-            if result.get("status") in ("deferred", "error"):
+            if result.get("status") == "capacity_hold":
+                # Capacity is provider-scoped. Stop trying sibling sources
+                # until the provider's two-hour retry is due.
                 break
         return results
 
