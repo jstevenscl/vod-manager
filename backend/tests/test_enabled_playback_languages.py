@@ -10,16 +10,28 @@ _enabled_languages_clause into the actual playback/export/failover query
 paths. Those are later, separate passes.
 """
 
+import pytest
+
 import config
 
 
 def test_get_enabled_languages_defaults_to_en_es(db):
     assert config.get_enabled_languages() == ["EN", "ES"]
+    assert config.get_primary_language() == "EN"
 
 
 def test_save_and_get_enabled_languages_roundtrips():
     config.save_enabled_languages(["en", " fr ", "DE"])
     assert config.get_enabled_languages() == ["EN", "FR", "DE"]
+
+
+def test_primary_language_must_be_enabled_and_roundtrips():
+    config.save_enabled_languages(["EN", "ES", "RU"])
+    config.save_primary_language(" ru ")
+    assert config.get_primary_language() == "RU"
+
+    with pytest.raises(ValueError, match="enabled playback languages"):
+        config.save_primary_language("IT")
 
 
 def test_source_language_detects_pipe_colon_dash_prefixes(db):

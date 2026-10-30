@@ -726,6 +726,22 @@ def save_enabled_languages(codes: list[str]) -> None:
         "enabled_playback_languages", [c.strip().upper() for c in codes if c.strip()]))
 
 
+def get_primary_language() -> str:
+    """Return the global default language used when one language must be assigned."""
+    data = _read_raw()
+    value = str(data.get("primary_playback_language") or "EN").strip().upper()
+    return value or "EN"
+
+
+def save_primary_language(code: str) -> None:
+    cleaned = str(code or "").strip().upper()
+    if not cleaned:
+        raise ValueError("primary language is required")
+    if cleaned not in set(get_enabled_languages()):
+        raise ValueError("primary language must be one of the enabled playback languages")
+    _update_raw(lambda data: data.__setitem__("primary_playback_language", cleaned))
+
+
 def get_default_categories_prompt_dismissed() -> bool:
     """Whether the admin has already answered the one-time "include 18+ in
     the built-in All Movies/All TV Shows categories?" prompt (see

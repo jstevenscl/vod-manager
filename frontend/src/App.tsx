@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CalendarDays, Database, Download, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
+  Activity, ArrowUp, CalendarDays, Database, Download, Film, Flame, HardDriveDownload, LayoutGrid, Loader2, LogOut, Moon,
   Palette, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Settings as SettingsIcon, Sun, Tv, Users, Wrench,
 } from 'lucide-react'
 import VodManager, { type DvrSubTab, type VodManagerTab } from '@/pages/VodManager'
@@ -27,6 +27,34 @@ function initTheme(): Theme {
   const t: Theme = (saved && (THEMES as readonly string[]).includes(saved)) ? saved as Theme : 'dark'
   document.documentElement.setAttribute('data-theme', t)
   return t
+}
+
+function ScrollToTopButton() {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const update = () => {
+      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+      setVisible(max > 0 && window.scrollY >= max * 0.1)
+    }
+    update()
+    window.addEventListener('scroll', update, { passive: true })
+    window.addEventListener('resize', update)
+    return () => {
+      window.removeEventListener('scroll', update)
+      window.removeEventListener('resize', update)
+    }
+  }, [])
+  if (!visible) return null
+  return (
+    <button
+      aria-label="Return to top"
+      title="Return to top"
+      className="fixed bottom-5 right-5 z-30 rounded-full border border-primary/50 bg-card p-3 text-primary shadow-lg hover:bg-accent"
+      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+    >
+      <ArrowUp size={17} />
+    </button>
+  )
 }
 
 type AuthState = 'checking' | 'login' | 'ready'
@@ -372,6 +400,7 @@ export default function App() {
             <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
           )}
         </main>
+        <ScrollToTopButton />
       </div>
     </div>
   )

@@ -22,6 +22,7 @@ from config import (
     get_default_categories_prompt_dismissed,
     get_duplicate_finder_quality_prefix_matching,
     get_enabled_languages,
+    get_primary_language,
     get_gemini_api_key,
     get_hide_dvr_tab,
     get_import_country_exclusion,
@@ -39,6 +40,7 @@ from config import (
     save_anthropic_api_key,
     save_duplicate_finder_quality_prefix_matching,
     save_enabled_languages,
+    save_primary_language,
     save_gemini_api_key,
     save_import_country_exclusion,
     save_import_language_exclusion,
@@ -141,6 +143,10 @@ class ImportCountryExclusionRequest(BaseModel):
 
 class EnabledLanguagesRequest(BaseModel):
     codes: list[str] = []
+
+
+class PrimaryLanguageRequest(BaseModel):
+    code: str
 
 
 class ProviderImportExcludeCategoriesRequest(BaseModel):
@@ -982,13 +988,30 @@ async def answer_default_categories_prompt(body: DefaultCategoriesAdultRequest):
 
 @router.get("/enabled-languages/", dependencies=_GUARDS)
 async def get_enabled_languages_setting():
-    return {"codes": get_enabled_languages()}
+    return {"codes": get_enabled_languages(), "primary_language": get_primary_language()}
+
+
+@router.get("/primary-language/", dependencies=_GUARDS)
+async def get_primary_language_setting():
+    return {"code": get_primary_language()}
+
+
+@router.post("/primary-language/", dependencies=_GUARDS)
+async def save_primary_language_setting(body: PrimaryLanguageRequest):
+    try:
+        save_primary_language(body.code)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"ok": True, "code": get_primary_language()}
 
 
 @router.post("/enabled-languages/", dependencies=_GUARDS)
 async def save_enabled_languages_setting(body: EnabledLanguagesRequest):
     save_enabled_languages(body.codes)
-    return {"ok": True}
+    enabled = get_enabled_languages()
+    if enabled and get_primary_language() not in enabled:
+        save_primary_language(enabled[0])
+    return {"ok": True, "primary_language": get_primary_language()}
 
 
 @router.get("/import-language-exclusion/", dependencies=_GUARDS)
