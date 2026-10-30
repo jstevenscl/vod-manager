@@ -186,6 +186,7 @@ def test_language_trickle_uses_experimental_limits_and_saved_playback_policy(db,
 
 
 def test_language_trickle_runs_up_to_source_limit_per_cycle(monkeypatch):
+    config.save_language_trickle_settings(15, 180, None, enabled=True)
     targets = [
         {"kind": "movie", "source_id": i, "provider_id": 1 if i < 8 else 2}
         for i in range(15)

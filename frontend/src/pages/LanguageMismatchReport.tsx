@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Languages, Loader2, RefreshCw, X } from 'lucide-react'
+import { Check, Languages, Loader2, Power, RefreshCw, X } from 'lucide-react'
 import api from '@/lib/api'
 import { notify } from '@/lib/confirm'
 
@@ -11,6 +11,7 @@ type Mismatch = {
   title: string
   year: number | null
   tmdb_id: string | null
+  container_extension: string | null
   provider_name: string
   configured_language: string | null
   observed_languages: string[]
@@ -55,7 +56,27 @@ export default function LanguageMismatchReport() {
   const report = useQuery<Report>({
     queryKey: ['language-mismatch-report'],
     queryFn: () => api.get('/vod/language-mismatch-report/').then((r) => r.data),
-    refetchInterval: 30_000,
+    refetchInterval: (query) => query.state.data?.trickle?.enabled ? 30_000 : false,
+  })
+  const settings = useQuery({ queryKey: ['language-trickle-settings'], queryFn: () => api.get('/vod/language-trickle/settings/').then((r) => r.data) })
+  const [form, setForm] = useState({ probes_per_cycle: 15, interval_seconds: 180, daily_limit: '' })
+  useEffect(() => {
+    if (settings.data) setForm({ probes_per_cycle: settings.data.language_trickle_probes_per_cycle, interval_seconds: settings.data.language_trickle_interval_seconds, daily_limit: settings.data.language_trickle_daily_limit == null ? '' : String(settings.data.language_trickle_daily_limit) })
+  }, [settings.data])
+  const saveSettings = useMutation({
+    mutationFn: () => api.post('/vod/language-trickle/settings/', { probes_per_cycle: Number(form.probes_per_cycle), interval_seconds: Number(form.interval_seconds), daily_limit: form.daily_limit === '' ? null : Number(form.daily_limit) }).then((r) => r.data),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['language-trickle-settings'] }); qc.invalidateQueries({ queryKey: ['language-mismatch-report'] }); notify('Language probe pacing saved.') },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not save language probe pacing.'),
+  })
+  const toggleEnabled = useMutation({
+    mutationFn: (enabled: boolean) => api.post('/vod/language-trickle/enabled/', { enabled }).then((r) => r.data),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['language-trickle-settings'] }); qc.invalidateQueries({ queryKey: ['language-mismatch-report'] }); notify('Language mismatch monitoring state saved.') },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not change language mismatch monitoring state.'),
+  })
+  const unblockProvider = useMutation({
+    mutationFn: (providerId: number) => api.post(`/vod/language-trickle/providers/${providerId}/unblock/`).then((r) => r.data),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['language-mismatch-report'] }); notify('Provider returned to normal monitoring.') },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not unblock provider.'),
   })
   const rows = report.data?.results ?? []
   const errors = report.data?.errors ?? []
@@ -80,7 +101,9 @@ export default function LanguageMismatchReport() {
   const capacitySortLabel = (column: typeof capacitySort, label: string) => <button className="text-left hover:text-white" onClick={() => sortCapacityBy(column)}>{label}{capacitySort === column ? (capacitySortAsc ? ' ▲' : ' ▼') : ''}</button>
   const capacityDate = (value: number) => new Date(value * 1000).toLocaleString()
   const key = (r: Mismatch) => `${r.kind}:${r.source_id}`
-  const selectable = useMemo(() => rows.filter((r) => r.safe_to_apply).map(key), [rows])
+  const providerOptions = useMemo(() => [...new Set(rows.map((row) => row.provider_name))], [rows])
+  const observedOptions = useMemo(() => [...new Set(rows.map((row) => row.observed_languages.join(', ')))], [rows])
+  const filteredRows = useMemo(() => rows.filter((row) => (!providerFilters.length || providerFilters.includes(row.provider_name)) && (!observedFilters.length || observedFilters.includes(row.observed_languages.join(', ')))), [rows, providerFilters, observedFilters])
   useEffect(() => {
     setSelected((old) => new Set([...old].filter((id) => rows.some((r) => key(r) === id))))
   }, [rows])
@@ -95,6 +118,15 @@ export default function LanguageMismatchReport() {
     },
     onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not record the language decision.'),
   })
+  const confirmDecision = (row: Mismatch, decision: 'approved' | 'rejected') => {
+    const observed = row.observed_languages.join(', ')
+    const message = decision === 'rejected'
+      ? `Keep ${row.title} as-is?\n\nNo language or archive changes will be made. This source will not be checked again.`
+      : row.proposed_archive
+        ? `Archive the parent for ${row.title}?\n\nThis records the observed language (${observed}) and archives the parent because it is outside your wanted playback languages.\n\nThis is not reversible from this prompt.`
+        : `Record ${observed} as the source language for ${row.title}?\n\nThe parent will not be archived.`
+    if (window.confirm(message)) decide.mutate({ row, decision })
+  }
   const runNow = useMutation({
     mutationFn: () => api.post('/vod/language-trickle/run/').then((r) => r.data),
     onSuccess: (result) => {
@@ -103,13 +135,45 @@ export default function LanguageMismatchReport() {
     },
     onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not start the language check cycle.'),
   })
-
   const runBulk = async (decision: 'approved' | 'rejected', all = false) => {
     const targets = all ? rows : rows.filter((r) => selected.has(key(r)))
     const safeTargets = decision === 'approved' ? targets.filter((r) => r.safe_to_apply) : targets
     if (!safeTargets.length) { notify(decision === 'approved' ? 'No single-language results are selected for approval.' : 'No mismatches are selected.'); return }
+    const archiveCount = safeTargets.filter((row) => row.proposed_archive).length
+    const message = decision === 'rejected'
+      ? `Keep ${safeTargets.length} selected source${safeTargets.length === 1 ? '' : 's'} as-is? No changes will be made.`
+      : archiveCount
+        ? `Apply ${safeTargets.length} selected decisions?\n\n${archiveCount} parent${archiveCount === 1 ? '' : 's'} will be archived because the observed language is outside your wanted playback languages.`
+        : `Record the observed language for ${safeTargets.length} selected source${safeTargets.length === 1 ? '' : 's'}? No parent will be archived.`
+    if (!window.confirm(message)) return
     for (const row of safeTargets) await decide.mutateAsync({ row, decision })
     setSelected(new Set())
+    setSelectionAnchor(null)
+  }
+
+  const toggleRowSelection = (row: Mismatch, index: number, event: React.ChangeEvent<HTMLInputElement>) => {
+    const id = key(row)
+    const shiftKey = (event.nativeEvent as Event & { shiftKey?: boolean }).shiftKey === true
+    setSelected((old) => {
+      const next = new Set(old)
+      const anchorIndex = shiftKey && selectionAnchor
+        ? filteredRows.findIndex((candidate) => key(candidate) === selectionAnchor)
+        : -1
+      if (anchorIndex >= 0) {
+        const start = Math.min(anchorIndex, index)
+        const end = Math.max(anchorIndex, index)
+        for (let i = start; i <= end; i += 1) {
+          const rangeId = key(filteredRows[i])
+          event.target.checked ? next.add(rangeId) : next.delete(rangeId)
+        }
+      } else if (event.target.checked) {
+        next.add(id)
+      } else {
+        next.delete(id)
+      }
+      return next
+    })
+    setSelectionAnchor(id)
   }
 
   if (report.isLoading) return <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={15} className="animate-spin" /> Loading language mismatch report…</div>
@@ -120,9 +184,10 @@ export default function LanguageMismatchReport() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-lg font-semibold flex items-center gap-2"><Languages size={18} /> Language Mismatch Report</h1>
-          <p className="text-xs text-muted-foreground mt-1">Embedded audio tags are compared with the configured wanted-language policy. Approved single-language results update the source metadata and archive the parent when the observed language is outside that policy. Reject records the decision and prevents automatic re-checking.</p>
+          <p className="text-xs text-muted-foreground mt-1">This report contains confirmed single-language mismatches only. Unknown or untagged results are reviewed separately. Every action asks for confirmation before changing anything.</p>
           <p className="text-xs text-muted-foreground mt-1">Wanted playback languages: {report.data?.enabled_languages.join(', ') || 'none'}</p>
-          {report.data?.trickle && <p className="text-xs text-muted-foreground mt-1">Trickle: up to {report.data.trickle.global_concurrency} probes every {report.data.trickle.interval_seconds}s · {report.data.trickle.checked_today}/{report.data.trickle.daily_max} today · language cap {report.data.trickle.language_window_max} per {Math.round(report.data.trickle.language_window_seconds / 60)} minutes{report.data.trickle.blocked_providers ? ` · ${report.data.trickle.blocked_providers} provider paused` : ''}</p>}
+          {report.data?.trickle && <p className="text-xs text-muted-foreground mt-1">Monitoring is {report.data.trickle.enabled ? 'enabled' : 'disabled'}.</p>}
+          {report.data?.trickle && <p className="text-xs text-muted-foreground mt-1">Trickle: {report.data.trickle.probes_per_cycle} targets every {report.data.trickle.interval_seconds}s · {report.data.trickle.checked_today} completed of {report.data.trickle.attempts_today} attempts today · {report.data.trickle.deferred_today} deferred · rotates across active providers</p>}
         </div>
         <span className="flex items-center gap-2">
           {report.data?.trickle && <button className={`flex items-center gap-1.5 border rounded px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50 ${report.data.trickle.enabled ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400'}`} disabled={toggleEnabled.isPending} onClick={() => toggleEnabled.mutate(!report.data!.trickle!.enabled)}><Power size={12} /> {report.data.trickle.enabled ? 'Disable monitoring' : 'Enable monitoring'}</button>}
@@ -205,38 +270,42 @@ export default function LanguageMismatchReport() {
       </details>
 
       <div className="flex flex-wrap items-center gap-2 border border-border rounded-md bg-card px-3 py-2 text-xs">
-        <span className="text-muted-foreground">{rows.length} pending mismatch{rows.length === 1 ? '' : 'es'}</span>
+        <span className="text-muted-foreground">{filteredRows.length} shown of {rows.length} pending mismatch{rows.length === 1 ? '' : 'es'}</span>
         <span className="text-muted-foreground">· {selected.size} selected</span>
-        <button className="ml-auto border border-border rounded px-2 py-1 hover:bg-accent" onClick={() => setSelected(new Set(selectable))}>Select all approvable</button>
+        <details className="relative"><summary className="cursor-pointer rounded border border-border px-2 py-1 text-[11px] text-foreground">Provider{providerFilters.length ? ` (${providerFilters.length})` : ''}</summary><div className="absolute left-0 z-30 mt-1 max-h-60 min-w-48 overflow-auto rounded border border-border bg-card p-2 shadow-lg">{providerOptions.map((provider) => <label className="flex items-center gap-2 whitespace-nowrap py-1 text-[11px] text-foreground" key={provider}><input type="checkbox" checked={providerFilters.includes(provider)} onChange={() => setProviderFilters((old) => old.includes(provider) ? old.filter((value) => value !== provider) : [...old, provider])} />{provider}</label>)}{providerFilters.length > 0 && <button className="mt-1 text-[11px] text-primary" onClick={() => setProviderFilters([])}>Clear providers</button>}</div></details>
+        <details className="relative"><summary className="cursor-pointer rounded border border-border px-2 py-1 text-[11px] text-foreground">Observed{observedFilters.length ? ` (${observedFilters.length})` : ''}</summary><div className="absolute left-0 z-30 mt-1 max-h-60 min-w-56 overflow-auto rounded border border-border bg-card p-2 shadow-lg">{observedOptions.map((observed) => <label className="flex items-center gap-2 whitespace-nowrap py-1 text-[11px] text-foreground" key={observed}><input type="checkbox" checked={observedFilters.includes(observed)} onChange={() => setObservedFilters((old) => old.includes(observed) ? old.filter((value) => value !== observed) : [...old, observed])} />{observed}</label>)}{observedFilters.length > 0 && <button className="mt-1 text-[11px] text-primary" onClick={() => setObservedFilters([])}>Clear observed</button>}</div></details>
+        <button className="border border-border rounded px-2 py-1 hover:bg-accent" onClick={() => { setSelected((old) => old.size === filteredRows.length ? new Set() : new Set(filteredRows.map(key))); setSelectionAnchor(null) }}>{selected.size === filteredRows.length && filteredRows.length ? 'Clear selection' : 'Select all shown'}</button>
         <button className="border border-emerald-500/40 text-emerald-400 rounded px-2 py-1 hover:bg-emerald-500/10 disabled:opacity-50" disabled={decide.isPending || !selected.size} onClick={() => runBulk('approved')}>Approve selected</button>
-        <button className="border border-amber-500/40 text-amber-400 rounded px-2 py-1 hover:bg-amber-500/10 disabled:opacity-50" disabled={decide.isPending || !selected.size} onClick={() => runBulk('rejected')}>Keep configured selected</button>
+        <button className="border border-amber-500/40 text-amber-400 rounded px-2 py-1 hover:bg-amber-500/10 disabled:opacity-50" disabled={decide.isPending || !selected.size} onClick={() => runBulk('rejected')}>Keep selected</button>
         <button className="border border-emerald-500/40 text-emerald-400 rounded px-2 py-1 hover:bg-emerald-500/10 disabled:opacity-50" disabled={decide.isPending || !rows.length} onClick={() => runBulk('approved', true)}>Approve all proposed</button>
-        <button className="border border-amber-500/40 text-amber-400 rounded px-2 py-1 hover:bg-amber-500/10 disabled:opacity-50" disabled={decide.isPending || !rows.length} onClick={() => runBulk('rejected', true)}>Keep configured all</button>
+        <button className="border border-amber-500/40 text-amber-400 rounded px-2 py-1 hover:bg-amber-500/10 disabled:opacity-50" disabled={decide.isPending || !rows.length} onClick={() => runBulk('rejected', true)}>Keep all</button>
       </div>
 
-      <div className="flex flex-wrap gap-x-5 gap-y-1 border border-border/70 rounded-md bg-background/50 px-3 py-2 text-[11px] text-muted-foreground">
-        <span><strong className="text-emerald-400">✓ Approve</strong> — apply the proposed observed language; archive the parent when it is outside the wanted-language policy.</span>
-        <span><strong className="text-amber-400">× Keep configured / Ignore</strong> — leave the current language and catalog state unchanged; record the decision and do not recheck.</span>
-        <span><strong className="text-foreground">Manual review</strong> — multiple or ambiguous audio tags; approval is disabled until the user decides.</span>
-      </div>
+      <details className="rounded-md border border-border/70 bg-background/50 px-3 py-2">
+        <summary className="cursor-pointer text-[11px] font-medium">How decisions work</summary>
+        <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-muted-foreground">
+          <span><strong className="text-emerald-400">Apply language</strong> — records the one observed language; no parent archive when the result is wanted.</span>
+        <span><strong className="text-amber-400">Archive parent</strong> — records the observed language and archives the parent because it is outside wanted playback languages.</span>
+        <span><strong className="text-foreground">Keep as-is</strong> — makes no changes and stops future checks for that source.</span>
+        </div>
+      </details>
 
-      {rows.length === 0 ? <div className="border border-border rounded-md bg-card p-8 text-center text-sm text-muted-foreground">No pending language mismatches.</div> : (
+      {filteredRows.length === 0 ? <div className="border border-border rounded-md bg-card p-8 text-center text-sm text-muted-foreground">{rows.length === 0 ? 'No pending language mismatches.' : 'No mismatches match the selected filters.'}</div> : (
         <div className="overflow-x-auto border border-border rounded-md">
-          <table className="w-full text-xs">
+          <table className="w-full table-fixed text-xs text-white [&_.text-muted-foreground]:text-white">
             <thead className="bg-card text-muted-foreground"><tr className="text-left">
-              <th className="p-2 w-8"></th><th className="p-2">Title</th><th className="p-2">Provider</th><th className="p-2">Configured</th><th className="p-2">Observed</th><th className="p-2">Proposed result</th><th className="p-2">Checked</th><th className="p-2">Decision</th>
+              <th className="p-2 w-8"><input type="checkbox" aria-label="Select all shown mismatches" checked={filteredRows.length > 0 && filteredRows.every((row) => selected.has(key(row)))} onChange={(e) => setSelected((old) => { const next = new Set(old); filteredRows.forEach((row) => e.target.checked ? next.add(key(row)) : next.delete(key(row))); return next })} /></th><th className="p-2 w-[42%]">Title / provider</th><th className="p-2 w-[11%]">Configured</th><th className="p-2 w-[18%]">Observed / archive</th><th className="p-2 w-[13%]">Proposed result</th><th className="p-2 w-[10%]">Checked</th><th className="p-2 w-[16%]">Decision</th>
             </tr></thead>
-            <tbody>{rows.map((row) => {
+            <tbody>{filteredRows.map((row) => {
               const id = key(row); const disabled = !row.safe_to_apply
               return <tr key={id} className="border-t border-border/60 align-top">
-                <td className="p-2"><input type="checkbox" disabled={disabled} checked={selected.has(id)} onChange={(e) => setSelected((old) => { const n = new Set(old); e.target.checked ? n.add(id) : n.delete(id); return n })} /></td>
-                <td className="p-2"><div className="font-medium">{row.title} {row.year ? `(${row.year})` : ''}</div><div className="text-muted-foreground">{row.kind === 'episode' ? `S${row.season_number}E${row.episode_number} · ${row.episode_name ?? ''}` : 'Movie'}{row.tmdb_id ? ` · TMDB ${row.tmdb_id}` : ''}</div></td>
-                <td className="p-2">{row.provider_name}</td>
+                <td className="p-2"><input type="checkbox" checked={selected.has(id)} onChange={(e) => toggleRowSelection(row, filteredRows.indexOf(row), e)} /></td>
+                <td className="p-2"><div className="font-medium flex items-center gap-1"><span className="mr-1 rounded border border-border px-1 text-[10px]">{row.kind === 'episode' ? 'S' : 'M'}</span>{row.title} {row.year ? `(${row.year})` : ''}</div><div className="text-white text-[11px]">{row.provider_name} · {row.kind === 'episode' ? `S${row.season_number}E${row.episode_number} · ${row.episode_name ?? ''}` : 'Movie'}{row.tmdb_id ? ` · TMDB ${row.tmdb_id}` : ''}</div></td>
                 <td className="p-2">{languageLabel(row.configured_language)}</td>
-                <td className="p-2">{row.observed_languages.map(languageLabel).join(', ')}</td>
-                <td className="p-2">{disabled ? 'Manual review required' : <>{languageLabel(row.proposed_language)}{row.proposed_archive && <div className="text-amber-400">Then archive</div>}</>}</td>
+                <td className="p-2"><div>{row.observed_languages.map(languageLabel).join(', ')}</div><div className={row.proposed_archive ? 'text-[11px] text-amber-400' : 'text-[11px] text-white'}>{row.proposed_archive ? 'Approve archive' : 'No archive'}</div></td>
+                <td className="p-2">{disabled ? 'Manual review required' : languageLabel(row.proposed_language)}</td>
                 <td className="p-2 text-muted-foreground">{row.language_probed_at ? new Date(row.language_probed_at).toLocaleString() : '—'}</td>
-                <td className="p-2"><span className="flex gap-1"><button title="Approve: apply the proposed language and any archive result" disabled={decide.isPending || disabled} className="p-1 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40" onClick={() => decide.mutate({ row, decision: 'approved' })}><Check size={13} /></button><button title="Keep configured language and ignore this result; do not re-check" disabled={decide.isPending} className="p-1 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40" onClick={() => decide.mutate({ row, decision: 'rejected' })}><X size={13} /></button></span></td>
+                <td className="p-2"><span className="flex flex-wrap gap-1"><button title={row.proposed_archive ? 'Archive parent after confirmation' : 'Record observed language after confirmation'} disabled={decide.isPending || disabled} className="px-1.5 py-1 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'approved')}><Check size={13} /> {disabled ? 'Manual review' : row.proposed_archive ? 'Archive parent' : 'Apply language'}</button><button title="Keep unchanged after confirmation" disabled={decide.isPending} className="px-1.5 py-1 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'rejected')}><X size={13} /> Keep as-is</button></span><div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground"><div>{disabled ? 'Multiple/ambiguous result: manual review required' : row.proposed_archive ? 'Records language and archives parent' : 'Records language; no archive'}</div><div>Keep as-is: no changes; no future checks</div></div></td>
               </tr>
             })}</tbody>
           </table>

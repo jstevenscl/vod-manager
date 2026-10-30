@@ -726,6 +726,59 @@ def save_enabled_languages(codes: list[str]) -> None:
         "enabled_playback_languages", [c.strip().upper() for c in codes if c.strip()]))
 
 
+def get_primary_language() -> str:
+    """Return the global default language used when one language must be assigned."""
+    data = _read_raw()
+    value = str(data.get("primary_playback_language") or "EN").strip().upper()
+    return value or "EN"
+
+
+def save_primary_language(code: str) -> None:
+    cleaned = str(code or "").strip().upper()
+    if not cleaned:
+        raise ValueError("primary language is required")
+    if cleaned not in set(get_enabled_languages()):
+        raise ValueError("primary language must be one of the enabled playback languages")
+    _update_raw(lambda data: data.__setitem__("primary_playback_language", cleaned))
+
+
+_LANGUAGE_TRICKLE_DEFAULTS = {
+    "language_trickle_enabled": False,
+    "language_trickle_probes_per_cycle": 15,
+    "language_trickle_interval_seconds": 120,
+    "language_trickle_daily_limit": None,
+}
+
+
+def get_language_trickle_settings() -> dict:
+    data = _read_raw()
+    return {key: data.get(key, value) for key, value in _LANGUAGE_TRICKLE_DEFAULTS.items()}
+
+
+def save_language_trickle_settings(
+    probes_per_cycle: int,
+    interval_seconds: int,
+    daily_limit: int | None,
+    enabled: bool | None = None,
+) -> None:
+    if daily_limit is not None and int(daily_limit) < 1:
+        daily_limit = None
+
+    def update(data: dict) -> None:
+        if enabled is not None:
+            data["language_trickle_enabled"] = bool(enabled)
+        data.update({
+            "language_trickle_probes_per_cycle": min(600, max(1, int(probes_per_cycle))),
+            "language_trickle_interval_seconds": min(86400, max(90, int(interval_seconds))),
+            "language_trickle_daily_limit": min(1000000, int(daily_limit)) if daily_limit is not None else None,
+        })
+    _update_raw(update)
+
+
+def save_language_trickle_enabled(enabled: bool) -> None:
+    _update_raw(lambda data: data.update({"language_trickle_enabled": bool(enabled)}))
+
+
 def get_default_categories_prompt_dismissed() -> bool:
     """Whether the admin has already answered the one-time "include 18+ in
     the built-in All Movies/All TV Shows categories?" prompt (see

@@ -4191,6 +4191,37 @@ async def language_mismatch_report():
     return report
 
 
+@router.get("/language-unknown-report/", dependencies=_GUARDS)
+async def language_unknown_report():
+    return await asyncio.to_thread(vod_db.list_language_unknowns)
+
+
+@router.get("/language-trickle/settings/", dependencies=_GUARDS)
+async def language_trickle_settings():
+    return config.get_language_trickle_settings()
+
+
+@router.post("/language-trickle/settings/", dependencies=_GUARDS)
+async def save_language_trickle_settings(body: LanguageTrickleSettingsRequest):
+    config.save_language_trickle_settings(body.probes_per_cycle, body.interval_seconds, body.daily_limit)
+    return config.get_language_trickle_settings()
+
+
+@router.post("/language-trickle/enabled/", dependencies=_GUARDS)
+async def save_language_trickle_enabled(body: LanguageTrickleEnabledRequest):
+    config.save_language_trickle_enabled(body.enabled)
+    return config.get_language_trickle_settings()
+
+
+@router.post("/language-trickle/providers/{provider_id}/unblock/", dependencies=_GUARDS)
+async def unblock_language_trickle_provider(provider_id: int):
+    settings = config.get_language_trickle_settings()
+    return await asyncio.to_thread(
+        vod_db.unblock_language_probe_provider,
+        provider_id, settings["language_trickle_probes_per_cycle"],
+    )
+
+
 @router.post("/language-trickle/run/", dependencies=_GUARDS)
 async def run_language_trickle():
     """Run one bounded manual cycle; the same provider gates and daily cap apply."""

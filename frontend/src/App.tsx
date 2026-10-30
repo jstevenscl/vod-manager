@@ -12,6 +12,8 @@ import TmdbStore from '@/pages/TmdbStore'
 import api from '@/lib/api'
 import NoticesBell from '@/components/NoticesBell'
 import LanguageMismatchReport from '@/pages/LanguageMismatchReport'
+import LanguageProbeErrors from '@/pages/LanguageProbeErrors'
+import LanguageUnknowns from '@/pages/LanguageUnknowns'
 
 export const THEMES = ['dark', 'mid', 'light', 'mono', 'warm'] as const
 export type Theme = typeof THEMES[number]
@@ -32,7 +34,7 @@ function initTheme(): Theme {
 }
 
 type AuthState = 'checking' | 'login' | 'ready'
-type AppTab = VodManagerTab | 'tmdb' | 'language-report'
+type AppTab = VodManagerTab | 'tmdb' | 'language-report' | 'language-errors' | 'language-unknowns'
 
 interface NavItem {
   label: string
@@ -86,7 +88,7 @@ export default function App() {
 
   const [activeTab, setActiveTabState] = useState<AppTab>(() => {
     const saved = localStorage.getItem('vodmanager-tab')
-    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'artwork' || saved === 'tmdb' || saved === 'language-report' ? saved : 'movies'
+    return saved === 'movies' || saved === 'series' || saved === 'metadata' || saved === 'recovery' || saved === 'curation' || saved === 'config' || saved === 'downloads' || saved === 'dvr' || saved === 'artwork' || saved === 'tmdb' || saved === 'language-report' || saved === 'language-errors' || saved === 'language-unknowns' ? saved : 'movies'
   })
   // the user can hide/unhide the sidebar menu; remembered per browser
   const [navHidden, setNavHiddenState] = useState(() => localStorage.getItem('vodmanager-nav-hidden') === '1')
@@ -381,6 +383,10 @@ export default function App() {
             <TmdbStore />
           ) : activeTab === 'language-report' ? (
             <LanguageMismatchReport />
+          ) : activeTab === 'language-errors' ? (
+            <LanguageProbeErrors />
+          ) : activeTab === 'language-unknowns' ? (
+            <LanguageUnknowns />
           ) : (
             <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
           )}

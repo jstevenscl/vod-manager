@@ -26,7 +26,6 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, get_config, get_duplicate_finder_auto_merge_tmdb,
-    get_duplicate_finder_auto_merge_year_tolerance,
     get_duplicate_finder_quality_prefix_matching, get_enabled_languages, get_primary_language,
     get_refresh_settings, get_stream_priority_mode, get_vod_xc_account_id,
 )
@@ -1255,6 +1254,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movie_sources", "language_probed_at", "TEXT"),
         ("movie_sources", "language_probe_decision", "TEXT"),
         ("movie_sources", "language_probe_decided_at", "TEXT"),
+        ("movie_sources", "language_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("movie_sources", "language_probe_last_failed_at", "TEXT"),
+        ("movie_sources", "language_probe_quarantined_at", "TEXT"),
         ("episode_sources", "probe_width", "INTEGER"),
         ("episode_sources", "probe_height", "INTEGER"),
         ("episode_sources", "probe_codec", "TEXT"),
@@ -1267,6 +1269,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("episode_sources", "language_probed_at", "TEXT"),
         ("episode_sources", "language_probe_decision", "TEXT"),
         ("episode_sources", "language_probe_decided_at", "TEXT"),
+        ("episode_sources", "language_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("episode_sources", "language_probe_last_failed_at", "TEXT"),
+        ("episode_sources", "language_probe_quarantined_at", "TEXT"),
         ("dvr_user_limits", "retention_max_age_days", "INTEGER"),
         ("dvr_user_limits", "retention_max_episodes_per_show", "INTEGER"),
         ("dvr_recording_profiles", "backfill_mode", "TEXT"),
@@ -8466,7 +8471,9 @@ def list_language_mismatches(limit: int = 1000) -> dict:
                 observed = sorted(set(json.loads(item.pop("language_probe_languages") or "[]")))
             except (TypeError, ValueError):
                 observed = []
-            if not observed or observed == [item.get("configured_language")]:
+            if not observed or all(language == "UNKNOWN" for language in observed):
+                continue
+            if item.get("configured_language") and item.get("configured_language") in observed:
                 continue
             item["observed_languages"] = observed
             item["safe_to_apply"] = len(observed) == 1
@@ -8669,8 +8676,8 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str) -> dict:
                 observed = sorted(set(json.loads(row["language_probe_languages"] or "[]")))
             except (TypeError, ValueError):
                 observed = []
-            if decision == "approved" and len(observed) != 1:
-                raise ValueError("only a single observed language can be approved automatically")
+            if decision == "approved" and (len(observed) != 1 or observed[0] == "UNKNOWN"):
+                raise ValueError("unknown or multiple observed languages cannot be approved as a mismatch")
             now = _now()
             if decision == "rejected":
                 conn.execute(f"UPDATE {table} SET language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
