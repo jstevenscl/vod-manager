@@ -543,6 +543,16 @@ function LanguageProbe({ kind, source, size = 11 }: { kind: 'movie' | 'episode';
   }))
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<string | null>(null)
+  useEffect(() => {
+    setRes({
+      configured: source.language ?? null,
+      observed: (() => { try { return JSON.parse(source.language_probe_languages || '[]') } catch { return [] } })() as string[],
+      status: source.language_probe_status ?? null,
+      confidence: source.language_probe_confidence ?? null,
+      checked: !!source.language_probed_at,
+      mismatch: false,
+    })
+  }, [source.language, source.language_probe_languages, source.language_probe_status, source.language_probe_confidence, source.language_probed_at])
   const check = (force: boolean) => {
     setBusy(true); setNote(null)
     api.post('/vod/sources/check-language/', { kind, source_id: source.id, force })
@@ -558,11 +568,16 @@ function LanguageProbe({ kind, source, size = 11 }: { kind: 'movie' | 'episode';
       .finally(() => setBusy(false))
   }
   const labels = res.observed.map((code) => LANGUAGE_CODE_NAMES[code] ? `${code} (${LANGUAGE_CODE_NAMES[code]})` : code)
+  const confirmedLanguage = res.configured || labels[0]
+  const hasDetectedAudioLanguage = ['observed', 'auto_approved'].includes(res.status ?? '') && labels.length > 0
+  const languageSummary = res.status === 'manual_approved'
+    ? confirmedLanguage ? `Language: ${confirmedLanguage} (confirmed)` : 'Audio language: unknown'
+    : hasDetectedAudioLanguage ? `Audio: ${labels.join(', ')}` : 'Audio language: unknown'
   return (
     <span className="flex items-center gap-1.5">
       {note && <span className="text-destructive">{note}</span>}
-      {res.checked && <span className={res.mismatch ? 'text-amber-500' : 'text-muted-foreground'} title="Embedded audio-track tags only; this never changes playback eligibility">
-        {res.status === 'observed' ? `Audio: ${labels.join(', ')}` : 'Audio language: unknown'}{res.mismatch ? ' · review' : ''}
+      {res.checked && <span className={res.mismatch ? 'text-amber-500' : 'text-muted-foreground'} title={res.status === 'manual_approved' ? 'Language confirmed by a reviewer and saved for this provider source.' : 'Embedded audio-track tags only; this never changes playback eligibility'}>
+        {languageSummary}{res.mismatch ? ' · review' : ''}
       </span>}
       <button
         title={res.checked ? 'Check embedded audio language tags again' : 'Read a small bounded stream header for embedded audio language tags'}
