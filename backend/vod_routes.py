@@ -561,6 +561,26 @@ class BulkArchiveRequest(BaseModel):
     archived: bool
 
 
+class PossibleMetadataMatchPair(BaseModel):
+    item_id: int
+    candidate_id: int
+
+
+class BulkPossibleMetadataMatchesRequest(BaseModel):
+    content_type: str
+    pairs: list[PossibleMetadataMatchPair]
+
+
+class PossibleMetadataIgnoreItem(BaseModel):
+    item_id: int
+    candidate_ids: list[int]
+
+
+class BulkPossibleMetadataIgnoreRequest(BaseModel):
+    content_type: str
+    items: list[PossibleMetadataIgnoreItem]
+
+
 class SeriesRequest(BaseModel):
     name: str
     year: Optional[int] = None
@@ -2956,6 +2976,36 @@ async def list_metadata_review(content_type: Optional[str] = None):
     return vod_db.list_metadata_review(content_type)
 
 
+@router.get("/metadata-review/counts/", dependencies=_GUARDS)
+async def metadata_review_counts():
+    return await asyncio.to_thread(vod_db.count_metadata_review)
+
+
+@router.get("/possible-matches/", dependencies=_GUARDS)
+async def list_possible_metadata_matches(content_type: Optional[str] = None, limit: int = 50, offset: int = 0, hide_adult: bool = True):
+    if content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return await asyncio.to_thread(vod_db.list_possible_metadata_matches, content_type, limit, offset, hide_adult)
+
+
+@router.post("/possible-matches/bulk-merge/", dependencies=_GUARDS)
+async def bulk_merge_possible_metadata_matches(body: BulkPossibleMetadataMatchesRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if not body.pairs or len(body.pairs) > 250:
+        raise HTTPException(400, detail="select between 1 and 250 matches")
+    return await asyncio.to_thread(vod_db.bulk_merge_possible_metadata_matches, body.content_type,
+                                   [pair.model_dump() for pair in body.pairs])
+
+
+@router.post("/possible-matches/bulk-keep-separate/", dependencies=_GUARDS)
+async def bulk_keep_possible_metadata_matches_separate(body: BulkPossibleMetadataIgnoreRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    return {"kept_separate": await asyncio.to_thread(vod_db.bulk_ignore_possible_metadata_matches,
+                    body.content_type, [item.model_dump() for item in body.items])}
+
+
 @router.get("/tmdb-lookup-failures/", dependencies=_GUARDS)
 async def list_tmdb_lookup_failures(content_type: Optional[str] = None):
     """Review queue for a stored TMDB id that TMDB confirmed no longer
@@ -3286,6 +3336,24 @@ async def bulk_resolve_needs_review(body: BulkAiResolveRequest):
         raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
     job_id = await vod_bulk_ai_service.start_needs_review_bulk_resolve(body.content_type, body.ids)
     return {"job_id": job_id}
+
+
+@router.post("/needs-review/bulk-user-merge/", dependencies=_GUARDS, status_code=202)
+async def bulk_user_merge_needs_review(body: BulkAiResolveRequest):
+    if body.content_type not in ("movie", "series"):
+        raise HTTPException(400, detail="content_type must be 'movie' or 'series'")
+    if not body.ids or len(body.ids) > 250:
+        raise HTTPException(400, detail="select between 1 and 250 titles")
+    job_id = await vod_bulk_ai_service.start_needs_review_user_merge(body.content_type, body.ids)
+    return {"job_id": job_id}
+
+
+@router.get("/needs-review/bulk-user-merge/{job_id}/", dependencies=_GUARDS)
+async def bulk_user_merge_needs_review_progress(job_id: str):
+    job = vod_bulk_ai_service.get_bulk_ai_job(job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+    return job
 
 
 @router.get("/needs-review/bulk-resolve/{job_id}/", dependencies=_GUARDS)

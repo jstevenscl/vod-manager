@@ -137,6 +137,19 @@ def test_search_title_answer_kept_and_reused(store, tmdb):
     assert second[1]["year"] == 2011  # same answer TMDB gave the first time
 
 
+def test_review_search_filters_unrelated_fuzzy_titles_before_detail_lookup(store, tmdb):
+    tmdb.routes = {
+        "/search/movie": (200, {"results": [
+            {"id": 10, "title": "Example 10x10", "release_date": "2018-01-01"},
+            {"id": 11, "title": "Unrelated Story", "release_date": "2013-01-01"},
+        ]}),
+        "/movie/10": (200, _movie(10, "Example 10x10")),
+    }
+    results = asyncio.run(tmdb_sync.search_title("Example 10x10", "movie"))
+    assert [result["name"] for result in results] == ["Example 10x10"]
+    assert "/movie/11" not in tmdb.calls
+
+
 # --- TMDB Library page lookup ---------------------------------------------------
 
 def test_library_page_lookup_answer_kept(store, tmdb):

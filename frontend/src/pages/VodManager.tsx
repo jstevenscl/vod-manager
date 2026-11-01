@@ -1657,7 +1657,13 @@ function useBulkAiJob(startEndpoint: string, progressEndpointPrefix: string, can
 
 // Compact "N resolved · M skipped · E errors" summary + expandable per-item
 // detail list, shared by all three bulk-AI panels below.
-function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (r: BulkAiJobResult) => string }) {
+function BulkAiJobSummary({ job, labelFor, workingLabel = 'Resolving', completedLabel = 'resolved', skipExplanation = 'Only high-confidence AI matches are applied automatically.' }: {
+  job: BulkAiJobStatus
+  labelFor: (r: BulkAiJobResult) => string
+  workingLabel?: string
+  completedLabel?: string
+  skipExplanation?: string
+}) {
   const [expanded, setExpanded] = useState(false)
   // Why items were skipped, most common first -- otherwise "N skipped" gives no hint
   // that e.g. the AI wasn't confident enough (only high-confidence picks are applied).
@@ -1672,10 +1678,10 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
     <div className="text-xs px-2 py-1.5 rounded border border-primary/30 bg-primary/5 space-y-1">
       <div className="flex items-center gap-2">
         {job.running ? (
-          <span className="flex items-center gap-1 text-muted-foreground"><Loader2 size={11} className="animate-spin" /> Resolving {job.done}/{job.total}…</span>
+          <span className="flex items-center gap-1 text-muted-foreground"><Loader2 size={11} className="animate-spin" /> {workingLabel} {job.done}/{job.total}…</span>
         ) : (
           <span>
-            <strong>{job.resolved}</strong> resolved · <strong>{job.skipped}</strong> skipped
+            <strong>{job.resolved}</strong> {completedLabel} · <strong>{job.skipped}</strong> skipped
             {job.errors > 0 && <> · <strong>{job.errors}</strong> error{job.errors === 1 ? '' : 's'}</>}
           </span>
         )}
@@ -1688,7 +1694,7 @@ function BulkAiJobSummary({ job, labelFor }: { job: BulkAiJobStatus; labelFor: (
       {!job.running && skipReasons.length > 0 && (
         <p className="text-muted-foreground">
           Skipped because: {skipReasons.slice(0, 3).map(([why, n]) => `${why} (${n})`).join(' · ')}
-          {skipReasons.length > 3 ? ' · …' : ''}. Only high-confidence AI matches are applied automatically.
+          {skipReasons.length > 3 ? ' · …' : ''}. {skipExplanation}
         </p>
       )}
       {job.error && <p className="text-destructive">{job.error}</p>}
@@ -6127,6 +6133,111 @@ function LibraryLanguageModal({ contentType, qc, onClose }: {
 export type VodManagerTab = 'movies' | 'series' | 'metadata' | 'recovery' | 'curation' | 'providers' | 'config' | 'downloads' | 'dvr' | 'artwork'
 export type DvrSubTab = 'scheduled' | 'users' | 'library' | 'missing' | 'metrics'
 
+interface ExistingMatchCandidate {
+  id: number
+  name: string
+  year: number | null
+  tmdb_id: string | null
+  poster_url: string | null
+  match_reason: string
+}
+
+interface ExistingMatchItem {
+  id: number
+  name: string
+  year: number | null
+  poster_url: string | null
+  candidates: ExistingMatchCandidate[]
+}
+
+function PossibleMetadataMatches({ contentType, hideAdult }: { contentType: 'movie' | 'series'; hideAdult: boolean }) {
+  const qc = useQueryClient()
+  const [offset, setOffset] = useState(0)
+  const [selected, setSelected] = useState<Map<number, number>>(new Map())
+  const anchor = useRef<number | null>(null)
+  const query = useQuery<{ items: ExistingMatchItem[]; total: number; limit: number; offset: number }>({
+    queryKey: ['vod-possible-matches', contentType, hideAdult, offset],
+    queryFn: () => api.get('/vod/possible-matches/', { params: { content_type: contentType, hide_adult: hideAdult, limit: 50, offset } }).then((r) => r.data),
+  })
+  useEffect(() => { setOffset(0); setSelected(new Map()); anchor.current = null }, [contentType, hideAdult])
+  const merge = useMutation({
+    mutationFn: (pairs: { item_id: number; candidate_id: number }[]) => api.post('/vod/possible-matches/bulk-merge/', { content_type: contentType, pairs }),
+    onSuccess: (r) => { setSelected(new Map()); anchor.current = null; qc.invalidateQueries({ queryKey: ['vod-possible-matches', contentType] }); qc.invalidateQueries({ queryKey: ['vod-metadata-review'] }); qc.invalidateQueries({ queryKey: ['vod-metadata-review', 'counts'] }); qc.invalidateQueries({ queryKey: contentType === 'movie' ? ['vod-movies'] : ['vod-series'] }); notify(`Merged ${r.data.merged}; skipped ${r.data.skipped.length}.`) },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Bulk merge failed.'),
+  })
+  const keepSeparate = useMutation({
+    mutationFn: (items: { item_id: number; candidate_ids: number[] }[]) => api.post('/vod/possible-matches/bulk-keep-separate/', { content_type: contentType, items }),
+    onSuccess: (r) => { setSelected(new Map()); anchor.current = null; qc.invalidateQueries({ queryKey: ['vod-possible-matches', contentType] }); notify(`Kept ${r.data.kept_separate} items as separate entries.`) },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not keep selected items separate.'),
+  })
+  const archive = useMutation({
+    mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: contentType, ids, archived: true }),
+    onSuccess: (r) => { setSelected(new Map()); anchor.current = null; qc.invalidateQueries({ queryKey: ['vod-possible-matches', contentType] }); qc.invalidateQueries({ queryKey: ['vod-metadata-review'] }); qc.invalidateQueries({ queryKey: ['vod-metadata-review', 'counts'] }); notify(`Archived ${r.data.changed} items.`) },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not archive selected items.'),
+  })
+  const items = query.data?.items ?? []
+  const allSelected = items.length > 0 && items.every((item) => selected.has(item.id))
+  const toggleAll = () => setSelected((current) => {
+    const next = new Map(current)
+    if (allSelected) items.forEach((item) => next.delete(item.id))
+    else items.forEach((item) => { if (item.candidates[0]) next.set(item.id, item.candidates[0].id) })
+    return next
+  })
+  const toggle = (item: ExistingMatchItem, index: number, shift: boolean) => {
+    setSelected((current) => {
+      const next = new Map(current)
+      if (shift && anchor.current != null) {
+        for (let i = Math.min(anchor.current, index); i <= Math.max(anchor.current, index); i++) {
+          const row = items[i]
+          if (row?.candidates[0]) next.set(row.id, row.candidates[0].id)
+        }
+      } else if (current.has(item.id)) next.delete(item.id)
+      else if (item.candidates[0]) next.set(item.id, item.candidates[0].id)
+      anchor.current = index
+      return next
+    })
+  }
+  const busy = merge.isPending || keepSeparate.isPending || archive.isPending
+  const controls = (atBottom = false) => <div className="flex flex-wrap items-center gap-2 rounded border border-border/60 bg-muted/20 px-2 py-1.5">
+    <button className="text-xs text-primary hover:underline" onClick={toggleAll}>{allSelected ? 'Clear visible' : `Select all visible (${items.length})`}</button>
+    <span className="text-xs text-muted-foreground">{selected.size} selected</span>
+    <Button size="sm" disabled={!selected.size || busy} onClick={() => {
+      if (window.confirm(`Approve and merge ${selected.size} selected ${contentType === 'movie' ? 'movie' : 'TV show'} matches?`)) merge.mutate(Array.from(selected, ([item_id, candidate_id]) => ({ item_id, candidate_id })))
+    }}>Approve merge ({selected.size})</Button>
+    <Button size="sm" variant="outline" disabled={!selected.size || busy} onClick={() => {
+      const rows = items.filter((item) => selected.has(item.id)).map((item) => ({ item_id: item.id, candidate_ids: item.candidates.map((candidate) => candidate.id) }))
+      if (window.confirm(`Keep ${rows.length} selected entries active and separate? Reviewed matches will be dismissed.`)) keepSeparate.mutate(rows)
+    }}>Keep separate</Button>
+    <Button size="sm" variant="outline" className="text-destructive" disabled={!selected.size || busy} onClick={() => {
+      const ids = Array.from(selected.keys())
+      if (window.confirm(`Archive ${ids.length} selected entries and remove category placements?`)) archive.mutate(ids)
+    }}><Archive size={12} className="mr-1" />Archive selected</Button>
+    {query.data && !atBottom && <span className="ml-auto text-xs text-muted-foreground">{query.data.total.toLocaleString()} possible matches</span>}
+  </div>
+  return <SectionCard title={`Existing ${contentType === 'movie' ? 'Movie' : 'TV Show'} Matches`} description="Compare same-title catalog entries and decide which imports to merge, keep separate, or archive." icon={<ArrowRightLeft size={14} />} collapsible={false}>
+    <p className="text-xs text-muted-foreground">Candidate titles stay expanded for review. Shift-click selects a range; check year differences before approving a bulk merge.</p>
+    <Button size="sm" variant="outline" disabled={query.isFetching} onClick={() => query.refetch()}><RefreshCw size={12} className="mr-1" />Refresh matches</Button>
+    {controls()}
+    {query.isLoading && <p className="text-xs text-muted-foreground">Finding possible matches…</p>}
+    {query.isError && <p className="text-xs text-destructive">Could not load possible matches.</p>}
+    {!query.isLoading && !items.length && <p className="text-xs text-muted-foreground">No possible matches found.</p>}
+    <div className="space-y-2">{items.map((item, index) => <div key={item.id} className={`rounded border p-2 ${selected.has(item.id) ? 'border-primary/60 bg-primary/5' : 'border-border/50'}`}>
+      <div className="flex items-start gap-2"><input type="checkbox" aria-label={`Select ${item.name}`} checked={selected.has(item.id)} onChange={(event) => toggle(item, index, event.nativeEvent instanceof MouseEvent && event.nativeEvent.shiftKey)} />
+        <PosterThumb url={item.poster_url} className="w-10 h-[60px] rounded object-cover shrink-0" fallback={<div className="w-10 h-[60px] rounded bg-muted flex items-center justify-center"><Film size={14} className="text-muted-foreground" /></div>} />
+        <div className="min-w-0 flex-1"><div className="font-medium">{item.name} <span className="text-xs text-amber-500">{item.year ? `${item.year} · no TMDB ID` : 'no year or TMDB ID'}</span></div>
+          <div className="mt-1 space-y-1">{item.candidates.map((candidate) => <label key={candidate.id} className="flex items-center gap-2 rounded border border-border/40 bg-background/30 px-2 py-1 text-xs cursor-pointer">
+            <input type="radio" name={`existing-match-${contentType}-${item.id}`} checked={selected.get(item.id) === candidate.id} onChange={() => setSelected((current) => new Map(current).set(item.id, candidate.id))} />
+            <PosterThumb url={candidate.poster_url} className="w-8 h-12 rounded object-cover shrink-0" fallback={<div className="w-8 h-12 rounded bg-muted flex items-center justify-center"><Film size={12} className="text-muted-foreground" /></div>} />
+            <span className="font-medium">{candidate.name}</span><span className={`text-muted-foreground ${candidate.match_reason.includes('differs by') ? 'text-amber-500' : ''}`}>{candidate.year ?? 'no year'}{candidate.tmdb_id ? ` · TMDB ${candidate.tmdb_id}` : ''} · {candidate.match_reason}</span>
+          </label>)}</div>
+        </div>
+      </div>
+    </div>)}</div>
+    {items.length > 0 && controls(true)}
+    {query.data && <Pager total={query.data.total} limit={query.data.limit} offset={offset} onOffset={(value) => { setOffset(value); setSelected(new Map()); anchor.current = null }} />}
+  </SectionCard>
+}
+
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
   activeTab: VodManagerTab
   setActiveTab: (t: VodManagerTab) => void
@@ -6152,8 +6263,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const [categoriesModalOpen, setCategoriesModalOpen] = useState<'movie' | 'series' | null>(null)
   const [needsReviewModalOpen, setNeedsReviewModalOpen] = useState<'movie' | 'series' | null>(null)
   const [metadataContentType, setMetadataContentType] = useState<'movie' | 'series'>('movie')
+  const [metadataReviewView, setMetadataReviewView] = useState<'identity' | 'matches'>('identity')
   const [metadataSelected, setMetadataSelected] = useState<Set<number>>(new Set())
-  const [metadataHideAdult, setMetadataHideAdult] = useState(false)
+  const [metadataHideAdult, setMetadataHideAdult] = useState(true)
   const [tmdbFailuresContentType, setTmdbFailuresContentType] = useState<'movie' | 'series'>('movie')
   const [tmdbFailuresSelected, setTmdbFailuresSelected] = useState<Set<number>>(new Set())
   const [missingArtworkModalOpen, setMissingArtworkModalOpen] = useState<'movie' | 'series' | null>(null)
@@ -7819,6 +7931,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
   const metadataItems = (metadataContentType === 'movie' ? metadataReviewQuery.data?.movies : metadataReviewQuery.data?.series) ?? []
   const filteredMetadataItems = metadataHideAdult ? metadataItems.filter((item) => !item.is_adult) : metadataItems
   const metadataBulkAi = useBulkAiJob('/vod/needs-review/bulk-resolve/', '/vod/needs-review/bulk-resolve/')
+  const metadataUserMerge = useBulkAiJob('/vod/needs-review/bulk-user-merge/', '/vod/needs-review/bulk-user-merge/')
   const archiveMetadata = useMutation({
     mutationFn: (ids: number[]) => api.post('/vod/bulk-archive/', { content_type: metadataContentType, ids, archived: true }),
     onSuccess: () => {
@@ -7828,14 +7941,14 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     },
   })
   useEffect(() => {
-    if (metadataBulkAi.job && !metadataBulkAi.job.running) {
+    if ((metadataBulkAi.job && !metadataBulkAi.job.running) || (metadataUserMerge.job && !metadataUserMerge.job.running)) {
       setMetadataSelected(new Set())
       qc.invalidateQueries({ queryKey: ['vod-metadata-review'] })
       qc.invalidateQueries({ queryKey: ['vod-needs-review'] })
       qc.invalidateQueries({ queryKey: metadataContentType === 'movie' ? ['vod-movies'] : ['vod-series'] })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [metadataBulkAi.job?.running])
+  }, [metadataBulkAi.job?.running, metadataUserMerge.job?.running])
   // ── Incorrect TMDB IDs (a stored id TMDB itself now confirms is gone,
   // via a 404 -- distinct from Metadata Review above, which is no id at all) ──
   const tmdbFailuresQuery = useQuery<NeedsReviewData>({
@@ -9766,31 +9879,31 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'metadata' && (
       <>
-      <SectionCard title="Metadata Review" description="Review titles needing metadata attention." icon={<Search size={14} />}>
+      <SectionCard title="Metadata Review" description="Review titles needing metadata attention." icon={<Search size={14} />} collapsible={false}>
         <p className="text-xs text-muted-foreground">
-          Fix active movies and shows the provider left without a usable TMDB identity, whether or not a year is present, plus the held ambiguous-year queue.
-          Search TMDB, then select the exact result. That records its confirmed TMDB ID and year; if the corrected
-          identity already exists in the pool, its sources and categories merge into that existing title.
+          Review active titles missing a usable TMDB identity or compare same-title items that may already exist in the catalog.
         </p>
         <div className="flex items-center gap-1.5 pt-1">
+          <Button size="sm" variant={metadataReviewView === 'identity' ? 'default' : 'outline'} onClick={() => { setMetadataReviewView('identity'); setMetadataSelected(new Set()) }}>Missing identity</Button>
+          <Button size="sm" variant={metadataReviewView === 'matches' ? 'default' : 'outline'} onClick={() => { setMetadataReviewView('matches'); setMetadataSelected(new Set()) }}>Existing matches</Button>
           <Button
             size="sm"
             variant={metadataContentType === 'movie' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('movie'); setMetadataSelected(new Set()) }}
           >
-            Movies{metadataReviewQuery.data?.movies.length ? ` (${metadataReviewQuery.data.movies.length})` : ''}
+            Movies{metadataReviewView === 'matches' ? '' : ` (${metadataHideAdult ? metadataReviewQuery.data?.movies.filter((item) => !item.is_adult).length ?? 0 : metadataReviewQuery.data?.movies.length ?? 0})`}
           </Button>
           <Button
             size="sm"
             variant={metadataContentType === 'series' ? 'default' : 'outline'}
             onClick={() => { setMetadataContentType('series'); setMetadataSelected(new Set()) }}
           >
-            TV Shows{metadataReviewQuery.data?.series.length ? ` (${metadataReviewQuery.data.series.length})` : ''}
+            TV Shows{metadataReviewView === 'matches' ? '' : ` (${metadataHideAdult ? metadataReviewQuery.data?.series.filter((item) => !item.is_adult).length ?? 0 : metadataReviewQuery.data?.series.length ?? 0})`}
           </Button>
-          <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
+          {metadataReviewView === 'identity' && <Button size="sm" variant="outline" disabled={metadataReviewQuery.isFetching} onClick={() => metadataReviewQuery.refetch()}>
             {metadataReviewQuery.isFetching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             <span className="ml-1">Refresh</span>
-          </Button>
+          </Button>}
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground rounded border border-border/60 bg-muted/20 px-2.5 py-2">
           <span><strong className="text-foreground">Missing identity:</strong> no usable TMDB ID, with or without a year, or an ambiguous year held for review. A same-title row elsewhere is only a candidate until the year/identity is safe to copy.</span>
@@ -9804,6 +9917,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           Hide adult titles
           {metadataHideAdult && <span>({filteredMetadataItems.length} of {metadataItems.length})</span>}
         </label>
+        {metadataReviewView === 'matches' ? <PossibleMetadataMatches contentType={metadataContentType} hideAdult={metadataHideAdult} /> : <>
         {metadataReviewQuery.isLoading && <p className="text-xs text-muted-foreground">Loading review queue…</p>}
         {metadataReviewQuery.isError && <p className="text-xs text-destructive">Could not load the metadata review queue.</p>}
         {metadataReviewQuery.data && (
@@ -9823,7 +9937,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   <span className="text-muted-foreground">{metadataSelected.size} selected</span>
                   <Button
                     size="sm" variant="outline" className="h-7 text-xs ml-auto text-destructive"
-                    disabled={metadataSelected.size === 0 || archiveMetadata.isPending}
+                    disabled={metadataSelected.size === 0 || archiveMetadata.isPending || metadataUserMerge.starting || !!metadataUserMerge.job?.running}
                     onClick={() => askConfirm(
                       `Archive ${metadataSelected.size} selected ${metadataContentType === 'movie' ? 'movie' : 'TV show'}${metadataSelected.size === 1 ? '' : 's'}? This removes them from categories and hides them from the active pool.`,
                       () => archiveMetadata.mutate(Array.from(metadataSelected)),
@@ -9834,16 +9948,37 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
                   </Button>
                   <Button
                     size="sm" variant="outline" className="h-7 text-xs"
-                    disabled={metadataSelected.size === 0 || metadataBulkAi.starting || !!metadataBulkAi.job?.running}
+                    disabled={metadataSelected.size === 0 || metadataBulkAi.starting || !!metadataBulkAi.job?.running || metadataUserMerge.starting || !!metadataUserMerge.job?.running}
                     title="Searches TMDB for each selected title and applies a year + TMDB ID only when AI is highly confident. Other titles remain for manual review."
                     onClick={() => metadataBulkAi.start({ content_type: metadataContentType, ids: Array.from(metadataSelected) })}
                   >
                     {metadataBulkAi.starting || metadataBulkAi.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <Sparkles size={11} className="mr-1" />}
                     Resolve selected with AI ({metadataSelected.size})
                   </Button>
+                  {metadataReviewView === 'identity' && <Button
+                    size="sm" variant="outline" className="h-7 text-xs border-primary/50"
+                    disabled={metadataSelected.size === 0 || metadataUserMerge.starting || !!metadataUserMerge.job?.running || metadataBulkAi.starting || !!metadataBulkAi.job?.running}
+                    title="For each selected title, apply the TMDB result only when the filtered search returns exactly one candidate. Titles with no or multiple results stay unchanged."
+                    onClick={() => askConfirm(
+                      `User Merge will search ${metadataSelected.size} selected titles and apply the TMDB result only when exactly one candidate is found. Titles with no or multiple results will be skipped. Continue?`,
+                      () => metadataUserMerge.start({ content_type: metadataContentType, ids: Array.from(metadataSelected) }),
+                    )}
+                  >
+                    {metadataUserMerge.starting || metadataUserMerge.job?.running ? <Loader2 size={11} className="animate-spin mr-1" /> : <ArrowRightLeft size={11} className="mr-1" />}
+                    User Merge ({metadataSelected.size})
+                  </Button>}
                 </div>
                 {metadataBulkAi.startError && <p className="text-xs text-destructive">{metadataBulkAi.startError}</p>}
                 {metadataBulkAi.job && <BulkAiJobSummary job={metadataBulkAi.job} labelFor={(r) => r.name ?? `#${r.id}`} />}
+                {metadataUserMerge.startError && <p className="text-xs text-destructive">{metadataUserMerge.startError}</p>}
+                {metadataUserMerge.progressError && <p className="text-xs text-destructive">{metadataUserMerge.progressError}</p>}
+                {metadataUserMerge.job && <BulkAiJobSummary
+                  job={metadataUserMerge.job}
+                  labelFor={(r) => r.name ?? `#${r.id}`}
+                  workingLabel="Applying user-approved matches"
+                  completedLabel="merged/applied"
+                  skipExplanation="User Merge applies only when the filtered TMDB search returns exactly one candidate; other titles remain unchanged."
+                />}
                 <ul className="divide-y divide-border/50">
                   {filteredMetadataItems.map((item) => (
                     <Fragment key={item.id}>
@@ -9869,6 +10004,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             )}
           </>
         )}
+        </>}
       </SectionCard>
       <SectionCard title="Incorrect TMDB IDs" description="Review catalog items with TMDB lookups that need correction." icon={<Search size={14} />}>
         <p className="text-xs text-muted-foreground">
