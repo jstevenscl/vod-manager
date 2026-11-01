@@ -4159,11 +4159,21 @@ class SourceLanguageProbeRequest(BaseModel):
 
 class LanguageMismatchDecisionRequest(BaseModel):
     decision: str                   # approved or rejected
+    language: Optional[str] = None   # selected observed language for ambiguous results
 
 
 class LanguageProbeErrorActionRequest(BaseModel):
     action: str                     # approve, retry or delete
     language: Optional[str] = None  # manually confirmed enabled language
+
+
+class LanguageProbeBulkApprovalRequest(BaseModel):
+    sources: list[dict[str, object]]
+    language: str
+
+
+class LanguageProbeBulkArchiveRequest(BaseModel):
+    items: list[dict[str, object]]
 
 
 class LanguageTrickleSettingsRequest(BaseModel):
@@ -4281,10 +4291,26 @@ async def language_probe_error_action(kind: str, source_id: int, body: LanguageP
         raise HTTPException(400, detail=str(exc))
 
 
+@router.post("/language-probe-errors/bulk-approve/", dependencies=_GUARDS)
+async def bulk_approve_language_probe_errors(body: LanguageProbeBulkApprovalRequest):
+    try:
+        return await asyncio.to_thread(vod_db.approve_language_probe_sources, body.sources, body.language)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+@router.post("/language-probe-errors/bulk-archive/", dependencies=_GUARDS)
+async def bulk_archive_language_probe_errors(body: LanguageProbeBulkArchiveRequest):
+    try:
+        return await asyncio.to_thread(vod_db.bulk_archive_language_probe_parents, body.items)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
 @router.post("/language-mismatch/{kind}/{source_id}/decision/", dependencies=_GUARDS)
 async def language_mismatch_decision(kind: str, source_id: int, body: LanguageMismatchDecisionRequest):
     try:
-        return await asyncio.to_thread(vod_db.decide_language_mismatch, kind, source_id, body.decision)
+        return await asyncio.to_thread(vod_db.decide_language_mismatch, kind, source_id, body.decision, body.language)
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
 

@@ -7907,6 +7907,97 @@ def approve_language_probe_source(kind: str, source_id: int, language: str | Non
             conn.close()
 
 
+def approve_language_probe_sources(sources: list[dict], language: str) -> dict:
+    """Confirm one language for a batch of unknown sources in one transaction."""
+    confirmed_language = str(language or "").strip().upper()
+    enabled = set(get_enabled_languages())
+    if not confirmed_language or confirmed_language not in enabled:
+        raise ValueError("confirmed language must be enabled for playback")
+    if not sources or len(sources) > 250:
+        raise ValueError("select between 1 and 250 sources")
+
+    grouped: dict[str, list[int]] = {"movie": [], "episode": []}
+    seen: set[tuple[str, int]] = set()
+    for source in sources:
+        kind = str(source.get("kind") or "")
+        if kind not in grouped:
+            raise ValueError("source kind must be movie or episode")
+        try:
+            source_id = int(source.get("source_id"))
+        except (TypeError, ValueError):
+            raise ValueError("source id must be an integer") from None
+        key = (kind, source_id)
+        if source_id <= 0 or key in seen:
+            raise ValueError("source ids must be positive and unique")
+        seen.add(key)
+        grouped[kind].append(source_id)
+
+    now = _now()
+    audit_rows: list[tuple] = []
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for kind, source_ids in grouped.items():
+                if not source_ids:
+                    continue
+                table = "movie_sources" if kind == "movie" else "episode_sources"
+                placeholders = ",".join("?" for _ in source_ids)
+                rows = conn.execute(
+                    f"""SELECT src.id, src.provider_id, src.language_probe_status,
+                               src.language_probe_decision, src.language_probe_languages
+                        FROM {table} src JOIN providers p ON p.id=src.provider_id
+                        WHERE src.id IN ({placeholders}) AND p.is_active=1""",
+                    source_ids,
+                ).fetchall()
+                by_id = {int(row["id"]): row for row in rows}
+                if len(by_id) != len(source_ids):
+                    raise ValueError("one or more selected sources no longer exist or their provider is inactive")
+                for source_id in source_ids:
+                    row = by_id[source_id]
+                    try:
+                        observed = json.loads(row["language_probe_languages"] or "[]")
+                    except (TypeError, ValueError):
+                        observed = []
+                    if row["language_probe_status"] not in ("unknown", "observed") or row["language_probe_decision"] is not None or any(tag not in (None, "", "UNKNOWN") for tag in observed):
+                        raise ValueError("one or more selected sources are no longer unknown; refresh the report and try again")
+                    audit_rows.append((kind, source_id, row["provider_id"], now,
+                                       "manual_approved", confirmed_language,
+                                       json.dumps([confirmed_language]),
+                                       json.dumps(sorted(enabled)), 0,
+                                       int(confirmed_language in enabled),
+                                       "Language manually confirmed after playback review."))
+
+            for kind, source_ids in grouped.items():
+                if not source_ids:
+                    continue
+                table = "movie_sources" if kind == "movie" else "episode_sources"
+                placeholders = ",".join("?" for _ in source_ids)
+                conn.execute(
+                    f"""UPDATE {table}
+                        SET language=?, language_probe_status='manual_approved',
+                            language_probe_decision='approved', language_probe_decided_at=?,
+                            language_probe_error=NULL, language_probe_method='manual_language_confirmed',
+                            language_probe_confidence='manual', language_probe_languages=?,
+                            language_probed_at=?, language_probe_failures=0,
+                            language_probe_last_failed_at=NULL, language_probe_quarantined_at=NULL
+                        WHERE id IN ({placeholders})""",
+                    [confirmed_language, now, json.dumps([confirmed_language]), now, *source_ids],
+                )
+            conn.executemany("""INSERT INTO language_probe_runs
+                (kind, source_id, provider_id, checked_at, status,
+                 configured_language, observed_languages, wanted_languages,
+                 mismatch, wanted_match, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", audit_rows)
+            _commit_with_retry(conn)
+            return {"action": "approved", "language": confirmed_language, "count": len(audit_rows)}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
 def delete_language_probe_source(kind: str, source_id: int) -> None:
     """Permanently remove a quarantined source while preserving other copies."""
     table, parent_table, parent_fk = _language_probe_table(kind)
@@ -8496,7 +8587,8 @@ def list_language_mismatches(limit: int = 1000) -> dict:
             item["observed_languages"] = observed
             item["safe_to_apply"] = len(observed) == 1
             item["proposed_language"] = observed[0] if len(observed) == 1 else None
-            item["proposed_archive"] = bool(len(observed) == 1 and observed[0] not in enabled)
+            usable_observed = {language for language in observed if language and language != "UNKNOWN"}
+            item["proposed_archive"] = bool(usable_observed) and not bool(usable_observed & set(enabled))
             item["enabled_languages"] = enabled
             rows.append(item)
         return {"enabled_languages": enabled, "count": len(rows), "results": rows}
@@ -8673,8 +8765,8 @@ def next_language_probe_targets(limit: int = 3, distinct_providers: bool = True)
         conn.close()
 
 
-def decide_language_mismatch(kind: str, source_id: int, decision: str) -> dict:
-    """Approve or reject one report row; approved safe mismatches update and gate it."""
+def decide_language_mismatch(kind: str, source_id: int, decision: str, language: str | None = None) -> dict:
+    """Approve/reject one mismatch, optionally choosing one observed language."""
     if decision not in ("approved", "rejected"):
         raise ValueError("decision must be approved or rejected")
     table, parent_table, parent_fk = _language_probe_table(kind)
@@ -8694,8 +8786,15 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str) -> dict:
                 observed = sorted(set(json.loads(row["language_probe_languages"] or "[]")))
             except (TypeError, ValueError):
                 observed = []
-            if decision == "approved" and (len(observed) != 1 or observed[0] == "UNKNOWN"):
-                raise ValueError("unknown or multiple observed languages cannot be approved as a mismatch")
+            usable_observed = [tag for tag in observed if tag and tag != "UNKNOWN"]
+            chosen_language = str(language or "").strip().upper() or None
+            if decision == "approved":
+                if not usable_observed:
+                    raise ValueError("unknown or multiple observed languages require Unknown Language Review")
+                if chosen_language is None and len(usable_observed) == 1:
+                    chosen_language = usable_observed[0]
+                if chosen_language not in usable_observed:
+                    raise ValueError("choose one of the observed languages")
             now = _now()
             if decision == "rejected":
                 conn.execute(f"UPDATE {table} SET language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
@@ -8703,7 +8802,7 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str) -> dict:
                 _commit_with_retry(conn)
                 return {"decision": decision, "source_id": source_id, "applied": False}
 
-            language = observed[0]
+            language = chosen_language
             conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
                          (language, decision, now, source_id))
             parent_id = row["parent_id"]
@@ -13407,6 +13506,54 @@ def bulk_set_review_excluded(content_type: str, ids: list[int], excluded: bool) 
             _commit_with_retry(conn)
             conn.close()
             return len(ids)
+        finally:
+            conn.close()
+
+
+def bulk_archive_language_probe_parents(items: list[dict]) -> dict:
+    """Archive unique movie/series parents from Unknown Language Review atomically."""
+    if not items or len(items) > 250:
+        raise ValueError("select between 1 and 250 parent items")
+    grouped: dict[str, set[int]] = {"movie": set(), "episode": set()}
+    for item in items:
+        kind = str(item.get("kind") or "")
+        if kind not in grouped:
+            raise ValueError("parent kind must be movie or episode")
+        try:
+            parent_id = int(item.get("item_id"))
+        except (TypeError, ValueError):
+            raise ValueError("parent id must be an integer") from None
+        if parent_id <= 0:
+            raise ValueError("parent ids must be positive")
+        grouped[kind].add(parent_id)
+
+    count = sum(len(ids) for ids in grouped.values())
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for kind, ids in grouped.items():
+                if not ids:
+                    continue
+                table = "movies" if kind == "movie" else "series"
+                placements = "movie_category_placements" if kind == "movie" else "series_category_placements"
+                fk = "movie_id" if kind == "movie" else "series_id"
+                ordered_ids = sorted(ids)
+                placeholders = ",".join("?" for _ in ordered_ids)
+                found = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE id IN ({placeholders})", ordered_ids).fetchone()[0]
+                if int(found) != len(ordered_ids):
+                    raise ValueError("one or more selected parent items no longer exist")
+                conn.execute(
+                    f"UPDATE {table} SET review_excluded=1, review_excluded_manual=1, updated_at=? "
+                    f"WHERE id IN ({placeholders})",
+                    (_now(), *ordered_ids),
+                )
+                conn.execute(f"DELETE FROM {placements} WHERE {fk} IN ({placeholders})", ordered_ids)
+            _commit_with_retry(conn)
+            return {"action": "archived", "count": count}
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

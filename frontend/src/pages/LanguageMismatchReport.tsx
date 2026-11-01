@@ -44,6 +44,7 @@ function languageLabel(code: string | null | undefined) {
 export default function LanguageMismatchReport() {
   const qc = useQueryClient()
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [rowLanguages, setRowLanguages] = useState<Record<string, string>>({})
   const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null)
   const [providerFilters, setProviderFilters] = useState<string[]>([])
   const [observedFilters, setObservedFilters] = useState<string[]>([])
@@ -109,8 +110,8 @@ export default function LanguageMismatchReport() {
   }, [rows])
 
   const decide = useMutation({
-    mutationFn: ({ row, decision }: { row: Mismatch; decision: 'approved' | 'rejected' }) =>
-      api.post(`/vod/language-mismatch/${row.kind}/${row.source_id}/decision/`, { decision }).then((r) => r.data),
+    mutationFn: ({ row, decision, language }: { row: Mismatch; decision: 'approved' | 'rejected'; language?: string }) =>
+      api.post(`/vod/language-mismatch/${row.kind}/${row.source_id}/decision/`, { decision, ...(language ? { language } : {}) }).then((r) => r.data),
     onSuccess: (result) => {
       notify(result.action === 'language_updated_and_archived' ? 'Language updated and item archived.' : result.action === 'language_updated_and_restored' ? 'Language updated and item restored.' : result.decision === 'rejected' ? 'Mismatch ignored and will not be rechecked.' : 'Language updated; no archive was needed.')
       qc.invalidateQueries({ queryKey: ['language-mismatch-report'] })
@@ -118,14 +119,26 @@ export default function LanguageMismatchReport() {
     },
     onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not record the language decision.'),
   })
-  const confirmDecision = (row: Mismatch, decision: 'approved' | 'rejected') => {
+  const archiveParent = useMutation({
+    mutationFn: (row: Mismatch) => api.post(`/vod/${row.kind === 'movie' ? 'movies' : 'series'}/${row.item_id}/archive/`, null, { params: { archived: true } }),
+    onSuccess: () => {
+      notify('Parent item archived. Its source language was left unchanged.')
+      qc.invalidateQueries({ queryKey: ['language-mismatch-report'] })
+      qc.invalidateQueries({ queryKey: ['vod-notices'] })
+    },
+    onError: (e: any) => notify(e?.response?.data?.detail ?? 'Could not archive the parent item.'),
+  })
+  const confirmDecision = (row: Mismatch, decision: 'approved' | 'rejected', language?: string) => {
     const observed = row.observed_languages.join(', ')
+    const chosen = language ?? row.proposed_language ?? ''
     const message = decision === 'rejected'
       ? `Keep ${row.title} as-is?\n\nNo language or archive changes will be made. This source will not be checked again.`
-      : row.proposed_archive
-        ? `Archive the parent for ${row.title}?\n\nThis records the observed language (${observed}) and archives the parent because it is outside your wanted playback languages.\n\nThis is not reversible from this prompt.`
-        : `Record ${observed} as the source language for ${row.title}?\n\nThe parent will not be archived.`
-    if (window.confirm(message)) decide.mutate({ row, decision })
+      : `Record ${chosen} as the source language for ${row.title}?\n\nThis updates the source label. Parent archive status will follow the other provider sources and your wanted playback languages.`
+    if (window.confirm(message)) decide.mutate({ row, decision, ...(decision === 'approved' ? { language: chosen } : {}) })
+  }
+  const confirmArchiveParent = (row: Mismatch) => {
+    if (!window.confirm(`Archive ${row.title}${row.year ? ` (${row.year})` : ''}?\n\nNone of the observed languages (${row.observed_languages.join(', ')}) are wanted. The parent item will be archived and its source language will remain unchanged.`)) return
+    archiveParent.mutate(row)
   }
   const runNow = useMutation({
     mutationFn: () => api.post('/vod/language-trickle/run/').then((r) => r.data),
@@ -302,10 +315,10 @@ export default function LanguageMismatchReport() {
                 <td className="p-2"><input type="checkbox" checked={selected.has(id)} onChange={(e) => toggleRowSelection(row, filteredRows.indexOf(row), e)} /></td>
                 <td className="p-2"><div className="font-medium flex items-center gap-1"><span className="mr-1 rounded border border-border px-1 text-[10px]">{row.kind === 'episode' ? 'S' : 'M'}</span>{row.title} {row.year ? `(${row.year})` : ''}</div><div className="text-white text-[11px]">{row.provider_name} · {row.kind === 'episode' ? `S${row.season_number}E${row.episode_number} · ${row.episode_name ?? ''}` : 'Movie'}{row.tmdb_id ? ` · TMDB ${row.tmdb_id}` : ''}</div></td>
                 <td className="p-2">{languageLabel(row.configured_language)}</td>
-                <td className="p-2"><div>{row.observed_languages.map(languageLabel).join(', ')}</div><div className={row.proposed_archive ? 'text-[11px] text-amber-400' : 'text-[11px] text-white'}>{row.proposed_archive ? 'Approve archive' : 'No archive'}</div></td>
-                <td className="p-2">{disabled ? 'Manual review required' : languageLabel(row.proposed_language)}</td>
+                <td className="p-2"><div>{row.observed_languages.map(languageLabel).join(', ')}</div><div className={row.proposed_archive ? 'text-[11px] text-amber-400' : 'text-[11px] text-white'}>{row.proposed_archive ? 'All observed languages are unwanted' : 'At least one observed language is wanted'}</div></td>
+                <td className="p-2">{disabled ? 'Choose an observed language' : languageLabel(row.proposed_language)}</td>
                 <td className="p-2 text-muted-foreground">{row.language_probed_at ? new Date(row.language_probed_at).toLocaleString() : '—'}</td>
-                <td className="p-2"><span className="flex flex-wrap gap-1"><button title={row.proposed_archive ? 'Archive parent after confirmation' : 'Record observed language after confirmation'} disabled={decide.isPending || disabled} className="px-1.5 py-1 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'approved')}><Check size={13} /> {disabled ? 'Manual review' : row.proposed_archive ? 'Archive parent' : 'Apply language'}</button><button title="Keep unchanged after confirmation" disabled={decide.isPending} className="px-1.5 py-1 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'rejected')}><X size={13} /> Keep as-is</button></span><div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground"><div>{disabled ? 'Multiple/ambiguous result: manual review required' : row.proposed_archive ? 'Records language and archives parent' : 'Records language; no archive'}</div><div>Keep as-is: no changes; no future checks</div></div></td>
+                <td className="p-2"><div className="flex flex-wrap items-center gap-1">{disabled && <select aria-label={`Language to record for ${row.title}`} className="rounded border border-border bg-background px-1 py-1" value={rowLanguages[id] ?? ''} onChange={(e) => setRowLanguages((old) => ({ ...old, [id]: e.target.value }))}><option value="">Choose language</option>{row.observed_languages.filter((language) => language !== 'UNKNOWN').map((language) => <option key={language} value={language}>{languageLabel(language)}</option>)}</select>}<button title="Record the selected observed language" disabled={decide.isPending || archiveParent.isPending || (disabled && !rowLanguages[id])} className="px-1.5 py-1 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'approved', rowLanguages[id] ?? row.proposed_language ?? undefined)}><Check size={13} /> {disabled ? 'Apply selected language' : 'Apply language'}</button>{row.proposed_archive && <button title="Archive parent without changing source language" disabled={decide.isPending || archiveParent.isPending} className="px-1.5 py-1 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40" onClick={() => confirmArchiveParent(row)}>Archive parent</button>}<button title="Keep unchanged after confirmation" disabled={decide.isPending || archiveParent.isPending} className="px-1.5 py-1 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40" onClick={() => confirmDecision(row, 'rejected')}><X size={13} /> Keep as-is</button></div><div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground"><div>{disabled ? 'Choose the correct tag to update this provider source.' : row.proposed_archive ? 'Choose a language or explicitly archive the parent.' : 'Records the observed source language.'}</div><div>Keep as-is: no changes; no future checks</div></div></td>
               </tr>
             })}</tbody>
           </table>

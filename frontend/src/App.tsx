@@ -38,7 +38,7 @@ function ScrollToTopButton() {
   useEffect(() => {
     const update = () => {
       const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
-      setVisible(max > 0 && window.scrollY >= max * 0.1)
+      setVisible(max > 0 && window.scrollY >= max * 0.075)
     }
     update()
     window.addEventListener('scroll', update, { passive: true })
