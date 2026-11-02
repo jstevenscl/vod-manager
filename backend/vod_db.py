@@ -4778,6 +4778,15 @@ _QUALITY_PREFIX_RE = re.compile(r"^(4k|uhd|fhd)\s+")
 # fuzzy-matching any leading token is unsafe here).
 _QUALITY_LANG_DASH_RE = re.compile(r"^(4k|uhd|fhd)-([A-Za-z]{2,6})\s*-\s+", re.IGNORECASE)
 
+# Strip explicit quality labels from the default TMDB lookup only. Requiring
+# a separator keeps a real title such as "4K Collection" intact.
+_TMDB_RESOLUTION_TOKENS = r"(?:8k|4k|uhd|qhd|fhd|hd|2160p|1440p|1080p|720p|576p|480p)"
+_TMDB_RESOLUTION_PREFIX_RE = re.compile(
+    rf"^\s*(?:\[\s*{_TMDB_RESOLUTION_TOKENS}\s*\]\s*(?::|\||-|–|—)?\s*"
+    rf"|{_TMDB_RESOLUTION_TOKENS}\s*(?::|\||-|–|—)\s*)",
+    re.IGNORECASE,
+)
+
 
 def _strip_quality_lang_prefix_for_dedup(name: str) -> str:
     """Strips a leading "<4K/UHD/FHD>-<lang code> - " prefix from a RAW
@@ -4844,11 +4853,16 @@ def tmdb_review_search_query(name: str | None, q: str | None = None) -> str:
     """Default TMDB search text for review/AI flows.
 
     A reviewer's own q is used verbatim; otherwise strip one trailing "(US)"
-    and one "(YYYY)" tag, which TMDB search fails to match.
+    and one "(YYYY)" tag, then a leading quality label such as "4K:".
     """
     if q and q.strip():
         return q.strip()
-    return _import_match_key_name(name or "") or (name or "").strip()
+    cleaned = _import_match_key_name(name or "") or (name or "").strip()
+    quality_language = _QUALITY_LANG_DASH_RE.match(cleaned)
+    if quality_language and quality_language.group(2).upper() in _KNOWN_LANGUAGE_CODES:
+        cleaned = cleaned[quality_language.end():].strip()
+    cleaned = _TMDB_RESOLUTION_PREFIX_RE.sub("", cleaned, count=1).strip()
+    return cleaned or (name or "").strip()
 
 
 def _duplicate_ignore_signature(item_ids: list[int]) -> str:
