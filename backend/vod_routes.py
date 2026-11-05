@@ -78,6 +78,7 @@ import portal_auth
 import strm_export
 import vod_downloader
 import vod_probe
+import language_autoclean
 import tmdb_sync
 import vod_bulk_ai_service
 import vod_db
@@ -4249,6 +4250,46 @@ async def save_language_trickle_settings(body: LanguageTrickleSettingsRequest):
 async def save_language_trickle_enabled(body: LanguageTrickleEnabledRequest):
     config.save_language_trickle_enabled(body.enabled)
     return config.get_language_trickle_settings()
+
+
+class LanguageAutocleanSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    batch_size: Optional[int] = None
+    interval_seconds: Optional[int] = None
+    cooldown_seconds: Optional[int] = None
+
+
+def _language_autoclean_view() -> dict:
+    return {**config.get_language_autoclean_settings(), "status": language_autoclean.get_status()}
+
+
+# KNM: 2026-11-05 - language auto-clean: settings (default off), dry-run preview, change log and revert.
+@router.get("/language-autoclean/settings/", dependencies=_GUARDS)
+async def language_autoclean_settings():
+    return _language_autoclean_view()
+
+
+@router.post("/language-autoclean/settings/", dependencies=_GUARDS)
+async def save_language_autoclean_settings(body: LanguageAutocleanSettingsRequest):
+    config.save_language_autoclean_settings(body.enabled, body.batch_size, body.interval_seconds, body.cooldown_seconds)
+    return _language_autoclean_view()
+
+
+@router.get("/language-autoclean/preview/", dependencies=_GUARDS)
+async def language_autoclean_preview(limit: int = 200):
+    return await asyncio.to_thread(language_autoclean.preview, max(1, min(int(limit), 2000)))
+
+
+@router.get("/language-autoclean/log/", dependencies=_GUARDS)
+async def language_autoclean_log(limit: int = 200):
+    return {"results": await asyncio.to_thread(language_autoclean.list_log, max(1, min(int(limit), 2000)))}
+
+
+@router.post("/language-autoclean/log/{log_id}/revert/", dependencies=_GUARDS)
+async def revert_language_autoclean(log_id: int):
+    if not await asyncio.to_thread(language_autoclean.revert, log_id):
+        raise HTTPException(409, "Already reverted, or the source was changed since auto-clean touched it.")
+    return {"reverted": True}
 
 
 @router.post("/language-trickle/providers/{provider_id}/unblock/", dependencies=_GUARDS)

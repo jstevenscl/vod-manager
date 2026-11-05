@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Languages, Loader2, Power, RefreshCw, X } from 'lucide-react'
 import api from '@/lib/api'
+import LanguageAutocleanPanel from '@/components/LanguageAutocleanPanel'
 import { notify } from '@/lib/confirm'
 
 type Mismatch = {
@@ -237,6 +238,8 @@ export default function LanguageMismatchReport() {
           return <div className="rounded border border-border bg-background/40 px-2 py-2 text-[11px]" key={provider.provider_id}><div className="flex items-center justify-between gap-2"><span className="font-medium">{provider.name}</span><span className={blocked ? 'text-red-400' : gated ? 'text-amber-400' : 'text-emerald-400'}>{label}</span></div><div className="mt-1 text-muted-foreground">{budget}{lastResponse ? ` · ${lastResponse}` : ''}</div>{blocked && <button className="mt-2 inline-flex items-center gap-1.5 border border-primary/40 rounded px-2 py-1 text-primary hover:bg-accent" disabled={unblockProvider.isPending} onClick={() => unblockProvider.mutate(provider.provider_id)}>{unblockProvider.isPending && <Loader2 size={12} className="animate-spin" />}{unblockProvider.isPending ? 'Unblocking…' : 'Unblock'}</button>}</div>
         })}</div>}
       </details>
+
+      <LanguageAutocleanPanel />
 
       {capacityReportOpen && <div className="rounded-md border border-border bg-card px-3 py-3">
         <h2 className="text-xs font-medium">Provider capacity holds</h2>

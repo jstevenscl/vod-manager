@@ -1092,6 +1092,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
         error               TEXT
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_language_probe_runs_checked ON language_probe_runs(checked_at)")
+    # KNM: 2026-11-05 - every language auto-clean change, so it can be reviewed and reverted.
+    conn.execute("""CREATE TABLE IF NOT EXISTS language_autoclean_log (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind                   TEXT NOT NULL,
+        source_id              INTEGER NOT NULL,
+        previous_language      TEXT,
+        new_language           TEXT,
+        observed_languages     TEXT,
+        tmdb_original_language TEXT,
+        applied_at             TEXT NOT NULL,
+        reverted_at            TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_language_autoclean_log_source ON language_autoclean_log(kind, source_id)")
     # Persist the small amount of provider-level language-probe state needed
     # for adaptive pacing and a user-visible blocked state.  Provider rows are
     # still the source of truth for which providers are active; this table is
@@ -7759,6 +7772,39 @@ def set_source_language_probe(kind: str, source_id: int, languages: list[str] | 
         conn.close()
 
 
+# KNM: 2026-11-05 - provider labels use country-style codes (KR, JP, CZ) and ffprobe
+# yields ISO 639 codes (KO, JA, CS); compare through one alias map so the same
+# language is never treated as a mismatch or wrongly archived.
+_LANGUAGE_ALIASES = {
+    "KR": "KO", "JP": "JA", "CN": "ZH", "DK": "DA", "SE": "SV", "GR": "EL", "GRE": "EL",
+    "CZ": "CS", "CZE": "CS", "UA": "UK", "UKR": "UK", "IL": "HE", "HEB": "HE", "IND": "ID",
+    "FIL": "TL", "TGL": "TL", "PER": "FA", "RUM": "RO", "FRE": "FR", "HUN": "HU", "VIE": "VI",
+    "NOB": "NO", "KAN": "KN", "CAT": "CA", "PAN": "PA", "ALB": "SQ", "BR": "PT", "MUL": "MULTI",
+}
+
+
+def canonical_language(code: str | None) -> str | None:
+    if not code:
+        return None
+    code = str(code).strip().upper()
+    return _LANGUAGE_ALIASES.get(code, code)
+
+
+def languages_match(label: str | None, observed) -> bool:
+    """True when the label's language is among the observed tags (alias-aware)."""
+    target = canonical_language(label)
+    return bool(target) and target in {canonical_language(o) for o in observed or []}
+
+
+def _enabled_spelling(code: str | None, enabled) -> str | None:
+    """The enabled-list spelling of an alias (KO -> KR when KR is enabled), else code."""
+    target = canonical_language(code)
+    for e in enabled:
+        if canonical_language(e) == target:
+            return e
+    return code
+
+
 def auto_approve_language_probe_source(kind: str, source_id: int, languages: list[str]) -> None:
     """Close a probe when the configured language is present in the tracks."""
     table = "movie_sources" if kind == "movie" else "episode_sources"
@@ -7767,7 +7813,7 @@ def auto_approve_language_probe_source(kind: str, source_id: int, languages: lis
         conn = _connect()
         try:
             row = conn.execute(f"SELECT language FROM {table} WHERE id=?", (source_id,)).fetchone()
-            if not row or not row["language"] or row["language"] not in set(languages):
+            if not row or not languages_match(row["language"], languages):
                 return
             conn.execute(
                 f"""UPDATE {table}
@@ -7801,7 +7847,7 @@ def auto_approve_existing_language_matches() -> int:
                         languages = set(json.loads(row["language_probe_languages"] or "[]"))
                     except (TypeError, ValueError):
                         languages = set()
-                    if row["language"] not in languages:
+                    if not languages_match(row["language"], languages):
                         continue
                     conn.execute(
                         f"""UPDATE {table}
@@ -8582,11 +8628,11 @@ def list_language_mismatches(limit: int = 1000) -> dict:
                 observed = []
             if not observed or all(language == "UNKNOWN" for language in observed):
                 continue
-            if item.get("configured_language") and item.get("configured_language") in observed:
+            if languages_match(item.get("configured_language"), observed):
                 continue
             item["observed_languages"] = observed
             usable_observed = {language for language in observed if language and language != "UNKNOWN"}
-            item["proposed_archive"] = bool(usable_observed) and not bool(usable_observed & set(enabled))
+            item["proposed_archive"] = bool(usable_observed) and not any(languages_match(e, usable_observed) for e in [*enabled, "MULTI"])
             item["safe_to_apply"] = item["proposed_archive"] or len(usable_observed) == 1
             item["proposed_language"] = next(iter(usable_observed)) if len(usable_observed) == 1 and not item["proposed_archive"] else None
             item["enabled_languages"] = enabled
@@ -8788,13 +8834,20 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str, language:
                 observed = []
             usable_observed = [tag for tag in observed if tag and tag != "UNKNOWN"]
             enabled = set(get_enabled_languages())
-            archive_only = bool(usable_observed) and not bool(set(usable_observed) & enabled)
+            archive_only = bool(usable_observed) and not any(languages_match(e, usable_observed) for e in [*enabled, "MULTI"])
             chosen_language = str(language or "").strip().upper() or None
+            if chosen_language and not archive_only:
+                # Accept an alias of an observed tag (KR for observed KO).
+                chosen_language = next((o for o in usable_observed if languages_match(chosen_language, [o])), chosen_language)
             if decision == "approved":
                 if not usable_observed:
                     raise ValueError("unknown or multiple observed languages require Unknown Language Review")
                 if archive_only:
-                    chosen_language = None
+                    # KNM: 2026-11-05 - tag the source with an observed unwanted language so
+                    # _enabled_languages_clause hides just this feed; leaving it EN kept it served
+                    # whenever another wanted source kept the parent title live.
+                    if chosen_language not in usable_observed:
+                        chosen_language = usable_observed[0]
                 elif chosen_language is None and len(usable_observed) == 1:
                     chosen_language = usable_observed[0]
                 if not archive_only and chosen_language not in usable_observed:
@@ -8806,13 +8859,9 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str, language:
                 _commit_with_retry(conn)
                 return {"decision": decision, "source_id": source_id, "applied": False}
 
-            language = chosen_language
-            if archive_only:
-                conn.execute(f"UPDATE {table} SET language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
-                             (decision, now, source_id))
-            else:
-                conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
-                             (language, decision, now, source_id))
+            language = chosen_language if archive_only else _enabled_spelling(chosen_language, enabled)
+            conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
+                         (language, decision, now, source_id))
             parent_id = row["parent_id"]
             if kind == "episode":
                 # Keep the series-level source label aligned with the provider's
@@ -8853,6 +8902,50 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str, language:
                 action = "language_updated_and_restored"
             _commit_with_retry(conn)
             return {"decision": decision, "source_id": source_id, "applied": True, "language": language, "action": action}
+        finally:
+            conn.close()
+
+
+def log_language_autoclean(kind: str, source_id: int, previous_language: str | None, new_language: str | None,
+                           observed: list[str], tmdb_original_language: str | None) -> None:
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("""INSERT INTO language_autoclean_log (kind, source_id, previous_language, new_language,
+                                observed_languages, tmdb_original_language, applied_at) VALUES (?,?,?,?,?,?,?)""",
+                         (kind, source_id, previous_language, new_language, json.dumps(observed), tmdb_original_language, _now()))
+            _commit_with_retry(conn)
+        finally:
+            conn.close()
+
+
+def list_language_autoclean_log(limit: int = 200) -> list[dict]:
+    conn = _connect()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM language_autoclean_log ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+    finally:
+        conn.close()
+
+
+def revert_language_autoclean(log_id: int) -> bool:
+    """Undo one auto-clean change; refuses if someone has changed the source since."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            log = conn.execute("SELECT * FROM language_autoclean_log WHERE id=?", (log_id,)).fetchone()
+            if not log or log["reverted_at"]:
+                return False
+            table = "movie_sources" if log["kind"] == "movie" else "episode_sources"
+            changed = conn.execute(
+                f"""UPDATE {table} SET language=?, language_probe_decision=NULL, language_probe_decided_at=NULL
+                    WHERE id=? AND language_probe_decision='approved' AND language IS ?""",
+                (log["previous_language"], log["source_id"], log["new_language"])).rowcount
+            if not changed:
+                return False
+            conn.execute("UPDATE language_autoclean_log SET reverted_at=? WHERE id=?", (_now(), log_id))
+            _commit_with_retry(conn)
+            return True
         finally:
             conn.close()
 
@@ -9571,7 +9664,7 @@ def _add_episode_source_row(
                raw_name=excluded.raw_name,
                provider_category_name=excluded.provider_category_name,
                bitrate=COALESCE(excluded.bitrate, episode_sources.bitrate),
-               language=excluded.language""",
+               language=CASE WHEN episode_sources.language_probe_decision='approved' THEN episode_sources.language ELSE excluded.language END""",
         (episode_id, provider_id, provider_stream_id, container_extension, file_size_bytes, local_file_path, raw_name, provider_category_name, bitrate, _source_language(raw_name, provider_category_name), _now(), _now()),
     )
     return conn.execute(
@@ -10440,7 +10533,7 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                            VALUES (?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(provider_id, provider_stream_id) DO UPDATE SET
                                movie_id=excluded.movie_id, last_seen_at=excluded.last_seen_at, provider_category_name=excluded.provider_category_name,
-                               raw_name=excluded.raw_name, language=excluded.language""",
+                               raw_name=excluded.raw_name, language=CASE WHEN movie_sources.language_probe_decision='approved' THEN movie_sources.language ELSE excluded.language END""",
                             (movie_id, provider_id, item["provider_stream_id"], item.get("container_extension", "mp4"),
                              item.get("provider_category_name"), item.get("raw_name"), _source_language(item.get("raw_name"), item.get("provider_category_name")), now, now),
                         )
@@ -13279,6 +13372,14 @@ def apply_language_backfill() -> int:
     return total
 
 
+def _undecided_filter(table: str) -> str:
+    # KNM: 2026-11-05 - recompute must not revert languages approved via probe review or manual
+    # confirmation (series_sources has no decision column, so it is unaffected).
+    if table in ("movie_sources", "episode_sources"):
+        return " AND COALESCE(language_probe_decision, '') != 'approved'"
+    return ""
+
+
 def language_recompute_dry_run_report(sample_size: int = 5) -> dict:
     """Rows that already have a language set, but whose stored value no
     longer matches what _source_language would compute today -- i.e. they
@@ -13293,7 +13394,7 @@ def language_recompute_dry_run_report(sample_size: int = 5) -> dict:
         report = {}
         for table, fk_col, parent_table in _BACKFILL_TABLES:
             rows = conn.execute(
-                f"SELECT raw_name, provider_category_name, language, {fk_col} AS parent_id FROM {table} WHERE language IS NOT NULL"
+                f"SELECT raw_name, provider_category_name, language, {fk_col} AS parent_id FROM {table} WHERE language IS NOT NULL{_undecided_filter(table)}"
             ).fetchall()
             by_code: dict[str, dict] = {}
             for row in rows:
@@ -13333,7 +13434,7 @@ def apply_language_recompute() -> int:
     batch_size = 25
     total = 0
     for table, _fk_col, _parent_table in _BACKFILL_TABLES:
-        rows = _connect().execute(f"SELECT id, raw_name, provider_category_name, language FROM {table} WHERE language IS NOT NULL").fetchall()
+        rows = _connect().execute(f"SELECT id, raw_name, provider_category_name, language FROM {table} WHERE language IS NOT NULL{_undecided_filter(table)}").fetchall()
         mismatches = [(row["id"], recomputed) for row in rows
                       if (recomputed := _source_language(row["raw_name"], row["provider_category_name"])) != row["language"]]
         if not mismatches:
