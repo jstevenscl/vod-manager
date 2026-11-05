@@ -400,7 +400,7 @@ def test_language_audit_stats_group_recent_error_codes_by_provider(db):
     assert codes[("error-code-provider", "CAPACITY")] == 1
 
 
-def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_source(db, tmp_path):
+def test_language_mismatch_report_approval_archives_without_changing_unwanted_tag(db, tmp_path):
     pid = db.upsert_provider("report-language", "", "", "", provider_type="library")
     mid = db.upsert_movie("Report Hindi Movie", 2026)
     path = tmp_path / "report.mkv"
@@ -414,12 +414,12 @@ def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_sou
 
     report = db.list_language_mismatches()
     row = next(r for r in report["results"] if r["source_id"] == sid)
-    assert row["proposed_language"] == "HI" and row["proposed_archive"] is True
+    assert row["proposed_language"] is None and row["proposed_archive"] is True
 
     result = db.decide_language_mismatch("movie", sid, "approved")
-    assert result["action"] == "language_updated_and_archived"
+    assert result["action"] == "parent_archived"
     source = db.get_language_probe_source("movie", sid)
-    assert source["language"] == "HI" and source["language_probe_decision"] == "approved"
+    assert source["language"] == "EN" and source["language_probe_decision"] == "approved"
     assert db.get_movie(mid)["review_excluded"] == 1
     assert not db.list_language_mismatches()["results"]
 

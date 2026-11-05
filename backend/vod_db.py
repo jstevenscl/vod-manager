@@ -8537,7 +8537,7 @@ def _language_probe_table(kind: str) -> tuple[str, str, str]:
 
 
 def list_language_mismatches(limit: int = 1000) -> dict:
-    """Pending single-tag mismatches, excluding already archived parents.
+    """Pending language mismatches, excluding already archived parents.
 
     This is intentionally a review report, not an export query. A source is
     eligible for this report only once and a decision removes it permanently
@@ -8585,10 +8585,10 @@ def list_language_mismatches(limit: int = 1000) -> dict:
             if item.get("configured_language") and item.get("configured_language") in observed:
                 continue
             item["observed_languages"] = observed
-            item["safe_to_apply"] = len(observed) == 1
-            item["proposed_language"] = observed[0] if len(observed) == 1 else None
             usable_observed = {language for language in observed if language and language != "UNKNOWN"}
             item["proposed_archive"] = bool(usable_observed) and not bool(usable_observed & set(enabled))
+            item["safe_to_apply"] = item["proposed_archive"] or len(usable_observed) == 1
+            item["proposed_language"] = next(iter(usable_observed)) if len(usable_observed) == 1 and not item["proposed_archive"] else None
             item["enabled_languages"] = enabled
             rows.append(item)
         return {"enabled_languages": enabled, "count": len(rows), "results": rows}
@@ -8787,13 +8787,17 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str, language:
             except (TypeError, ValueError):
                 observed = []
             usable_observed = [tag for tag in observed if tag and tag != "UNKNOWN"]
+            enabled = set(get_enabled_languages())
+            archive_only = bool(usable_observed) and not bool(set(usable_observed) & enabled)
             chosen_language = str(language or "").strip().upper() or None
             if decision == "approved":
                 if not usable_observed:
                     raise ValueError("unknown or multiple observed languages require Unknown Language Review")
-                if chosen_language is None and len(usable_observed) == 1:
+                if archive_only:
+                    chosen_language = None
+                elif chosen_language is None and len(usable_observed) == 1:
                     chosen_language = usable_observed[0]
-                if chosen_language not in usable_observed:
+                if not archive_only and chosen_language not in usable_observed:
                     raise ValueError("choose one of the observed languages")
             now = _now()
             if decision == "rejected":
@@ -8803,33 +8807,48 @@ def decide_language_mismatch(kind: str, source_id: int, decision: str, language:
                 return {"decision": decision, "source_id": source_id, "applied": False}
 
             language = chosen_language
-            conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
-                         (language, decision, now, source_id))
+            if archive_only:
+                conn.execute(f"UPDATE {table} SET language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
+                             (decision, now, source_id))
+            else:
+                conn.execute(f"UPDATE {table} SET language=?, language_probe_decision=?, language_probe_decided_at=? WHERE id=?",
+                             (language, decision, now, source_id))
             parent_id = row["parent_id"]
             if kind == "episode":
                 # Keep the series-level source label aligned with the provider's
                 # observed episode when that provider has a series source row.
-                conn.execute("""UPDATE series_sources SET language=?
-                               WHERE series_id=? AND provider_id=?""",
-                             (language, parent_id, row["provider_id"]))
                 source_langs = _source_languages(conn, "series_sources", "series_id", parent_id)
-                if not source_langs:
+                if archive_only:
+                    source_langs = {r[0] for r in conn.execute(
+                        "SELECT language FROM series_sources WHERE series_id=? AND provider_id!=? AND language IS NOT NULL",
+                        (parent_id, row["provider_id"]),
+                    ).fetchall()}
+                else:
+                    conn.execute("""UPDATE series_sources SET language=?
+                                   WHERE series_id=? AND provider_id=?""",
+                                 (language, parent_id, row["provider_id"]))
+                if not source_langs and not archive_only:
                     source_langs = {language}
                 parent_table = "series"
                 placements = "series_category_placements"
                 placement_key = "series_id"
             else:
                 source_langs = _source_languages(conn, "movie_sources", "movie_id", parent_id)
+                if archive_only:
+                    source_langs = {r[0] for r in conn.execute(
+                        "SELECT language FROM movie_sources WHERE movie_id=? AND id!=? AND language IS NOT NULL",
+                        (parent_id, source_id),
+                    ).fetchall()}
                 placements = "movie_category_placements"
                 placement_key = "movie_id"
             eligible = _any_language_enabled(source_langs, set(get_enabled_languages()))
             parent_row = conn.execute(f"SELECT review_excluded, review_excluded_manual, review_excluded_language FROM {parent_table} WHERE id=?", (parent_id,)).fetchone()
-            action = "language_updated"
+            action = "archive_skipped_wanted_source" if archive_only and eligible else ("archive_skipped_manual_exclusion" if archive_only and parent_row and parent_row["review_excluded_manual"] else ("parent_archived" if archive_only else "language_updated"))
             if not eligible and parent_row and not parent_row["review_excluded_manual"]:
                 conn.execute(f"UPDATE {parent_table} SET review_excluded=1, review_excluded_language=1, updated_at=? WHERE id=?", (now, parent_id))
                 conn.execute(f"DELETE FROM {placements} WHERE {placement_key}=?", (parent_id,))
-                action = "language_updated_and_archived"
-            elif eligible and parent_row and parent_row["review_excluded_language"] and not parent_row["review_excluded_manual"]:
+                action = "parent_archived" if archive_only else "language_updated_and_archived"
+            elif not archive_only and eligible and parent_row and parent_row["review_excluded_language"] and not parent_row["review_excluded_manual"]:
                 conn.execute(f"UPDATE {parent_table} SET review_excluded=0, review_excluded_language=0, updated_at=? WHERE id=?", (now, parent_id))
                 action = "language_updated_and_restored"
             _commit_with_retry(conn)
