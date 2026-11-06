@@ -166,7 +166,7 @@ export default function LanguageMismatchReport() {
     const message = decision === 'rejected'
       ? `Keep ${safeTargets.length} selected source${safeTargets.length === 1 ? '' : 's'} as-is? No changes will be made.`
       : archiveCount
-        ? `Apply ${safeTargets.length} proposed actions?\n\n${archiveCount} source${archiveCount === 1 ? '' : 's'} will be set to the observed (unwanted) language and hidden; each title is archived unless another source has a wanted language.\n\nProgress shows on this page, with one summary at the end.`
+        ? `Archive ${archiveCount} title${archiveCount === 1 ? '' : 's'}?\n\nNone of the observed languages (${[...new Set(safeTargets.filter((row) => row.proposed_archive).flatMap((row) => row.observed_languages.filter((l) => l && l !== 'UNKNOWN')))].sort().join(', ')}) are wanted. Each source will be set to its observed language and hidden, and the title archived unless another source has a wanted language.${safeTargets.length > archiveCount ? `\n\n${safeTargets.length - archiveCount} other source${safeTargets.length - archiveCount === 1 ? '' : 's'} will be labeled with the observed language.` : ''}`
         : `Record the observed language for ${safeTargets.length} selected source${safeTargets.length === 1 ? '' : 's'}? No parent will be archived.`
     if (!window.confirm(message)) return
     setBulkAction(decision)
@@ -196,7 +196,11 @@ export default function LanguageMismatchReport() {
       qc.invalidateQueries({ queryKey: ['vod-notices'] })
       notify(decision === 'rejected'
         ? `Done: ${tally.kept} kept as-is${tally.failed ? `, ${tally.failed} failed` : ''}.`
-        : `Done: ${tally.archived} archived, ${tally.updated} language updated (title kept active)${tally.failed ? `, ${tally.failed} failed` : ''}.`)
+        : [
+            tally.archived && `${tally.archived} parent${tally.archived === 1 ? '' : 's'} archived; source language set to the observed language.`,
+            tally.updated && `${tally.updated} source${tally.updated === 1 ? '' : 's'} relabeled; title stays available (another feed has a wanted language).`,
+            tally.failed && `${tally.failed} failed; ${tally.failed === 1 ? 'it remains' : 'they remain'} in the report.`,
+          ].filter(Boolean).join('\n\n') || 'No changes were made.')
     }
   }
 
