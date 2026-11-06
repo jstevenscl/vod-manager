@@ -146,3 +146,25 @@ def test_routes_toggle_preview_and_revert(db):
         asyncio.run(vod_routes.revert_language_autoclean(log_id))
     # a reverted source is never auto-cleaned again
     assert ac.preview()["candidates"] == []
+
+
+def test_log_shows_title_provider_and_readable_time(db):
+    # KNM: 2026-11-05 - the log showed "episode #1681044" and a raw timestamp; users need names.
+    sid = _movie(db, "Cure", 1101, ["JA"])
+    db.log_language_autoclean("movie", sid, "EN", "JA", ["JA"], "ja")
+    pid = db.upsert_provider("prov-show", "", "", "", provider_type="library")
+    series = db.upsert_series("Dark", 2017)
+    esrc = db.add_episode_source(db.add_episode(series, 1, 2, "Lies"), pid, "e-dark", "mkv")
+    db.log_language_autoclean("episode", esrc, "EN", "DE", ["DE"], "de")
+
+    rows = {r["kind"]: r for r in db.list_language_autoclean_log()}
+
+    assert rows["movie"]["title"] == "Cure" and rows["movie"]["provider_name"] == "prov-Cure"
+    assert rows["episode"]["title"] == "Dark S01E02 · Lies" and rows["episode"]["provider_name"] == "prov-show"
+    assert rows["movie"]["applied_at_iso"].endswith("+00:00")
+
+
+def test_middle_english_tag_counts_as_english():
+    # KNM: 2026-11-05 - "enm" (Middle English) on a modern file is a mistagged "eng".
+    import vod_probe
+    assert vod_probe._LANGUAGE_CODES["enm"] == "EN"

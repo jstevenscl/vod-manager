@@ -8922,8 +8922,28 @@ def log_language_autoclean(kind: str, source_id: int, previous_language: str | N
 def list_language_autoclean_log(limit: int = 200) -> list[dict]:
     conn = _connect()
     try:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM language_autoclean_log ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+        # KNM: 2026-11-05 - include title/provider and an ISO time so the log is readable.
+        rows = [dict(r) for r in conn.execute("""
+            SELECT l.*,
+                   CASE WHEN l.kind='movie' THEN m.name
+                        ELSE s.name || ' S' || printf('%02d', e.season_number) || 'E' || printf('%02d', e.episode_number)
+                             || CASE WHEN COALESCE(e.name,'')!='' THEN ' · ' || e.name ELSE '' END END AS title,
+                   COALESCE(pm.name, pe.name) AS provider_name
+            FROM language_autoclean_log l
+            LEFT JOIN movie_sources ms ON l.kind='movie' AND ms.id=l.source_id
+            LEFT JOIN movies m ON m.id=ms.movie_id
+            LEFT JOIN providers pm ON pm.id=ms.provider_id
+            LEFT JOIN episode_sources es ON l.kind='episode' AND es.id=l.source_id
+            LEFT JOIN episodes e ON e.id=es.episode_id
+            LEFT JOIN series s ON s.id=e.series_id
+            LEFT JOIN providers pe ON pe.id=es.provider_id
+            ORDER BY l.id DESC LIMIT ?""", (int(limit),)).fetchall()]
+        for r in rows:
+            try:
+                r["applied_at_iso"] = datetime.datetime.fromtimestamp(float(r["applied_at"]), datetime.timezone.utc).isoformat(timespec="seconds")
+            except (TypeError, ValueError):
+                r["applied_at_iso"] = r["applied_at"]
+        return rows
     finally:
         conn.close()
 

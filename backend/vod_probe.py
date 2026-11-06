@@ -206,7 +206,8 @@ async def _ffprobe_video(path: str) -> tuple[int | None, int | None, str | None]
 
 
 _LANGUAGE_CODES = {
-    "eng": "EN", "hin": "HI", "fra": "FR", "spa": "ES", "deu": "DE",
+    "eng": "EN", "enm": "EN",  # KNM: 2026-11-05 - enm is a common mistag for eng
+    "hin": "HI", "fra": "FR", "spa": "ES", "deu": "DE",
     "ger": "DE", "ita": "IT", "por": "PT", "jpn": "JA", "zho": "ZH",
     "chi": "ZH", "kor": "KO", "ara": "AR", "rus": "RU", "tam": "TA",
     "tel": "TE", "mal": "ML", "tha": "TH", "dan": "DA", "nld": "NL",

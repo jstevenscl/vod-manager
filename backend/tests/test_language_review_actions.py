@@ -33,8 +33,9 @@ def test_all_unwanted_observed_languages_propose_parent_archive(db, monkeypatch,
     assert row["proposed_archive"] is True
     result = db.decide_language_mismatch("movie", source_id, "approved")
     assert result["action"] == "parent_archived"
-    assert result["language"] is None
-    assert db.get_language_probe_source("movie", source_id)["language"] == "EN"
+    assert result["language"] == observed[0]
+    # The feed is relabelled to the heard language so the playback gate stops serving it.
+    assert db.get_language_probe_source("movie", source_id)["language"] == observed[0]
     assert db.get_language_probe_source("movie", source_id)["language_probe_decision"] == "approved"
     assert db.get_movie(movie_id)["review_excluded"] == 1
 
