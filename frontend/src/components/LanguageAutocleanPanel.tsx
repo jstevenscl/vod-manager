@@ -71,6 +71,14 @@ export default function LanguageAutocleanPanel() {
         <button className="border border-primary/40 text-primary rounded px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50" disabled={save.isPending} onClick={() => save.mutate({ batch_size: Number(form.batch_size), interval_seconds: Number(form.interval_seconds), cooldown_seconds: Number(form.cooldown_seconds) })}>Save pacing</button>
         <button className="flex items-center gap-1.5 border border-border rounded px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50" disabled={runPreview.isPending} onClick={() => runPreview.mutate()}>{runPreview.isPending ? <Loader2 size={12} className="animate-spin" /> : <Eye size={12} />} Preview what it would hide</button>
       </div>
+      {/* KNM: 2026-11-05 - plain-language limits and guidance; the server clamps out-of-range values silently. */}
+      <ul className="text-sm text-foreground mt-2 list-disc pl-5 space-y-0.5">
+        <li><span className="font-medium">How it works:</span> auto-clean only reviews feeds the background language check has already listened to, using the TMDB details already saved in VOD Manager. It never contacts your providers or the TMDB website, so batches use almost no CPU.</li>
+        <li><span className="font-medium">Feeds per batch:</span> 1 to 500. 25 to 100 works well on any system. Larger batches clear the list faster, and you can revert any feed from the log.</li>
+        <li><span className="font-medium">Seconds between batches:</span> at least 60. 120 to 300 is a good range.</li>
+        <li><span className="font-medium">Cooldown after other jobs:</span> 0 to 86,400 seconds (one day). This is how long to wait after an import, sync or TMDB update finishes before starting again. 600 to 900 (10 to 15 minutes) is recommended.</li>
+        <li>Values outside these ranges are changed to the nearest allowed value when you save.</li>
+      </ul>
 
       {preview && (
         <div className="mt-3 text-xs">
