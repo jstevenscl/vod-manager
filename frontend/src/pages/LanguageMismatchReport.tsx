@@ -232,6 +232,28 @@ export default function LanguageMismatchReport() {
           <button className="inline-flex items-center gap-1.5 border border-primary/40 text-primary rounded px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50" disabled={saveSettings.isPending} onClick={() => saveSettings.mutate()}>{saveSettings.isPending && <Loader2 size={12} className="animate-spin" />}{saveSettings.isPending ? 'Saving…' : 'Save pacing'}</button>
           <span className="text-[11px] text-muted-foreground">Leave Daily cap blank for no cap. Provider safeguards reduce or pause only providers that show repeated throttling.</span>
         </div>
+        {/* KNM: 2026-11-05 - pacing examples. Each provider is checked one file at a time, so peak CPU depends on how many providers run at once (about one core with 4); batch size only sets how long each burst lasts. */}
+        <div className="mt-3 rounded border border-border bg-background/40 px-3 py-2">
+          <div className="text-sm font-medium text-foreground">Suggested settings</div>
+          <p className="text-sm text-foreground mt-1">Each provider is checked one file at a time, so a burst uses about one CPU core when four providers are checked together. Smaller batches more often mean shorter bursts with the same overall pace. Real speed is usually below the estimate, because each check waits on the provider.</p>
+          <div className="mt-2 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {[
+              { name: 'Light', who: '2 to 4 CPU cores, or a shared host', probes: 10, interval: 180, note: 'Very short bursts with long quiet gaps. Slow, but you will hardly notice it.' },
+              { name: 'Balanced (recommended)', who: '4 to 6 CPU cores', probes: 15, interval: 120, note: 'Bursts of under a minute every two minutes. Good everyday setting.' },
+              { name: 'Steady', who: '6 or more CPU cores', probes: 25, interval: 120, note: 'Moves through the list faster while bursts stay short.' },
+              { name: 'Fast catch-up', who: 'Large backlog, providers showing Normal', probes: 40, interval: 90, note: 'Clears a big list quickly. Each provider still gets one file at a time. Switch back to Balanced once caught up.' },
+              { name: 'Overnight backlog', who: 'Run while nobody is watching', probes: 80, interval: 90, note: 'Fastest. Long bursts of steady CPU use. Watch the provider cards below; if one leaves Normal, step down.' },
+            ].map((p) => (
+              <div className="rounded border border-border px-2 py-2 text-sm text-foreground" key={p.name}>
+                <div className="flex items-center justify-between gap-2"><span className="font-medium">{p.name}</span><button className="border border-primary/40 text-primary rounded px-2 py-0.5 text-sm hover:bg-accent" onClick={() => setForm({ ...form, probes_per_cycle: p.probes, interval_seconds: p.interval })}>Use</button></div>
+                <div className="mt-1">{p.who}</div>
+                <div className="mt-1">{p.probes} per cycle, every {p.interval}s · up to about {Math.round(p.probes * 3600 / p.interval).toLocaleString()}/hr</div>
+                <div className="mt-1">{p.note}</div>
+              </div>
+            ))}
+          </div>
+          <p className="text-sm text-foreground mt-2">Click Use, then Save pacing.</p>
+        </div>
         {!!report.data?.trickle?.providers?.length && <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">{report.data.trickle.providers.map((provider) => {
           const gated = provider.status === 'gating'
           const blocked = provider.status === 'blocked'
