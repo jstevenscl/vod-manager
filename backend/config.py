@@ -879,6 +879,34 @@ _REFRESH_DEFAULTS = {
 }
 
 
+# KNM: 2026-11-05 - language auto-clean (language_autoclean.py); off until a person turns it on.
+_LANGUAGE_AUTOCLEAN_DEFAULTS = {
+    "language_autoclean_enabled": False,
+    "language_autoclean_batch_size": 25,
+    "language_autoclean_interval_seconds": 300,
+    "language_autoclean_cooldown_seconds": 900,
+}
+
+
+def get_language_autoclean_settings() -> dict:
+    data = _read_raw()
+    return {key: data.get(key, value) for key, value in _LANGUAGE_AUTOCLEAN_DEFAULTS.items()}
+
+
+def save_language_autoclean_settings(enabled: bool | None = None, batch_size: int | None = None,
+                                     interval_seconds: int | None = None, cooldown_seconds: int | None = None) -> None:
+    def update(data: dict) -> None:
+        if enabled is not None:
+            data["language_autoclean_enabled"] = bool(enabled)
+        if batch_size is not None:
+            data["language_autoclean_batch_size"] = min(500, max(1, int(batch_size)))
+        if interval_seconds is not None:
+            data["language_autoclean_interval_seconds"] = min(86400, max(60, int(interval_seconds)))
+        if cooldown_seconds is not None:
+            data["language_autoclean_cooldown_seconds"] = min(86400, max(0, int(cooldown_seconds)))
+    _update_raw(update)
+
+
 def get_refresh_settings() -> dict:
     data = _read_raw()
     return {k: data.get(k, v) for k, v in _REFRESH_DEFAULTS.items()}

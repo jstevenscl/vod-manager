@@ -33,7 +33,7 @@ function initTheme(): Theme {
   return t
 }
 
-function ScrollToTopButton({ threshold = 0.1 }: { threshold?: number }) {
+function ScrollToTopButton({ threshold = 0.075 }: { threshold?: number }) {
   const [visible, setVisible] = useState(false)
   useEffect(() => {
     const update = () => {
@@ -431,7 +431,7 @@ export default function App() {
             <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
           )}
         </main>
-        <ScrollToTopButton threshold={activeTab === 'metadata' ? 0.05 : 0.1} />
+        <ScrollToTopButton threshold={activeTab === 'metadata' ? 0.05 : 0.075} />
       </div>
     </div>
   )

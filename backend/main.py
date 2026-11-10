@@ -33,6 +33,7 @@ import vod_db
 import vod_importer
 import vod_list_sync
 import vod_probe
+import language_autoclean
 from vod_routes import router as vod_router
 from xc_server import _redact_upstream_url, hls_sweep_loop, router as xc_router
 
@@ -529,6 +530,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_vod_enrichment_scheduler()),
         asyncio.create_task(_episode_trickle_scheduler()),
         asyncio.create_task(vod_probe.language_trickle_loop()),
+        asyncio.create_task(language_autoclean.autoclean_loop()),  # KNM: 2026-11-05 default off
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(tmdb_fill.fill_loop()),
         asyncio.create_task(_category_schedule_loop()),

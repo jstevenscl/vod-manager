@@ -2,6 +2,7 @@
 ffprobe isn't needed here: the frame-size read is stubbed, the HTTP side runs against a real local server."""
 
 import asyncio
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -400,7 +401,10 @@ def test_language_audit_stats_group_recent_error_codes_by_provider(db):
     assert codes[("error-code-provider", "CAPACITY")] == 1
 
 
-def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_source(db, tmp_path):
+@pytest.mark.parametrize("observed", [["HI"], ["ES", "HI"], ["FR", "HI", "RU"]])
+def test_language_mismatch_report_approval_archives_without_changing_unwanted_tag(db, tmp_path, monkeypatch, observed):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "wanted-languages.json")
+    config.save_enabled_languages(["EN"])
     pid = db.upsert_provider("report-language", "", "", "", provider_type="library")
     mid = db.upsert_movie("Report Hindi Movie", 2026)
     path = tmp_path / "report.mkv"
@@ -410,18 +414,97 @@ def test_language_mismatch_report_approval_updates_tag_and_archives_excluded_sou
     sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
     conn.execute("UPDATE movie_sources SET language='EN' WHERE id=?", (sid,))
     conn.commit(); conn.close()
-    db.set_source_language_probe("movie", sid, ["HI"], "observed", "local_embedded_audio_tags", "high")
+    db.set_source_language_probe("movie", sid, observed, "observed", "local_embedded_audio_tags", "high")
 
     report = db.list_language_mismatches()
     row = next(r for r in report["results"] if r["source_id"] == sid)
-    assert row["proposed_language"] == "HI" and row["proposed_archive"] is True
+    assert row["safe_to_apply"] is True
+    assert row["proposed_language"] is None and row["proposed_archive"] is True
 
     result = db.decide_language_mismatch("movie", sid, "approved")
-    assert result["action"] == "language_updated_and_archived"
+    assert result["action"] == "parent_archived"
     source = db.get_language_probe_source("movie", sid)
-    assert source["language"] == "HI" and source["language_probe_decision"] == "approved"
+    # KNM: 2026-11-05 - the source must carry an unwanted language so the read-time gate hides it.
+    assert source["language"] == observed[0] and source["language_probe_decision"] == "approved"
     assert db.get_movie(mid)["review_excluded"] == 1
     assert not db.list_language_mismatches()["results"]
+
+
+def test_unwanted_source_approval_hides_only_that_feed(db, tmp_path, monkeypatch):
+    """MASH case: one English feed + one Japanese feed -> only the Japanese feed is hidden."""
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "wanted-per-source.json")
+    config.save_enabled_languages(["EN"])
+    en_pid = db.upsert_provider("per-source-en", "", "", "", provider_type="library")
+    ja_pid = db.upsert_provider("per-source-ja", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Per Source Movie", 1970)
+    db.add_movie_source(mid, en_pid, "en-feed", "mkv")
+    db.add_movie_source(mid, ja_pid, "ja-feed", "mkv")
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE movie_sources SET language='EN' WHERE movie_id=?", (mid,))
+        ja_sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=? AND provider_id=?", (mid, ja_pid)).fetchone()["id"]
+        conn.commit()
+    finally:
+        conn.close()
+    db.set_source_language_probe("movie", ja_sid, ["JA"], "observed", "remote_embedded_audio_tags", "high")
+
+    result = db.decide_language_mismatch("movie", ja_sid, "approved")
+
+    assert result["action"] == "archive_skipped_wanted_source"
+    assert db.get_language_probe_source("movie", ja_sid)["language"] == "JA"
+    served = {r["provider_id"] for r in db.list_movie_sources_for_streaming(mid)}
+    assert served == {en_pid}
+    assert db.get_movie(mid)["review_excluded"] == 0
+
+
+def test_unwanted_episode_source_approval_hides_only_that_feed(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "wanted-per-episode.json")
+    config.save_enabled_languages(["EN"])
+    en_pid = db.upsert_provider("ep-source-en", "", "", "", provider_type="library")
+    es_pid = db.upsert_provider("ep-source-es", "", "", "", provider_type="library")
+    sid = db.upsert_series("Per Source Show", 1972)
+    eid = db.add_episode(sid, 1, 1, "Pilot")
+    db.add_episode_source(eid, en_pid, "en-ep", "mp4")
+    es_src = db.add_episode_source(eid, es_pid, "es-ep", "mp4")
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE episode_sources SET language='EN' WHERE episode_id=?", (eid,))
+        for pid in (en_pid, es_pid):
+            conn.execute("INSERT INTO series_sources (series_id, provider_id, provider_series_id, raw_name, language, added_at, last_seen_at) "
+                         "VALUES (?, ?, ?, 'Per Source Show', 'EN', datetime('now'), datetime('now'))", (sid, pid, f"s{pid}"))
+        conn.commit()
+    finally:
+        conn.close()
+    db.set_source_language_probe("episode", es_src, ["ES"], "observed", "remote_embedded_audio_tags", "high")
+
+    db.decide_language_mismatch("episode", es_src, "approved")
+
+    assert db.get_language_probe_source("episode", es_src)["language"] == "ES"
+    served = {r["provider_id"] for r in db.list_episode_sources_for_streaming(eid)}
+    assert served == {en_pid}
+    assert db.get_series(sid)["review_excluded"] == 0
+
+
+def test_language_mismatch_with_any_wanted_observation_stays_manual_review(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "wanted-language-mixed.json")
+    config.save_enabled_languages(["EN"])
+    pid = db.upsert_provider("mixed-report-language", "", "", "", provider_type="library")
+    mid = db.upsert_movie("Mixed Language Movie", 2026)
+    db.add_movie_source(mid, pid, "mixed-report", "mkv")
+    conn = db._connect()
+    try:
+        sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+        conn.execute("UPDATE movie_sources SET language='ES' WHERE id=?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    db.set_source_language_probe("movie", sid, ["DE", "EN"], "observed", "local_embedded_audio_tags", "high")
+
+    row = next(result for result in db.list_language_mismatches()["results"] if result["source_id"] == sid)
+    assert row["safe_to_apply"] is False
+    assert row["proposed_archive"] is False
+    with pytest.raises(ValueError, match="choose one of the observed languages"):
+        db.decide_language_mismatch("movie", sid, "approved")
 
 
 def test_unknown_language_is_separate_and_never_archive_approvable(db, tmp_path):
@@ -509,6 +592,61 @@ def test_language_provider_error_does_not_pause_provider(monkeypatch):
         asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
     with pytest.raises(vod_probe.ProbeRefused, match="paused"):
         asyncio.run(vod_probe._probe_remote_language("movie", source, provider, spacing=0))
+
+
+def _remote_language_stubs(monkeypatch, total, head_result, full_result):
+    """KNM: 2026-11-05 - fake provider: ffprobe sees `head_result` on the head-only temp file and
+    `full_result` once the tail has been laid into a sparse file of the real length."""
+    fetches = []
+    async def fetch(url, ua, name, pid, tail=None):
+        fetches.append(tail)
+        return (b"T" * tail[1], total) if tail else (b"H" * 1024, total)
+    async def probe(path):
+        return full_result if os.path.getsize(path) == total else head_result
+    async def credentials(*args, **kwargs):
+        return None
+    async def build(*args, **kwargs):
+        return "http://provider.invalid/stream"
+    monkeypatch.setattr(vod_probe, "_fetch_head", fetch)
+    monkeypatch.setattr(vod_probe, "_ffprobe_audio_streams", probe)
+    monkeypatch.setattr(vod_probe.vod_downloader, "_is_remote_library", lambda p: True)
+    monkeypatch.setattr(vod_probe.xc_server, "_build_upstream_url", build)
+    return fetches
+
+
+def test_language_probe_reads_file_tail_when_head_has_no_audio(monkeypatch):
+    total = vod_probe.PROBE_BYTES * 3
+    fetches = _remote_language_stubs(monkeypatch, total, None, ["JA"])
+    provider = {"id": 902, "name": "tail-provider", "provider_type": "xc"}
+    out = asyncio.run(vod_probe._probe_remote_language("movie", {"provider_id": 902}, provider, spacing=0))
+    assert out == ["JA"]
+    assert fetches[0] is None and fetches[1] is not None
+    assert fetches[1][0] + fetches[1][1] == total
+
+
+def test_language_probe_skips_tail_when_head_has_untagged_audio(monkeypatch):
+    fetches = _remote_language_stubs(monkeypatch, vod_probe.PROBE_BYTES * 3, [], ["JA"])
+    provider = {"id": 903, "name": "untagged-provider", "provider_type": "xc"}
+    out = asyncio.run(vod_probe._probe_remote_language("movie", {"provider_id": 903}, provider, spacing=0))
+    assert out == []
+    assert fetches == [None]
+
+
+def test_language_probe_marks_unreadable_file_separately(db, monkeypatch):
+    pid = db.upsert_provider("unreadable-provider", "http://p.invalid", "u", "p")
+    mid = db.upsert_movie("Unreadable Movie", 2026)
+    db.add_movie_source(mid, pid, "unreadable", "mp4")
+    conn = db._connect()
+    sid = conn.execute("SELECT id FROM movie_sources WHERE movie_id=?", (mid,)).fetchone()["id"]
+    conn.close()
+    _remote_language_stubs(monkeypatch, vod_probe.PROBE_BYTES * 3, None, None)
+    monkeypatch.setattr(vod_probe.shutil, "which", lambda name: "ffprobe")
+    monkeypatch.setattr(vod_probe, "_gate", lambda *a, **k: None)
+
+    out = asyncio.run(vod_probe.probe_language_source("movie", sid, spacing=0))
+
+    assert out["status"] == "unknown"
+    assert db.get_language_probe_source("movie", sid)["language_probe_method"] == "embedded_audio_unreadable"
 
 
 def test_probe_stores_size_and_resolution_and_is_cached(db, server):

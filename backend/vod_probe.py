@@ -206,31 +206,48 @@ async def _ffprobe_video(path: str) -> tuple[int | None, int | None, str | None]
 
 
 _LANGUAGE_CODES = {
-    "eng": "EN", "hin": "HI", "fra": "FR", "spa": "ES", "deu": "DE",
+    "eng": "EN", "enm": "EN",  # KNM: 2026-11-05 - enm is a common mistag for eng
+    "hin": "HI", "fra": "FR", "spa": "ES", "deu": "DE",
     "ger": "DE", "ita": "IT", "por": "PT", "jpn": "JA", "zho": "ZH",
     "chi": "ZH", "kor": "KO", "ara": "AR", "rus": "RU", "tam": "TA",
     "tel": "TE", "mal": "ML", "tha": "TH", "dan": "DA", "nld": "NL",
     "dut": "NL", "tur": "TR", "pol": "PL", "swe": "SV", "nor": "NO",
     "fin": "FI", "und": "UNKNOWN",
+    # KNM: 2026-11-05 - bibliographic/terminology codes seen live that fell back to raw[:3].
+    "fre": "FR", "cze": "CS", "ces": "CS", "hun": "HU", "ind": "ID", "ukr": "UK",
+    "rum": "RO", "ron": "RO", "vie": "VI", "nob": "NO", "nno": "NO", "heb": "HE",
+    "kan": "KN", "gre": "EL", "ell": "EL", "cat": "CA", "tgl": "TL", "fil": "TL",
+    "per": "FA", "fas": "FA", "pan": "PA", "alb": "SQ", "sqi": "SQ", "bul": "BG",
+    "hrv": "HR", "srp": "SR", "slv": "SL", "slk": "SK", "slo": "SK", "lit": "LT",
+    "lav": "LV", "est": "ET", "urd": "UR", "ben": "BN", "msa": "MS", "may": "MS",
+    "mar": "MR", "guj": "GU", "isl": "IS", "ice": "IS", "mul": "MULTI",
 }
 
 
-async def _ffprobe_audio_languages(path: str) -> list[str]:
-    """Return embedded audio-track language tags; empty means not tagged/unknown."""
+def _configured_present(configured: str | None, observed) -> bool:
+    return vod_db.languages_match(configured, observed)
+
+
+async def _ffprobe_audio_streams(path: str) -> list[str] | None:
+    """Embedded audio-track language tags; [] = audio tracks exist but are untagged,
+    None = ffprobe found no audio track at all (unreadable/truncated, e.g. MP4 index at the end)."""
+    # KNM: 2026-11-05 - split "no tag" from "couldn't read" so the remote probe knows when the tail is worth fetching.
     proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream_tags=language:stream_disposition=attached_pic",
+        "-show_entries", "stream=index:stream_tags=language:stream_disposition=attached_pic",
         "-of", "json", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), PROBE_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return []
+        return None
     try:
         streams = json.loads(out.decode(errors="replace")).get("streams") or []
     except ValueError:
-        return []
+        return None
+    if not streams:
+        return None
     found = []
     for stream in streams:
         raw = ((stream.get("tags") or {}).get("language") or "").strip().lower()
@@ -238,6 +255,11 @@ async def _ffprobe_audio_languages(path: str) -> list[str]:
             continue
         found.append(_LANGUAGE_CODES.get(raw, raw[:3].upper()))
     return sorted(set(found))
+
+
+async def _ffprobe_audio_languages(path: str) -> list[str]:
+    """Return embedded audio-track language tags; empty means not tagged/unknown."""
+    return await _ffprobe_audio_streams(path) or []
 
 
 def _back_off(pid: int) -> int:
@@ -378,8 +400,8 @@ async def probe_source(kind: str, source_id: int, force: bool = False, spacing: 
     return out
 
 
-async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: float | None = None) -> list[str]:
-    """Read only the bounded stream header and inspect embedded audio tags."""
+async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: float | None = None) -> list[str] | None:
+    """Bounded head read (plus end-of-file index read when needed); None = no audio track readable."""
     global _running_total
     pid = provider["id"]
     current_day = time.strftime("%Y-%m-%d", time.localtime())
@@ -402,9 +424,9 @@ async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: 
             if reservation is None:
                 raise ProbeRefused(f"{provider['name']} has no free probe connection.", 60, "capacity")
         url = await xc_server._build_upstream_url("movie" if kind == "movie" else "series", provider, src, reservation)
+        ua = provider.get("custom_user_agent")
         try:
-            data, _ = await asyncio.wait_for(
-                _fetch_head(url, provider.get("custom_user_agent"), provider["name"], pid), PROBE_TIMEOUT)
+            data, total = await asyncio.wait_for(_fetch_head(url, ua, provider["name"], pid), PROBE_TIMEOUT)
         except ProbeRefused as exc:
             if reservation is not None and exc.kind != "capacity":
                 await asyncio.to_thread(vod_db.clear_language_probe_capacity_hold, pid)
@@ -419,7 +441,22 @@ async def _probe_remote_language(kind: str, src: dict, provider: dict, spacing: 
         fd, tmp = tempfile.mkstemp(suffix=".bin", prefix="vodlangprobe-")
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
-        return await _ffprobe_audio_languages(tmp)
+        languages = await _ffprobe_audio_streams(tmp)
+        if languages is None and total and total > PROBE_BYTES * 2:
+            # KNM: 2026-11-05 - same end-of-file index read the quality probe does: many MP4s
+            # (many provider sources) keep the moov index at the end, so the head shows no tracks.
+            begin = _index_offset(data, total)
+            if begin is None:
+                begin = total - TAIL_BYTES
+            length = min(total - begin, TAIL_BYTES)
+            tail, _ = await asyncio.wait_for(_fetch_head(url, ua, provider["name"], pid, tail=(begin, length)), PROBE_TIMEOUT)
+            if tail:
+                with open(tmp, "r+b") as fh:
+                    fh.truncate(total)
+                    fh.seek(begin)
+                    fh.write(tail)
+                languages = await _ffprobe_audio_streams(tmp)
+        return languages
     except ProbeRefused as exc:
         if exc.kind in ("pushback", "capacity", "provider_error", "other"):
             _language_provider_blocks[pid] = f"{current_day}:{exc}"
@@ -464,11 +501,13 @@ async def probe_language_source(kind: str, source_id: int, force: bool = False,
         method = "local_embedded_audio_tags"
     else:
         languages = await _probe_remote_language(kind, src, provider, spacing)
+        if languages is None:
+            languages, method = [], "embedded_audio_unreadable"
     status = "observed" if languages else "unknown"
     confidence = "high" if languages else "none"
     await asyncio.to_thread(vod_db.set_source_language_probe, kind, source_id, languages, status, method, confidence)
     out = language_result_of(await asyncio.to_thread(vod_db.get_language_probe_source, kind, source_id))
-    out["mismatch"] = bool(languages and src.get("language") and src["language"] not in languages)
+    out["mismatch"] = bool(languages and src.get("language") and not _configured_present(src["language"], languages))
     return out
 
 
@@ -499,11 +538,11 @@ async def language_trickle_once(target: dict | None = None) -> dict:
         observed = result.get("observed_languages") or []
         configured = result.get("configured_language")
         wanted = config.get_enabled_languages()
-        auto_approved = bool(configured and observed and configured in observed)
+        auto_approved = bool(observed and _configured_present(configured, observed))
         # The report treats any multi-track result or a changed single-track
         # result as needing review unless the configured language is present.
         mismatch = bool(observed and not auto_approved and observed != [configured])
-        wanted_match = bool(observed and set(observed).issubset(set(wanted)))
+        wanted_match = bool(observed and all(any(_configured_present(w, [o]) for w in wanted) for o in observed))
         if auto_approved:
             await asyncio.to_thread(vod_db.auto_approve_language_probe_source,
                                     target["kind"], target["source_id"], observed)
