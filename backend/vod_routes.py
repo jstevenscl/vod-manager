@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -3222,6 +3224,25 @@ async def bulk_resolve_duplicates_progress(job_id: str):
     return job
 
 
+def _review_title_key(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    without_marks = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", without_marks.casefold().replace("&", " and ")).strip()
+
+
+def _filter_review_candidates(candidates: list[dict], query: str, year: int | None) -> list[dict]:
+    """Prefer exact normalized title hits and, when available, the catalog year."""
+    query_key = _review_title_key(query)
+    exact = [candidate for candidate in candidates if _review_title_key(candidate.get("name") or "") == query_key]
+    if not exact:
+        return candidates
+    if year:
+        same_year = [candidate for candidate in exact if candidate.get("year") == year]
+        if same_year:
+            return same_year
+    return exact
+
+
 @router.get("/needs-review/{content_type}/{item_id}/suggestions/", dependencies=_GUARDS)
 async def year_review_suggestions(content_type: str, item_id: int, q: Optional[str] = None):
     if content_type not in ("movie", "series"):
@@ -3235,7 +3256,9 @@ async def year_review_suggestions(content_type: str, item_id: int, q: Optional[s
         # different region (e.g. international vs. North American title),
         # and the default search (item's own stored name) won't find a match
         # TMDB's index doesn't already associate with that exact string.
-        return await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
+        query = vod_db.tmdb_review_search_query(item["name"], q)
+        candidates = await tmdb_sync.search_title(query, content_type)
+        return _filter_review_candidates(candidates, query, item.get("year"))
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:
@@ -3254,7 +3277,9 @@ async def year_review_ai_suggest(content_type: str, item_id: int, q: Optional[st
     if not item:
         raise HTTPException(404, detail=f"{content_type} not found")
     try:
-        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"], q), content_type)
+        query = vod_db.tmdb_review_search_query(item["name"], q)
+        candidates = await tmdb_sync.search_title(query, content_type)
+        candidates = _filter_review_candidates(candidates, query, item.get("year"))
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc))
     except Exception as exc:

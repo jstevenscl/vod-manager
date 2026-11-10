@@ -26,10 +26,45 @@ import uuid
 import ai_assist
 import tmdb_sync
 import vod_db
+import vod_importer
 
 logger = logging.getLogger(__name__)
 
 _HIGH_CONFIDENCE = "high"
+
+
+# KNM: 2026-11-06 -- bulk AI applied a 2013 short to "A Hard Place" (2025) because a
+# high-confidence pick was trusted without checking its year. Only auto-apply when the
+# pick's year is within a year of what we already know, and leave the title for the
+# user (who sees all the options) when more than 3 candidates fit that year.
+_MAX_AUTO_CANDIDATES = 3
+
+
+def _known_years(content_type: str, item: dict) -> set[int]:
+    years = {int(item["year"])} if item.get("year") else set()
+    lister = vod_db.list_movie_sources if content_type == "movie" else vod_db.list_series_sources
+    for source in lister(item["id"]) or []:
+        raw_year = vod_importer.parse_name_year(source.get("raw_name") or "")[1]
+        if raw_year:
+            years.add(int(raw_year))
+    return years
+
+
+def _year_guard(content_type: str, item: dict, candidates: list[dict], pick: dict) -> str | None:
+    """Skip reason when the pick can't be trusted on stored data alone, else None."""
+    known = _known_years(content_type, item)
+    if not known:
+        return None
+
+    def fits(c):
+        return c.get("year") is not None and any(abs(int(c["year"]) - y) <= 1 for y in known)
+    shown = "/".join(str(y) for y in sorted(known))
+    if pick.get("year") is not None and not fits(pick):
+        return f"AI picked the {pick['year']} title but ours is {shown}; left for you to choose"
+    fitting = sum(1 for c in candidates if fits(c))
+    if fitting > _MAX_AUTO_CANDIDATES:
+        return f"{fitting} possible matches from {shown}; left for you to choose"
+    return None
 _MAX_TRACKED_JOBS = 5
 
 _jobs: dict[str, dict] = {}
@@ -129,6 +164,9 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
         }
 
     pick = candidates[idx]
+    reason = _year_guard(content_type, item, candidates, pick)
+    if reason:
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": reason}
     try:
         result = vod_db.resolve_year_review(content_type, item_id, pick.get("year"), pick.get("tmdb_id"))
     except ValueError as exc:
@@ -185,6 +223,9 @@ async def _resolve_one_tmdb_lookup_failure(content_type: str, item_id: int) -> d
     if idx is None or suggestion.get("confidence") != _HIGH_CONFIDENCE or not (0 <= idx < len(candidates)):
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": suggestion.get("reasoning") or "no confident match"}
     pick = candidates[idx]
+    reason = _year_guard(content_type, item, candidates, pick)
+    if reason:
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": reason}
     if not pick.get("tmdb_id"):
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "AI result has no TMDB ID"}
     try:
@@ -248,6 +289,9 @@ async def _resolve_one_missing_artwork(content_type: str, item_id: int) -> dict:
         }
 
     pick = candidates[idx]
+    reason = _year_guard(content_type, item, candidates, pick)
+    if reason:
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": reason}
     if not pick.get("poster_url"):
         return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "AI's pick has no TMDB poster either"}
     try:
