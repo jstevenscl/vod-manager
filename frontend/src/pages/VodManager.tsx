@@ -241,6 +241,9 @@ interface RefreshSettings {
   enrichment_ttl_seconds: number
   tmdb_sync_interval_seconds: number | null
   smart_category_reconciliation_enabled: boolean
+  episode_trickle_batch: number
+  episode_trickle_interval_seconds: number
+  episode_trickle_spacing_seconds: number
 }
 
 interface BackupComponent {
@@ -6916,6 +6919,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     enrichment_ttl_hours: string
     tmdb_sync_hours: string
     smart_category_reconciliation_enabled: boolean
+    trickle_batch: string
+    trickle_pause_minutes: string
+    trickle_spacing_seconds: string
   } | null>(null)
   const secToHrStr = (s: number | null | undefined) => (s == null ? '' : String(s / 3600))
   const refreshValues = refreshForm ?? (refreshSettingsQuery.data ? {
@@ -6926,7 +6932,20 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     enrichment_ttl_hours:           secToHrStr(refreshSettingsQuery.data.enrichment_ttl_seconds),
     tmdb_sync_hours:                secToHrStr(refreshSettingsQuery.data.tmdb_sync_interval_seconds),
     smart_category_reconciliation_enabled: refreshSettingsQuery.data.smart_category_reconciliation_enabled,
+    trickle_batch:                  String(refreshSettingsQuery.data.episode_trickle_batch),
+    trickle_pause_minutes:          String(refreshSettingsQuery.data.episode_trickle_interval_seconds / 60),
+    trickle_spacing_seconds:        String(refreshSettingsQuery.data.episode_trickle_spacing_seconds),
   } : null)
+  const trickleEstimate = (() => {
+    if (!refreshValues) return null
+    const batch = Number(refreshValues.trickle_batch)
+    const pause = Math.max(5, Number(refreshValues.trickle_pause_minutes)) * 60
+    const spacing = Math.max(1, Number(refreshValues.trickle_spacing_seconds))
+    if (![batch, pause, spacing].every(Number.isFinite)) return null
+    if (batch <= 0) return 'Off: this scheduled trickle is disabled; existing import, enrichment, and on-demand paths remain active.'
+    const perHour = Math.round((batch * 3600) / (batch * spacing + pause))
+    return `About ${perHour.toLocaleString()} shows per hour per provider, one request every ${spacing} s during a batch.`
+  })()
   const saveRefreshSettings = useMutation({
     mutationFn: () => {
       const hrToSec = (v: string) => Math.round(Number(v) * 3600)
@@ -6938,6 +6957,9 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
         enrichment_ttl_seconds:           hrToSec(refreshValues!.enrichment_ttl_hours),
         tmdb_sync_interval_seconds:       refreshValues!.tmdb_sync_hours.trim() ? hrToSec(refreshValues!.tmdb_sync_hours) : null,
         smart_category_reconciliation_enabled: refreshValues!.smart_category_reconciliation_enabled,
+        episode_trickle_batch: Math.round(Number(refreshValues!.trickle_batch)),
+        episode_trickle_interval_seconds: Math.round(Number(refreshValues!.trickle_pause_minutes) * 60),
+        episode_trickle_spacing_seconds: Number(refreshValues!.trickle_spacing_seconds),
       })
     },
     onSuccess: () => {
@@ -9106,6 +9128,38 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
               <span className="block text-muted-foreground">Run the full-pool safety check every 15 minutes. The interval is fixed.</span>
             </span>
           </label>
+        )}
+        {refreshValues && (
+          <div className="mt-3 space-y-2 border-t border-border pt-3">
+            <h4 className="text-sm font-semibold">Episode list preloading</h4>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              The app gradually fetches episode lists for shows nobody has opened yet. Opening a show still loads
+              its episodes immediately. Requests run one at a time per provider with a gap between requests; a
+              provider is paused for the current batch after three consecutive failures or when it enters backoff.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-2">
+              <label className="flex items-center gap-1.5 text-xs">
+                Shows per batch
+                <input className={inputCls('w-16')} type="number" min={0} max={500} step="10"
+                  value={refreshValues.trickle_batch}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_batch: e.target.value })} />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs">
+                Pause between batches (min)
+                <input className={inputCls('w-16')} type="number" min={5} max={1440} step="5"
+                  value={refreshValues.trickle_pause_minutes}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_pause_minutes: e.target.value })} />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs">
+                Gap between requests (sec)
+                <input className={inputCls('w-16')} type="number" min={1} max={60} step="1"
+                  value={refreshValues.trickle_spacing_seconds}
+                  onChange={(e) => setRefreshForm({ ...refreshValues, trickle_spacing_seconds: e.target.value })} />
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">Allowed: 0–500 shows (0 disables this trickle only), 5 min–24 h pause, 1–60 s gap. Defaults: 100, 15 min, 3 s.</p>
+            {trickleEstimate && <p className="text-xs font-medium text-primary">{trickleEstimate}</p>}
+          </div>
         )}
         <div className="flex items-center gap-1.5">
           <Button

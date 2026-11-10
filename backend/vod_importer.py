@@ -1493,7 +1493,8 @@ async def enrich_series(series_id: int, *, force: bool = False, write_queue: "as
 
 async def _enrich_one_series_source(
     series_id: int, series: dict, source: dict, *, force: bool = False, series_due: bool = False,
-    write_queue: "asyncio.Queue | None" = None,
+    write_queue: "asyncio.Queue | None" = None, episodes_only: bool = False,
+    raise_on_backoff: bool = False,
 ) -> dict:
     """Fetches and persists exactly ONE series_sources row's episodes/detail.
     Extracted from enrich_series's loop body so each provider's source is
@@ -1548,6 +1549,16 @@ async def _enrich_one_series_source(
     client = XCProviderClient(provider)
     try:
         info = _as_dict(await client.get_series_info(str(source["provider_series_id"])))
+    except ProviderBackoffError as exc:
+        if raise_on_backoff:
+            raise
+        try:
+            await _to_thread(
+                vod_db.record_series_source_failure, series_id, source["provider_id"], source["provider_series_id"],
+            )
+        except Exception:
+            logger.exception("[_enrich_one_series_source] failed to record backoff for series_id=%s", series_id)
+        return {"fetched": False, "reason": str(exc), "backoff": True}
     except Exception:
         # Found live 2026-09-16: record_series_source_failure is already
         # _WRITE_LOCK-protected, but under sustained heavy concurrent write
@@ -1570,7 +1581,7 @@ async def _enrich_one_series_source(
             )
         return {"fetched": False, "reason": f"get_series_info failed for provider {provider.get('name') or provider['id']}"}
 
-    detail = _as_dict(info.get("info"))
+    detail = {} if episodes_only else _as_dict(info.get("info"))
 
     if detail:
         # See enrich_movie's identical comment -- safe as of 2026-07-29's
@@ -1619,7 +1630,7 @@ async def _enrich_one_series_source(
         await _to_thread(vod_db.set_series_enrichment, series_id, **series_fields)
         if series_tmdb_id:
             await _to_thread(vod_db.auto_merge_series_by_tmdb, series_id)
-    else:
+    elif not episodes_only:
         # Some panels send episodes without an info block. Still record that
         # episodes were synced as of this last_modified (and stamp the TTL),
         # otherwise the series-level gate would report it due on every pass.
@@ -1690,6 +1701,25 @@ async def _enrich_one_series_source(
     return {"fetched": True, "reason": None, "unchanged": unchanged}
 
 
+async def enrich_series_source_only(
+    series_id: int, provider_id: int, *, source_id: int | None = None,
+    episodes_only: bool = True, raise_on_backoff: bool = False,
+) -> dict:
+    """Enrich one provider's series source without visiting its fallbacks."""
+    series = await _to_thread(vod_db.get_series, series_id)
+    if not series:
+        return {"fetched": False, "reason": "series not found"}
+    sources = await _to_thread(vod_db.list_series_sources, series_id)
+    source = next((item for item in sources
+                   if item["provider_id"] == provider_id and (source_id is None or item["id"] == source_id)), None)
+    if not source:
+        return {"fetched": False, "reason": "no provider source recorded"}
+    return await _enrich_one_series_source(
+        series_id, series, source, episodes_only=episodes_only,
+        raise_on_backoff=raise_on_backoff,
+    )
+
+
 # ── Bulk enrichment ──────────────────────────────────────────────────────────
 # On-demand-and-cache (above) only ever touches one item per click. Bulk mode
 # walks the whole pool with bounded concurrency so it doesn't hammer a real
@@ -1703,6 +1733,7 @@ _ENRICH_PROGRESS: dict = {
     "series_total": 0, "series_done": 0, "series_errors": 0, "series_backoff_skipped": 0,
     "started_at": None, "finished_at": None,
 }
+_EPISODE_TRICKLE_RUNNING = False
 
 
 def get_enrich_progress() -> dict:
@@ -1907,6 +1938,66 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
             _ENRICH_PROGRESS["series_done"], _ENRICH_PROGRESS["series_total"], _ENRICH_PROGRESS["series_errors"],
             _ENRICH_PROGRESS["series_backoff_skipped"],
         )
+
+
+_trickle_sleep = asyncio.sleep
+_TRICKLE_MAX_CONSECUTIVE_FAILURES = 3
+
+
+async def run_episode_trickle_tick(
+    batch_size: int | None = None, spacing_seconds: float | None = None,
+) -> list[dict]:
+    """Fetch a bounded, sequential batch of pending episode lists per provider."""
+    global _EPISODE_TRICKLE_RUNNING
+    settings = config.get_refresh_settings()
+    batch = int(batch_size if batch_size is not None else settings["episode_trickle_batch"])
+    spacing = float(spacing_seconds if spacing_seconds is not None else settings["episode_trickle_spacing_seconds"])
+    if batch <= 0 or _ENRICH_PROGRESS["running"] or _EPISODE_TRICKLE_RUNNING:
+        return []
+    if _XC_IMPORT_LOCK.locked():
+        logger.info("[episode_trickle] catalog import running; skipping this tick")
+        return []
+
+    _EPISODE_TRICKLE_RUNNING = True
+    results: list[dict] = []
+    try:
+        providers = await _to_thread(vod_db.list_providers)
+        for provider in providers:
+            provider_id = int(provider["id"])
+            if (provider.get("provider_type") != "xc" or not provider.get("is_active", True)
+                    or _provider_backoff_remaining(provider_id) > 0):
+                continue
+            pending = await _to_thread(vod_db.list_pending_series_sources, provider_id, batch)
+            failures = 0
+            for index, source in enumerate(pending):
+                if _ENRICH_PROGRESS["running"] or _XC_IMPORT_LOCK.locked():
+                    break
+                if _provider_backoff_remaining(provider_id) > 0:
+                    break
+                try:
+                    result = await enrich_series_source_only(
+                        source["series_id"], provider_id, source_id=source["id"],
+                        episodes_only=True, raise_on_backoff=True,
+                    )
+                except ProviderBackoffError as exc:
+                    results.append({"provider_id": provider_id, "series_id": source["series_id"],
+                                    "fetched": False, "reason": str(exc), "backoff": True})
+                    break
+                except Exception as exc:
+                    logger.warning("[episode_trickle] series_id=%s provider_id=%s failed: %s",
+                                   source["series_id"], provider_id, _redact_upstream_url(str(exc)))
+                    result = {"fetched": False, "reason": "episode list fetch failed"}
+                results.append({"provider_id": provider_id, "series_id": source["series_id"], **result})
+                failures = failures + 1 if not result.get("fetched") else 0
+                if failures >= _TRICKLE_MAX_CONSECUTIVE_FAILURES:
+                    logger.info("[episode_trickle] pausing provider_id=%s after %d consecutive failures",
+                                provider_id, failures)
+                    break
+                if spacing > 0 and index + 1 < len(pending):
+                    await _trickle_sleep(spacing)
+        return results
+    finally:
+        _EPISODE_TRICKLE_RUNNING = False
 
 
 async def resweep_smart_categories(movie_ids: set[int] | None = None, series_ids: set[int] | None = None) -> None:

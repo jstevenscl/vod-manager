@@ -9217,12 +9217,18 @@ def has_pending_series_source_enrichment(provider_id: int) -> bool:
         conn.close()
 
 
-def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
+_SERIES_SOURCE_RETRY_COOLDOWN = 24 * 60 * 60
+
+
+def list_pending_series_sources(
+    provider_id: int | None = None, limit: int | None = None,
+) -> list[dict]:
     """Lists unprocessed episode-discovery sources, not just canonical series.
 
     A canonical series can retain several source variants from one provider.
-    Automatic intake must visit every unstamped source so each fallback has
-    its own episode stream rows."""
+    Automatic intake visits every unstamped source, clean sources first. A
+    source that recently failed is held for 24 hours so one broken listing
+    cannot consume every scheduled batch."""
     conn = _connect()
     try:
         provider_clause = ""
@@ -9230,6 +9236,10 @@ def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
         if provider_id is not None:
             provider_clause = "AND ss.provider_id=?"
             params = (provider_id,)
+        params = (time.time() - _SERIES_SOURCE_RETRY_COOLDOWN, *params)
+        limit_clause = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params = (*params, max(1, int(limit)))
         # KNM: 2026-10-06 -- same disabled-language gate as has_pending_series_source_enrichment.
         lang_clause, lang_params = _enabled_languages_clause("ss.language")
         params = (*lang_params, *params)
@@ -9240,8 +9250,10 @@ def list_pending_series_sources(provider_id: int | None = None) -> list[dict]:
         WHERE ss.episodes_last_enriched_at IS NULL
           AND s.review_excluded=0
           AND {lang_clause}
+          AND (ss.consecutive_failures=0 OR ss.last_failed_at IS NULL OR CAST(ss.last_failed_at AS REAL) < ?)
           {provider_clause}
-        ORDER BY ss.id
+        ORDER BY (ss.consecutive_failures > 0), CAST(ss.last_failed_at AS REAL), ss.id
+        {limit_clause}
     """, params).fetchall()
         conn.close()
         return [dict(row) for row in rows]

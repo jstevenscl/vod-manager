@@ -284,6 +284,18 @@ def _enrichment_sleep_seconds(ttl: float, elapsed: float) -> float:
     return max(ttl - elapsed, min(ttl, _ENRICHMENT_MIN_REST_SECONDS))
 
 
+async def _episode_trickle_scheduler() -> None:
+    """Slowly discover episode lists the first time a series is enriched."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await vod_importer.run_episode_trickle_tick()
+        except Exception as exc:
+            logger.warning("[episode_trickle] tick failed: %s", exc)
+        interval = get_refresh_settings()["episode_trickle_interval_seconds"]
+        await asyncio.sleep(max(300, int(interval)))
+
+
 async def _vod_enrichment_scheduler() -> None:
     """Background task: periodically runs bulk_enrich_all so newly-imported or
     stale (past ENRICHMENT_TTL_SECONDS) items get enriched without a manual
@@ -515,6 +527,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_dispatcharr_dvr_poller()),
         asyncio.create_task(_watch_session_poller()),
         asyncio.create_task(_vod_enrichment_scheduler()),
+        asyncio.create_task(_episode_trickle_scheduler()),
         asyncio.create_task(vod_probe.language_trickle_loop()),
         asyncio.create_task(_tmdb_sync_scheduler()),
         asyncio.create_task(tmdb_fill.fill_loop()),
