@@ -443,7 +443,10 @@ setting picks the default language for detection and correction), a
 **Language Mismatch Report** (checks a few sources at a time by reading the
 embedded audio language tags, rotates across providers, backs off from any
 provider that is full or throttling, and changes nothing until you approve each
-decision; monitoring is off by default), **Duplicate Finder** (matches on
+decision; monitoring is off by default; unknown-language rows can be confirmed
+or archived in bulk, and an optional, off-by-default **auto-clean** can hide
+feeds whose audio and TMDB both say they are an unwanted language, with a log
+and one-click revert), **Duplicate Finder** (matches on
 punctuation variants, adjacent-year mislabeling, and TMDB id, with one-click
 bulk merges for both fully-corroborated TMDB-confirmed matches and a second,
 separate tier where only one candidate carries a self-consistent TMDB id; an
@@ -457,7 +460,10 @@ exact same source it was archived from can bring it back), **Needs Review**
 and the broader sidebar **Metadata Review** (resolve year-ambiguous imports
 and titles a provider left without any TMDB identity at all, with or without a
 year; its local-first TMDB search also powers an inline **Find TMDB match**
-picker in Duplicate Finder) alongside its
+picker in Duplicate Finder; an **Existing matches** view compares an incoming
+title with same-named catalog titles so you can merge, keep separate or archive
+in bulk, and **User Merge** applies a TMDB result only when exactly one candidate
+is found) alongside its
 sibling **Incorrect TMDB IDs** (a stored id TMDB itself now confirms is
 gone), and **Orphan Checker** (finds dead rows a provider deletion can
 leave behind — a series whose only source provider no longer exists, or
@@ -469,7 +475,10 @@ when you already know the correct match, and (for a series) editing an
 individual episode's name/number, or filling one series' episode names from TMDB
 (**Use TMDB episode titles**, with a preview first). **Apply TMDB Titles** (Movies/TV Shows
 toolbar) does this in bulk for every already-confirmed TMDB match at once,
-instead of one item at a time. **Client Title Format** (Curation &
+instead of one item at a time. **Episode list preloading** (on by default; Configuration → Refresh Schedule)
+quietly fetches episode lists for Xtream Codes providers in the background, up
+to 100 shows per provider every 15 minutes, one request every 3 seconds; set
+*Shows per batch* to 0 to turn it off. **Client Title Format** (Curation &
 Maintenance) is a separate, ongoing setting to have VOD clients see a
 "(Year)" suffix on every title, independent of the pool's own stored data.
 

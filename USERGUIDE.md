@@ -1472,7 +1472,7 @@ The **Show menu** button at the left of the top bar brings it back. Your
 browser remembers which one you picked.
 
 On long pages, a round **Return to top** button appears at the bottom right once
-you have scrolled down a little; one click scrolls smoothly back to the top. On
+you have scrolled down a little (a bit sooner on Metadata Review, whose lists are long); one click scrolls smoothly back to the top. On
 the **Configuration** and **Curation & Maintenance** pages the sections start
 collapsed, each with a one-line description under its title, so you can scan the
 page and open only what you need.
@@ -1818,7 +1818,10 @@ you still review and confirm yourself:
   at a time. A fix is only ever applied when the AI reports **high**
   confidence; anything medium, low, or with no confident match is left
   completely untouched, with the AI's reasoning shown so you know why it
-  was skipped. A progress summary (`N resolved · M skipped · E errors`)
+  was skipped. A **year guard** adds a second check: a high-confidence pick
+  is also skipped when its release year is more than one year away from the
+  year the catalog holds for the title (a title with no stored year is not
+  blocked by this). A progress summary (`N resolved · M skipped · E errors`)
   appears once the job finishes, with an expandable per-item detail list.
   Duplicate Finder's version is a little different: a group whose
   candidates already agree on one TMDB id merges immediately with no AI
@@ -2222,7 +2225,35 @@ existing pool entry, sources and categories merge into it automatically,
 same as everywhere else in the app. The search looks in your
 local TMDB library (TMDB Library page) first when it is on, and only asks TMDB
 when that has nothing, so a name search works even without a TMDB key as long
-as the local library can answer it.
+as the local library can answer it. Suggested TMDB matches are narrowed to
+the same cleaned title and year as the item, and a quality prefix or tag a provider
+adds to the name (`4K:`, `[4K]`, `UHD |`, `HD:`, a trailing `4K-EN -`) is stripped
+from the automatic search first; text you type into the search box yourself is
+never altered.
+
+**Existing matches.** The **Existing matches** button on this page lists
+titles that have no TMDB identity of their own but share a name with a title
+already in your catalog, for Movies and TV Shows separately. Each row shows the
+incoming title, the existing candidate(s) and why they look alike (same title and
+year, year differs by N, or year missing). Choose a candidate with its radio
+button, then:
+
+- **Approve merge** merges the incoming title into the chosen existing one:
+  sources and category placements move to the existing title, which keeps its
+  identity.
+- **Keep separate** keeps both titles active and dismisses the pair so it is
+  not suggested again.
+- **Archive selected** archives the incoming title and removes its category
+  placements.
+- **User Merge** (also on the main Metadata Review list) searches TMDB for each
+  selected title and applies the result **only when exactly one candidate** is
+  found. Titles with no candidate, or several, are skipped and listed with the
+  reason; nothing is guessed.
+
+Every bulk action asks you to confirm first, and shift-click selects a range.
+**Hide adult titles** is on by default here.
+
+![Metadata Review's Existing matches view](docs/screenshots/existing-matches.png)
 
 A series that already carries a TMDB id but no year gets resolved
 automatically in the background after each provider import, straight from
@@ -2291,7 +2322,7 @@ Report** (sidebar → System) reads the language tags embedded in the audio of a
 few sources at a time and lists the ones that don't match what the catalog says.
 Nothing is changed until you decide; it is an audit, not an automatic fix.
 
-![The Language Mismatch Report, with monitoring off and nothing waiting for review](docs/screenshots/language-mismatch-report.png)
+![The Language Mismatch Report, with monitoring off, auto-clean off and nothing waiting for review](docs/screenshots/language-mismatch-report.png)
 
 **How a check works.** The app reads only the first small chunk of a source's
 stream (not the whole file), saves it to a temporary file and runs `ffprobe` on
@@ -2305,7 +2336,11 @@ A check never changes playback by itself.
   language found in the audio, and the proposed result.
 - **No usable tag** — shown separately under **Unknown language review**, where you
   choose one of your enabled playback languages (your Primary Language is
-  pre-selected) and confirm it.
+  pre-selected) and confirm it. Rows can be selected in bulk: **Confirm selected as
+  XX** records one language for all of them in a single request (up to 250 at a
+  time), **Retry selected** queues them for another check, **Archive selected**
+  archives the movie or series (the source itself is kept), and **Delete selected**
+  removes the sources. Each asks for confirmation first.
 
 **Monitoring is off by default.** Press **Enable monitoring** to let the app check
 sources quietly in the background, or **Run one cycle now** to run a single batch.
@@ -2334,10 +2369,46 @@ connection is never pushed:
 be selected in bulk (shift-click selects a range):
 
 - **Apply language** — records the language found in the audio as the source's
-  language. The movie or series is not archived.
-- **Archive parent** — records that language and archives the movie or series,
-  shown when the language found is outside your enabled playback languages.
+  language. The movie or series is not archived. When the audio carried several
+  languages and none is a clear single answer, the row shows a **Choose language**
+  list of the observed tags; pick one and use **Apply selected language**.
+- **Archive parent** — shown when every language found is outside your enabled
+  playback languages. It sets the source to the language found, which hides that
+  source, and archives the movie or series **only if no other source has a wanted
+  language**; if another feed is wanted, the title stays active.
 - **Keep as-is** — changes nothing and stops future checks of that source.
+- **Approve all proposed** — applies each row's proposed action in one go after a
+  single confirmation, and reports one summary. A language you already decided on a
+  source is never overwritten by a later check.
+
+A language you confirm by hand is shown as "Language: XX (confirmed)" in the source
+preview. Manual approvals are recorded the same way as checks, so they appear under
+**Completed checks today** and count toward any daily cap.
+
+#### Auto-clean unwanted-language feeds (off by default)
+
+An optional extra under the report, **Auto-clean unwanted-language feeds**, does
+the "hide it" part without you clicking. It is **off by default** and nothing
+happens until you press **Turn on auto-clean** and confirm.
+
+A feed is hidden only when three independent signals agree: the audio check found
+tracks and none is a wanted language, TMDB's original language is not a wanted
+language, and no TMDB spoken language is wanted either. It only hides a feed while
+another wanted feed keeps the title playable (it never archives a title), and it
+never touches a source someone already decided. It reads only checks already done
+and TMDB details already stored, so it contacts neither your providers nor TMDB.
+
+- **Preview what it would hide** lists the feeds it would act on, and how many it
+  left alone and why, without changing anything.
+- It works in small batches (**Feeds per batch**, default 25; **Seconds between
+  batches**, default 300; **Cooldown after other jobs**, default 900), pauses while
+  an import, sync, enrichment or episode preloading is running, and waits the
+  cooldown afterwards. After a restart it waits one cooldown before its first batch.
+- **Recent auto-clean changes** logs every feed it hid with the old and new
+  language. **Revert** puts a feed back exactly as it was, and auto-clean will not
+  touch that feed again. A change can be reverted once.
+
+![The auto-clean panel, off, with its pacing settings](docs/screenshots/language-autoclean.png)
 
 When a check finds a mismatch, a notice appears in the bell at the top of the
 screen. It clears itself the next time you open the report and nothing is left to
