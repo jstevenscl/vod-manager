@@ -33,12 +33,12 @@ function initTheme(): Theme {
   return t
 }
 
-function ScrollToTopButton() {
+function ScrollToTopButton({ threshold = 0.1 }: { threshold?: number }) {
   const [visible, setVisible] = useState(false)
   useEffect(() => {
     const update = () => {
       const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
-      setVisible(max > 0 && window.scrollY >= max * 0.1)
+      setVisible(max > 0 && window.scrollY >= max * threshold)
     }
     update()
     window.addEventListener('scroll', update, { passive: true })
@@ -47,7 +47,7 @@ function ScrollToTopButton() {
       window.removeEventListener('scroll', update)
       window.removeEventListener('resize', update)
     }
-  }, [])
+  }, [threshold])
   if (!visible) return null
   return (
     <button
@@ -188,6 +188,17 @@ export default function App() {
     },
     retry: false,
   })
+  const metadataReviewCountsQuery = useQuery<Record<'movies' | 'series', { total: number; adult: number }>>({
+    queryKey: ['vod-metadata-review', 'counts'],
+    queryFn: () => api.get('/vod/metadata-review/counts/').then((r) => r.data),
+    enabled: authState === 'ready',
+    refetchInterval: 15_000,
+    retry: false,
+  })
+  const metadataReviewCounts = metadataReviewCountsQuery.data ? {
+    movies: Math.max(0, metadataReviewCountsQuery.data.movies.total - metadataReviewCountsQuery.data.movies.adult),
+    series: Math.max(0, metadataReviewCountsQuery.data.series.total - metadataReviewCountsQuery.data.series.adult),
+  } : null
   const navGroups = hideDvrTabQuery.data?.hidden ? NAV_GROUPS.filter((g) => g.label !== 'DVR') : NAV_GROUPS
   const runtime = runtimeStatusQuery.data
   const catalogBusy = !!(runtime?.import.running || runtime?.import.queued || runtime?.bulk_ai.running || runtime?.tmdb.running || runtime?.enrichment.running)
@@ -320,6 +331,7 @@ export default function App() {
                   >
                     <span className={isActive ? 'text-primary [&_svg]:w-[15px] [&_svg]:h-[15px]' : 'opacity-80 [&_svg]:w-[15px] [&_svg]:h-[15px]'}>{item.icon}</span>
                     {item.label}
+                    {item.tab === 'metadata' && metadataReviewCounts && <span className="ml-auto text-[10px] text-muted-foreground">M {metadataReviewCounts.movies.toLocaleString()} · TV {metadataReviewCounts.series.toLocaleString()}</span>}
                   </button>
                 )
               })}
@@ -419,7 +431,7 @@ export default function App() {
             <VodManager activeTab={activeTab} setActiveTab={setActiveTab} dvrSubTab={dvrSubTab} setDvrSubTabPersisted={setDvrSubTabPersisted} />
           )}
         </main>
-        <ScrollToTopButton />
+        <ScrollToTopButton threshold={activeTab === 'metadata' ? 0.05 : 0.1} />
       </div>
     </div>
   )

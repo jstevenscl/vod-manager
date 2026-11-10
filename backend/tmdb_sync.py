@@ -223,14 +223,38 @@ def _result_ids(items) -> list:
     return [i.get("id") for i in items or [] if i.get("id") is not None]
 
 
+def _review_search_title_relevant(query: str, title: str | None, original: str | None) -> bool:
+    def tokens(value: str) -> set[str]:
+        found = set(re.findall(r"[a-z0-9]+", value.casefold()))
+        return {token[:-1] if len(token) > 4 and token.endswith("s") else token for token in found}
+
+    query_tokens = tokens(query)
+    informative = {token for token in query_tokens if len(token) > 2 and not token.isdigit()}
+    for value in (title or "", original or ""):
+        result_tokens = tokens(value)
+        if result_tokens == query_tokens:
+            return True
+        overlap = informative & {token for token in result_tokens if len(token) > 2 and not token.isdigit()}
+        if len(overlap) >= (1 if len(informative) <= 2 else 2):
+            return True
+    return False
+
+
 async def tmdb_search(media_type: str, query: str, year: int | None = None) -> tuple[dict, bool]:
     """TMDB /search/{movie|tv}: the kept answer, else asked and kept."""
     params = {"api_key": get_tmdb_api_key(), "query": query}
     if year:
         params["year" if media_type == "movie" else "first_air_date_year"] = year
+    def relevant_ids(data: dict) -> dict:
+        title_key = "title" if media_type == "movie" else "name"
+        original_key = "original_title" if media_type == "movie" else "original_name"
+        items = [item for item in data.get("results", []) if _review_search_title_relevant(
+            query, item.get(title_key), item.get(original_key),
+        )]
+        return {media_type: _result_ids(items)}
     return await _kept_or_fetch(
         f"search/{media_type}", query, year, f"{_API_BASE}/search/{media_type}", params,
-        lambda data: {media_type: _result_ids(data.get("results"))},
+        relevant_ids,
     )
 
 
@@ -448,11 +472,17 @@ async def search_title(query: str, content_type: str) -> list[dict]:
         return out
 
     results = data.get("results", [])
-    query_lower = query.strip().lower()
+    def relevant(item: dict) -> bool:
+        title = item.get("title") if content_type == "movie" else item.get("name")
+        original = item.get("original_title") if content_type == "movie" else item.get("original_name")
+        return _review_search_title_relevant(query, title, original)
+
+    results = [item for item in results if relevant(item)]
+    query_lower = query.strip().casefold()
 
     def _not_exact(item: dict) -> bool:
         title = item.get("title") if content_type == "movie" else item.get("name")
-        return (title or "").strip().lower() != query_lower
+        return (title or "").strip().casefold() != query_lower
 
     results.sort(key=_not_exact)  # stable sort: exact matches (False) float ahead of fuzzy ones (True)
     candidates = results[:5]

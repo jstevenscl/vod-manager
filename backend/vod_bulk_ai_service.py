@@ -70,6 +70,13 @@ _MAX_TRACKED_JOBS = 5
 _jobs: dict[str, dict] = {}
 
 
+def _needs_identity_review(item: dict) -> bool:
+    """Mirror Metadata Review's active no-ID/held-year eligibility rules."""
+    if item.get("review_excluded"):
+        return False
+    return bool(item.get("needs_year_review")) or not str(item.get("tmdb_id") or "").strip()
+
+
 def _new_job(total: int) -> str:
     if len(_jobs) >= _MAX_TRACKED_JOBS:
         oldest_id = min(_jobs, key=lambda jid: _jobs[jid]["started_at"])
@@ -141,8 +148,8 @@ async def _resolve_one_needs_review(content_type: str, item_id: int) -> dict:
     item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
     if not item:
         return {"id": item_id, "status": "error", "detail": "not found"}
-    if not item.get("needs_year_review"):
-        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs review"}
+    if not _needs_identity_review(item):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs identity review"}
 
     try:
         candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"]), content_type)
@@ -194,6 +201,81 @@ async def _run_needs_review_job(job_id: str, content_type: str, ids: list[int]) 
 async def start_needs_review_bulk_resolve(content_type: str, ids: list[int]) -> str:
     job_id = _new_job(len(ids))
     asyncio.create_task(_run_needs_review_job(job_id, content_type, ids))
+    return job_id
+
+
+async def _user_merge_one_needs_review(content_type: str, item_id: int) -> dict:
+    """Apply a user's approval when TMDB returns exactly one relevant result.
+
+    This intentionally bypasses AI confidence scoring. Ambiguous or missing
+    results remain untouched and carry a per-item explanation in job results.
+    """
+    item = vod_db.get_movie(item_id) if content_type == "movie" else vod_db.get_series(item_id)
+    if not item:
+        return {"id": item_id, "status": "error", "detail": "not found"}
+    if not _needs_identity_review(item):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no longer needs identity review"}
+    try:
+        candidates = await tmdb_sync.search_title(vod_db.tmdb_review_search_query(item["name"]), content_type)
+    except Exception as exc:
+        return {"id": item_id, "name": item["name"], "status": "error", "detail": f"TMDB search failed: {exc}"}
+    if not candidates:
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "no TMDB candidates found"}
+    if len(candidates) != 1:
+        return {
+            "id": item_id, "name": item["name"], "status": "skipped",
+            "detail": f"expected exactly one TMDB candidate; found {len(candidates)}",
+        }
+    candidate = candidates[0]
+    if not candidate.get("tmdb_id"):
+        return {"id": item_id, "name": item["name"], "status": "skipped", "detail": "the only TMDB candidate has no usable ID"}
+    year = candidate.get("year") if candidate.get("year") is not None else item.get("year")
+    try:
+        # The user's explicit TMDB choice can merge an exact identity collision
+        # even when background auto-merge is disabled. If none exists, save
+        # the year through the normal review resolver.
+        result = vod_db.set_tmdb_id(content_type, item_id, int(candidate["tmdb_id"]))
+        if result.get("merged_into"):
+            return {
+                "id": item_id, "name": item["name"], "status": "resolved",
+                "detail": f"user-approved merge into #{result['merged_into']} using the only TMDB candidate",
+            }
+        if year is not None:
+            result = vod_db.resolve_year_review(content_type, item_id, int(year), str(candidate["tmdb_id"]))
+    except ValueError as exc:
+        return {"id": item_id, "name": item["name"], "status": "error", "detail": str(exc)}
+    if result.get("merged_into"):
+        detail = f"user-approved merge into #{result['merged_into']} using the only TMDB candidate"
+    else:
+        detail = "user-approved TMDB candidate applied; no existing duplicate was merged"
+    return {"id": item_id, "name": item["name"], "status": "resolved", "detail": detail}
+
+
+async def _run_needs_review_user_merge_job(job_id: str, content_type: str, ids: list[int]) -> None:
+    try:
+        for item_id in ids:
+            if _cancel_requested(job_id):
+                break
+            try:
+                result = await _user_merge_one_needs_review(content_type, item_id)
+            except Exception as exc:
+                result = {"id": item_id, "status": "error", "detail": str(exc)}
+            _record(job_id, result)
+    except Exception as exc:
+        _jobs[job_id]["error"] = str(exc)
+        logger.exception("[vod_bulk_user_merge] job %s failed: %s", job_id, exc)
+    finally:
+        _finish_job(job_id)
+
+
+async def start_needs_review_user_merge(content_type: str, ids: list[int]) -> str:
+    if content_type not in ("movie", "series"):
+        raise ValueError("content_type must be 'movie' or 'series'")
+    if not ids or len(ids) > 250:
+        raise ValueError("select between 1 and 250 titles")
+    selected_ids = list(dict.fromkeys(int(item_id) for item_id in ids))
+    job_id = _new_job(len(selected_ids))
+    asyncio.create_task(_run_needs_review_user_merge_job(job_id, content_type, selected_ids))
     return job_id
 
 

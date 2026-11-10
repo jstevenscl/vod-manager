@@ -12638,25 +12638,7 @@ def list_metadata_review(content_type: str | None = None) -> dict:
             # conditions those partial indexes were built for, each branch scans
             # its own tiny index instead of the whole table; UNION also
             # naturally dedupes the (rare) row matching both branches.
-            rows = [dict(r) for r in conn.execute(
-                f"""SELECT * FROM (
-                    SELECT * FROM {table} WHERE review_excluded=0 AND needs_year_review=1
-                    UNION
-                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_missing
-                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
-                    UNION
-                    SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_no_tmdb
-                      WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NOT NULL
-                        AND id NOT IN ({_reviewed_auto_match_ids(table)})
-                    UNION
-                    SELECT * FROM {table}
-                      WHERE review_excluded=0 AND tmdb_id IS NOT NULL AND TRIM(tmdb_id)=''
-                    UNION
-                    SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL
-                      AND id IN ({_ambiguous_auto_match_ids(table)})
-                )
-                ORDER BY needs_year_review DESC, name"""
-            ).fetchall()]
+            rows = [dict(r) for r in conn.execute(_metadata_review_sql(table)).fetchall()]
             out[key] = rows
         conn.close()
         return out
@@ -12734,6 +12716,174 @@ def _settle_auto_match(content_type: str, item_id: int, *, reviewed: bool = Fals
             conn.execute("DELETE FROM tmdb_auto_match WHERE content_type=? AND item_id=?", (content_type, item_id))
         _commit_with_retry(conn)
         conn.close()
+    finally:
+        conn.close()
+
+
+def _metadata_review_sql(table: str) -> str:
+    return f"""SELECT * FROM (
+        SELECT * FROM {table} WHERE review_excluded=0 AND needs_year_review=1
+        UNION
+        SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_missing
+          WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NULL
+        UNION
+        SELECT * FROM {table} INDEXED BY idx_{table}_metadata_review_no_tmdb
+          WHERE review_excluded=0 AND tmdb_id IS NULL AND year IS NOT NULL
+            AND id NOT IN ({_reviewed_auto_match_ids(table)})
+        UNION
+        SELECT * FROM {table}
+          WHERE review_excluded=0 AND tmdb_id IS NOT NULL AND TRIM(tmdb_id)=''
+        UNION
+        SELECT * FROM {table} WHERE review_excluded=0 AND tmdb_id IS NULL
+          AND id IN ({_ambiguous_auto_match_ids(table)})
+    ) ORDER BY needs_year_review DESC, name"""
+
+
+def count_metadata_review() -> dict:
+    """Count the exact Metadata Review query, including its adult subset."""
+    conn = _connect()
+    try:
+        result = {}
+        for table, key in (("movies", "movies"), ("series", "series")):
+            row = conn.execute(
+                f"SELECT COUNT(*) AS total, COALESCE(SUM(is_adult), 0) AS adult FROM ({_metadata_review_sql(table)})"
+            ).fetchone()
+            result[key] = {"total": row["total"], "adult": row["adult"]}
+        return result
+    finally:
+        conn.close()
+
+
+def list_possible_metadata_matches(content_type: str, limit: int = 50, offset: int = 0, hide_adult: bool = True) -> dict:
+    """Return missing-identity items with same-title catalog candidates."""
+    if content_type not in ("movie", "series"):
+        raise ValueError("content_type must be 'movie' or 'series'")
+    table = "movies" if content_type == "movie" else "series"
+    conn = _connect()
+    try:
+        active_review = _metadata_review_sql(table)
+        adult_filter = "AND COALESCE(is_adult, 0)=0" if hide_adult else ""
+        incoming = [dict(row) for row in conn.execute(
+            f"""SELECT id, name, year, tmdb_id, poster_url FROM ({active_review})
+                WHERE (tmdb_id IS NULL OR TRIM(tmdb_id)='') {adult_filter}
+                ORDER BY name, id"""
+        ).fetchall()]
+        catalog = [dict(row) for row in conn.execute(
+            f"SELECT id, name, year, tmdb_id, poster_url FROM {table} WHERE review_excluded=0 {adult_filter} ORDER BY id"
+        ).fetchall()]
+        by_name: dict[str, list[dict]] = {}
+        for row in catalog:
+            by_name.setdefault(_base_name_for_dedup(row["name"] or ""), []).append(row)
+        ignored = set(list_ignored_duplicate_signatures(content_type))
+        matched = []
+        for row in incoming:
+            candidates = [candidate for candidate in by_name.get(_base_name_for_dedup(row["name"] or ""), [])
+                if candidate["id"] != row["id"]
+                and _duplicate_ignore_signature([row["id"], candidate["id"]]) not in ignored
+                and not (not str(candidate["tmdb_id"] or "").strip() and candidate["id"] > row["id"])
+                and (row["year"] is None or candidate["year"] is None
+                     or abs(int(row["year"]) - int(candidate["year"])) <= 3)]
+            candidates.sort(key=lambda candidate: (
+                0 if row["year"] is not None and candidate["year"] == row["year"] else 1,
+                abs(int(row["year"]) - int(candidate["year"])) if row["year"] is not None and candidate["year"] is not None else 9999,
+                not str(candidate["tmdb_id"] or "").strip(), candidate["id"],
+            ))
+            for candidate in candidates:
+                if row["year"] is None:
+                    candidate["match_reason"] = "same normalized title; incoming year missing"
+                elif candidate["year"] is None:
+                    candidate["match_reason"] = "same normalized title; existing year missing"
+                elif row["year"] == candidate["year"]:
+                    candidate["match_reason"] = "same title and year"
+                else:
+                    candidate["match_reason"] = f"same normalized title; year differs by {abs(int(row['year']) - int(candidate['year']))}"
+            if candidates:
+                matched.append({
+                    "id": row["id"], "name": row["name"], "year": row["year"], "poster_url": row["poster_url"],
+                    "candidates": [{key: candidate[key] for key in ("id", "name", "year", "tmdb_id", "poster_url", "match_reason")}
+                                   for candidate in candidates[:5]],
+                })
+        total = len(matched)
+        page_limit = max(1, min(int(limit), 200))
+        page_offset = max(0, int(offset))
+        return {"items": matched[page_offset:page_offset + page_limit], "total": total,
+                "limit": page_limit, "offset": page_offset}
+    finally:
+        conn.close()
+
+
+def bulk_merge_possible_metadata_matches(content_type: str, pairs: list[dict]) -> dict:
+    """Merge explicitly approved same-title candidates with final rechecks."""
+    if content_type not in ("movie", "series"):
+        raise ValueError("content_type must be 'movie' or 'series'")
+    if not pairs or len(pairs) > 250:
+        raise ValueError("select between 1 and 250 matches")
+    table = "movies" if content_type == "movie" else "series"
+    merge = merge_movie if content_type == "movie" else merge_series
+    merged, skipped = 0, []
+    for pair in pairs:
+        try:
+            item_id, candidate_id = int(pair["item_id"]), int(pair["candidate_id"])
+        except (KeyError, TypeError, ValueError):
+            skipped.append({**pair, "reason": "invalid pair"})
+            continue
+        conn = _connect()
+        try:
+            item = conn.execute(f"SELECT name, year, tmdb_id, review_excluded FROM {table} WHERE id=?", (item_id,)).fetchone()
+            candidate = conn.execute(f"SELECT name, year, review_excluded FROM {table} WHERE id=?", (candidate_id,)).fetchone()
+            if not item or not candidate or item["review_excluded"] or candidate["review_excluded"]:
+                skipped.append({"item_id": item_id, "candidate_id": candidate_id, "reason": "row no longer active"})
+                continue
+            years_ok = item["year"] is None or candidate["year"] is None or abs(int(item["year"]) - int(candidate["year"])) <= 3
+            if str(item["tmdb_id"] or "").strip() or _base_name_for_dedup(item["name"] or "") != _base_name_for_dedup(candidate["name"] or "") or not years_ok:
+                skipped.append({"item_id": item_id, "candidate_id": candidate_id, "reason": "identity changed or title/year no longer matches"})
+                continue
+        finally:
+            conn.close()
+        try:
+            merge(item_id, candidate_id)
+            merged += 1
+        except Exception as exc:
+            logger.warning("[vod_db] possible-match merge %s %s->%s failed: %s", content_type, item_id, candidate_id, exc)
+            skipped.append({"item_id": item_id, "candidate_id": candidate_id, "reason": f"merge failed: {exc}"})
+    return {"merged": merged, "skipped": skipped}
+
+
+def bulk_ignore_possible_metadata_matches(content_type: str, rows: list[dict]) -> int:
+    """Dismiss approved candidate pairs so the item remains a separate entry."""
+    if content_type not in ("movie", "series") or not rows or len(rows) > 250:
+        raise ValueError("select between 1 and 250 items")
+    table = "movies" if content_type == "movie" else "series"
+    pairs: set[tuple[int, int]] = set()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            item_id = int(row["item_id"])
+            item = conn.execute(f"SELECT name, year, tmdb_id, review_excluded FROM {table} WHERE id=?", (item_id,)).fetchone()
+            if not item or item["review_excluded"] or str(item["tmdb_id"] or "").strip():
+                continue
+            for candidate_id in row.get("candidate_ids", []):
+                candidate_id = int(candidate_id)
+                candidate = conn.execute(f"SELECT name, year, review_excluded FROM {table} WHERE id=?", (candidate_id,)).fetchone()
+                if not candidate or candidate["review_excluded"] or candidate_id == item_id:
+                    continue
+                same_title = _base_name_for_dedup(item["name"] or "") == _base_name_for_dedup(candidate["name"] or "")
+                year_ok = item["year"] is None or candidate["year"] is None or abs(int(item["year"]) - int(candidate["year"])) <= 3
+                if same_title and year_ok:
+                    pairs.add((min(item_id, candidate_id), max(item_id, candidate_id)))
+        if not pairs:
+            conn.rollback()
+            return 0
+        conn.executemany(
+            "INSERT OR IGNORE INTO duplicate_ignores (content_type, signature, created_at) VALUES (?,?,?)",
+            [(content_type, _duplicate_ignore_signature(list(pair)), _now()) for pair in sorted(pairs)],
+        )
+        _commit_with_retry(conn)
+        return len(pairs)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
