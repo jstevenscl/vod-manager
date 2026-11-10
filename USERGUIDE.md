@@ -1479,16 +1479,22 @@ page and open only what you need.
 
 ### Episode list preloading
 
-For Xtream Codes providers, VOD Manager gradually fetches episode lists for
-series that have not been opened yet. This makes episodes available sooner
-without sending a large burst of requests. Opening a series still loads its
-episodes immediately. In **Configuration → Refresh Schedule**, set the
-maximum shows per batch, the pause between batches, and the gap between
-requests. Defaults are 100 shows, 15 minutes, and 3 seconds; set the batch to
-0 to turn this scheduled trickle off; existing import, enrichment, and
-on-demand paths are unchanged. A provider's batch stops after three
-consecutive failures or when that provider is already in backoff. Recently
-failed series sources wait 24 hours before another automatic attempt.
+**This is ON by default.** After you update, VOD Manager starts quietly fetching
+episode lists in the background for Xtream Codes providers: up to **100 shows
+per provider every 15 minutes, one request every 3 seconds**. It only covers
+series that have not had their episode list fetched yet, so the first episode
+view of a show is faster and there is no large burst of requests. Opening a
+series still loads its episodes immediately, and the existing import,
+enrichment and on-demand paths are unchanged.
+
+To change or turn it off, open **Configuration → Refresh Schedule → Episode
+list preloading**: *Shows per batch* (0–500; **set it to 0 to turn this
+scheduled preloading off**), *Pause between batches* (5 minutes–24 hours) and
+*Gap between requests* (1–60 seconds). The page shows an estimate of how many
+shows per hour that works out to. A provider's batch stops after three
+consecutive failures or when that provider is already in backoff, and a series
+source that recently failed waits 24 hours before another automatic attempt.
+Inactive providers and sources in languages you have not enabled are skipped.
 
 Above the catalog itself, the dashboard always shows two live cards:
 

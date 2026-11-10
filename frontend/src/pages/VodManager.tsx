@@ -9133,7 +9133,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
           <div className="mt-3 space-y-2 border-t border-border pt-3">
             <h4 className="text-sm font-semibold">Episode list preloading</h4>
             <p className="text-xs text-muted-foreground leading-relaxed">
-              The app gradually fetches episode lists for shows nobody has opened yet. Opening a show still loads
+              This is on by default. The app gradually fetches episode lists for shows nobody has opened yet; set Shows per batch to 0 to turn it off. Opening a show still loads
               its episodes immediately. Requests run one at a time per provider with a gap between requests; a
               provider is paused for the current batch after three consecutive failures or when it enters backoff.
             </p>
