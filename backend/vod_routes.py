@@ -3920,6 +3920,8 @@ async def enrich_movie(movie_id: int, force: bool = False):
         fetched = await vod_importer.enrich_movie(movie_id, force=force)
     except vod_importer.ProviderBackoffError as exc:
         raise HTTPException(503, detail=str(exc))
+    # KNM: 2026-11-12 -- card open fills a still-missing release date (local TMDB library, then TMDB).
+    await vod_importer.fill_movie_release_date(movie_id)
     return {"fetched": fetched, "movie": vod_db.get_movie(movie_id)}
 
 
@@ -4980,6 +4982,10 @@ async def enrich_series(series_id: int, force: bool = False):
         result = await vod_importer.enrich_series(series_id, force=force)
     except vod_importer.ProviderBackoffError as exc:
         raise HTTPException(503, detail=str(exc))
+    if not result["fetched"]:
+        # KNM: 2026-11-12 -- card open on an already-synced show still fills missing air dates (a fetch
+        # does this itself); local TMDB library first, then TMDB.
+        await vod_importer.fill_series_air_dates(series_id)
     series = vod_db.get_series(series_id)
     if not series:
         # Found live 2026-09-15: a concurrent auto-merge (see

@@ -603,6 +603,21 @@ async def get_series_episode_list_local(tmdb_id: str) -> list[dict]:
         return []
 
 
+# KNM: 2026-11-12 -- store-only read of a show's first air date, to fill a missing
+# series release date without a TMDB request.
+async def get_series_first_air_date_local(tmdb_id: str) -> str | None:
+    """first_air_date from the local TMDB library only; None when the store is
+    off or holds nothing for this show. Never calls TMDB."""
+    if not (store_enabled() and str(tmdb_id).isdigit()):
+        return None
+    try:
+        payload = await asyncio.to_thread(tmdb_store.get_payload, "tv", int(tmdb_id))
+    except Exception as exc:
+        logger.warning("[tmdb_sync] local first_air_date read failed for tmdb_id=%s: %s", tmdb_id, exc)
+        return None
+    return (payload or {}).get("first_air_date") or None
+
+
 async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:
     """TMDB's own canonical title and release year per id. Two Duplicate
     Finder candidates sharing a tmdb_id confirms they're the same real

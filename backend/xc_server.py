@@ -504,6 +504,9 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                     "plot": ep["description"] or "",
                     "duration_secs": ep["duration_secs"] or 0,
                     "bitrate": ep.get("bitrate") or 0,
+                    # KNM: 2026-11-12 -- ISO YYYY-MM-DD, omitted when unknown (Dispatcharr parses
+                    # this key with datetime.fromisoformat, so an empty string would be an error).
+                    **({"air_date": ep["air_date"]} if ep.get("air_date") else {}),
                 },
             })
 

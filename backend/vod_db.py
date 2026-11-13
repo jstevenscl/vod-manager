@@ -1318,6 +1318,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("movies", "release_date", "TEXT"),
         ("series", "rating", "TEXT"),
         ("series", "release_date", "TEXT"),
+        # KNM: 2026-11-12 -- per-episode air date (ISO YYYY-MM-DD), served in the XC episode info block.
+        ("episodes", "air_date", "TEXT"),
         ("movie_sources", "bitrate", "INTEGER"),
         ("episode_sources", "bitrate", "INTEGER"),
         ("provider_live_accounts", "dispatcharr_profile_id", "INTEGER"),
@@ -9715,6 +9717,8 @@ def _add_episode_row(conn: sqlite3.Connection, series_id: int, season_number: in
     can hold a single connection/transaction across the whole series instead
     of paying a fresh connection + WAL fsync per episode. add_episode wraps
     this with its own lock/connect/commit for one-off single-episode callers."""
+    # KNM: 2026-11-12 -- air_date only ever fills a NULL; a stored date is never replaced.
+    air_date = normalize_air_date(fields.pop("air_date", None))
     row = conn.execute(
         "SELECT id, name_locked FROM episodes WHERE series_id=? AND season_number=? AND episode_number=?",
         (series_id, season_number, episode_number),
@@ -9725,7 +9729,14 @@ def _add_episode_row(conn: sqlite3.Connection, series_id: int, season_number: in
             fields["name"] = name
         sets = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE episodes SET {sets}, updated_at=? WHERE id=?", (*fields.values(), _now(), episode_id))
+        if air_date:
+            conn.execute(
+                "UPDATE episodes SET air_date=? WHERE id=? AND (air_date IS NULL OR air_date='')",
+                (air_date, episode_id),
+            )
     else:
+        if air_date:
+            fields["air_date"] = air_date
         cols = ["series_id", "season_number", "episode_number", "name", *fields.keys()]
         vals = [series_id, season_number, episode_number, name, *fields.values()]
         placeholders = ", ".join("?" for _ in cols)
@@ -9735,6 +9746,78 @@ def _add_episode_row(conn: sqlite3.Connection, series_id: int, season_number: in
         )
         episode_id = cur.lastrowid
     return episode_id
+
+
+
+# KNM: 2026-11-12 -- episode air dates and fill-only release dates (never overwrite a stored value).
+_AIR_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:$|[T ])")
+
+
+def normalize_air_date(value) -> str | None:
+    """ISO YYYY-MM-DD from a provider/TMDB date string, or None when it is
+    empty, not ISO-shaped, or not a real calendar date."""
+    if not isinstance(value, str):
+        return None
+    m = _AIR_DATE_RE.match(value.strip())
+    if not m:
+        return None
+    try:
+        datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def count_episodes_missing_air_date(series_id: int) -> int:
+    conn = _connect()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) c FROM episodes WHERE series_id=? AND (air_date IS NULL OR air_date='')",
+            (series_id,),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+
+
+def fill_episode_air_dates(series_id: int, dates: dict[tuple[int, int], str]) -> int:
+    """Sets air_date on this series' episodes that have none, matched by
+    (season, episode). Returns how many were filled."""
+    valid = {k: d for k, v in dates.items() if (d := normalize_air_date(v))}
+    if not valid:
+        return 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            n = 0
+            for (season, episode), date in valid.items():
+                n += conn.execute(
+                    "UPDATE episodes SET air_date=? WHERE series_id=? AND season_number=? AND episode_number=? "
+                    "AND (air_date IS NULL OR air_date='')",
+                    (date, series_id, season, episode),
+                ).rowcount
+            _commit_with_retry(conn)
+            return n
+        finally:
+            conn.close()
+
+
+def fill_missing_release_date(kind: str, item_id: int, date: str | None) -> bool:
+    """Sets movies/series.release_date only when it is empty. True if written."""
+    table = {"movie": "movies", "series": "series"}[kind]
+    value = normalize_air_date(date)
+    if not value:
+        return False
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            changed = conn.execute(
+                f"UPDATE {table} SET release_date=? WHERE id=? AND (release_date IS NULL OR TRIM(release_date)='')",
+                (value, item_id),
+            ).rowcount
+            _commit_with_retry(conn)
+            return bool(changed)
+        finally:
+            conn.close()
 
 
 def add_episode(series_id: int, season_number: int, episode_number: int, name: str, **fields) -> int:
@@ -9895,6 +9978,7 @@ def enrich_series_episodes_batch(series_id: int, provider_id: int, episodes: lis
                         episode_id = _add_episode_row(
                             conn, series_id, ep["season_number"], ep["episode_number"], ep["name"],
                             description=ep.get("description"), duration_secs=ep.get("duration_secs"),
+                            air_date=ep.get("air_date"),
                         )
                         _add_episode_source_row(
                             conn, episode_id, provider_id, ep["provider_stream_id"],
@@ -10393,7 +10477,7 @@ def get_episode_export_rows_for_series(series_id: int) -> list[dict]:
         SELECT
             e.id AS episode_id, e.series_id AS series_id, e.season_number AS season_number,
             e.episode_number AS episode_number, e.name AS name, e.description AS description,
-            e.duration_secs AS duration_secs,
+            e.duration_secs AS duration_secs, e.air_date AS air_date,
             es.provider_id AS provider_id, es.provider_stream_id AS provider_stream_id,
             es.container_extension AS container_extension, es.bitrate AS bitrate
         FROM episodes e
