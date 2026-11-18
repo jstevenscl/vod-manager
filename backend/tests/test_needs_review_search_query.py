@@ -79,3 +79,16 @@ def test_review_search_query_helper(db):
     assert db.tmdb_review_search_query("Plain Title") == "Plain Title"
     assert db.tmdb_review_search_query("Plain Title", "  Other  ") == "Other"
     assert db.tmdb_review_search_query("(2014)") == "(2014)"
+
+
+def test_review_search_query_strips_provider_language_tags(db):
+    assert db.tmdb_review_search_query("EN| Copper Harbor") == "Copper Harbor"
+    assert db.tmdb_review_search_query("ES| Harborlight Story (2022)") == "Harborlight Story"
+    assert db.tmdb_review_search_query("EN - Copper Harbor") == "Copper Harbor"
+    assert db.tmdb_review_search_query("EN| 4K: Copper Harbor") == "Copper Harbor"
+    assert db.tmdb_review_search_query("IN| TELUGU| Copper Harbor") == "Copper Harbor"
+    # real titles that only look like a tag are left alone
+    assert db.tmdb_review_search_query("IT: Chapter Two") == "IT: Chapter Two"
+    assert db.tmdb_review_search_query("Spider-Man") == "Spider-Man"
+    assert db.tmdb_review_search_query("He-Man and the Masters of the Universe") == "He-Man and the Masters of the Universe"
+    assert db.tmdb_review_search_query("WWE: 25") == "WWE: 25"

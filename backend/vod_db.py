@@ -5002,7 +5002,8 @@ def tmdb_review_search_query(name: str | None, q: str | None = None) -> str:
     """Default TMDB search text for review/AI flows.
 
     A reviewer's own q is used verbatim; otherwise strip one trailing "(US)"
-    and one "(YYYY)" tag, then a leading quality label such as "4K:".
+    and one "(YYYY)" tag, then a leading quality label such as "4K:" and any
+    leading language code such as "EN|".
     """
     if q and q.strip():
         return q.strip()
@@ -5010,7 +5011,11 @@ def tmdb_review_search_query(name: str | None, q: str | None = None) -> str:
     quality_language = _QUALITY_LANG_DASH_RE.match(cleaned)
     if quality_language and quality_language.group(2).upper() in _KNOWN_LANGUAGE_CODES:
         cleaned = cleaned[quality_language.end():].strip()
+    # Providers tag titles with a language code ("EN| Show", "ES - Show");
+    # TMDB has nothing under that literal text, so search the bare title.
+    cleaned = _strip_lang_prefixes(cleaned)
     cleaned = _TMDB_RESOLUTION_PREFIX_RE.sub("", cleaned, count=1).strip()
+    cleaned = _strip_lang_prefixes(cleaned)
     return cleaned or (name or "").strip()
 
 
@@ -13105,6 +13110,21 @@ def record_auto_match(content_type: str, item_id: int, status: str, reason: str 
             )
             _commit_with_retry(conn)
             conn.close()
+        finally:
+            conn.close()
+
+
+def requeue_unmatched_auto_match() -> int:
+    """Forget every 'unmatched' auto-match decision so those titles are tried
+    again on the next pass. Used once, after language-tag stripping was added
+    to the search: titles tagged "EN| ..." had been recorded as unmatched
+    only because TMDB was searched for the tag text too."""
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute("DELETE FROM tmdb_auto_match WHERE status='unmatched'")
+            _commit_with_retry(conn)
+            return cur.rowcount
         finally:
             conn.close()
 

@@ -29,7 +29,10 @@ _TRAILING_YEAR = re.compile(r"\s*\((?:19|20)\d{2}\)\s*$")
 def _search_name(name: str) -> str:
     """Providers often send series as "Show (2022)"; TMDB finds nothing for
     that, so query with the bare title (the year is passed separately)."""
-    return _TRAILING_YEAR.sub("", name).strip() or name
+    bare = _TRAILING_YEAR.sub("", name).strip() or name
+    # ...and with a provider's leading language tag ("EN| Show"): TMDB has
+    # nothing under that literal text, so every such title came back "unmatched".
+    return vod_db._strip_lang_prefixes(bare).strip() or bare
 
 
 async def _unique_on_tmdb(content_type: str, name: str) -> bool:
@@ -43,8 +46,24 @@ async def _unique_on_tmdb(content_type: str, name: str) -> bool:
         return False
 
 
+_LANGTAG_RETRY_KEY = "automatch_langtag_retry_done"
+
+
+async def _retry_unmatched_once() -> None:
+    """Titles with a provider language tag ("EN| Show") used to be searched with
+    the tag included and so recorded as 'unmatched', which then waited a week.
+    Clear those decisions once so the fixed search gets a chance at them."""
+    if await asyncio.to_thread(tmdb_store.get_meta, _LANGTAG_RETRY_KEY, "") == "1":
+        return
+    cleared = await asyncio.to_thread(vod_db.requeue_unmatched_auto_match)
+    await asyncio.to_thread(tmdb_store.set_meta, _LANGTAG_RETRY_KEY, "1")
+    if cleared:
+        logger.info("[tmdb_automatch] re-queued %d earlier 'unmatched' titles", cleared)
+
+
 async def run_auto_match(limit: int | None = None) -> dict:
     """One pass over up to `limit` no-ID titles, series first."""
+    await _retry_unmatched_once()
     if limit is None:
         limit = get_tmdb_store_settings()["auto_match_batch"]
     counts = {"checked": 0, "matched": 0, "ambiguous": 0, "unmatched": 0, "failed": 0}

@@ -281,3 +281,41 @@ def test_provider_name_with_year_suffix_is_searched_by_bare_title(env):
 
     assert _tmdb_id(db, "series", item) == "95396"
     assert all("(2022)" not in str(call) for call in fake.calls)
+
+
+def test_search_name_drops_year_suffix_and_language_tag():
+    assert tmdb_automatch._search_name("EN| Copper Harbor (2022)") == "Copper Harbor"
+    assert tmdb_automatch._search_name("ES| Copper Harbor") == "Copper Harbor"
+    assert tmdb_automatch._search_name("Copper Harbor (2022)") == "Copper Harbor"
+    assert tmdb_automatch._search_name("IT: Chapter Two") == "IT: Chapter Two"
+    assert tmdb_automatch._search_name("Spider-Man") == "Spider-Man"
+
+
+def test_auto_match_finds_a_title_the_provider_tagged_with_a_language(env):
+    db, fake = env
+    tmdb_store.upsert_payload("tv", _tv(10, "Father Knows Best", "1954-10-03"))
+    _seed_export("tv", [(10, "Father Knows Best")])
+    item = _add(db, "series", "EN| Father Knows Best (1954)", 1954)
+
+    result = asyncio.run(tmdb_automatch.run_auto_match())
+
+    assert _tmdb_id(db, "series", item) == "10"
+    assert result["matched"] == 1
+
+
+def test_earlier_unmatched_decisions_are_retried_once(env):
+    db, fake = env
+    tmdb_store.upsert_payload("tv", _tv(10, "Father Knows Best", "1954-10-03"))
+    _seed_export("tv", [(10, "Father Knows Best")])
+    item = _add(db, "series", "EN| Father Knows Best", 1954)
+    db.record_auto_match("series", item, "unmatched", "no TMDB results")  # recorded before tags were stripped
+
+    result = asyncio.run(tmdb_automatch.run_auto_match())
+
+    assert _tmdb_id(db, "series", item) == "10"
+    assert result["matched"] == 1
+    # the clean-up is a one-off: a later 'unmatched' decision is kept again
+    other = _add(db, "series", "Nothing Like This", 2001)
+    db.record_auto_match("series", other, "unmatched", "no TMDB results")
+    asyncio.run(tmdb_automatch.run_auto_match())
+    assert ("series", other, "unmatched") in _auto_match_rows(db)
