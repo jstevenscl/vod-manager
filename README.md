@@ -486,7 +486,9 @@ Maintenance) is a separate, ongoing setting to have VOD clients see a
 
 **Finding and bulk-fixing titles.** The **No TMDB ID** button on the Movies and
 TV Shows pages lists every title that still has no TMDB match, including
-year-bearing ones (Metadata Review lists those too). **Select all
+year-bearing ones (Metadata Review lists those too), with a note on whether
+automatic matching is running. Open a title and click **Find TMDB match** to search
+TMDB and pick the right entry in one click. **Select all
 filtered** selects everything matching the current filters across all pages, so
 **TMDB episode titles** (preview first, then Apply) can run over a whole library
 or a filtered slice, and the result names the series that had no TMDB match.

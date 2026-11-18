@@ -1776,14 +1776,32 @@ what it could not fill, so a normal pass costs no TMDB requests. **Run now** doe
 **Finding items with no TMDB ID.** The **No TMDB ID** button next to *Archived*
 on the Movies and TV Shows pages lists only the titles that still have no TMDB
 match. **Metadata Review** lists the same titles (no year, a year that never
-matched, or an ambiguous auto-match), so the two counts agree. Open one to use
-*Search TMDB*, or have them matched by name and year automatically: on the
-**TMDB Library** page, save a TMDB API key and turn the library **on**, then click
-**Match titles without a TMDB ID**. Automatic matching only runs while the
-library is on (the button is disabled when it is off, and nothing runs in the
-background). It matches 2,000 titles per run and 4 runs a day, series first, so a
-catalog with many thousands of unmatched titles takes a few days; titles TMDB
-cannot find are retried after a week.
+matched, or an ambiguous auto-match), so the two counts agree. While the filter
+is on, a note above the list says whether automatic matching is running and
+links to the page to turn it on (or to Metadata Review).
+
+![The note shown above the list while the No TMDB ID filter is on](docs/screenshots/no-tmdb-id-hint.png)
+
+**Pick a match yourself.** Open a title with no TMDB ID and click **Find TMDB
+match**. It searches TMDB (your local TMDB library first, when it is on) using
+the title with any language tag such as `EN|` or `ES -`, a trailing year and a
+quality label like `4K:` removed, and lists the results with poster, year, TMDB
+id and overview. Click one to save its TMDB id (and year, when TMDB gives one).
+Type a different title in the box to search again, or use *Set TMDB id* when you
+already know the number. A matching id may merge the title into the card you
+already have.
+
+![Find TMDB match in a title's details](docs/screenshots/find-tmdb-match.png)
+
+**Have them matched for you.** On the **TMDB Library** page, save a TMDB API key
+and turn the library **on**, then click **Match titles without a TMDB ID**.
+Automatic matching only runs while the library is on (the button is disabled
+when it is off, and nothing runs in the background). It matches 2,000 titles per
+run and 4 runs a day, series first, so a catalog with many thousands of
+unmatched titles takes a few days. It searches with the same cleaned title
+(language tag and trailing year removed). Titles TMDB cannot find are retried
+after a week, and ones it cannot settle are listed in Metadata Review with the
+candidates.
 
 ![The No TMDB ID filter with Select all filtered and Remove from category](docs/screenshots/no-tmdb-filter-and-remove.png)
 
