@@ -77,6 +77,7 @@ interface NavGroup {
 interface RuntimeStatus {
   import: { running: boolean; queued?: boolean; queue_position?: number | null; provider_name: string | null; error: string | null }
   enrichment: { running: boolean; movies_done: number; movies_total: number; series_done: number; series_total: number }
+  episode_discovery?: { running: boolean; series_sources_done: number; series_sources_total: number; series_errors: number; cancelled?: boolean }
   tmdb: { running: boolean; done: number; total: number }
   bulk_ai: { running: boolean; done: number; total: number; jobs: number }
   process_cpu_percent: number | null
@@ -184,7 +185,7 @@ export default function App() {
     enabled: authState === 'ready',
     refetchInterval: (query) => {
       const status = query.state.data
-      return status?.import.running || status?.enrichment.running || status?.tmdb.running || status?.bulk_ai.running ? 2000 : 10_000
+      return status?.import.running || status?.enrichment.running || status?.episode_discovery?.running || status?.tmdb.running || status?.bulk_ai.running ? 2000 : 10_000
     },
     retry: false,
   })
@@ -219,7 +220,10 @@ export default function App() {
           ? `TMDB: ${runtime.tmdb.done}/${runtime.tmdb.total}`
           : runtime?.enrichment.running
             ? `Enriching: ${runtime.enrichment.movies_done}/${runtime.enrichment.movies_total} movies · ${runtime.enrichment.series_done}/${runtime.enrichment.series_total} series`
-            : catalogFailed ? `Import failed for ${failedSummary}. Check ${failedImports.length > 1 ? 'those providers' : 'that provider'} in Providers and retry.` : 'Idle'
+            : catalogFailed ? `Import failed for ${failedSummary}. Check ${failedImports.length > 1 ? 'those providers' : 'that provider'} in Providers and retry.`
+              : runtime?.episode_discovery?.running
+                ? `Episode discovery: ${runtime.episode_discovery.series_sources_done}/${runtime.episode_discovery.series_sources_total} sources`
+                : 'Idle'
 
   useEffect(() => {
     if (isLoading) return

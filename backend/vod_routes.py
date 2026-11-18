@@ -99,6 +99,10 @@ vod_db.init_db()
 
 # ── Request models ──────────────────────────────────────────────────────────
 
+class CatalogSyncDeleteRequest(BaseModel):
+    run_ids: list[int]
+
+
 class TmdbApiKeyRequest(BaseModel):
     api_key: str
 
@@ -636,6 +640,15 @@ async def sync_history_detail(run_id: int):
     if not report:
         raise HTTPException(404, detail="sync report not found")
     return report
+
+
+@router.delete("/sync-history/", dependencies=_GUARDS)
+async def delete_sync_history(body: CatalogSyncDeleteRequest):
+    """Delete selected Sync History reports. Never touches catalog content."""
+    if not body.run_ids:
+        raise HTTPException(400, detail="run_ids must not be empty")
+    deleted = await asyncio.to_thread(vod_db.delete_catalog_sync_runs, body.run_ids)
+    return {"deleted": deleted}
 
 
 # ── XC clients (per-instance credentials) ───────────────────────────────────
@@ -5011,11 +5024,25 @@ async def runtime_status():
     return {
         "import": vod_importer.get_import_progress(),
         "enrichment": vod_importer.get_enrich_progress(),
+        "episode_discovery": vod_importer.get_episode_discovery_progress(),
         "tmdb": {"running": False, "done": 0, "total": 0},
         "bulk_ai": vod_bulk_ai_service.get_active_bulk_ai_status(),
         "process_cpu_percent": vod_importer.get_process_cpu_percent(),
         "failed_imports": await asyncio.to_thread(vod_db.list_failed_provider_imports),
     }
+
+
+@router.get("/episode-discovery/status/", dependencies=_GUARDS)
+async def episode_discovery_status():
+    """Progress of the paced background episode-list fetch (the trickle)."""
+    return vod_importer.get_episode_discovery_progress()
+
+
+@router.post("/episode-discovery/cancel/", dependencies=_GUARDS)
+async def episode_discovery_cancel():
+    if not vod_importer.cancel_episode_discovery():
+        raise HTTPException(409, detail="episode discovery is not running")
+    return {"cancel_requested": True}
 
 
 # ── Metadata rewrite rules ───────────────────────────────────────────────────

@@ -638,6 +638,22 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
+        -- Per-run snapshot of the catalog cards a sync added or changed (shown
+        -- in Curation & Maintenance > Sync History). Report data only: deleting
+        -- a run cascades to these rows and never touches the catalog itself.
+        -- (Report format by @knmplace.)
+        CREATE TABLE IF NOT EXISTS catalog_sync_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES catalog_sync_runs(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL CHECK(content_type IN ('movie','series')),
+            content_id INTEGER,
+            title TEXT NOT NULL,
+            year INTEGER,
+            action TEXT NOT NULL,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+
         -- Automatic name+year TMDB matching for items with no
         -- tmdb_id (tmdb_automatch). Only undecided outcomes are kept: 'ambiguous'
         -- shows in Metadata Review, 'unmatched' is retried after a while,
@@ -680,6 +696,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_vod_stream_failures_created_at ON vod_stream_failures(created_at);
         CREATE INDEX IF NOT EXISTS idx_tmdb_lookup_failures_type_time ON tmdb_lookup_failures(content_type, last_failed_at);
         CREATE INDEX IF NOT EXISTS idx_catalog_sync_runs_created_at ON catalog_sync_runs(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_catalog_sync_events_run_id ON catalog_sync_events(run_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_accounts_provider_id ON provider_sub_accounts(provider_id);
         CREATE INDEX IF NOT EXISTS idx_provider_sub_account_live_accounts_sub_account_id ON provider_sub_account_live_accounts(sub_account_id);
         CREATE INDEX IF NOT EXISTS idx_movie_source_owners_source_id ON movie_source_owners(movie_source_id);
@@ -1497,6 +1514,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("download_jobs", "import_seen_size", "INTEGER"),  # size-stable check before importing
         ("download_jobs", "import_seen_at", "REAL"),
         ("download_jobs", "import_since", "REAL"),         # start of the stall clock
+        # Sync History phase timings (@knmplace's report layout). Additive and
+        # nullable: rows written before these existed fall back to
+        # started_at/finished_at when read (see _sync_run_out).
+        ("catalog_sync_runs", "import_started_at", "TEXT"),
+        ("catalog_sync_runs", "import_finished_at", "TEXT"),
+        ("catalog_sync_runs", "reconciliation_started_at", "TEXT"),
+        ("catalog_sync_runs", "reconciliation_finished_at", "TEXT"),
+        ("catalog_sync_runs", "enrichment_started_at", "TEXT"),
+        ("catalog_sync_runs", "enrichment_finished_at", "TEXT"),
+        ("catalog_sync_runs", "ready_at", "TEXT"),
     ]
     for table, column, coltype in migrations:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1585,10 +1612,10 @@ def create_catalog_sync_run(provider_id: int | None, provider_name: str, provide
         try:
             cur = conn.execute(
                 """INSERT INTO catalog_sync_runs
-                   (provider_id, provider_name, provider_type, queued_at, started_at, status, created_at)
+                   (provider_id, provider_name, provider_type, queued_at, started_at, import_started_at, status, created_at)
                    VALUES (CASE WHEN EXISTS (SELECT 1 FROM providers WHERE id=?) THEN ? ELSE NULL END,
-                           ?,?,?,?,?,?)""",
-                (provider_id, provider_id, provider_name, provider_type, now, now, "running", now),
+                           ?,?,?,?,?,?,?)""",
+                (provider_id, provider_id, provider_name, provider_type, now, now, now, "running", now),
             )
             _commit_with_retry(conn)
             return int(cur.lastrowid)
@@ -1601,14 +1628,15 @@ def create_catalog_sync_run(provider_id: int | None, provider_name: str, provide
 
 def finish_catalog_sync_run(run_id: int, *, summary: dict | None = None, error: str | None = None) -> None:
     """Close one import report exactly once with a compact, safe summary."""
+    now = _now()
     with _WRITE_LOCK:
         conn = _connect()
         try:
             conn.execute(
                 """UPDATE catalog_sync_runs
-                       SET finished_at=?, status=?, summary_json=?, error=?
+                       SET finished_at=?, import_finished_at=?, ready_at=?, status=?, summary_json=?, error=?
                      WHERE id=? AND status='running'""",
-                (_now(), "failed" if error else "ready", json.dumps(summary or {}, separators=(",", ":")), error, run_id),
+                (now, now, now, "failed" if error else "ready", json.dumps(summary or {}, separators=(",", ":")), error, run_id),
             )
             _commit_with_retry(conn)
         except BaseException:
@@ -1657,23 +1685,104 @@ def list_failed_provider_imports() -> list[dict]:
         conn.close()
 
 
+def _sync_run_out(row) -> dict:
+    """One report row as the API/UI shape.
+
+    Phase timings fall back to the original started_at/finished_at so reports
+    written before the phase columns existed (and the non-XC adapters, which
+    only record an import phase) still show a sensible duration."""
+    item = dict(row)
+    try:
+        item["summary"] = json.loads(item.pop("summary_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        item["summary"] = {}
+    item["run_type"] = item.get("provider_type") or "provider_import"
+    if not item.get("import_started_at"):
+        item["import_started_at"] = item.get("started_at")
+    if not item.get("import_finished_at"):
+        item["import_finished_at"] = item.get("finished_at")
+    if not item.get("ready_at") and item.get("status") == "ready":
+        item["ready_at"] = item.get("finished_at")
+    return item
+
+
+def update_catalog_sync_run(run_id: int, **fields) -> None:
+    """Stamp optional phase timings (enrichment / review) on a sync report."""
+    allowed = {
+        "reconciliation_started_at", "reconciliation_finished_at",
+        "enrichment_started_at", "enrichment_finished_at", "ready_at",
+    }
+    values = {key: value for key, value in fields.items() if key in allowed}
+    if not values:
+        return
+    assignments = ", ".join(f"{key}=?" for key in values)
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(f"UPDATE catalog_sync_runs SET {assignments} WHERE id=?", (*values.values(), run_id))
+            _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def record_catalog_sync_events(
+    run_id: int, *, movie_ids=(), series_ids=(), created_movie_ids=(), created_series_ids=(),
+    summary: dict | None = None,
+) -> int:
+    """Snapshot the catalog cards a sync added or changed into its report.
+
+    Episode-level changes are summarized on the series event; this is a
+    report, not an episode review queue. (Design by @knmplace.)"""
+    created = {
+        "movie": {int(i) for i in created_movie_ids if i is not None},
+        "series": {int(i) for i in created_series_ids if i is not None},
+    }
+    inserted = 0
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            now = _now()
+            for content_type, ids, table in (("movie", movie_ids, "movies"), ("series", series_ids, "series")):
+                ids = sorted({int(i) for i in ids if i is not None})
+                for offset in range(0, len(ids), 900):
+                    batch = ids[offset:offset + 900]
+                    rows = conn.execute(
+                        f"SELECT id, name, year, tmdb_id FROM {table} WHERE id IN ({','.join('?' * len(batch))})",
+                        batch,
+                    ).fetchall()
+                    for row in rows:
+                        detail = {"tmdb_id": row["tmdb_id"], "summary": summary or {}}
+                        conn.execute(
+                            """INSERT INTO catalog_sync_events
+                               (run_id, content_type, content_id, title, year, action, detail_json, created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (run_id, content_type, row["id"], row["name"], row["year"],
+                             "added" if row["id"] in created[content_type] else "changed",
+                             json.dumps(detail, separators=(",", ":")), now),
+                        )
+                        inserted += 1
+            if inserted:
+                _commit_with_retry(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    return inserted
+
+
 def list_catalog_sync_runs(limit: int = 100, offset: int = 0) -> list[dict]:
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT * FROM catalog_sync_runs ORDER BY id DESC LIMIT ? OFFSET ?",
+            """SELECT r.*, (SELECT COUNT(*) FROM catalog_sync_events e WHERE e.run_id=r.id) AS event_count
+                 FROM catalog_sync_runs r ORDER BY r.id DESC LIMIT ? OFFSET ?""",
             (max(1, min(limit, 500)), max(0, offset)),
         ).fetchall()
-        conn.close()
-        result = []
-        for row in rows:
-            item = dict(row)
-            try:
-                item["summary"] = json.loads(item.pop("summary_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                item["summary"] = {}
-            result.append(item)
-        return result
+        return [_sync_run_out(row) for row in rows]
     finally:
         conn.close()
 
@@ -1682,17 +1791,44 @@ def get_catalog_sync_run(run_id: int) -> dict | None:
     conn = _connect()
     try:
         row = conn.execute("SELECT * FROM catalog_sync_runs WHERE id=?", (run_id,)).fetchone()
-        conn.close()
         if not row:
             return None
-        result = dict(row)
-        try:
-            result["summary"] = json.loads(result.pop("summary_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            result["summary"] = {}
+        result = _sync_run_out(row)
+        events = conn.execute(
+            "SELECT * FROM catalog_sync_events WHERE run_id=? ORDER BY id", (run_id,)
+        ).fetchall()
+        result["event_count"] = len(events)
+        result["events"] = []
+        for event in events:
+            item = dict(event)
+            try:
+                item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["detail"] = {}
+            result["events"].append(item)
         return result
     finally:
         conn.close()
+
+
+def delete_catalog_sync_runs(run_ids: list[int]) -> int:
+    """Delete reports only -- never any catalog content. Returns rows removed."""
+    ids = sorted({int(run_id) for run_id in run_ids})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    with _WRITE_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(f"DELETE FROM catalog_sync_events WHERE run_id IN ({placeholders})", ids)
+            removed = conn.execute(f"DELETE FROM catalog_sync_runs WHERE id IN ({placeholders})", ids).rowcount
+            _commit_with_retry(conn)
+            return removed
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def _commit_with_retry(conn: sqlite3.Connection, retries: int = 5) -> None:
@@ -10324,6 +10460,9 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
             archived = 0
             unarchived = 0
             lock_retry_items = []
+            # Report-only bookkeeping for Sync History (see record_catalog_sync_events).
+            changed_movie_ids: set[int] = set()
+            created_movie_ids: set[int] = set()
             # Committed every batch_size items rather than once at the very end (see
             # _commit_with_retry's docstring) -- a real XC catalog is thousands of
             # items, and holding one uncommitted transaction open for the whole loop
@@ -10574,6 +10713,10 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                                WHERE id=?""",
                                 (item["poster_url"], movie_id),
                             )
+                        source_is_new = conn.execute(
+                            "SELECT 1 FROM movie_sources WHERE provider_id=? AND provider_stream_id=?",
+                            (provider_id, item["provider_stream_id"]),
+                        ).fetchone() is None
                         conn.execute(
                             """INSERT INTO movie_sources (movie_id, provider_id, provider_stream_id, container_extension, provider_category_name, raw_name, language, added_at, last_seen_at)
                            VALUES (?,?,?,?,?,?,?,?,?)
@@ -10588,6 +10731,10 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
                         flagged += did_flag
                         archived += did_archive
                         unarchived += did_unarchive
+                        if did_create:
+                            created_movie_ids.add(movie_id)
+                        if did_create or source_is_new or did_archive or did_unarchive:
+                            changed_movie_ids.add(movie_id)
                 except sqlite3.OperationalError as exc:
                     # A periodic commit (above) frees the write lock regularly, but a
                     # concurrent writer can still grab it in the gap between this
@@ -10643,8 +10790,11 @@ def bulk_import_movies(provider_id: int, items: list[dict], _retry_depth: int = 
         unarchived += retry_result["movies_unarchived"]
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
+        changed_movie_ids.update(retry_result.get("changed_movie_ids", []))
+        created_movie_ids.update(retry_result.get("created_movie_ids", []))
 
-    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"movies_created": created, "movies_matched": matched, "movies_archived": archived, "movies_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors,
+            "changed_movie_ids": sorted(changed_movie_ids), "created_movie_ids": sorted(created_movie_ids)}
 
 
 def apply_provider_trailers(provider_id: int, content_type: str, items: list[dict]) -> int:
@@ -10732,6 +10882,9 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
             archived = 0
             unarchived = 0
             lock_retry_items = []
+            # Report-only bookkeeping for Sync History (see record_catalog_sync_events).
+            changed_series_ids: set[int] = set()
+            created_series_ids: set[int] = set()
             # See bulk_import_movies's identical comment -- same fix, same reason.
             batch_size = 25
             for i, item in enumerate(items):
@@ -10956,7 +11109,12 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         # against series_sources' own UNIQUE(provider_id,
                         # provider_series_id) constraint -- a re-import of an
                         # already-known source is a no-op here.
+                        source_is_new = False
                         if series_id_for_detail is not None and item.get("provider_series_id") is not None:
+                            source_is_new = conn.execute(
+                                "SELECT 1 FROM series_sources WHERE provider_id=? AND provider_series_id=?",
+                                (provider_id, item.get("provider_series_id")),
+                            ).fetchone() is None
                             conn.execute(
                                 "INSERT OR IGNORE INTO series_sources "
                                 "(series_id, provider_id, provider_series_id, provider_category_name, raw_name, language, added_at, last_seen_at) "
@@ -10976,6 +11134,11 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
                         flagged += did_flag
                         archived += did_archive
                         unarchived += did_unarchive
+                        if series_id_for_detail is not None:
+                            if did_create:
+                                created_series_ids.add(series_id_for_detail)
+                            if did_create or source_is_new or did_archive or did_unarchive:
+                                changed_series_ids.add(series_id_for_detail)
                 except sqlite3.OperationalError as exc:
                     # See bulk_import_movies's identical handler -- transient lock
                     # contention gets a retry pass instead of a permanent, silent
@@ -11023,8 +11186,11 @@ def bulk_import_series(provider_id: int, items: list[dict], _retry_depth: int = 
         unarchived += retry_result["series_unarchived"]
         flagged += retry_result["flagged_for_review"]
         errors += retry_result["errors"]
+        changed_series_ids.update(retry_result.get("changed_series_ids", []))
+        created_series_ids.update(retry_result.get("created_series_ids", []))
 
-    return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors}
+    return {"series_created": created, "series_matched": matched, "series_archived": archived, "series_unarchived": unarchived, "total": len(items), "flagged_for_review": flagged, "errors": errors,
+            "changed_series_ids": sorted(changed_series_ids), "created_series_ids": sorted(created_series_ids)}
 
 
 _PLEX_DETAIL_FIELDS = ("genre", "description", "director", "cast_list", "poster_url", "last_enriched_at", "rating", "release_date")

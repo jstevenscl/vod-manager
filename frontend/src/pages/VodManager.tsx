@@ -1821,6 +1821,65 @@ interface DvrRecordingFailure {
   detected_at: string
 }
 
+// Sync History report shapes (report layout by @knmplace).
+interface CatalogSyncEvent {
+  id: number
+  content_type: 'movie' | 'series'
+  content_id: number | null
+  title: string
+  year: number | null
+  action: string
+  detail: Record<string, any>
+  created_at: string
+}
+
+interface CatalogSyncRun {
+  id: number
+  provider_name: string
+  run_type: string
+  queued_at: string
+  import_started_at: string | null
+  import_finished_at: string | null
+  reconciliation_started_at: string | null
+  reconciliation_finished_at: string | null
+  enrichment_started_at: string | null
+  enrichment_finished_at: string | null
+  ready_at: string | null
+  status: string
+  error?: string | null
+  summary: Record<string, unknown>
+  event_count: number
+  events?: CatalogSyncEvent[]
+}
+
+interface EpisodeDiscoveryProgress {
+  running: boolean
+  series_sources_total: number; series_sources_done: number
+  series_errors: number; series_backoff_skipped: number
+  started_at: number | null; finished_at: number | null
+  cancelled?: boolean
+}
+
+function syncLabel(value: string): string {
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function syncDuration(start: string | null | undefined, finish: string | null | undefined): string {
+  if (!start || !finish) return 'pending'
+  const seconds = Math.max(0, Math.round(Number(finish) - Number(start)))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+function syncEventDescription(event: CatalogSyncEvent): string {
+  if (event.action === 'added') return 'Added from the provider feed.'
+  if (event.action === 'archived') return 'Archived from active review/playback queues by the import rules.'
+  if (event.action === 'unarchived') return 'Returned to the active review/playback queues.'
+  return 'Provider source added or updated for this catalog item.'
+}
+
 interface EnrichProgress {
   running: boolean
   movies_total: number; movies_done: number; movies_errors: number; movies_backoff_skipped: number
@@ -6578,6 +6637,37 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
     queryFn:  () => api.get('/vod/enrich-all/status/').then((r) => r.data),
     refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
   })
+  const episodeDiscoveryQuery = useQuery<EpisodeDiscoveryProgress>({
+    queryKey: ['vod-episode-discovery-progress'],
+    queryFn: () => api.get('/vod/episode-discovery/status/').then((r) => r.data),
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 10000),
+  })
+  const cancelEpisodeDiscovery = useMutation({
+    mutationFn: () => api.post('/vod/episode-discovery/cancel/'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['vod-episode-discovery-progress'] }),
+  })
+  const episodeDiscovery = episodeDiscoveryQuery.data
+  const syncHistoryQuery = useQuery<CatalogSyncRun[]>({
+    queryKey: ['vod-sync-history'],
+    queryFn: () => api.get('/vod/sync-history/').then((r) => r.data),
+    refetchInterval: 10000,
+  })
+  const [syncHistorySelected, setSyncHistorySelected] = useState<Set<number>>(new Set())
+  const [syncHistoryOpen, setSyncHistoryOpen] = useState<number | null>(null)
+  const [syncHistoryEventTab, setSyncHistoryEventTab] = useState<'movie' | 'series'>('movie')
+  const syncHistoryDetailQuery = useQuery<CatalogSyncRun>({
+    queryKey: ['vod-sync-history-detail', syncHistoryOpen],
+    queryFn: () => api.get(`/vod/sync-history/${syncHistoryOpen}/`).then((r) => r.data),
+    enabled: syncHistoryOpen != null,
+  })
+  const deleteSyncHistory = useMutation({
+    mutationFn: (runIds: number[]) => api.delete('/vod/sync-history/', { data: { run_ids: runIds } }),
+    onSuccess: () => {
+      setSyncHistorySelected(new Set())
+      setSyncHistoryOpen(null)
+      qc.invalidateQueries({ queryKey: ['vod-sync-history'] })
+    },
+  })
   const xcCredentialsQuery = useQuery<XcCredentials>({
     queryKey: ['vod-xc-credentials'],
     queryFn:  () => api.get('/vod/xc-credentials/').then((r) => r.data),
@@ -10225,6 +10315,153 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             })()}
           </div>
         )}
+      </SectionCard>
+      <SectionCard title="Episode discovery" description="Fetch missing provider episode listings on the separate trickle schedule. Catalog enrichment does not make these provider requests." icon={<List size={14} />}>
+        <div className="flex items-center gap-2">
+          {episodeDiscovery?.running ? (
+            <Button size="sm" variant="outline" disabled={cancelEpisodeDiscovery.isPending} onClick={() => cancelEpisodeDiscovery.mutate()}>
+              Cancel episode discovery
+            </Button>
+          ) : <span className="text-xs text-muted-foreground">Waiting for the next scheduled tick.</span>}
+          {episodeDiscovery?.finished_at && !episodeDiscovery.running && (
+            <span className="text-xs text-muted-foreground">{episodeDiscovery.cancelled ? 'Stopped' : 'Last tick complete'}</span>
+          )}
+        </div>
+        {episodeDiscovery && (episodeDiscovery.running || episodeDiscovery.finished_at) && (() => {
+          const pct = episodeDiscovery.series_sources_total
+            ? Math.min(100, Math.round(episodeDiscovery.series_sources_done / episodeDiscovery.series_sources_total * 100)) : 100
+          return (
+            <div className="mt-2 space-y-1">
+              <div className="flex justify-between text-[11px] text-muted-foreground">
+                <span>{episodeDiscovery.running ? 'Discovering provider episodes' : 'Last tick'}</span>
+                <span className="tabular-nums">
+                  {episodeDiscovery.series_sources_done.toLocaleString()} / {episodeDiscovery.series_sources_total.toLocaleString()} sources
+                  {episodeDiscovery.series_errors ? ` · ${episodeDiscovery.series_errors} errors` : ''}
+                  {episodeDiscovery.series_backoff_skipped ? ` · ${episodeDiscovery.series_backoff_skipped} paused (provider backoff)` : ''}
+                </span>
+              </div>
+              <div className="h-1.5 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-cyan-500" style={{ width: `${pct}%` }} /></div>
+            </div>
+          )
+        })()}
+      </SectionCard>
+      <SectionCard title="Sync History" description="Review what each provider import added or changed. Deleting a report never changes your catalog." icon={<List size={14} />}>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" disabled={!syncHistorySelected.size || deleteSyncHistory.isPending}
+            onClick={() => askConfirm(`Delete ${syncHistorySelected.size} sync report${syncHistorySelected.size === 1 ? '' : 's'}? Catalog content will not be changed.`, () => deleteSyncHistory.mutate(Array.from(syncHistorySelected)))}>
+            {deleteSyncHistory.isPending ? <Loader2 size={12} className="animate-spin mr-1" /> : <Trash2 size={12} className="mr-1" />}Delete selected reports
+          </Button>
+          <span className="text-xs text-muted-foreground">{syncHistorySelected.size} selected</span>
+        </div>
+        <div className="overflow-x-auto rounded border border-border/60">
+          <table className="w-full text-xs">
+            <thead className="text-left text-muted-foreground bg-muted/20">
+              <tr>
+                <th className="p-2 w-8">
+                  <input type="checkbox" title="Select all reports" aria-label="Select all reports" disabled={!syncHistoryQuery.data?.length}
+                    checked={!!syncHistoryQuery.data?.length && syncHistoryQuery.data.every((run) => syncHistorySelected.has(run.id))}
+                    onChange={(event) => setSyncHistorySelected(event.target.checked ? new Set((syncHistoryQuery.data ?? []).map((run) => run.id)) : new Set())} />
+                </th>
+                <th className="p-2">Run</th><th className="p-2">Provider</th><th className="p-2">Status</th><th className="p-2">Changes</th><th className="p-2">Duration</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(syncHistoryQuery.data ?? []).map((run) => (
+                <Fragment key={run.id}>
+                  <tr className="border-t border-border/40 hover:bg-muted/10">
+                    <td className="p-2">
+                      <input type="checkbox" aria-label={`Select report ${run.id}`} checked={syncHistorySelected.has(run.id)}
+                        onChange={() => setSyncHistorySelected((current) => { const next = new Set(current); if (next.has(run.id)) next.delete(run.id); else next.add(run.id); return next })} />
+                    </td>
+                    <td className="p-2">
+                      <button className="text-primary hover:underline" onClick={() => setSyncHistoryOpen(syncHistoryOpen === run.id ? null : run.id)}>
+                        {new Date(Number(run.queued_at) * 1000).toLocaleString()}
+                      </button>
+                    </td>
+                    <td className="p-2">{run.provider_name}</td>
+                    <td className="p-2">{run.status}</td>
+                    <td className="p-2 tabular-nums">{run.event_count}</td>
+                    <td className="p-2 tabular-nums">
+                      <span>{syncDuration(run.import_started_at, run.ready_at ?? run.import_finished_at)}</span>
+                      {run.enrichment_started_at && run.enrichment_finished_at && (
+                        <span className="block text-[10px] text-muted-foreground">enrich {syncDuration(run.enrichment_started_at, run.enrichment_finished_at)}</span>
+                      )}
+                    </td>
+                  </tr>
+                  {syncHistoryOpen === run.id && (
+                    <tr className="border-t border-border/20 bg-muted/5">
+                      <td colSpan={6} className="p-3">
+                        {syncHistoryDetailQuery.isLoading ? <span className="text-muted-foreground">Loading report…</span>
+                          : syncHistoryDetailQuery.isError ? <span className="text-destructive">Could not load this report. Refresh and try again.</span>
+                          : syncHistoryDetailQuery.data && (() => {
+                            const detail = syncHistoryDetailQuery.data
+                            const summaryEntries = Object.entries(detail.summary ?? {}).filter(([key, value]) => !['provider', 'catalog_changed', 'post_import_enrichment_queued'].includes(key) && typeof value !== 'object' && value !== null)
+                            const events = detail.events ?? []
+                            const movieEvents = events.filter((event) => event.content_type === 'movie')
+                            const seriesEvents = events.filter((event) => event.content_type === 'series')
+                            const visibleEvents = syncHistoryEventTab === 'movie' ? movieEvents : seriesEvents
+                            return (
+                              <div className="space-y-3">
+                                {detail.error && <div className="text-destructive">Import failed: {detail.error}</div>}
+                                <div className="grid gap-2 sm:grid-cols-2">
+                                  {[
+                                    ['Total', syncDuration(detail.import_started_at, detail.ready_at ?? detail.import_finished_at)],
+                                    ['Import', syncDuration(detail.import_started_at, detail.import_finished_at)],
+                                  ].map(([label, value]) => (
+                                    <div key={label} className="rounded border border-border/50 bg-background/40 px-2 py-1.5">
+                                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+                                      <div className="font-semibold tabular-nums">{value}</div>
+                                    </div>
+                                  ))}
+                                </div>
+                                <div className="rounded border border-border/50 bg-background/30 p-2">
+                                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">What this run did</div>
+                                  {summaryEntries.length ? (
+                                    <div className="grid gap-x-4 gap-y-1 sm:grid-cols-3">
+                                      {summaryEntries.map(([key, value]) => (
+                                        <div key={key} className="flex justify-between gap-2"><span className="text-muted-foreground">{syncLabel(key)}</span><span className="font-medium tabular-nums">{String(value)}</span></div>
+                                      ))}
+                                    </div>
+                                  ) : <div className="text-muted-foreground">No summary counters were recorded.</div>}
+                                </div>
+                                <div className="space-y-1.5">
+                                  <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Catalog changes</div>
+                                  <div className="flex items-center gap-1 border-b border-border/50">
+                                    {([['movie', 'Movies', movieEvents.length], ['series', 'Series', seriesEvents.length]] as const).map(([tab, label, count]) => (
+                                      <button key={tab} type="button"
+                                        className={`border-b-2 px-2.5 py-1.5 text-xs font-medium transition-colors ${syncHistoryEventTab === tab ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+                                        onClick={() => setSyncHistoryEventTab(tab)}>
+                                        {label} <span className="ml-1 tabular-nums text-[10px]">{count.toLocaleString()}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                  {visibleEvents.length ? (
+                                    <ul className="max-h-80 space-y-1.5 overflow-y-auto">
+                                      {visibleEvents.map((event) => (
+                                        <li key={event.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border/40 bg-background/25 px-2 py-1.5">
+                                          <span className="font-medium">{event.title}{event.year ? ` (${event.year})` : ''}</span>
+                                          <span className="text-cyan-300">{syncLabel(event.action)}</span>
+                                          <span className="text-muted-foreground">{syncEventDescription(event)}</span>
+                                          <Button size="sm" variant="ghost" className="ml-auto h-6 px-1.5 text-[10px]" onClick={() => setActiveTab(event.content_type === 'movie' ? 'movies' : 'series')}>
+                                            Open {event.content_type === 'movie' ? 'Movies' : 'TV Shows'}
+                                          </Button>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  ) : <div className="rounded border border-dashed border-border/60 p-2 text-muted-foreground">No {syncHistoryEventTab === 'movie' ? 'movie' : 'series'} cards changed in this run.</div>}
+                                </div>
+                              </div>
+                            )
+                          })()}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+              {!syncHistoryQuery.data?.length && <tr><td colSpan={6} className="p-3 text-muted-foreground">No sync reports yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </SectionCard>
       </>
       )}

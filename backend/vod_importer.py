@@ -506,6 +506,14 @@ class XCProviderClient:
         return await self._call("get_series_info", series_id=series_id)
 
 
+def _loggable_import_result(result):
+    """Import results carry per-item id lists for Sync History events; keep
+    them out of the log line (thousands of ids on a big catalog)."""
+    if not isinstance(result, dict):
+        return result
+    return {k: (len(v) if k.endswith("_ids") and isinstance(v, list) else v) for k, v in result.items()}
+
+
 async def _import_movies_for_provider(
     client: "XCProviderClient", provider: dict, provider_id: int,
     category_names: dict[str, str], exclude_categories: list[str], exclude_uncategorized: bool,
@@ -573,7 +581,7 @@ async def _import_movies_for_provider(
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s movies: %s (fetch=%.2fs db_write=%.2fs items=%d)",
-        provider["name"], movie_result, fetch_elapsed, db_elapsed, len(streams),
+        provider["name"], _loggable_import_result(movie_result), fetch_elapsed, db_elapsed, len(streams),
     )
     # Raw snapshot of every stream_id this provider's catalog actually
     # advertised, kept separate from movie_items (which is filtered by local
@@ -651,7 +659,7 @@ async def _import_series_for_provider(
     db_elapsed = time.time() - db_started
     logger.info(
         "[vod_importer] provider=%s series: %s (fetch=%.2fs db_write=%.2fs items=%d)",
-        provider["name"], series_result, fetch_elapsed, db_elapsed, len(series_list),
+        provider["name"], _loggable_import_result(series_result), fetch_elapsed, db_elapsed, len(series_list),
     )
     return series_result, len(series_list), {str(s["series_id"]) for s in series_list}
 
@@ -813,7 +821,19 @@ async def import_provider_catalog(provider_id: int, *, schedule_enrichment: bool
                 await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, error=type(exc).__name__)
             raise
         _IMPORT_PROGRESS.update({"running": False, "finished_at": time.time()})
+        # The id lists exist only to build the Sync History event rows; keep
+        # them out of the result handed back to callers/the API.
+        changed_movie_ids = result.pop("changed_movie_ids", [])
+        changed_series_ids = result.pop("changed_series_ids", [])
+        created_movie_ids = result.pop("created_movie_ids", [])
+        created_series_ids = result.pop("created_series_ids", [])
         if run_id is not None:
+            await asyncio.to_thread(
+                _write_catalog_report, vod_db.record_catalog_sync_events, run_id,
+                movie_ids=changed_movie_ids, series_ids=changed_series_ids,
+                created_movie_ids=created_movie_ids, created_series_ids=created_series_ids,
+                summary=_catalog_sync_summary(result),
+            )
             await asyncio.to_thread(_write_catalog_report, vod_db.finish_catalog_sync_run, run_id, summary=_catalog_sync_summary(result))
             result["catalog_sync_run_id"] = run_id
     if schedule_enrichment:
@@ -1943,12 +1963,37 @@ async def bulk_enrich_all(concurrency: int = 8, force: bool = False) -> None:
 _trickle_sleep = asyncio.sleep
 _TRICKLE_MAX_CONSECUTIVE_FAILURES = 3
 
+# Live progress of the paced episode-discovery trickle, shown on Curation &
+# Maintenance > Episode discovery and in the header status banner. Progress
+# and cancel design by @knmplace.
+_EPISODE_DISCOVERY_PROGRESS: dict = {
+    "running": False,
+    "series_sources_total": 0, "series_sources_done": 0,
+    "series_errors": 0, "series_backoff_skipped": 0,
+    "started_at": None, "finished_at": None, "cancelled": False,
+}
+_EPISODE_DISCOVERY_CANCEL_REQUESTED = False
+
+
+def get_episode_discovery_progress() -> dict:
+    return dict(_EPISODE_DISCOVERY_PROGRESS)
+
+
+def cancel_episode_discovery() -> bool:
+    """Ask a running tick to stop after the source it is fetching right now."""
+    global _EPISODE_DISCOVERY_CANCEL_REQUESTED
+    if not _EPISODE_DISCOVERY_PROGRESS["running"]:
+        return False
+    _EPISODE_DISCOVERY_CANCEL_REQUESTED = True
+    logger.info("[episode_trickle] cancellation requested")
+    return True
+
 
 async def run_episode_trickle_tick(
     batch_size: int | None = None, spacing_seconds: float | None = None,
 ) -> list[dict]:
     """Fetch a bounded, sequential batch of pending episode lists per provider."""
-    global _EPISODE_TRICKLE_RUNNING
+    global _EPISODE_TRICKLE_RUNNING, _EPISODE_DISCOVERY_CANCEL_REQUESTED
     settings = config.get_refresh_settings()
     batch = int(batch_size if batch_size is not None else settings["episode_trickle_batch"])
     spacing = float(spacing_seconds if spacing_seconds is not None else settings["episode_trickle_spacing_seconds"])
@@ -1959,17 +2004,28 @@ async def run_episode_trickle_tick(
         return []
 
     _EPISODE_TRICKLE_RUNNING = True
+    _EPISODE_DISCOVERY_CANCEL_REQUESTED = False
     results: list[dict] = []
+    _EPISODE_DISCOVERY_PROGRESS.update({
+        "running": True, "series_sources_total": 0, "series_sources_done": 0,
+        "series_errors": 0, "series_backoff_skipped": 0,
+        "started_at": time.time(), "finished_at": None, "cancelled": False,
+    })
     try:
         providers = await _to_thread(vod_db.list_providers)
         for provider in providers:
+            if _EPISODE_DISCOVERY_CANCEL_REQUESTED:
+                break
             provider_id = int(provider["id"])
             if (provider.get("provider_type") != "xc" or not provider.get("is_active", True)
                     or _provider_backoff_remaining(provider_id) > 0):
                 continue
             pending = await _to_thread(vod_db.list_pending_series_sources, provider_id, batch)
+            _EPISODE_DISCOVERY_PROGRESS["series_sources_total"] += len(pending)
             failures = 0
             for index, source in enumerate(pending):
+                if _EPISODE_DISCOVERY_CANCEL_REQUESTED:
+                    break
                 if _ENRICH_PROGRESS["running"] or _XC_IMPORT_LOCK.locked():
                     break
                 if _provider_backoff_remaining(provider_id) > 0:
@@ -1982,12 +2038,16 @@ async def run_episode_trickle_tick(
                 except ProviderBackoffError as exc:
                     results.append({"provider_id": provider_id, "series_id": source["series_id"],
                                     "fetched": False, "reason": str(exc), "backoff": True})
+                    _EPISODE_DISCOVERY_PROGRESS["series_backoff_skipped"] += 1
                     break
                 except Exception as exc:
                     logger.warning("[episode_trickle] series_id=%s provider_id=%s failed: %s",
                                    source["series_id"], provider_id, _redact_upstream_url(str(exc)))
                     result = {"fetched": False, "reason": "episode list fetch failed"}
                 results.append({"provider_id": provider_id, "series_id": source["series_id"], **result})
+                _EPISODE_DISCOVERY_PROGRESS["series_sources_done"] += 1
+                if not result.get("fetched"):
+                    _EPISODE_DISCOVERY_PROGRESS["series_errors"] += 1
                 failures = failures + 1 if not result.get("fetched") else 0
                 if failures >= _TRICKLE_MAX_CONSECUTIVE_FAILURES:
                     logger.info("[episode_trickle] pausing provider_id=%s after %d consecutive failures",
@@ -1998,6 +2058,9 @@ async def run_episode_trickle_tick(
         return results
     finally:
         _EPISODE_TRICKLE_RUNNING = False
+        _EPISODE_DISCOVERY_PROGRESS["running"] = False
+        _EPISODE_DISCOVERY_PROGRESS["finished_at"] = time.time()
+        _EPISODE_DISCOVERY_PROGRESS["cancelled"] = _EPISODE_DISCOVERY_CANCEL_REQUESTED
 
 
 async def resweep_smart_categories(movie_ids: set[int] | None = None, series_ids: set[int] | None = None) -> None:
