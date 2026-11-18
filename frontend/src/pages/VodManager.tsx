@@ -2404,7 +2404,7 @@ function DuplicateInlinePreview({ kind, itemId, xcCredentials }: {
 
 function DuplicateIdentityPicker({ contentType, item, onSaved }: {
   contentType: 'movie' | 'series'
-  item: DuplicateGroupItem
+  item: Pick<DuplicateGroupItem, 'id' | 'name' | 'year' | 'tmdb_id'>
   onSaved: () => void
 }) {
   const qc = useQueryClient()
@@ -2512,6 +2512,47 @@ function DuplicateIdentityPicker({ contentType, item, onSaved }: {
           <p className="text-[10px] text-muted-foreground">Selecting a result saves its TMDB ID and year when TMDB provides one. A matching ID may merge this card into the existing catalog card.</p>
         </div>
       )}
+    </div>
+  )
+}
+
+// Shown above the Movies / TV Shows list while the "No TMDB ID" filter is on:
+// says why these titles are still unmatched and what to do about them.
+function NoTmdbIdHint({ contentType, onOpenTmdb, onOpenReview }: {
+  contentType: 'movie' | 'series'
+  onOpenTmdb: () => void
+  onOpenReview: () => void
+}) {
+  const statusQuery = useQuery<{ has_api_key: boolean; active: boolean; settings: { auto_match_batch: number; bursts_per_day: number } }>({
+    queryKey: ['tmdb-store-status'],
+    queryFn: () => api.get('/tmdb-store/status').then((r) => r.data),
+    staleTime: 30000,
+    retry: false,
+  })
+  const status = statusQuery.data
+  if (!status) return null
+  const noun = contentType === 'movie' ? 'movie' : 'show'
+  let message: string
+  let action: { label: string; onClick: () => void }
+  if (!status.has_api_key) {
+    message = 'No TMDB API key is saved, so these titles cannot be matched automatically. Save a TMDB API key in Configuration, then turn on the TMDB Library and they are matched by name and year.'
+    action = { label: 'Open TMDB Library', onClick: onOpenTmdb }
+  } else if (!status.active) {
+    message = 'Automatic matching by name and year is off. Turn on the TMDB Library and click Match titles without a TMDB ID, and these titles are matched for you.'
+    action = { label: 'Open TMDB Library', onClick: onOpenTmdb }
+  } else if (!status.settings.auto_match_batch) {
+    message = 'The TMDB Library is on, but automatic matching of titles without a TMDB ID is set to 0 titles per run. Raise it on the TMDB Library page to have these matched for you.'
+    action = { label: 'Open TMDB Library', onClick: onOpenTmdb }
+  } else {
+    message = `Automatic matching is on: up to ${status.settings.auto_match_batch.toLocaleString()} titles per run, ${status.settings.bursts_per_day} runs a day, series first. Titles it cannot settle are listed in Metadata Review.`
+    action = { label: 'Open Metadata Review', onClick: onOpenReview }
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded border border-primary/30 bg-primary/5 px-2 py-1.5 text-xs">
+      <span className="flex-1 min-w-48 text-muted-foreground">
+        {message} Or open a {noun} and use <strong className="text-foreground">Find TMDB match</strong> to pick one yourself.
+      </span>
+      <Button size="sm" variant="outline" onClick={action.onClick}>{action.label}</Button>
     </div>
   )
 }
@@ -4000,6 +4041,7 @@ function MovieRow({ movie, movieCategories, providers, qc, xcCredentials, select
         {useTmdbTitle.isError && <p className="text-destructive">{(useTmdbTitle.error as any)?.response?.data?.detail ?? 'TMDB title fetch failed'}</p>}
         {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
         {setTmdbId.isError && <p className="text-destructive">{(setTmdbId.error as any)?.response?.data?.detail ?? 'Set TMDB id failed'}</p>}
+        {!movie.tmdb_id && <DuplicateIdentityPicker contentType="movie" item={movie} onSaved={() => undefined} />}
         <div className="flex items-center gap-1.5 mt-1">
           <span className="text-muted-foreground">Wrong content?</span>
           <FlagMismatchControl
@@ -4589,6 +4631,7 @@ function SeriesRow({ series, seriesCategories, qc, xcCredentials, selected, onTo
         )}
         {clearTmdbId.isError && <p className="text-destructive">{(clearTmdbId.error as any)?.response?.data?.detail ?? 'Clear TMDB match failed'}</p>}
         {setTmdbId.isError && <p className="text-destructive">{(setTmdbId.error as any)?.response?.data?.detail ?? 'Set TMDB id failed'}</p>}
+        {!series.tmdb_id && <DuplicateIdentityPicker contentType="series" item={series} onSaved={() => undefined} />}
         <div className="flex items-center gap-1.5 mt-1">
           <span className="text-muted-foreground">Wrong content?</span>
           <FlagMismatchControl
@@ -6317,7 +6360,7 @@ function PossibleMetadataMatches({ contentType, hideAdult }: { contentType: 'mov
 
 export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrSubTabPersisted }: {
   activeTab: VodManagerTab
-  setActiveTab: (t: VodManagerTab) => void
+  setActiveTab: (t: VodManagerTab | 'tmdb') => void
   dvrSubTab: DvrSubTab
   setDvrSubTabPersisted: (t: DvrSubTab) => void
 }) {
@@ -13091,7 +13134,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             size="sm"
             variant={movieNoTmdb ? 'default' : 'outline'}
             onClick={() => { setMovieNoTmdb((v) => !v); setMovieOffset(0) }}
-            title={movieNoTmdb ? 'Showing only movies with no TMDB ID — click to show everything' : 'Show only movies that have no TMDB ID yet (including ones Metadata Review does not list)'}
+            title={movieNoTmdb ? 'Showing only movies with no TMDB ID — click to show everything' : 'Show only movies that have no TMDB ID yet'}
           >
             No TMDB ID
           </Button>
@@ -13159,6 +13202,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </button>
           </div>
         </div>
+        {movieNoTmdb && <NoTmdbIdHint contentType="movie" onOpenTmdb={() => setActiveTab('tmdb')} onOpenReview={() => setActiveTab('metadata')} />}
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
           <span className="text-xs text-muted-foreground">{selectedMovieIds.size} selected · shift-click to select a range</span>
           <button
@@ -13325,7 +13369,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             size="sm"
             variant={seriesNoTmdb ? 'default' : 'outline'}
             onClick={() => { setSeriesNoTmdb((v) => !v); setSeriesOffset(0) }}
-            title={seriesNoTmdb ? 'Showing only series with no TMDB ID — click to show everything' : 'Show only series that have no TMDB ID yet (including ones Metadata Review does not list)'}
+            title={seriesNoTmdb ? 'Showing only series with no TMDB ID — click to show everything' : 'Show only series that have no TMDB ID yet'}
           >
             No TMDB ID
           </Button>
@@ -13393,6 +13437,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
             </button>
           </div>
         </div>
+        {seriesNoTmdb && <NoTmdbIdHint contentType="series" onOpenTmdb={() => setActiveTab('tmdb')} onOpenReview={() => setActiveTab('metadata')} />}
         <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/50 bg-muted/30 px-2 py-1.5">
           <span className="text-xs text-muted-foreground">{selectedSeriesIds.size} selected · shift-click to select a range</span>
           <button
