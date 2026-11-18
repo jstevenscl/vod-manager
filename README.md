@@ -478,7 +478,9 @@ toolbar) does this in bulk for every already-confirmed TMDB match at once,
 instead of one item at a time. **Episode list preloading** (on by default; Configuration → Refresh Schedule)
 quietly fetches episode lists for Xtream Codes providers in the background, up
 to 100 shows per provider every 15 minutes, one request every 3 seconds; set
-*Shows per batch* to 0 to turn it off. **Client Title Format** (Curation &
+*Shows per batch* to 0 to turn it off; **Curation & Maintenance → Episode discovery** shows
+its progress with a Cancel button, and **Sync History** lists every catalog import with what it
+added or changed (both by @knmplace). **Client Title Format** (Curation &
 Maintenance) is a separate, ongoing setting to have VOD clients see a
 "(Year)" suffix on every title, independent of the pool's own stored data.
 

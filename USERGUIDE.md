@@ -1496,6 +1496,18 @@ consecutive failures or when that provider is already in backoff, and a series
 source that recently failed waits 24 hours before another automatic attempt.
 Inactive providers and sources in languages you have not enabled are skipped.
 
+To watch it work, open **Curation & Maintenance → Episode discovery** (expand
+the section by clicking its title). While a batch is running it shows how many
+sources have been fetched out of the batch total, with a count of errors and of
+providers paused because they were in backoff, and a **Cancel episode
+discovery** button that stops the batch after the request in flight. Between
+batches it reads "Waiting for the next scheduled tick", and the last batch's
+result stays on screen. The same progress also appears in the status banner at
+the top of the page while a batch runs. (Progress and Cancel by
+[@knmplace](https://github.com/knmplace).)
+
+![Episode discovery card on Curation & Maintenance](docs/screenshots/episode-discovery.png)
+
 Above the catalog itself, the dashboard always shows two live cards:
 
 - **Activity** — what's playing right now, across every viewer, refreshed
@@ -1526,6 +1538,24 @@ names each provider whose latest import failed, with the error (for example
 succeeds, or when you deactivate or delete it; **Sync History** keeps the
 per-provider record. Fix the provider (credentials, URL, User-Agent)
 and run **Import** again.
+
+### Sync History
+
+**Curation & Maintenance → Sync History** (click the section title to expand
+it) lists every catalog import, newest first: when it ran, which provider,
+whether it finished or failed, how many catalog cards it changed, and how long
+it took. Click a run's date to open its report: the timings, the counters for
+that run ("What this run did"), and the individual movies and series it added
+or changed, on **Movies** and **Series** tabs, each with an **Open** shortcut to
+that page. A run's changes are *added* (a brand-new title) or *changed* (a
+provider source was attached, or the title was archived or restored by your
+import rules). A failed run shows its error. Tick one or more reports and use
+**Delete selected reports** to clear them; this only removes the report and
+never changes your catalog. Reports from before this screen existed show their
+original start and end times. (Sync History report by
+[@knmplace](https://github.com/knmplace).)
+
+![Sync History with one run expanded, showing its counters and Movies and Series changes](docs/screenshots/sync-history.png)
 
 On the **Movies** and **TV Shows** pages, the **All categories** dropdown next to
 the provider filter shows only the items placed in one of your categories —
@@ -1745,10 +1775,15 @@ what it could not fill, so a normal pass costs no TMDB requests. **Run now** doe
 
 **Finding items with no TMDB ID.** The **No TMDB ID** button next to *Archived*
 on the Movies and TV Shows pages lists only the titles that still have no TMDB
-match. This is wider than **Metadata Review**, which only lists titles with no
-year or an ambiguous auto-match; a title with a year that simply never matched
-shows up only here. Open one to use *Search TMDB*, or run **Match titles without
-a TMDB ID** on the TMDB Library page to have them matched by name and year.
+match. **Metadata Review** lists the same titles (no year, a year that never
+matched, or an ambiguous auto-match), so the two counts agree. Open one to use
+*Search TMDB*, or have them matched by name and year automatically: on the
+**TMDB Library** page, save a TMDB API key and turn the library **on**, then click
+**Match titles without a TMDB ID**. Automatic matching only runs while the
+library is on (the button is disabled when it is off, and nothing runs in the
+background). It matches 2,000 titles per run and 4 runs a day, series first, so a
+catalog with many thousands of unmatched titles takes a few days; titles TMDB
+cannot find are retried after a week.
 
 ![The No TMDB ID filter with Select all filtered and Remove from category](docs/screenshots/no-tmdb-filter-and-remove.png)
 
@@ -2196,7 +2231,7 @@ Each candidate also has its own **flag** icon to report "this isn't
 actually the same title" directly from the group, without leaving Duplicate
 Finder — see [Flagging wrong content](#flagging-wrong-content) in §9.
 
-![Orphan Checker, Duplicate Finder, and TMDB Lists](docs/screenshots/curation-tools.png)
+![Curation & Maintenance: each tool is a collapsible section, including Orphan Checker, Duplicate Finder, TMDB Lists, Episode discovery and Sync History](docs/screenshots/curation-tools.png)
 ![Duplicate Finder with TMDB-confirmed matches](docs/screenshots/duplicate-finder.png)
 
 ### Needs Review
@@ -2622,7 +2657,7 @@ regular XC client first, to rule out a provider-side issue.
 **Catalog status says "Import failed for …".** The card names the provider
 whose most recent import failed and the error type. Check that provider's URL,
 credentials and User-Agent (§5), then run **Import** again. If several providers
-fail, only the latest shows — Sync History lists each run.
+fail, only the latest shows — Curation & Maintenance → Sync History lists each run.
 
 **Emby/Jellyfin shows an empty library after the .strm export.** Confirm the
 export reported files written, that the media server mounts the same folder
