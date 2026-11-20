@@ -3074,6 +3074,108 @@ function DownloadMenu({ target, label, providers, seasons }: {
 }
 
 // Download Configuration -> Downloads: settings, the legal note, and the live queue.
+// KNM: 2026-11-19 -- one-time, user-started fill of missing episode air dates. The server keeps
+// the state (pending / running / done) so the Start button and the prompt never come back.
+type AirDateBackfillStatus = {
+  state: 'pending' | 'running' | 'done'
+  running: boolean
+  total: number
+  processed: number
+  filled: number
+  skipped_no_tmdb_id: number
+  errors: number
+  started_at: number | null
+  finished_at: number | null
+}
+
+function useAirDateBackfill() {
+  return useQuery<AirDateBackfillStatus>({
+    queryKey: ['vod-air-date-backfill'],
+    queryFn: () => api.get('/vod/air-date-backfill/').then((r) => r.data),
+    refetchInterval: (q) => ((q.state.data as AirDateBackfillStatus | undefined)?.state === 'running' ? 3000 : false),
+  })
+}
+
+function AirDateBackfillCard() {
+  const qc = useQueryClient()
+  const q = useAirDateBackfill()
+  const start = useMutation({
+    mutationFn: () => api.post('/vod/air-date-backfill/start/').then((r) => r.data as AirDateBackfillStatus),
+    onSuccess: (data) => qc.setQueryData(['vod-air-date-backfill'], data),
+    onError: (e: any) => toast.error(e?.response?.data?.detail ?? e?.message ?? 'Could not start.'),
+  })
+  const st = q.data
+  const pct = st && st.total > 0 ? Math.min(100, Math.round((st.processed / st.total) * 100)) : 0
+  const when = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() : '')
+  // Running on disk but no live task means the app stopped mid-run; Start simply continues it.
+  const interrupted = st?.state === 'running' && !st.running
+  return (
+    <div id="air-date-backfill-card">
+    <SectionCard title="Fill missing episode air dates" description="One-time job: add the date each episode first aired." icon={<CalendarDays size={14} />}>
+      <p className="text-sm text-foreground">
+        Apps like Dispatcharr only show when an episode aired if we have that date. Most of your episodes do not have one yet.
+        This job fills them in from the local TMDB library first, and from TMDB only for what is still missing. It never contacts
+        your providers, never changes a date that is already saved, and runs in the background, so you can keep using the app.
+        You only need to run it once.
+      </p>
+      {!st && <p className="text-sm text-foreground">Loading...</p>}
+      {st && (st.state === 'pending' || interrupted) && (
+        <div className="space-y-1.5">
+          {interrupted && (
+            <p className="text-sm text-foreground">
+              This job was interrupted (for example by a restart). Press the button to carry on where it stopped.
+              {' '}{st.processed} of {st.total} shows done so far.
+            </p>
+          )}
+          <Button size="sm" disabled={start.isPending} onClick={() => start.mutate()}>
+            {start.isPending ? <Loader2 size={12} className="animate-spin" /> : interrupted ? 'Continue' : 'Start'}
+          </Button>
+        </div>
+      )}
+      {st && st.state === 'running' && !interrupted && (
+        <div className="space-y-1.5">
+          <p className="text-sm text-foreground flex items-center gap-1.5">
+            <Loader2 size={12} className="animate-spin" /> Running: {st.processed} of {st.total} shows checked, {st.filled} episode dates added so far ({pct}%).
+          </p>
+          <div className="h-2 w-full rounded bg-secondary overflow-hidden">
+            <div className="h-full bg-primary" style={{ width: `${pct}%` }} />
+          </div>
+          <p className="text-sm text-foreground">You can leave this page. If the app restarts, it carries on by itself.</p>
+        </div>
+      )}
+      {st && st.state === 'done' && (
+        <div className="space-y-1">
+          <p className="text-sm text-foreground flex items-center gap-1.5"><CheckCircle2 size={12} /> Finished{st.finished_at ? ` ${when(st.finished_at)}` : ''}.</p>
+          <ul className="text-sm text-foreground list-disc pl-5">
+            <li>{st.processed} shows checked</li>
+            <li>{st.filled} episode air dates added</li>
+            <li>{st.skipped_no_tmdb_id} shows skipped (no TMDB match, so no date source)</li>
+            <li>{st.errors} shows had an error and were skipped</li>
+          </ul>
+        </div>
+      )}
+    </SectionCard>
+    </div>
+  )
+}
+
+function AirDateBackfillPrompt({ onGo }: { onGo: () => void }) {
+  const q = useAirDateBackfill()
+  const [dismissed, setDismissed] = useState(false)
+  // Only while the job has never been started; "Not now" hides it for this visit only.
+  if (dismissed || q.data?.state !== 'pending') return null
+  return (
+    <div className="rounded-md border border-primary/60 bg-card p-3 flex flex-wrap items-center gap-3">
+      <p className="text-sm text-foreground flex-1 min-w-[16rem]">
+        New: most episodes have no air date yet, so Dispatcharr and other apps cannot show one. You can fill them in once, in the background,
+        from the Configuration page.
+      </p>
+      <Button size="sm" onClick={onGo}>Go to Configuration</Button>
+      <Button size="sm" variant="outline" onClick={() => setDismissed(true)}>Not now</Button>
+    </div>
+  )
+}
+
 function DownloadsCard() {
   const qc = useQueryClient()
   const status = useDownloadStatus(true)
@@ -8793,6 +8895,12 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
       {activeTab === 'artwork' && (
         <MissingArtworkPage contentType={artworkContentType} qc={qc} onBack={() => setActiveTab('movies')} onContentType={setArtworkContentType} />
       )}
+      {activeTab !== 'config' && (
+        <AirDateBackfillPrompt onGo={() => {
+          setActiveTab('config')
+          setTimeout(() => document.getElementById('air-date-backfill-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 400)
+        }} />
+      )}
       {defaultCategoriesPromptQuery.data?.show && (
         <Modal onClose={() => answerDefaultCategoriesPrompt.mutate(false)} maxWidth="max-w-md">
           <div className="p-5 space-y-3">
@@ -10511,6 +10619,7 @@ export default function VodManager({ activeTab, setActiveTab, dvrSubTab, setDvrS
 
       {activeTab === 'config' && (
       <>
+      <AirDateBackfillCard />
       <SectionCard title="Title & Metadata Rules" description="Control automatic title cleanup and metadata behavior." icon={<Zap size={14} />}>
         <p className="text-xs text-muted-foreground">
           Find/replace applied to imported text, e.g. stripping a provider's own quality-tier prefix ("4K: Movie" → "Movie").

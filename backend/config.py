@@ -805,6 +805,17 @@ def set_hide_dvr_tab(hidden: bool) -> None:
     _update_raw(lambda data: data.__setitem__("hide_dvr_tab", hidden))
 
 
+# KNM: one-time episode air date backfill state (pending/running/done + progress
+# counters), kept in config.json like every other app setting -- no schema change. 2026-11-19
+def get_air_date_backfill() -> dict:
+    value = _read_raw().get("air_date_backfill")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def save_air_date_backfill(state: dict) -> None:
+    _update_raw(lambda data: data.__setitem__("air_date_backfill", dict(state)))
+
+
 def get_openai_api_key() -> str | None:
     data = _read_raw()
     return data.get("openai_api_key") or None

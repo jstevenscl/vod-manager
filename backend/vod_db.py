@@ -9779,6 +9779,36 @@ def count_episodes_missing_air_date(series_id: int) -> int:
         conn.close()
 
 
+# KNM: 2026-11-19 -- series the one-time air date backfill should visit: numeric TMDB id
+# and at least one episode with no air date. Series with missing dates but no usable
+# TMDB id are only counted (nothing local or TMDB-side can fill them).
+_TMDB_ID_IS_NUMERIC = "s.tmdb_id GLOB '[0-9]*' AND s.tmdb_id NOT GLOB '*[^0-9]*'"
+
+
+def list_series_ids_missing_air_dates() -> list[int]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT s.id FROM series s WHERE {_TMDB_ID_IS_NUMERIC} AND EXISTS ("
+            "SELECT 1 FROM episodes e WHERE e.series_id=s.id AND (e.air_date IS NULL OR e.air_date='')) "
+            "ORDER BY s.id"
+        ).fetchall()
+        return [r["id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def count_series_missing_air_dates_without_tmdb_id() -> int:
+    conn = _connect()
+    try:
+        return conn.execute(
+            f"SELECT COUNT(*) c FROM series s WHERE NOT (s.tmdb_id IS NOT NULL AND {_TMDB_ID_IS_NUMERIC}) AND EXISTS ("
+            "SELECT 1 FROM episodes e WHERE e.series_id=s.id AND (e.air_date IS NULL OR e.air_date=''))"
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+
+
 def fill_episode_air_dates(series_id: int, dates: dict[tuple[int, int], str]) -> int:
     """Sets air_date on this series' episodes that have none, matched by
     (season, episode). Returns how many were filled."""
