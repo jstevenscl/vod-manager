@@ -13,6 +13,8 @@ organizes what's already there according to an external list.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import re
 import time
@@ -53,6 +55,18 @@ _TMDB_BACKOFF_STATUS_CODES = {429, 503}
 _TMDB_BACKOFF_SECONDS = 5.0
 _tmdb_backoff_until = 0.0
 
+# KNM: optional pacer for one running task tree (the one-time air-date backfill).
+# Default None = every other caller behaves exactly as before. A pacer offers
+# slot() (async context manager, entered BEFORE the global semaphore so a paced
+# caller never holds global slots while it waits for its turn) and throttled()
+# (called when TMDB answers 429/503 so the pacer can slow itself down). 2026-11-19
+_tmdb_pacing: contextvars.ContextVar = contextvars.ContextVar("_tmdb_pacing", default=None)
+
+
+def _paced_slot():
+    pacer = _tmdb_pacing.get()
+    return pacer.slot() if pacer is not None else contextlib.nullcontext()
+
 
 async def _tmdb_get(url: str, params: dict) -> httpx.Response:
     """GET through the shared TMDB client, honoring/setting the backoff --
@@ -64,6 +78,9 @@ async def _tmdb_get(url: str, params: dict) -> httpx.Response:
     r = await _tmdb_client.get(url, params=params)
     if r.status_code in _TMDB_BACKOFF_STATUS_CODES:
         _tmdb_backoff_until = time.time() + _TMDB_BACKOFF_SECONDS
+        pacer = _tmdb_pacing.get()
+        if pacer is not None:
+            pacer.throttled()
     return r
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
@@ -136,7 +153,7 @@ async def fetch_title_payload(media_type: str, tmdb_id, *, use_store: bool = Tru
     if use_store and count:
         await note_lookup(False)
     try:
-        async with _tmdb_semaphore:
+        async with _paced_slot(), _tmdb_semaphore:
             r = await _tmdb_get(
                 f"{_API_BASE}/{media_type}/{key}",
                 params={"api_key": api_key, "append_to_response": _STORE_APPEND[media_type]},
@@ -492,7 +509,7 @@ async def search_title(query: str, content_type: str) -> list[dict]:
 _LATEST_SEASON_MAX_AGE = 86400
 
 
-async def get_series_episode_list(tmdb_id: str) -> list[dict]:
+async def get_series_episode_list(tmdb_id: str, need_stills: bool = False) -> list[dict]:
     """Every canonical episode TMDB knows about for a series -- the DVR
     Library's Sonarr/Radarr-style missing-episode view diffs this against
     what's actually in the pool (vod_db.list_episodes_for_series_ids) to
@@ -526,12 +543,16 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
             except Exception as exc:
                 logger.warning("[tmdb_sync] local season read failed for tmdb_id=%s: %s", tmdb_id, exc)
                 cached = None
-            if cached is not None:
+            # GH #82: seasons stored before still images were kept have no "still_path" key at all;
+            # a caller that needs stills treats those as a miss and refetches once (the rewritten
+            # row then carries the key, null or not, so it is never refetched for this again).
+            stale_for_stills = need_stills and bool(cached) and "still_path" not in cached[0]
+            if cached is not None and not stale_for_stills:
                 await note_lookup(True)
                 return cached
         await note_lookup(False)
         try:
-            async with _tmdb_semaphore:
+            async with _paced_slot(), _tmdb_semaphore:
                 sr = await _tmdb_get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
             sr.raise_for_status()
             episodes = [
@@ -540,6 +561,7 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
                     "episode_number": ep["episode_number"],
                     "name": ep.get("name"),
                     "air_date": ep.get("air_date"),
+                    "still_path": ep.get("still_path"),
                 }
                 for ep in sr.json().get("episodes", [])
             ]
@@ -601,6 +623,21 @@ async def get_series_episode_list_local(tmdb_id: str) -> list[dict]:
     except Exception as exc:
         logger.warning("[tmdb_sync] local episode list read failed for tmdb_id=%s: %s", tmdb_id, exc)
         return []
+
+
+# KNM: 2026-11-12 -- store-only read of a show's first air date, to fill a missing
+# series release date without a TMDB request.
+async def get_series_first_air_date_local(tmdb_id: str) -> str | None:
+    """first_air_date from the local TMDB library only; None when the store is
+    off or holds nothing for this show. Never calls TMDB."""
+    if not (store_enabled() and str(tmdb_id).isdigit()):
+        return None
+    try:
+        payload = await asyncio.to_thread(tmdb_store.get_payload, "tv", int(tmdb_id))
+    except Exception as exc:
+        logger.warning("[tmdb_sync] local first_air_date read failed for tmdb_id=%s: %s", tmdb_id, exc)
+        return None
+    return (payload or {}).get("first_air_date") or None
 
 
 async def get_tmdb_details_for_ids(tmdb_ids: list[str], content_type: str) -> dict[str, dict]:

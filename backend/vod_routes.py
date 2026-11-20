@@ -60,6 +60,7 @@ from config import (
 from routes import require_auth
 from secrets_util import hash_password, looks_like_fernet_token
 import ai_assist
+import air_date_backfill
 import apply_exclusions_job
 import arr_client
 import arr_handoff
@@ -1006,6 +1007,18 @@ async def get_default_categories_prompt():
         return {"show": False}
     has_catchall = bool(await asyncio.to_thread(vod_db.list_catchall_category_ids))
     return {"show": has_catchall}
+
+
+# KNM: 2026-11-19 -- one-time, user-started fill of missing episode air dates (local TMDB
+# library first, then TMDB; never a provider). Start is ignored once running or done.
+@router.get("/air-date-backfill/", dependencies=_GUARDS)
+async def get_air_date_backfill_status():
+    return air_date_backfill.get_status()
+
+
+@router.post("/air-date-backfill/start/", dependencies=_GUARDS)
+async def start_air_date_backfill():
+    return air_date_backfill.start()
 
 
 @router.get("/hide-dvr-tab/", dependencies=_GUARDS)
@@ -3920,6 +3933,8 @@ async def enrich_movie(movie_id: int, force: bool = False):
         fetched = await vod_importer.enrich_movie(movie_id, force=force)
     except vod_importer.ProviderBackoffError as exc:
         raise HTTPException(503, detail=str(exc))
+    # KNM: 2026-11-12 -- card open fills a still-missing release date (local TMDB library, then TMDB).
+    await vod_importer.fill_movie_release_date(movie_id)
     return {"fetched": fetched, "movie": vod_db.get_movie(movie_id)}
 
 
@@ -4980,6 +4995,10 @@ async def enrich_series(series_id: int, force: bool = False):
         result = await vod_importer.enrich_series(series_id, force=force)
     except vod_importer.ProviderBackoffError as exc:
         raise HTTPException(503, detail=str(exc))
+    if not result["fetched"]:
+        # KNM: 2026-11-12 -- card open on an already-synced show still fills missing air dates (a fetch
+        # does this itself); local TMDB library first, then TMDB.
+        await vod_importer.fill_series_air_dates(series_id)
     series = vod_db.get_series(series_id)
     if not series:
         # Found live 2026-09-15: a concurrent auto-merge (see

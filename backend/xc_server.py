@@ -44,6 +44,9 @@ logger = logging.getLogger("vod_manager.xc_server")
 
 router = APIRouter(tags=["xc-vod"])
 
+# GH #82 -- episode stills are stored as TMDB image paths; the XC feed serves full URLs.
+_TMDB_STILL_BASE = "https://image.tmdb.org/t/p/w500"
+
 vod_db.init_db()
 
 # Some real XC providers silently drop the connection -- no HTTP response at
@@ -504,6 +507,11 @@ def _handle_player_api_action(action: str, params, authenticated: dict) -> dict 
                     "plot": ep["description"] or "",
                     "duration_secs": ep["duration_secs"] or 0,
                     "bitrate": ep.get("bitrate") or 0,
+                    # KNM: 2026-11-12 -- ISO YYYY-MM-DD, omitted when unknown (Dispatcharr parses
+                    # this key with datetime.fromisoformat, so an empty string would be an error).
+                    **({"air_date": ep["air_date"], "releasedate": ep["air_date"]} if ep.get("air_date") else {}),
+                    # GH #82 -- TMDB episode still as a full image URL, omitted when unknown.
+                    **({"movie_image": _TMDB_STILL_BASE + ep["still_path"]} if ep.get("still_path") else {}),
                 },
             })
 

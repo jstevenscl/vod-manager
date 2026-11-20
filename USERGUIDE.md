@@ -1539,6 +1539,27 @@ succeeds, or when you deactivate or delete it; **Sync History** keeps the
 per-provider record. Fix the provider (credentials, URL, User-Agent)
 and run **Import** again.
 
+### Episode air dates and images
+
+Each episode now carries the date it first aired and its TMDB picture (the
+"still"), and the series feed to Dispatcharr includes them (`air_date` and
+`releasedate`, plus `movie_image` for the picture), so apps that show an
+episode date or thumbnail can show them. Movies get a release date the same way when their card is opened and
+none is stored yet. Dates and pictures come from your local TMDB library first
+and from a TMDB request only when it does not have them; **providers are never asked**
+for this, and a title with no date or picture simply stays blank. New ones are filled in
+during import, sync and the episode trickle, and when a series card is opened.
+
+For a catalog that already has episodes without dates or pictures, **Configuration →
+Fill missing episode air dates and images** runs a one-time background job over every series
+that has a TMDB ID. Click **Start**; you can leave the page, and if the app
+restarts it carries on by itself. When it finishes it shows how many shows were
+checked, how many episode dates and images were added, and how many shows were
+skipped (no TMDB match, so no source) or errored. It paces its own TMDB requests
+(about 20 a second at most) and slows down by itself if TMDB asks it to.
+
+![The Fill missing episode air dates and images card while it runs](docs/screenshots/fill-air-dates-and-images.png)
+
 ### Sync History
 
 **Curation & Maintenance → Sync History** (click the section title to expand

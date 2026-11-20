@@ -25,6 +25,7 @@ import plex_importer
 import auto_episode_titles
 import strm_export
 import vod_downloader
+import air_date_backfill
 import tmdb_fill
 from portal_routes import router as portal_router
 from routes import router
@@ -518,6 +519,8 @@ async def lifespan(app: FastAPI):
     closed = await asyncio.to_thread(vod_db.close_orphaned_catalog_sync_runs)
     if closed:
         logger.info("Closed %d Sync History run(s) interrupted by the previous process", closed)
+    # KNM: 2026-11-19 -- continue a one-time air date backfill the last process died in the middle of.
+    air_date_backfill.resume_if_interrupted()
     tasks = [
         asyncio.create_task(_vod_catalog_refresher()),
         asyncio.create_task(_strm_export_scheduler()),

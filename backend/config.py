@@ -22,7 +22,7 @@ APP_PORT    = int(os.environ.get("APP_PORT", "8282"))
 # of sync once before (main.py's FastAPI(version=...) vs. routes.py's /version/
 # endpoint each having their own independent hardcoded literal), so both now
 # import this instead of repeating the string.
-APP_VERSION = "0.3.19"
+APP_VERSION = "0.3.20"
 
 # Persisted log file for main.py's rotating file handler -- the app previously
 # only logged to stdout, so a container restart (or just not having docker
@@ -803,6 +803,17 @@ def get_hide_dvr_tab() -> bool:
 
 def set_hide_dvr_tab(hidden: bool) -> None:
     _update_raw(lambda data: data.__setitem__("hide_dvr_tab", hidden))
+
+
+# KNM: one-time episode air date backfill state (pending/running/done + progress
+# counters), kept in config.json like every other app setting -- no schema change. 2026-11-19
+def get_air_date_backfill() -> dict:
+    value = _read_raw().get("air_date_backfill")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def save_air_date_backfill(state: dict) -> None:
+    _update_raw(lambda data: data.__setitem__("air_date_backfill", dict(state)))
 
 
 def get_openai_api_key() -> str | None:
