@@ -13,6 +13,8 @@ organizes what's already there according to an external list.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import re
 import time
@@ -53,6 +55,18 @@ _TMDB_BACKOFF_STATUS_CODES = {429, 503}
 _TMDB_BACKOFF_SECONDS = 5.0
 _tmdb_backoff_until = 0.0
 
+# KNM: optional pacer for one running task tree (the one-time air-date backfill).
+# Default None = every other caller behaves exactly as before. A pacer offers
+# slot() (async context manager, entered BEFORE the global semaphore so a paced
+# caller never holds global slots while it waits for its turn) and throttled()
+# (called when TMDB answers 429/503 so the pacer can slow itself down). 2026-11-19
+_tmdb_pacing: contextvars.ContextVar = contextvars.ContextVar("_tmdb_pacing", default=None)
+
+
+def _paced_slot():
+    pacer = _tmdb_pacing.get()
+    return pacer.slot() if pacer is not None else contextlib.nullcontext()
+
 
 async def _tmdb_get(url: str, params: dict) -> httpx.Response:
     """GET through the shared TMDB client, honoring/setting the backoff --
@@ -64,6 +78,9 @@ async def _tmdb_get(url: str, params: dict) -> httpx.Response:
     r = await _tmdb_client.get(url, params=params)
     if r.status_code in _TMDB_BACKOFF_STATUS_CODES:
         _tmdb_backoff_until = time.time() + _TMDB_BACKOFF_SECONDS
+        pacer = _tmdb_pacing.get()
+        if pacer is not None:
+            pacer.throttled()
     return r
 
 _API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+")
@@ -136,7 +153,7 @@ async def fetch_title_payload(media_type: str, tmdb_id, *, use_store: bool = Tru
     if use_store and count:
         await note_lookup(False)
     try:
-        async with _tmdb_semaphore:
+        async with _paced_slot(), _tmdb_semaphore:
             r = await _tmdb_get(
                 f"{_API_BASE}/{media_type}/{key}",
                 params={"api_key": api_key, "append_to_response": _STORE_APPEND[media_type]},
@@ -531,7 +548,7 @@ async def get_series_episode_list(tmdb_id: str) -> list[dict]:
                 return cached
         await note_lookup(False)
         try:
-            async with _tmdb_semaphore:
+            async with _paced_slot(), _tmdb_semaphore:
                 sr = await _tmdb_get(f"{_API_BASE}/tv/{tmdb_id}/season/{season_number}", params={"api_key": api_key})
             sr.raise_for_status()
             episodes = [

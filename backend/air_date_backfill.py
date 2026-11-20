@@ -7,19 +7,92 @@ progress live in config.json so a restart can pick the run up where it stopped.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 
 import config
+import tmdb_sync
 import vod_db
 import vod_importer
 
 logger = logging.getLogger(__name__)
 
-# KNM: gentle pace between series so a big catalog does not hammer TMDB; tmdb_sync._tmdb_get
-# already adds the shared concurrency cap and 429/503 backoff. 2026-11-19
-_PAUSE_SECONDS = 0.2
+# KNM: one-time catch-up of a large catalog, so it runs much faster than the always-on
+# features, yet well under TMDB's ~50 requests/s per IP: aim for 20/s and never exceed 25/s
+# in total across all workers. Only real TMDB requests are paced; series answered from the
+# local TMDB library cost no waiting. 2026-11-19
+_TARGET_REQUESTS_PER_SECOND = 20.0
+# KNM: hard ceiling on the request rate, whatever the target or recovery logic says. 2026-11-19
+_HARD_CAP_REQUESTS_PER_SECOND = 25.0
+# KNM: series processed in parallel. Each worker has one request in flight at a time, and
+# _MAX_IN_FLIGHT bounds the backfill's share of tmdb_sync's global cap of 40 concurrent
+# requests, leaving the rest free for card opens and the trickle. 2026-11-19
+_WORKERS = 12
+_MAX_IN_FLIGHT = 16
+# KNM: after TMDB answers 429/503 the backfill halves its own rate (the shared 5s backoff
+# also stalls the rest of the app), then climbs back 25% every _RECOVER_AFTER seconds. 2026-11-19
+_MIN_REQUESTS_PER_SECOND = 2.0
+_SLOWDOWN_COOLDOWN = 5.0
+_RECOVER_AFTER = 10.0
 _SAVE_EVERY = 25
+
+_clock = time.monotonic
+_sleep = asyncio.sleep
+
+
+class _RateLimiter:
+    """Spaces requests at least 1/rate apart across every caller. No await sits between
+    reading and updating _next, so concurrent callers cannot race. The rate can drop
+    after a 429/503 and recovers step by step, never above min(target, hard cap)."""
+
+    def __init__(self, target: float, cap: float, clock=None, sleep=None):
+        self._ceiling = min(float(target), float(cap))
+        self.rate = self._ceiling
+        self._clock = clock
+        self._sleep = sleep
+        self._next = 0.0
+        self._last_slowdown = float("-inf")
+        self._last_change = float("-inf")
+
+    def _now(self) -> float:
+        return (self._clock or _clock)()
+
+    async def acquire(self) -> None:
+        now = self._now()
+        if self.rate < self._ceiling and now - self._last_change >= _RECOVER_AFTER:
+            self.rate = min(self._ceiling, self.rate * 1.25)
+            self._last_change = now
+        start = max(now, self._next)
+        self._next = start + 1.0 / self.rate
+        wait = start - now
+        if wait > 0:
+            await (self._sleep or _sleep)(wait)
+
+    def slow_down(self) -> None:
+        now = self._now()
+        if now - self._last_slowdown < _SLOWDOWN_COOLDOWN:
+            return  # one burst of 429s counts once
+        self._last_slowdown = self._last_change = now
+        self.rate = max(min(_MIN_REQUESTS_PER_SECOND, self._ceiling), self.rate / 2.0)
+
+
+class _Pacer:
+    """Installed for the backfill's tasks via tmdb_sync._tmdb_pacing."""
+
+    def __init__(self, limiter: _RateLimiter):
+        self.limiter = limiter
+        self._in_flight = asyncio.Semaphore(_MAX_IN_FLIGHT)
+
+    @contextlib.asynccontextmanager
+    async def slot(self):
+        async with self._in_flight:
+            await self.limiter.acquire()
+            yield
+
+    def throttled(self) -> None:
+        self.limiter.slow_down()
+
 
 _COUNTERS = ("total", "processed", "filled", "skipped_no_tmdb_id", "errors")
 _task: asyncio.Task | None = None
@@ -49,38 +122,71 @@ def get_status() -> dict:
     return state
 
 
+async def _process(series_id: int, state: dict, tmdb_locks: dict) -> None:
+    try:
+        series = await asyncio.to_thread(vod_db.get_series, series_id)
+        tmdb_id = str((series or {}).get("tmdb_id") or "").strip()
+        # Series sharing a TMDB id take turns: the second finds the first one's data in the
+        # local library instead of asking TMDB again.
+        async with tmdb_locks.setdefault(tmdb_id, asyncio.Lock()):
+            before = await asyncio.to_thread(vod_db.count_episodes_missing_air_date, series_id)
+            await vod_importer.fill_series_air_dates(series_id)
+            after = await asyncio.to_thread(vod_db.count_episodes_missing_air_date, series_id)
+        state["filled"] += max(0, before - after)
+    except Exception as exc:  # a bad series is logged and skipped, never aborts the run
+        state["errors"] += 1
+        logger.warning("[air_date_backfill] series_id=%s skipped: %s", series_id, exc)
+    # No await below: counters change only in this synchronous stretch, so workers cannot race.
+    state["processed"] += 1
+    if state["processed"] % _SAVE_EVERY == 0:
+        _save(state)
+
+
+async def _worker(queue: asyncio.Queue, state: dict, tmdb_locks: dict) -> None:
+    while True:
+        try:
+            series_id = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        await _process(series_id, state, tmdb_locks)
+
+
 async def run() -> None:
     state = _load()
+    workers: list[asyncio.Task] = []
     try:
         ids = await asyncio.to_thread(vod_db.list_series_ids_missing_air_dates)
         state["skipped_no_tmdb_id"] = await asyncio.to_thread(vod_db.count_series_missing_air_dates_without_tmdb_id)
         # Resume: series already finished have no missing dates and drop out of `ids`.
         state["total"] = state["processed"] + len(ids)
         _save(state)
-        for n, series_id in enumerate(ids, 1):
-            try:
-                before = await asyncio.to_thread(vod_db.count_episodes_missing_air_date, series_id)
-                await vod_importer.fill_series_air_dates(series_id)
-                after = await asyncio.to_thread(vod_db.count_episodes_missing_air_date, series_id)
-                state["filled"] += max(0, before - after)
-            except Exception as exc:  # a bad series is logged and skipped, never aborts the run
-                state["errors"] += 1
-                logger.warning("[air_date_backfill] series_id=%s skipped: %s", series_id, exc)
-            state["processed"] += 1
-            if n % _SAVE_EVERY == 0:
-                _save(state)
-            if _PAUSE_SECONDS:
-                await asyncio.sleep(_PAUSE_SECONDS)
+        queue: asyncio.Queue = asyncio.Queue()
+        for series_id in ids:
+            queue.put_nowait(series_id)
+        tmdb_locks: dict = {}
+        # The pacer is set before the workers start, so each worker task inherits it; no other
+        # part of the app sees it.
+        token = tmdb_sync._tmdb_pacing.set(_Pacer(_RateLimiter(_TARGET_REQUESTS_PER_SECOND, _HARD_CAP_REQUESTS_PER_SECOND)))
+        try:
+            workers = [asyncio.create_task(_worker(queue, state, tmdb_locks)) for _ in range(_WORKERS)]
+        finally:
+            tmdb_sync._tmdb_pacing.reset(token)
+        await asyncio.gather(*workers)
         state["state"] = "done"
         state["finished_at"] = time.time()
         _save(state)
         logger.info("[air_date_backfill] done: %s", {k: state[k] for k in _COUNTERS})
     except asyncio.CancelledError:
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         _save(state)  # stays "running" on disk; resumed at next startup
         raise
     except Exception as exc:
         # Leave the state "running" so Start-up resume retries; surface the cause in the log.
         logger.error("[air_date_backfill] stopped early: %s", exc)
+        for w in workers:
+            w.cancel()
         _save(state)
 
 

@@ -30,9 +30,26 @@ def _air(db, sid):
     return {e["episode_number"]: e["air_date"] for e in db.list_episodes(sid)}
 
 
+class _FakeTime:
+    def __init__(self):
+        self.now = 100.0
+        self.sleeps = []
+
+    def clock(self):
+        return self.now
+
+    async def sleep(self, secs):
+        self.sleeps.append(secs)
+        self.now += secs
+
+
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    monkeypatch.setattr(air_date_backfill, "_PAUSE_SECONDS", 0)
+    # No real waiting in tests: the rate limiter's clock and sleep are faked.
+    ft = _FakeTime()
+    monkeypatch.setattr(air_date_backfill, "_clock", ft.clock)
+    monkeypatch.setattr(air_date_backfill, "_sleep", ft.sleep)
+    monkeypatch.setattr(pytest, "fake_time", ft, raising=False)
     monkeypatch.setattr(air_date_backfill, "_task", None)
 
     def boom(*a, **k):
@@ -225,3 +242,252 @@ def test_routes_expose_status_and_idempotent_start(db, tmdb):
         return await vod_routes.get_air_date_backfill_status()
     st = asyncio.run(go())
     assert st["state"] == "done" and st["filled"] == 1
+
+
+
+
+# ---- rate limiter, pacing, concurrency, write path ---------------------------
+
+def _limiter(target=20.0, cap=25.0):
+    ft = pytest.fake_time
+    return air_date_backfill._RateLimiter(target, cap, clock=ft.clock, sleep=ft.sleep), ft
+
+
+def test_default_target_is_20_and_hard_cap_25():
+    assert air_date_backfill._TARGET_REQUESTS_PER_SECOND == 20.0
+    assert air_date_backfill._HARD_CAP_REQUESTS_PER_SECOND == 25.0
+
+
+def test_limiter_caps_rate_at_target():
+    lim, ft = _limiter()
+
+    async def go():
+        t0 = ft.now
+        for _ in range(41):
+            await lim.acquire()
+        return ft.now - t0
+    assert asyncio.run(go()) == pytest.approx(2.0)  # 41 requests at 20/s
+
+
+def test_limiter_never_exceeds_hard_cap_even_if_target_is_higher():
+    lim, ft = _limiter(target=100.0, cap=25.0)
+
+    async def go():
+        t0 = ft.now
+        for _ in range(51):
+            await lim.acquire()
+        return ft.now - t0
+    assert asyncio.run(go()) >= 2.0 - 1e-9  # 50 gaps at >= 1/25 s
+
+
+def test_limiter_concurrent_callers_are_spaced_out():
+    lim, ft = _limiter()
+
+    async def one(times):
+        await lim.acquire()
+        times.append(ft.now)
+
+    async def go():
+        times = []
+        await asyncio.gather(*[one(times) for _ in range(30)])
+        return sorted(times)
+    times = asyncio.run(go())
+    assert all(b - a >= 1 / 25 - 1e-9 for a, b in zip(times, times[1:]))
+
+
+def test_429_halves_the_rate_then_recovers_gradually_and_bursts_count_once():
+    lim, ft = _limiter()
+    lim.slow_down()
+    assert lim.rate == pytest.approx(10.0)
+    lim.slow_down()  # same burst of 429s: no second halving
+    assert lim.rate == pytest.approx(10.0)
+
+    async def go():
+        ft.now += air_date_backfill._RECOVER_AFTER
+        await lim.acquire()
+        first = lim.rate
+        ft.now += air_date_backfill._RECOVER_AFTER
+        await lim.acquire()
+        return first, lim.rate
+    first, second = asyncio.run(go())
+    assert 10.0 < first < second <= 20.0
+    # a later, separate 429 halves again
+    ft.now += air_date_backfill._SLOWDOWN_COOLDOWN
+    before = lim.rate
+    lim.slow_down()
+    assert lim.rate == pytest.approx(before / 2)
+
+
+def test_tmdb_429_through_tmdb_get_slows_the_pacer(monkeypatch):
+    class Resp:
+        status_code = 429
+
+    async def fake_get(url, params=None):
+        return Resp()
+    monkeypatch.setattr(tmdb_sync._tmdb_client, "get", fake_get)
+    monkeypatch.setattr(tmdb_sync, "_tmdb_backoff_until", 0.0)
+    lim, _ = _limiter()
+    pacer = air_date_backfill._Pacer(lim)
+
+    async def go():
+        token = tmdb_sync._tmdb_pacing.set(pacer)
+        try:
+            await tmdb_sync._tmdb_get("http://x", {})
+        finally:
+            tmdb_sync._tmdb_pacing.reset(token)
+    asyncio.run(go())
+    assert lim.rate == pytest.approx(10.0)
+
+
+def test_tmdb_get_without_a_pacer_is_untouched(monkeypatch):
+    class Resp:
+        status_code = 200
+
+    async def fake_get(url, params=None):
+        return Resp()
+    monkeypatch.setattr(tmdb_sync._tmdb_client, "get", fake_get)
+    assert tmdb_sync._tmdb_pacing.get() is None
+    assert asyncio.run(tmdb_sync._tmdb_get("http://x", {})).status_code == 200
+
+
+def test_local_only_series_incur_no_pacing_delay(db, tmdb):
+    ft = pytest.fake_time
+    for i in range(30):
+        _series(db, f"S{i}", str(100 + i), (None,))
+        tmdb.local[str(100 + i)] = {1: "2008-01-20"}
+    _run()
+    assert ft.sleeps == []
+    assert air_date_backfill.get_status()["filled"] == 30
+
+
+def test_remote_requests_are_paced_across_concurrent_workers(db, tmdb, monkeypatch):
+    ft = pytest.fake_time
+    for i in range(40):
+        _series(db, f"S{i}", str(100 + i), (None,))
+    stamps = []
+
+    async def remote(tmdb_id):  # one request per series, entering the pacer like the real season fetch
+        async with tmdb_sync._paced_slot():
+            stamps.append(ft.now)
+        return [{"season_number": 1, "episode_number": 1, "air_date": "2010-01-01"}]
+    monkeypatch.setattr(tmdb_sync, "get_series_episode_list", remote)
+    _run()
+    stamps.sort()
+    assert len(stamps) == 40
+    assert stamps[-1] - stamps[0] >= 39 / 25 - 1e-9          # never above the 25/s cap
+    assert stamps[-1] - stamps[0] <= 39 / 20 + 0.05          # and it does reach ~20/s
+    st = air_date_backfill.get_status()
+    assert (st["processed"], st["total"], st["filled"], st["errors"]) == (40, 40, 40, 0)
+
+
+def test_in_flight_requests_stay_under_the_backfill_share(db, tmdb, monkeypatch):
+    for i in range(40):
+        _series(db, f"S{i}", str(100 + i), (None,))
+    now, peak = [0], [0]
+
+    async def remote(tmdb_id):
+        async with tmdb_sync._paced_slot():
+            now[0] += 1
+            peak[0] = max(peak[0], now[0])
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            now[0] -= 1
+        return []
+    monkeypatch.setattr(tmdb_sync, "get_series_episode_list", remote)
+    _run()
+    assert 1 <= peak[0] <= air_date_backfill._MAX_IN_FLIGHT < tmdb_sync._GLOBAL_TMDB_CONCURRENCY
+
+
+def test_counters_correct_under_concurrency_with_failures(db, tmdb, monkeypatch):
+    ids = [_series(db, f"S{i}", str(100 + i), (None, None)) for i in range(40)]
+    bad = set(ids[::4])
+    real = vod_importer.fill_series_air_dates
+
+    async def flaky(sid):
+        await asyncio.sleep(0)
+        if sid in bad:
+            raise RuntimeError("boom")
+        await real(sid)
+    monkeypatch.setattr(vod_importer, "fill_series_air_dates", flaky)
+    tmdb.local = {str(100 + i): {1: "2001-01-01", 2: "2001-01-02"} for i in range(40)}
+    _run()
+    st = air_date_backfill.get_status()
+    assert (st["total"], st["processed"], st["errors"], st["filled"]) == (40, 40, 10, 60)
+    assert st["state"] == "done"
+
+
+def test_progress_is_saved_every_batch_while_running(db, tmdb, monkeypatch):
+    for i in range(60):
+        _series(db, f"S{i}", str(100 + i), (None,))
+    saved = []
+    real_save = air_date_backfill._save
+
+    def spy(st):
+        saved.append(st["processed"])
+        real_save(st)
+    monkeypatch.setattr(air_date_backfill, "_save", spy)
+    _run()
+    assert 25 in saved and 50 in saved and saved[-1] == 60
+
+
+def test_series_sharing_a_tmdb_id_do_not_run_at_the_same_time(db, tmdb, monkeypatch):
+    a = _series(db, "A", "555", (None,))
+    b = _series(db, "B", "555", (None,))
+    tmdb.local = {"555": {1: "2009-09-09"}}
+    active, peak = [0], [0]
+    real = vod_importer.fill_series_air_dates
+
+    async def watch(sid):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        await asyncio.sleep(0)
+        await real(sid)
+        active[0] -= 1
+    monkeypatch.setattr(vod_importer, "fill_series_air_dates", watch)
+    _run()
+    assert peak[0] == 1
+    assert _air(db, a) == _air(db, b) == {1: "2009-09-09"}
+    assert air_date_backfill.get_status()["errors"] == 0
+
+
+def test_parallel_catalog_writes_lose_no_updates_and_never_lock(db):
+    import threading
+    ids = [_series(db, f"W{i}", str(900 + i), (None,) * 30) for i in range(12)]
+    errors = []
+
+    def work(sid, n):
+        try:
+            for _ in range(5):
+                db.fill_episode_air_dates(sid, {(1, e): f"20{10 + n:02d}-01-{(e % 28) + 1:02d}" for e in range(1, 31)})
+                db.fill_missing_release_date("series", sid, f"20{10 + n:02d}-05-05")
+        except Exception as exc:
+            errors.append(exc)
+    threads = [threading.Thread(target=work, args=(sid, n)) for n, sid in enumerate(ids)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    for n, sid in enumerate(ids):
+        eps = _air(db, sid)
+        assert len(eps) == 30 and all(eps.values())
+        assert db.get_series(sid)["release_date"] == f"20{10 + n:02d}-05-05"
+
+
+def test_parallel_tmdb_store_season_writes_never_lock(tmp_path, monkeypatch):
+    import threading
+    import tmdb_store
+    monkeypatch.setattr(tmdb_store, "DB_PATH", tmp_path / "tmdb.sqlite")
+    monkeypatch.setattr(tmdb_store, "_initialized_path", None)
+    tmdb_store.init_db()
+    errors = []
+
+    def work(n):
+        try:
+            for season in range(1, 11):
+                tmdb_store.put_season(n, season, [{"season_number": season, "episode_number": 1, "air_date": "2001-01-01"}])
+        except Exception as exc:
+            errors.append(exc)
+    threads = [threading.Thread(target=work, args=(n,)) for n in range(16)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    assert all(tmdb_store.get_season(n, 10) for n in range(16))
